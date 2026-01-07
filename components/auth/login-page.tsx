@@ -167,7 +167,7 @@ export function LoginPage({ onLogin }: LoginPageProps) {
                   )}
                 </Button>
               </form>
-            </CardContent>
+            </CardContent> 
           </Card>
         </div>
 
