@@ -1,0 +1,2602 @@
+"use client"
+
+import { useState, useEffect, useCallback, useMemo, useRef } from "react"
+import { Button } from "@/components/ui/button"
+import { Input } from "@/components/ui/input"
+import { Label } from "@/components/ui/label"
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog"
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
+import { Textarea } from "@/components/ui/textarea"
+import { Badge } from "@/components/ui/badge"
+import { Switch } from "@/components/ui/switch"
+import ProgressSpinner from "../ProgressSpinner/ProgressSpinner"
+import { Toast } from 'primereact/toast';
+import { UniversalToolbar } from "@/components/ui/universal-toolbar"
+import {
+  Plus,
+  Search,
+  FileText,
+  Edit,
+  Trash2,
+  Save,
+  X,
+  CheckCircle,
+  Upload,
+  Globe,
+  Key,
+  Shield,
+  UserPlus,
+  Bell,
+  MessageSquare,
+  Phone,
+} from "lucide-react"
+import { ExcelImport } from "@/components/ui/excel-import"
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
+import { useAuth } from "../auth/auth-context"
+import CustomerSearchPopup from "./CustomerSearchPopup"
+import ConfirmDialogYesNo from "../ui/ConfirmDialogYesNo"
+interface CustomersProps {
+  isSupplier?: boolean;
+}
+interface Customer {
+  id: number
+  customer_code: string
+  name: string
+  mobile1: string
+  mobile2: string
+  whatsapp1: string
+  whatsapp2: string
+  city: string
+  address: string
+  email: string
+  status: string
+  business_nature: string
+  salesman: string
+  classification?: string
+  registration_date?: string
+  web_username: string
+  web_password: string
+  transaction_notes?: string
+  general_notes: string
+  // Added for new fields
+  tax_number?: string
+  commercial_registration?: string
+  credit_limit?: string
+  payment_terms?: string
+  discount_percentage?: string,
+  type?: number
+}
+
+interface Classification {
+  id: number
+  name: string
+}
+
+interface priceCategory {
+  id: number
+  name: string
+}
+
+
+interface Salesman {
+  id: number
+  name: string
+  department?: string
+  is_active: boolean
+}
+
+interface CustomerFormData {
+  id: number,
+  customer_code: string
+  name: string
+  mobile1: string
+  mobile2: string
+  whatsapp1: string
+  whatsapp2: string
+  city: string
+  address: string
+  email: string
+  status: string
+  business_nature: string
+  salesman: string
+  classification: string
+  registration_date: string
+  web_username: string
+  web_password: string
+  transaction_notes: string
+  general_notes: string
+  tax_number: string
+  commercial_registration: string
+  credit_limit: string
+  payment_terms: string
+  discount_percentage: string,
+  pricecategory: number
+}
+
+interface CustomerUser {
+  id: number
+  username: string
+  email: string | null
+  is_active: boolean
+  last_login: string | null
+  can_view_orders: boolean
+  can_create_orders: boolean
+  can_view_balance: boolean
+  can_view_products: boolean
+  can_view_prices: boolean
+  can_view_stock: boolean
+}
+
+interface NotificationSettings {
+  id?: number
+  customer_id: number
+  notification_method: "sms" | "whatsapp" | "both"
+  preferred_phone: string
+  notify_on_received: boolean
+  notify_on_preparing: boolean
+  notify_on_quality_check: boolean
+  notify_on_ready_to_ship: boolean
+  notify_on_shipped: boolean
+  notify_on_delivered: boolean
+  notify_on_cancelled: boolean
+  is_active: boolean
+  send_daily_summary: boolean
+  daily_summary_time: string
+}
+
+export default function Customers({ isSupplier }: CustomersProps) {
+  const [customers, setCustomers] = useState<Customer[]>([])
+  const [isloading, setIsLoading] = useState(false)
+  const toast = useRef<Toast>(null);
+  const [currentIndex, setCurrentIndex] = useState(0)
+  const [showCustomerDialog, setShowCustomerDialog] = useState(false)
+  const [showNewCustomerDialog, setShowNewCustomerDialog] = useState(false)
+  const [showReportDialog, setShowReportDialog] = useState(false)
+  const [showImportDialog, setShowImportDialog] = useState(false) // Added import dialog state
+  const [showPortalDialog, setShowPortalDialog] = useState(false)
+  const [selectedCustomerForPortal, setSelectedCustomerForPortal] = useState<Customer | null>(null)
+  const [portalUsers, setPortalUsers] = useState<CustomerUser[]>([])
+  const [loadingPortalUsers, setLoadingPortalUsers] = useState(false)
+  const [showAddUserDialog, setShowAddUserDialog] = useState(false)
+  const [showEditPermissionsDialog, setShowEditPermissionsDialog] = useState(false)
+  const [selectedUser, setSelectedUser] = useState<CustomerUser | null>(null)
+  const customer_name = useRef<HTMLInputElement>(null);
+  const [showCustomerSearch, setShowCustomerSearch] = useState(false);
+  const [showConfirm, setShowConfirm] = useState(false);
+  const [showUnsaved, setShowUnsaved] = useState(false);
+  const [nextFunction, setNextFunction] = useState<(() => void) | null>(null);
+  const [newUserData, setNewUserData] = useState({
+    username: "",
+    password: "",
+    email: "",
+  })
+  const [userPermissions, setUserPermissions] = useState({
+    can_view_orders: true,
+    can_create_orders: true,
+    can_view_balance: true,
+    can_view_products: true,
+    can_view_prices: true,
+    can_view_stock: true,
+  })
+
+  const [notificationSettings, setNotificationSettings] = useState<NotificationSettings | null>(null)
+  const [loadingNotificationSettings, setLoadingNotificationSettings] = useState(false)
+  const [savingNotificationSettings, setSavingNotificationSettings] = useState(false)
+
+  const [classifications, setClassifications] = useState<Classification[]>([])
+  const [pricecategory, setPriceCategory] = useState<priceCategory[]>([])
+
+  const [salesmen, setSalesmen] = useState<Salesman[]>([])
+
+  const [formData, setFormData] = useState<CustomerFormData>({
+    id: 0,
+    customer_code: "",
+    name: "",
+    mobile1: "",
+    mobile2: "",
+    whatsapp1: "",
+    whatsapp2: "",
+    city: "",
+    address: "",
+    email: "",
+    status: "نشط",
+    business_nature: "",
+    salesman: "",
+    classification: "",
+    registration_date: new Date().toISOString().split("T")[0],
+    web_username: "",
+    web_password: "",
+    transaction_notes: "",
+    general_notes: "",
+    tax_number: "",
+    commercial_registration: "",
+    credit_limit: "",
+    payment_terms: "نقدي",
+    discount_percentage: "",
+    pricecategory: 0
+  })
+
+  const [searchFilters, setSearchFilters] = useState({
+    name: "",
+    city: "",
+    status: "",
+    salesman: "",
+  })
+
+  const [error, setError] = useState<string | null>(null)
+  const [saving, setSaving] = useState(false)
+  const [generatingNumber, setGeneratingNumber] = useState(false)
+  const [editingCustomer, setEditingCustomer] = useState(false)
+  const editingCustomerRef = useRef(false)
+  const [validationErrors, setValidationErrors] = useState<Record<string, string>>({})
+  const [showSuccessMessage, setShowSuccessMessage] = useState(false)
+
+  const filteredCustomers = useMemo(() => {
+    return customers.filter((customer) => {
+      return (
+        (!searchFilters.name || customer.name?.toLowerCase().includes(searchFilters.name.toLowerCase())) &&
+        (!searchFilters.city || customer.city === searchFilters.city) &&
+        (!searchFilters.status || customer.status === searchFilters.status) &&
+        (!searchFilters.salesman || customer.salesman === searchFilters.salesman)
+      )
+    })
+  }, [customers, searchFilters])
+
+  const currentCustomer = useMemo(() => {
+    console.log("customers[currentIndex] ", customers[currentIndex])
+    return customers[currentIndex] || null
+  }, [customers, currentIndex])
+
+  const fetchPortalUsers = useCallback(async (customerId: number) => {
+    try {
+      console.log("[v0] ========== START fetchPortalUsers ==========")
+      console.log("[v0] fetchPortalUsers called with customerId:", customerId)
+      setLoadingPortalUsers(true)
+      setError(null) // إضافة reset للخطأ
+
+      const url = `/api/admin/customer-users?customerId=${customerId}`
+
+      const response = await fetch(url)
+
+      if (response.ok) {
+        const data = await response.json()
+
+        setPortalUsers(data.users || [])
+      } else {
+        const errorData = await response.json()
+        console.error("[v0] Error response:", errorData)
+        setError(errorData.error || "فشل في تحميل المستخدمين")
+      }
+    } catch (error) {
+
+      setError("حدث خطأ في تحميل المستخدمين")
+    } finally {
+      setLoadingPortalUsers(false)
+      console.log("[v0] Loading state set to false")
+    }
+  }, [])
+  const doHotKeys = useRef(true)
+  const popupHasCalled = () => {
+    doHotKeys.current = false
+  };
+  const popupHasClosed = () => {
+    doHotKeys.current = true
+
+  };
+
+  const fetchNotificationSettings = useCallback(async (customerId: number) => {
+    try {
+      console.log("[v0] Fetching notification settings for customer:", customerId)
+      setLoadingNotificationSettings(true)
+
+      const response = await fetch(`/api/customer-notifications/settings?customerId=${customerId}`)
+
+      if (response.ok) {
+        const data = await response.json()
+        console.log("[v0] Notification settings loaded:", data)
+        setNotificationSettings(data.settings)
+      } else {
+        console.error("[v0] Failed to load notification settings")
+        // إنشاء إعدادات افتراضية
+        setNotificationSettings({
+          customer_id: customerId,
+          notification_method: "sms",
+          preferred_phone: "",
+          notify_on_received: true,
+          notify_on_preparing: true,
+          notify_on_quality_check: true,
+          notify_on_ready_to_ship: true,
+          notify_on_shipped: true,
+          notify_on_delivered: false,
+          notify_on_cancelled: true,
+          is_active: true,
+          send_daily_summary: false,
+          daily_summary_time: "09:00:00",
+        })
+      }
+    } catch (error) {
+      console.error("[v0] Error fetching notification settings:", error)
+    } finally {
+      setLoadingNotificationSettings(false)
+    }
+  }, [])
+
+  const handleAddPortalUser = useCallback(async () => {
+    if (!selectedCustomerForPortal || !newUserData.username || !newUserData.password) {
+      setError("اسم المستخدم وكلمة المرور مطلوبان")
+      return
+    }
+
+    try {
+      console.log("[v0] ========== START handleAddPortalUser ==========")
+      console.log("[v0] Adding portal user:", {
+        customerId: selectedCustomerForPortal.id,
+        username: newUserData.username,
+        email: newUserData.email,
+        permissions: userPermissions,
+      })
+
+      const response = await fetch("/api/admin/customer-users", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          customerId: selectedCustomerForPortal.id,
+          username: newUserData.username,
+          password: newUserData.password,
+          email: newUserData.email || null,
+          permissions: userPermissions,
+        }),
+      })
+
+      console.log("[v0] Add user response status:", response.status)
+
+      if (response.ok) {
+        const data = await response.json()
+        console.log("[v0] User added successfully:", data)
+        setShowAddUserDialog(false)
+        setNewUserData({ username: "", password: "", email: "" })
+        setUserPermissions({
+          can_view_orders: true,
+          can_create_orders: true,
+          can_view_balance: true,
+          can_view_products: true,
+          can_view_prices: true,
+          can_view_stock: true,
+        })
+        setError(null) // إضافة reset للخطأ
+        await fetchPortalUsers(selectedCustomerForPortal.id)
+        console.log("[v0] ========== END handleAddPortalUser (SUCCESS) ==========")
+      } else {
+        const data = await response.json()
+        console.error("[v0] Error adding user:", data)
+        setError(data.error || "فشل في إضافة المستخدم")
+      }
+    } catch (error) {
+      console.error("[v0] ========== ERROR in handleAddPortalUser ==========")
+      console.error("[v0] Error adding portal user:", error)
+      setError("حدث خطأ في إضافة المستخدم")
+    }
+  }, [selectedCustomerForPortal, newUserData, userPermissions, fetchPortalUsers])
+
+  const handleUpdatePermissions = useCallback(async () => {
+    if (!selectedUser) return
+
+    try {
+      const response = await fetch(`/api/admin/customer-users/${selectedUser.id}/permissions`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(userPermissions),
+      })
+
+      if (response.ok) {
+        setShowEditPermissionsDialog(false)
+        if (selectedCustomerForPortal) {
+          fetchPortalUsers(selectedCustomerForPortal.id)
+        }
+      } else {
+        const data = await response.json()
+        setError(data.error || "فشل في تحديث الصلاحيات")
+      }
+    } catch (error) {
+      console.error("Error updating permissions:", error)
+      setError("حدث خطأ في تحديث الصلاحيات")
+    }
+  }, [selectedUser, userPermissions, selectedCustomerForPortal, fetchPortalUsers])
+
+  const handleToggleUserStatus = useCallback(
+    async (userId: number) => {
+      try {
+        const response = await fetch(`/api/admin/customer-users/${userId}/toggle`, {
+          method: "PUT",
+        })
+
+        if (response.ok && selectedCustomerForPortal) {
+          fetchPortalUsers(selectedCustomerForPortal.id)
+        }
+      } catch (error) {
+        console.error("Error toggling user status:", error)
+      }
+    },
+    [selectedCustomerForPortal, fetchPortalUsers],
+  )
+
+  const handleResetPassword = useCallback(async (userId: number) => {
+    const newPassword = prompt("أدخل كلمة المرور الجديدة:")
+    if (!newPassword) return
+
+    try {
+      const response = await fetch(`/api/admin/customer-users/${userId}/password`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ password: newPassword }),
+      })
+
+      if (response.ok) {
+        alert("تم تغيير كلمة المرور بنجاح")
+      } else {
+        const data = await response.json()
+        setError(data.error || "فشل في تغيير كلمة المرور")
+      }
+    } catch (error) {
+      console.error("Error resetting password:", error)
+      setError("حدث خطأ في تغيير كلمة المرور")
+    }
+  }, [])
+
+  const handleSaveNotificationSettings = useCallback(async () => {
+    if (!notificationSettings || !selectedCustomerForPortal) return
+
+    try {
+      console.log("[v0] Saving notification settings:", notificationSettings)
+      setSavingNotificationSettings(true)
+      setError(null)
+
+      const response = await fetch("/api/customer-notifications/settings", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(notificationSettings),
+      })
+
+      if (response.ok) {
+        const data = await response.json()
+        console.log("[v0] Notification settings saved successfully:", data)
+        setNotificationSettings(data.settings)
+        alert("تم حفظ إعدادات الإشعارات بنجاح")
+      } else {
+        const errorData = await response.json()
+        console.error("[v0] Error saving notification settings:", errorData)
+        setError(errorData.error || "فشل في حفظ إعدادات الإشعارات")
+      }
+    } catch (error) {
+      console.error("[v0] Error saving notification settings:", error)
+      setError("حدث خطأ في حفظ إعدادات الإشعارات")
+    } finally {
+      setSavingNotificationSettings(false)
+    }
+  }, [notificationSettings, selectedCustomerForPortal])
+
+  const formatDate = (date: string | null) => {
+    if (!date) return "لم يسجل دخول بعد"
+    return new Date(date).toLocaleDateString("ar-SA", {
+      year: "numeric",
+      month: "short",
+      day: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+    })
+  }
+
+  const updateFormData = useCallback((customer: Customer | null) => {
+    if (!customer) {
+      const emptyCustomer: CustomerFormData = {
+      id: 0,
+      customer_code: "",
+      name: "",
+      mobile1: "",
+      mobile2: "",
+      whatsapp1: "",
+      whatsapp2: "",
+      city: "",
+      address: "",
+      email: "",
+      status: "نشط",
+      business_nature: "",
+      salesman: "",
+      classification: "",
+      registration_date: new Date().toISOString().split("T")[0],
+      web_username: "",
+      web_password: "",
+      transaction_notes: "",
+      general_notes: "",
+      tax_number: "",
+      commercial_registration: "",
+      credit_limit: "",
+      payment_terms: "نقدي",
+      discount_percentage: "",
+      pricecategory: pricecategory?.[0]?.id || 0,
+    }
+
+    setFormData(emptyCustomer)
+      return
+    }
+
+
+    setFormData({
+      id: customer.id || 0,
+      customer_code: customer.customer_code || "",
+      name: customer.name || "",
+      mobile1: customer.mobile1 || "",
+      mobile2: customer.mobile2 || "",
+      whatsapp1: customer.whatsapp1 || "",
+      whatsapp2: customer.whatsapp2 || "",
+      city: customer.city || "",
+      address: customer.address || "",
+      email: customer.email || "",
+      status: customer.status || "نشط",
+      business_nature: customer.business_nature || "",
+      salesman: customer.salesman || "",
+      classification: customer.classification || "",
+      registration_date: customer.registration_date || new Date().toISOString().split("T")[0],
+      web_username: customer.web_username || "",
+      web_password: customer.web_password || "",
+      transaction_notes: customer.transaction_notes || "",
+      general_notes: customer.general_notes || "",
+      tax_number: (customer as any).tax_number || "",
+      commercial_registration: (customer as any).commercial_registration || "",
+      credit_limit: (customer as any).credit_limit || "",
+      payment_terms: (customer as any).payment_terms || "نقدي",
+      discount_percentage: (customer as any).discount_percentage || "",
+      pricecategory: (customer as any).pricecategory || 0,
+    })
+  }, [])
+
+  const [currentCustomerId, setCurrentCustomerId] = useState<number>(0);
+
+  const loadData = async (
+    navigationType: "first" | "previous" | "next" | "last" | "ById",
+    customerId?: number,
+    isSupplier: boolean = false,
+    checkUnsaved: boolean = true
+  ) => {
+    const currentHash = getFormDataHash(formData);
+
+    if (checkUnsaved && currentHash !== initialHash.current) {
+      setShowUnsaved(true);
+      setNextFunction(() => () => loadData(navigationType, customerId, isSupplier, false));
+      return;
+    }
+
+    try {
+      /*if (!hasPermission(isSupplier ? "suppliers-view" : "customers-view")) {
+        toast.current?.show({
+          severity: 'error',
+          summary: '',
+          detail: isSupplier ? 'لا يوجد لديك استعلام مورد' : 'لا يوجد لديك استعلام زبون',
+          life: 3000
+        });
+        return;
+      }*/
+
+      const url = new URL(`/api/customer/navigations/${navigationType}`, location.origin);
+
+      // Determine ID for navigation
+      if (navigationType === "ById" && customerId) {
+        url.searchParams.set("id", String(customerId));
+      } else if (navigationType === "previous" || navigationType === "next") {
+        url.searchParams.set("currentId", currentCustomerId.toString());
+      }
+
+      // Pass type (customer/supplier)
+      url.searchParams.set("type", isSupplier ? "2" : "1");
+
+      const res = await fetch(url.toString());
+      console.log("res res ", url)
+      const customer = await res.json();
+      console.log("customer ", customer)
+      if (!customer.id || customer.id === currentCustomerId) {
+        toast.current?.show({
+          severity: 'error',
+          summary: '',
+          detail: navigationType === "previous" || navigationType === "first"
+            ? 'بداية السجلات'
+            : 'نهاية السجلات',
+          life: 3000
+        });
+        return;
+      }
+
+
+      const newFormData = {
+        ...customer
+      };
+      setFormData(customer);
+      console.log("newFormData ",newFormData)
+
+      setTimeout(() => {
+      customer_name.current?.focus();
+      initialHash.current = getFormDataHash(formData)
+      setCurrentCustomerId(customer.id)
+    }, 200);
+
+    } catch (err) {
+      console.error("Error loading customer:", err);
+    }
+  };
+
+  const handleFirst = useCallback(() => {
+    if (customers.length > 0) {
+      setCurrentIndex(0)
+      setEditingCustomer(true)
+      editingCustomerRef.current = true
+    }
+  }, [customers])
+
+  const handleLast = useCallback(() => {
+    if (customers.length > 0) {
+      console.log("handleLast ")
+      const lastIndex = customers.length - 1
+      console.log("lastIndex ", lastIndex)
+      setCurrentIndex(lastIndex)
+      setEditingCustomer(true)
+      editingCustomerRef.current = true
+    }
+  }, [customers])
+
+  const handleNext = useCallback(() => {
+    if (customers.length > 0 && currentIndex >= 0) {
+      const newIndex = currentIndex + 1
+      console.log("newIndex ", newIndex)
+      setCurrentIndex(newIndex)
+      setEditingCustomer(true)
+      editingCustomerRef.current = true
+    }
+  }, [customers, currentIndex])
+
+  const handlePrevious = useCallback(() => {
+
+    if (customers.length > 0 && currentIndex <= customers.length - 1) {
+      let newIndex = currentIndex - 1
+      console.log("currentCustomer ", editingCustomer)
+      if (!editingCustomerRef.current) {
+        handleLast();
+        return
+      }
+      console.log("newIndex ", newIndex)
+      setCurrentIndex(newIndex)
+      setEditingCustomer(true)
+      editingCustomerRef.current = true
+    }
+  }, [customers, currentIndex])
+
+
+
+  const updateField = useCallback(
+    <K extends keyof CustomerFormData>(field: K, value: CustomerFormData[K]) => {
+      setFormData((prev) => ({ ...prev, [field]: value }));
+      if (validationErrors[field]) {
+        setValidationErrors((prev) => ({ ...prev, [field]: "" }));
+      }
+    },
+    [validationErrors],
+  );
+
+
+  const validateForm = useCallback(() => {
+    const errors: Record<string, string> = {}
+
+    if (!formData.name.trim()) {
+      errors.customer_name = "اسم الزبون مطلوب"
+    }
+
+    if (!formData.mobile1.trim()) {
+      errors.mobile1 = "رقم الجوال مطلوب"
+    } else if (!/^\d{10}$/.test(formData.mobile1.replace(/\s/g, ""))) {
+      errors.mobile1 = "رقم الجوال يجب أن يكون 10 أرقام"
+    }
+
+    if (formData.email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(formData.email)) {
+      errors.email = "البريد الإلكتروني غير صحيح"
+    }
+
+    setValidationErrors(errors)
+    return Object.keys(errors).length === 0
+  }, [formData])
+
+  const fetchCustomers = useCallback(
+    async () => {
+      try {
+        setIsLoading(true);
+        setError(null);
+
+        // Fetch all from the same API and filter by type
+        const response = await fetch("/api/customers"); // same table endpoint
+
+        if (response.ok) {
+          const data = await response.json();
+          const allRecords = Array.isArray(data) ? data : data.customers || [];
+          console.log("allRecords ", allRecords)
+          // Filter by type
+          const filteredRecords = allRecords.filter((record: { type: number }) =>
+            isSupplier ? record.type === 2 : record.type === 1
+          );
+          console.log("isSupplier ", isSupplier)
+          filteredRecords.sort((a: Customer, b: Customer) => a.id - b.id);
+          setCustomers(filteredRecords);
+
+          if (filteredRecords.length > 0 && currentIndex >= filteredRecords.length) {
+            setCurrentIndex(0);
+          }
+        } else {
+          setError(isSupplier ? "فشل في تحميل بيانات الموردين" : "فشل في تحميل بيانات الزبائن");
+        }
+      } catch (error) {
+        console.error("Error fetching data:", error);
+        setError(isSupplier ? "حدث خطأ في تحميل الموردين" : "حدث خطأ في تحميل الزبائن");
+      } finally {
+        setIsLoading(false);
+      }
+    },
+    [currentIndex]
+  );
+
+
+  const fetchClassifications = useCallback(async () => {
+    try {
+      let response;
+      console.log("isSupplier ", isSupplier)
+      if (!isSupplier) response = await fetch("/api/customer-categories")
+      else response = await fetch("/api/supplier-categories")
+      if (response.ok) {
+        const data = await response.json()
+
+        setClassifications(data.categories)
+      }
+    } catch (error) {
+      console.error("Error fetching classifications:", error)
+    }
+  }, [])
+
+  const fetchPriceClass = useCallback(async () => {
+    try {
+      const response = await fetch("/api/pricecategory")
+      if (response.ok) {
+        const data = await response.json()
+        console.log("data ", data)
+        setPriceCategory(data)
+      }
+    } catch (error) {
+      console.error("Error fetching priceCategory:", error)
+    }
+  }, [])
+
+  const fetchSalesmen = useCallback(async () => {
+    try {
+      // For now, we'll use hardcoded salesmen until we have a proper API
+      const hardcodedSalesmen = [
+        { id: 1, name: "أحمد محمد", department: "المبيعات", is_active: true },
+        { id: 2, name: "محمد علي", department: "المبيعات", is_active: true },
+        { id: 3, name: "علي أحمد", department: "المبيعات", is_active: true },
+        { id: 4, name: "فاطمة سالم", department: "المبيعات", is_active: true },
+        { id: 5, name: "خديجة يوسف", department: "المبيعات", is_active: true },
+      ]
+      setSalesmen(hardcodedSalesmen)
+    } catch (error) {
+      console.error("Error fetching salesmen:", error)
+    }
+  }, [])
+
+  const generateCustomerNumber = useCallback(
+    async () => {
+      try {
+        setGeneratingNumber(true);
+        console.log("[v0] Generating number...", isSupplier ? "Supplier" : "Customer");
+
+        // Pass isSupplier as query param
+        const response = await fetch(`/api/customers/generate-number?isSupplier=${isSupplier}`);
+        if (response.ok) {
+          const contentType = response.headers.get("content-type");
+
+          if (contentType && contentType.includes("application/json")) {
+            const data = await response.json();
+            updateField("customer_code", data.customerNumber);
+          } else {
+            const text = await response.text();
+            setError("خطأ في الخادم - تم إرجاع صفحة HTML بدلاً من JSON");
+          }
+        } else {
+          const contentType = response.headers.get("content-type");
+          if (contentType && contentType.includes("application/json")) {
+            const errorData = await response.json();
+            setError(errorData.message || "فشل في توليد الرقم");
+          } else {
+            const text = await response.text();
+            setError("خطأ في الخادم - لا يمكن توليد الرقم");
+          }
+        }
+      } catch (error) {
+        console.error("Error generating number:", error);
+        if (error instanceof SyntaxError && error.message.includes("JSON")) {
+          setError("خطأ في تحليل استجابة الخادم - يرجى المحاولة مرة أخرى");
+        } else {
+          setError("خطأ في الاتصال بالخادم");
+        }
+      } finally {
+        setGeneratingNumber(false);
+      }
+    },
+    [updateField]
+  );
+  const handleSaveCustomer = (
+    customerData: CustomerFormData
+  ) => {
+    if (!validateForm()) return;
+
+    try {
+      setSaving(true);
+      setError(null);
+
+      const url =
+        currentCustomerId > 0
+          ? `/api/customers/${currentCustomerId}`
+          : "/api/customers";
+
+      const method = currentCustomerId > 0 ? "PUT" : "POST";
+
+      const dataToSend = {
+        id: customerData.id,
+        customer_code: customerData.customer_code,
+        customer_name: customerData.name,
+        mobile1: customerData.mobile1,
+        mobile2: customerData.mobile2,
+        whatsapp1: customerData.whatsapp1,
+        whatsapp2: customerData.whatsapp2,
+        city: customerData.city,
+        address: customerData.address,
+        email: customerData.email,
+        status: customerData.status,
+        business_nature: customerData.business_nature,
+        salesman: customerData.salesman,
+        classifications: customerData.classification,
+        account_opening_date: customerData.registration_date,
+        movement_notes: customerData.transaction_notes,
+        general_notes: customerData.general_notes,
+
+        // NEW FIELDS
+        tax_number: customerData.tax_number,
+        commercial_registration: customerData.commercial_registration,
+        credit_limit: customerData.credit_limit,
+        payment_terms: customerData.payment_terms,
+        discount_percentage: customerData.discount_percentage,
+        type: isSupplier ? 2 : 1,
+        pricecategory: customerData.pricecategory,
+      };
+
+      console.log("[v0] Sending customer data:", dataToSend);
+
+      fetch(url, {
+        method,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(dataToSend),
+      })
+        .then(async (response) => {
+          if (response.ok) {
+            return response.json();
+          } else {
+            let errorMessage = response.statusText;
+            try {
+              const errorData = await response.json();
+              if (errorData?.message) errorMessage = errorData.message;
+            } catch (err) {
+              // ignore
+            }
+
+            toast.current?.show({
+              severity: "error",
+              summary: "",
+              detail: errorMessage,
+              life: 3000,
+            });
+
+            throw new Error(errorMessage);
+          }
+        })
+        .then((savedCustomer) => {
+          console.log("[v0] Customer saved successfully:", savedCustomer);
+
+          setShowSuccessMessage(true);
+          setTimeout(() => setShowSuccessMessage(false), 3000);
+
+          setEditingCustomer(false);
+          editingCustomerRef.current = false;
+          reset_fields();
+        })
+        .catch((errorDataOrError) => {
+          if (
+            typeof errorDataOrError === "object" &&
+            errorDataOrError !== null &&
+            "error" in errorDataOrError
+          ) {
+            console.error("[v0] Save error:", errorDataOrError);
+            setError(
+              errorDataOrError.error ||
+              errorDataOrError.message ||
+              "فشل في حفظ البيانات"
+            );
+          } else {
+            console.error("[v0] Unexpected error during save:", errorDataOrError);
+            setError("فشل في حفظ البيانات - خطأ غير متوقع");
+          }
+        })
+        .finally(() => {
+          setSaving(false);
+        });
+    } catch (err) {
+      console.error("[v0] Error saving customer:", err);
+      setError("حدث خطأ في حفظ البيانات");
+      setSaving(false);
+    }
+  };
+
+
+  const confirmDelete = async () => {
+    setShowConfirm(false);
+    popupHasClosed()
+    await handleDeleteCustomer(); // your existing function
+  };
+
+
+  const handleDeleteClick = (checkUnsaved: any) => {
+
+    /*const currentHash = getFormDataHash(formData);
+    if (checkUnsaved === true && currentHash !== initialHash.current) {
+      setShowUnsaved(true)
+      return
+    }
+*/
+    if (!formData.id) {
+      toast.current?.show({
+        severity: 'warn',
+        summary: 'تنبيه',
+        detail: 'لا يوجد سجل لحذفه',
+        life: 3000
+      });
+      return;
+    }
+
+    /*if (!hasPermission("products-edit")) {
+      toast.current?.show({
+        severity: 'error',
+        summary: '',
+        detail: 'لا يوجد لديك صلاحية حذف زبون',
+        life: 3000
+      });
+      return
+    }*/
+
+    setShowConfirm(true);
+    popupHasCalled()
+  };
+
+  const handleDeleteCustomer = async () => {
+    setIsLoading(true)
+    if (!formData.id) {
+      toast.current?.show({
+        severity: 'warn',
+        summary: 'تنبيه',
+        detail: 'لا يوجد سجل لحذفه',
+        life: 3000
+      });
+      return;
+    }
+
+    try {
+      const response = await fetch(`/api/customers/${formData.id}`, {
+        method: "DELETE",
+      })
+
+      const result = await response.json();
+
+      if (!response.ok) {
+        throw new Error(result.error || "فشل في حذف السجل");
+      }
+
+      toast.current?.show({
+        severity: 'success',
+        summary: 'نجاح',
+        detail: 'تم حذف السجل بنجاح ✅',
+        life: 3000
+      });
+
+      reset_fields(); // clear form
+
+    } catch (err) {
+      console.error("Error deleting customer:", err);
+      toast.current?.show({
+        severity: 'error',
+        summary: 'خطأ',
+        detail: 'فشلت العملية ❌',
+        life: 5000
+      });
+    } finally {
+      setIsLoading(false)
+    }
+  };
+
+
+
+
+  const initialHash = useRef(0);
+  const hashCode = (str: string) => {
+    let hash = 0;
+    for (let i = 0; i < str.length; i++) {
+      const chr = str.charCodeAt(i);
+      hash = (hash << 5) - hash + chr;
+      hash |= 0; // Convert to 32bit integer
+    }
+    return hash;
+  };
+  const getFormDataHash = (data: any) => {
+    return hashCode(JSON.stringify(data));
+  };
+
+  /*const handleNewCustomer = useCallback(() => {
+    console.log("AAAAa")
+    setLoading(true)
+    updateFormData(null)
+    setEditingCustomer(false)
+    editingCustomerRef.current = false
+    setValidationErrors({})
+    setShowNewCustomerDialog(true)
+    generateCustomerNumber()
+    setLoading(false)
+    customer_name.current?.focus();
+  }, [updateFormData, generateCustomerNumber])
+*/
+  const reset_fields = async (from_code = 0, code = "") => {
+    setIsLoading(true)
+    updateFormData(null)
+    setEditingCustomer(false)
+    editingCustomerRef.current = false
+    setValidationErrors({})
+    setShowNewCustomerDialog(true)
+    await generateCustomerNumber()
+    setIsLoading(false)
+
+
+   
+    setTimeout(() => {
+      customer_name.current?.focus();
+    initialHash.current = getFormDataHash(formData)
+    
+    }, 200);
+    setCurrentCustomerId(0)
+  }
+  const handleNewCustomer = async (checkUnsaved: any) => {
+    const currentHash = getFormDataHash(formData);
+    if (checkUnsaved === true && currentHash !== initialHash.current) {
+      setShowUnsaved(true)
+      setNextFunction(() => () => reset_fields());
+      return
+    }
+    setIsLoading(true)
+    await reset_fields()
+    setIsLoading(false)
+
+  }
+
+  useEffect(() => {
+    if (showNewCustomerDialog) {
+      // Wait for the input to mount
+      setTimeout(() => {
+        customer_name.current?.focus();
+      }, 100);
+    }
+  }, [showNewCustomerDialog]);
+  const handleEditCustomer = useCallback(
+    (customer: Customer) => {
+      updateFormData(customer)
+      setEditingCustomer(true)
+      editingCustomerRef.current = true
+      setValidationErrors({})
+      setShowNewCustomerDialog(true)
+    },
+    [updateFormData],
+  )
+
+  const handleManagePortal = useCallback(
+    (customer: Customer) => {
+      console.log("[v0] ========== START handleManagePortal ==========")
+      console.log("[v0] handleManagePortal called for customer:", {
+        id: customer.id,
+        name: customer.name,
+        code: customer.customer_code,
+      })
+      setSelectedCustomerForPortal(customer)
+      setPortalUsers([]) // إضافة reset للمستخدمين السابقين
+      setError(null) // إضافة reset للخطأ
+      setNotificationSettings(null)
+      setShowPortalDialog(true)
+      console.log("[v0] Dialog opened, fetching users and notification settings...")
+      fetchPortalUsers(customer.id)
+      fetchNotificationSettings(customer.id)
+    },
+    [fetchPortalUsers, fetchNotificationSettings],
+  )
+
+  const openEditPermissionsDialog = useCallback((user: CustomerUser) => {
+    setSelectedUser(user)
+    setUserPermissions({
+      can_view_orders: user.can_view_orders,
+      can_create_orders: user.can_create_orders,
+      can_view_balance: user.can_view_balance,
+      can_view_products: user.can_view_products,
+      can_view_prices: user.can_view_prices,
+      can_view_stock: user.can_view_stock,
+    })
+    setShowEditPermissionsDialog(true)
+  }, [])
+
+  const statistics = useMemo(() => {
+    const totalCustomers = customers.length
+    const activeCustomers = customers.filter((c) => c.status === "نشط").length
+    const inactiveCustomers = customers.filter((c) => c.status === "غير نشط").length
+    const vipCustomers = customers.filter((c) => c.classification === "VIP").length
+
+    return {
+      total: totalCustomers,
+      active: activeCustomers,
+      inactive: inactiveCustomers,
+      vip: vipCustomers,
+    }
+  }, [customers])
+
+  useEffect(() => {
+    fetchCustomers()
+    fetchClassifications()
+    fetchSalesmen()
+    fetchPriceClass()
+  }, [fetchCustomers, fetchClassifications, fetchSalesmen, fetchPriceClass])
+
+  useEffect(() => {
+    console.log("[v0] Current customer changed:", currentCustomer)
+    if (currentCustomer) {
+      updateFormData(currentCustomer)
+    }
+  }, [currentCustomer, updateFormData])
+  const { isAuthenticated, hasPermission } = useAuth()
+  if (isloading) {
+    return (
+      <div className="flex items-center justify-center h-64">
+        <div className="text-lg">جاري التحميل...</div>
+      </div>
+    )
+  }
+
+  /*if (!hasPermission("customers-view")) {
+    return (
+      <div className="flex items-center justify-center h-64">
+        <div className="text-center">
+          <h2 className="text-2xl font-semibold mb-2 text-red-600">لا يوجد صلاحية</h2>
+          <p className="text-muted-foreground">ليس لديك صلاحية للوصول إلى العملاء</p>
+        </div>
+      </div>
+    )
+  }*/
+  return (
+
+    <div className="container mx-auto p-6 space-y-6" dir="rtl">
+      {/* Success Message */}
+      <ConfirmDialogYesNo
+        visible={showConfirm}
+        onConfirm={confirmDelete}
+        onCancel={() => { setShowConfirm(false); popupHasClosed() }}
+        message="هل تريد حذف هذا السجل؟"
+      />
+
+      <ConfirmDialogYesNo
+        visible={showUnsaved}
+        onConfirm={() => { setShowUnsaved(false); handleSaveCustomer(formData) }}
+        onCancel={async () => {
+          setShowUnsaved(false); popupHasClosed();
+          if (nextFunction) {
+            nextFunction();
+            setNextFunction(null);
+
+          }
+        }}
+        message="تم تعديل السجل هل تريد الحفظ؟"
+        onBack={() => { setShowUnsaved(false); popupHasClosed(); }}
+        showBack={true}
+      />
+      {showSuccessMessage && (
+        <div className="fixed top-4 right-4 bg-green-500 text-white px-4 py-2 rounded-lg shadow-lg flex items-center gap-2 z-50">
+          <CheckCircle className="h-4 w-4" />
+          تم حفظ البيانات بنجاح
+        </div>
+      )}
+      <ProgressSpinner loading={isloading} />
+      <Toast ref={toast} position="top-left" className="custom-toast" />
+      {/* Error Message */}
+      {error && <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded-lg">{error}</div>}
+
+      {/* Header */}
+      <div className="flex justify-between items-center">
+        <h1 className="text-3xl font-bold">{isSupplier ? "إدارة الموردين" : "إدارة الزبائن"} </h1>
+        <div className="flex gap-2">
+          <Button onClick={() => handleNewCustomer(false)} className="flex items-center gap-2">
+            <Plus className="h-4 w-4" />
+            {isSupplier ? "مورد جديد" : "زبون جديد"}
+          </Button>
+          <Button
+            variant="outline"
+            onClick={() => setShowImportDialog(true)}
+            className="flex items-center gap-2 bg-transparent"
+          >
+            <Upload className="h-4 w-4" />
+            استيراد من Excel
+          </Button>
+          <Dialog open={showReportDialog} onOpenChange={setShowReportDialog}>
+            <DialogTrigger asChild>
+              <Button variant="outline" className="flex items-center gap-2 bg-transparent">
+                <FileText className="h-4 w-4" />
+                التقارير
+              </Button>
+            </DialogTrigger>
+            <DialogContent className="max-w-4xl">
+              <DialogHeader>
+                <DialogTitle>تقارير الزبائن</DialogTitle>
+              </DialogHeader>
+              <div className="p-4">
+                <p>سيتم إضافة التقارير هنا</p>
+              </div>
+            </DialogContent>
+          </Dialog>
+        </div>
+      </div>
+
+      {/* Statistics Cards */}
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+        <Card className="bg-gradient-to-br from-blue-50 to-blue-100 border-blue-200">
+          <CardContent className="p-6">
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="text-sm font-medium text-blue-700">{isSupplier ? "إجمالي الموردين" : "إجمالي الزبائن"}</p>
+                <p className="text-3xl font-bold text-blue-900">{statistics.total}</p>
+              </div>
+              <div className="h-10 w-10 bg-blue-200 rounded-full flex items-center justify-center">
+                <span className="text-blue-700 text-lg font-bold">{statistics.total}</span>
+              </div>
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card className="bg-gradient-to-br from-green-50 to-green-100 border-green-200">
+          <CardContent className="p-6">
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="text-sm font-medium text-green-700"> {isSupplier ? "الموردين النشطين" : "الزبائن النشطين"}</p>
+                <p className="text-3xl font-bold text-green-900">{statistics.active}</p>
+              </div>
+              <div className="h-10 w-10 bg-green-200 rounded-full flex items-center justify-center">
+                <span className="text-green-700 text-lg font-bold">{statistics.active}</span>
+              </div>
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card className="bg-gradient-to-br from-red-50 to-red-100 border-red-200">
+          <CardContent className="p-6">
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="text-sm font-medium text-red-700">{isSupplier ? "الموردين غير النشطين" : "الزبائن غير النشطين"}</p>
+                <p className="text-3xl font-bold text-red-900">{statistics.inactive}</p>
+              </div>
+              <div className="h-10 w-10 bg-red-200 rounded-full flex items-center justify-center">
+                <span className="text-red-700 text-lg font-bold">{statistics.inactive}</span>
+              </div>
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card className="bg-gradient-to-br from-purple-50 to-purple-100 border-purple-200">
+          <CardContent className="p-6">
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="text-sm font-medium text-purple-700">{isSupplier ? "مورّدين VIP" : "زبائن VIP"}</p>
+                <p className="text-3xl font-bold text-purple-900">{statistics.vip}</p>
+              </div>
+              <div className="h-10 w-10 bg-purple-200 rounded-full flex items-center justify-center">
+                <span className="text-purple-700 text-lg font-bold">{statistics.vip}</span>
+              </div>
+            </div>
+          </CardContent>
+        </Card>
+      </div>
+
+      {/* Advanced Search */}
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <Search className="h-5 w-5" />
+            البحث المتقدم
+          </CardTitle>
+        </CardHeader>
+        <CardContent>
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+            <div>
+              <Label htmlFor="search-name"> {isSupplier ? "اسم المورد" : "اسم الزبون"}</Label>
+              <Input
+                id="search-name"
+                value={searchFilters.name}
+                onChange={(e) => setSearchFilters((prev) => ({ ...prev, name: e.target.value }))}
+                className="text-right"
+                placeholder="ابحث بالاسم..."
+              />
+            </div>
+            <div>
+              <Label htmlFor="search-city">المدينة</Label>
+              <Select
+                value={searchFilters.city}
+                onValueChange={(value) => setSearchFilters((prev) => ({ ...prev, city: value === "all" ? "" : value }))}
+              >
+                <SelectTrigger className="text-right">
+                  <SelectValue placeholder="اختر المدينة" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">جميع المدن</SelectItem>
+                  <SelectItem value="الرياض">الرياض</SelectItem>
+                  <SelectItem value="جدة">جدة</SelectItem>
+                  <SelectItem value="الدمام">الدمام</SelectItem>
+                  <SelectItem value="مكة المكرمة">مكة المكرمة</SelectItem>
+                  <SelectItem value="المدينة المنورة">المدينة المنورة</SelectItem>
+                  <SelectItem value="الطائف">الطائف</SelectItem>
+                  <SelectItem value="تبوك">تبوك</SelectItem>
+                  <SelectItem value="بريدة">بريدة</SelectItem>
+                  <SelectItem value="خميس مشيط">خميس مشيط</SelectItem>
+                  <SelectItem value="حائل">حائل</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <div>
+              <Label htmlFor="search-status">الحالة</Label>
+              <Select
+                value={searchFilters.status}
+                onValueChange={(value) =>
+                  setSearchFilters((prev) => ({ ...prev, status: value === "all" ? "" : value }))
+                }
+              >
+                <SelectTrigger className="text-right">
+                  <SelectValue placeholder="اختر الحالة" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">جميع الحالات</SelectItem>
+                  <SelectItem value="نشط">نشط</SelectItem>
+                  <SelectItem value="غير نشط">غير نشط</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <div>
+              <Label htmlFor="search-salesman">المندوب</Label>
+              <Select
+                value={searchFilters.salesman}
+                onValueChange={(value) =>
+                  setSearchFilters((prev) => ({ ...prev, salesman: value === "all" ? "" : value }))
+                }
+              >
+                <SelectTrigger className="text-right">
+                  <SelectValue placeholder="اختر المندوب" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">جميع المندوبين</SelectItem>
+                  {salesmen.map((salesman) => (
+                    <SelectItem key={salesman.id} value={salesman.name}>
+                      {salesman.name}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+          </div>
+        </CardContent>
+      </Card>
+
+      {/* Customers List */}
+      <Card>
+        <CardHeader>
+          <CardTitle>
+            {isSupplier ? `قائمة الموردين (${filteredCustomers.length})` : `قائمة الزبائن (${filteredCustomers.length})`}
+          </CardTitle>
+        </CardHeader>
+        <CardContent>
+          <div className="overflow-x-auto">
+            <table className="w-full border-collapse border border-gray-300">
+              <thead>
+                <tr className="bg-gray-50">
+                  <th className="border border-gray-300 px-4 py-2 text-right">
+                    {isSupplier ? "رقم المورد" : "رقم الزبون"}
+                  </th>
+                  <th className="border border-gray-300 px-4 py-2 text-right">
+                    {isSupplier ? "اسم المورد" : "اسم الزبون"}
+                  </th>
+                  <th className="border border-gray-300 px-4 py-2 text-right">الجوال</th>
+                  <th className="border border-gray-300 px-4 py-2 text-right">المدينة</th>
+                  <th className="border border-gray-300 px-4 py-2 text-right">الحالة</th>
+                  <th className="border border-gray-300 px-4 py-2 text-center">الإجراءات</th>
+                </tr>
+              </thead>
+              <tbody>
+                {filteredCustomers.map((customer) => (
+                  <tr key={customer.id} className="hover:bg-gray-50">
+                    <td className="border border-gray-300 px-4 py-2">{customer.customer_code}</td>
+                    <td className="border border-gray-300 px-4 py-2">{customer.name}</td>
+                    <td className="border border-gray-300 px-4 py-2">{customer.mobile1}</td>
+                    <td className="border border-gray-300 px-4 py-2">{customer.city}</td>
+                    <td className="border border-gray-300 px-4 py-2">
+                      <Badge variant={customer.status === "نشط" ? "default" : "secondary"}>{customer.status}</Badge>
+                    </td>
+                    <td className="border border-gray-300 px-4 py-2 text-center">
+                      <div className="flex justify-center gap-2">
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          onClick={() => handleManagePortal(customer)}
+                          title="إدارة بوابة العميل"
+                        >
+                          <Globe className="h-4 w-4" />
+                        </Button>
+                        <Button size="sm" variant="outline" onClick={() => handleEditCustomer(customer)}>
+                          <Edit className="h-4 w-4" />
+                        </Button>
+                        <Button size="sm" variant="outline" onClick={() => confirmDelete}>
+                          <Trash2 className="h-4 w-4" />
+                        </Button>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </CardContent>
+      </Card>
+
+      {/* Customer Form Dialog */}
+      <Dialog
+        open={showNewCustomerDialog}
+        onOpenChange={(open) => {
+          setShowNewCustomerDialog(open);
+          if (!open) {
+            // fetch customers after dialog is closed
+            fetchCustomers();
+          }
+        }}
+      >
+        <DialogContent className="max-w-[95vw] max-h-[95vh] overflow-hidden p-0" dir="rtl"
+          onPointerDownOutside={(event) => event.preventDefault()}
+          onEscapeKeyDown={(event) => event.preventDefault()}
+        >
+          <CustomerSearchPopup
+            visible={showCustomerSearch}
+            type={isSupplier ? 2 : 1}
+            onClose={() => setShowCustomerSearch(false)}
+            onSelect={(customer) => {   // customer: Customer
+              setFormData((prev) => ({
+                ...prev,
+                id: Number(customer.id), // use customer.id
+              }));
+              loadData("ById", customer.id); // pass the numeric id
+            }}
+          />
+          <div className="h-screen flex flex-col bg-background">
+            {/* Universal Toolbar - Fixed at top */}
+            <div className="flex-shrink-0">
+              <UniversalToolbar
+                onFirst={async () => { await loadData('first', 0, isSupplier) }}
+                onPrevious={async () => { await loadData('previous', 0, isSupplier) }}
+                onNext={async () => { await loadData('next', 0, isSupplier) }}
+                onLast={async () => { await loadData('last', 0, isSupplier) }}
+                onNew={() => handleNewCustomer(true)}
+                onSave={() => handleSaveCustomer(formData)}
+                onDelete={currentCustomerId > 0 ? () => handleDeleteClick(true) : undefined}
+                currentRecord={currentIndex + 1}
+                totalRecords={customers.length}
+                isFirstRecord={currentIndex === 0}
+                isLastRecord={currentIndex === customers.length - 1}
+                isSaving={saving}
+                onReport={() => console.log("Generate customer report")}
+                onExportExcel={() => console.log("Export to Excel")}
+                onPrint={() => console.log("Print customer")}
+                canSave={true}
+                canDelete={!!currentCustomer}
+              />
+            </div>
+
+            <div className="flex-1 overflow-y-auto">
+              <div className="space-y-6 p-6">
+                {/* Header */}
+                <div className="flex items-center justify-between">
+                  <div>
+                    <h1 className="text-2xl font-bold text-foreground flex items-center gap-3">
+                      <Plus className="h-7 w-7 text-primary" />
+                      {currentCustomerId === 0
+                        ? (isSupplier ? "مورد جديد" : "زبون جديد")
+                        : (isSupplier ? "تعديل مورد" : "تعديل زبون")}
+                    </h1>
+
+                  </div>
+                </div>
+
+                <form
+                  onSubmit={(e) => {
+                    e.preventDefault()
+                    handleSaveCustomer(formData)
+                  }}
+                  className="space-y-6"
+                >
+                  {/* المعلومات الأساسية والتعريف */}
+                  <Card>
+                    <CardHeader className="pb-4">
+                      <CardTitle className="flex items-center gap-2 text-lg">
+                        <Plus className="h-5 w-5 text-primary" />
+                        المعلومات الأساسية والتعريف
+                      </CardTitle>
+                    </CardHeader>
+
+                    <CardContent className="space-y-6">
+
+                      {/* ================= ROW 1: Code + Name ================= */}
+                      <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+
+                        {/* Code (1/4) */}
+                        <div className="col-span-1">
+                          <Label htmlFor="customer_code" className="text-sm font-medium">
+                            {isSupplier ? ' رقم المورد *' : 'رقم الزبون *'}
+                          </Label>
+                          <div className="flex gap-2">
+                            <Input
+                              id="customer_code"
+                              value={formData.customer_code}
+                              onChange={(e) => updateField("customer_code", e.target.value)}
+                              className="text-right"
+                              placeholder={isSupplier ? ' رقم المورد' : 'رقم الزبون '}
+                              readOnly
+                            />
+                            <Button type="button" onClick={() => setShowCustomerSearch(true)}>
+                              🔍
+                            </Button>
+                          </div>
+                        </div>
+
+                        {/* Name (3/4) */}
+                        <div className="col-span-1 md:col-span-3">
+                          <Label htmlFor="customer_name" className="text-sm font-medium">
+                            {isSupplier ? ' اسم المورد *' : 'اسم الزبون *'}
+                          </Label>
+                          <Input
+                            id="customer_name"
+                            ref={customer_name}
+                            value={formData.name}
+                            onChange={(e) => updateField("name", e.target.value)}
+                            className={`text-right ${validationErrors.name ? "border-red-500" : ""
+                              }`}
+                            placeholder=''
+                            required
+                          />
+                          {validationErrors.name && (
+                            <p className="text-red-500 text-xs mt-1">
+                              {validationErrors.name}
+                            </p>
+                          )}
+                        </div>
+
+                      </div>
+
+                      {/* ================ ROW 2: Selects ==================== */}
+                      <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+
+                        {/* Status */}
+                        <div>
+                          <Label htmlFor="status" className="text-sm font-medium">
+                            حالة الزبون
+                          </Label>
+                          <Select
+                            value={formData.status}
+                            disabled={currentCustomerId === 0}
+                            onValueChange={(value) => updateField("status", value)}
+                          >
+                            <SelectTrigger>
+                              <SelectValue placeholder="اختر الحالة" />
+                            </SelectTrigger>
+                            <SelectContent>
+                              <SelectItem value="نشط">نشط</SelectItem>
+                              <SelectItem value="غير نشط">غير نشط</SelectItem>
+                            </SelectContent>
+                          </Select>
+                        </div>
+
+                        {/* Classification */}
+                        <div>
+                          <Label htmlFor="classification" className="text-sm font-medium">
+                            التصنيف
+                          </Label>
+                          <Select
+                            value={formData.classification}
+                            onValueChange={(value) => updateField("classification", value)}
+                          >
+                            <SelectTrigger>
+                              <SelectValue placeholder="اختر التصنيف" />
+                            </SelectTrigger>
+                            <SelectContent>
+                              {classifications.map((c) => (
+                                <SelectItem key={c.id} value={c.name}>
+                                  {c.name}
+                                </SelectItem>
+                              ))}
+
+                            </SelectContent>
+                          </Select>
+                        </div>
+                        {/* Classification */}
+                        <div>
+                          <Label htmlFor="pricecategory" className="text-sm font-medium">
+                            فئة السعر
+                          </Label>
+                          <Select
+                            value={formData.pricecategory != null ? formData.pricecategory.toString() : ""}
+                            onValueChange={(value) => updateField("pricecategory", Number(value))}
+                          >
+                            <SelectTrigger>
+                              <SelectValue placeholder="فئة السعر" />
+                            </SelectTrigger>
+                            <SelectContent>
+                              {pricecategory?.map((c) => (
+                                <SelectItem key={c.id} value={c.id.toString()}>
+                                  {c.name}
+                                </SelectItem>
+                              ))}
+                            </SelectContent>
+                          </Select>
+                        </div>
+                        {/* Registration Date */}
+                        <div>
+                          <Label htmlFor="registration_date" className="text-sm font-medium">
+                            تاريخ التسجيل
+                          </Label>
+                          <Input
+                            id="registration_date"
+                            type="date"
+                            disabled={true}
+                            value={formData.registration_date}
+                            onChange={(e) => updateField("registration_date", e.target.value)}
+                            className="text-right"
+                          />
+                        </div>
+
+                      </div>
+
+                    </CardContent>
+                  </Card>
+
+
+                  {/* معلومات الاتصال */}
+                  <Card>
+                    <CardHeader className="pb-4">
+                      <CardTitle className="flex items-center gap-2 text-lg">
+                        <Plus className="h-5 w-5 text-primary" />
+                        معلومات الاتصال
+                      </CardTitle>
+                    </CardHeader>
+                    <CardContent>
+                      <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+                        <div>
+                          <Label htmlFor="mobile1" className="text-sm font-medium">
+                            الجوال الأول *
+                          </Label>
+                          <Input
+                            id="mobile1"
+                            value={formData.mobile1}
+                            onChange={(e) => updateField("mobile1", e.target.value)}
+                            className={`text-right ${validationErrors.mobile1 ? "border-red-500" : ""}`}
+                            placeholder="رقم الجوال الأول"
+                            required
+                          />
+                          {validationErrors.mobile1 && (
+                            <p className="text-red-500 text-xs mt-1">{validationErrors.mobile1}</p>
+                          )}
+                        </div>
+                        <div>
+                          <Label htmlFor="mobile2" className="text-sm font-medium">
+                            الجوال الثاني
+                          </Label>
+                          <Input
+                            id="mobile2"
+                            value={formData.mobile2}
+                            onChange={(e) => updateField("mobile2", e.target.value)}
+                            className="text-right"
+                            placeholder="رقم الجوال الثاني"
+                          />
+                        </div>
+                        <div>
+                          <Label htmlFor="whatsapp1" className="text-sm font-medium">
+                            واتساب الأول
+                          </Label>
+                          <Input
+                            id="whatsapp1"
+                            value={formData.whatsapp1}
+                            onChange={(e) => updateField("whatsapp1", e.target.value)}
+                            className="text-right"
+                            placeholder="رقم واتساب الأول"
+                          />
+                        </div>
+                        <div>
+                          <Label htmlFor="whatsapp2" className="text-sm font-medium">
+                            واتساب الثاني
+                          </Label>
+                          <Input
+                            id="whatsapp2"
+                            value={formData.whatsapp2}
+                            onChange={(e) => updateField("whatsapp2", e.target.value)}
+                            className="text-right"
+                            placeholder="رقم واتساب الثاني"
+                          />
+                        </div>
+                      </div>
+
+                      <div className="grid grid-cols-1 gap-4 mt-4">
+                        <div>
+                          <Label htmlFor="email" className="text-sm font-medium">
+                            البريد الإلكتروني
+                          </Label>
+                          <Input
+                            id="email"
+                            type="email"
+                            value={formData.email}
+                            onChange={(e) => updateField("email", e.target.value)}
+                            className={`text-right ${validationErrors.email ? "border-red-500" : ""}`}
+                            placeholder="البريد الإلكتروني"
+                          />
+                          {validationErrors.email && (
+                            <p className="text-red-500 text-xs mt-1">{validationErrors.email}</p>
+                          )}
+                        </div>
+                      </div>
+                    </CardContent>
+                  </Card>
+
+                  {/* العنوان والموقع */}
+                  <Card>
+                    <CardHeader className="pb-4">
+                      <CardTitle className="flex items-center gap-2 text-lg">
+                        <Plus className="h-5 w-5 text-primary" />
+                        العنوان والموقع
+                      </CardTitle>
+                    </CardHeader>
+                    <CardContent>
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        <div>
+                          <Label htmlFor="city" className="text-sm font-medium">
+                            المدينة
+                          </Label>
+                          <Input
+                            id="city"
+                            value={formData.city}
+                            onChange={(e) => updateField("city", e.target.value)}
+                            className="text-right"
+                            placeholder="المدينة"
+                          />
+                        </div>
+                        <div>
+                          <Label htmlFor="address" className="text-sm font-medium">
+                            العنوان التفصيلي
+                          </Label>
+                          <Input
+                            id="address"
+                            value={formData.address}
+                            onChange={(e) => updateField("address", e.target.value)}
+                            className="text-right"
+                            placeholder="العنوان التفصيلي"
+                          />
+                        </div>
+                      </div>
+                    </CardContent>
+                  </Card>
+
+                  {/* معلومات العمل والمبيعات */}
+                  <Card>
+                    <CardHeader className="pb-4">
+                      <CardTitle className="flex items-center gap-2 text-lg">
+                        <Plus className="h-5 w-5 text-primary" />
+                        معلومات العمل والمبيعات
+                      </CardTitle>
+                    </CardHeader>
+                    <CardContent>
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        <div>
+                          <Label htmlFor="business_nature" className="text-sm font-medium">
+                            طبيعة العمل
+                          </Label>
+                          <Input
+                            id="business_nature"
+                            value={formData.business_nature}
+                            onChange={(e) => updateField("business_nature", e.target.value)}
+                            className="text-right"
+                            placeholder="طبيعة العمل"
+                          />
+                        </div>
+                        <div>
+                          <Label htmlFor="salesman" className="text-sm font-medium">
+                            المندوب
+                          </Label>
+                          <Select value={formData.salesman} onValueChange={(value) => updateField("salesman", value)}>
+                            <SelectTrigger>
+                              <SelectValue placeholder="اختر المندوب" />
+                            </SelectTrigger>
+                            <SelectContent>
+                              {salesmen.map((salesman) => (
+                                <SelectItem key={salesman.id} value={salesman.name}>
+                                  {salesman.name}
+                                </SelectItem>
+                              ))}
+                              {/* Fallback options if no salesmen loaded */}
+                              {salesmen.length === 0 && (
+                                <>
+                                  <SelectItem value="أحمد">أحمد</SelectItem>
+                                  <SelectItem value="محمد">محمد</SelectItem>
+                                  <SelectItem value="علي">علي</SelectItem>
+                                </>
+                              )}
+                            </SelectContent>
+                          </Select>
+                        </div>
+                      </div>
+                    </CardContent>
+                  </Card>
+
+                  <Card>
+                    <CardHeader className="pb-4">
+                      <CardTitle className="flex items-center gap-2 text-lg">
+                        <Plus className="h-5 w-5 text-primary" />
+                        المعلومات المالية والضريبية
+                      </CardTitle>
+                    </CardHeader>
+                    <CardContent>
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        <div>
+                          <Label htmlFor="tax_number" className="text-sm font-medium">
+                            الرقم الضريبي
+                          </Label>
+                          <Input
+                            id="tax_number"
+                            value={formData.tax_number}
+                            onChange={(e) => updateField("tax_number", e.target.value)}
+                            className="text-right"
+                            placeholder="أدخل الرقم الضريبي"
+                          />
+                        </div>
+                        <div>
+                          <Label htmlFor="commercial_registration" className="text-sm font-medium">
+                            السجل التجاري
+                          </Label>
+                          <Input
+                            id="commercial_registration"
+                            value={formData.commercial_registration}
+                            onChange={(e) => updateField("commercial_registration", e.target.value)}
+                            className="text-right"
+                            placeholder="أدخل رقم السجل التجاري"
+                          />
+                        </div>
+                        <div>
+                          <Label htmlFor="credit_limit" className="text-sm font-medium">
+                            حد الائتمان
+                          </Label>
+                          <Input
+                            id="credit_limit"
+                            type="number"
+                            value={formData.credit_limit}
+                            onChange={(e) => updateField("credit_limit", e.target.value)}
+                            className="text-right"
+                            placeholder="0.00"
+                          />
+                        </div>
+                        <div>
+                          <Label htmlFor="payment_terms" className="text-sm font-medium">
+                            شروط الدفع
+                          </Label>
+                          <Select
+                            value={formData.payment_terms}
+                            onValueChange={(value) => updateField("payment_terms", value)}
+                          >
+                            <SelectTrigger>
+                              <SelectValue placeholder="اختر شروط الدفع" />
+                            </SelectTrigger>
+                            <SelectContent>
+                              <SelectItem value="نقدي">نقدي</SelectItem>
+                              <SelectItem value="آجل 7 أيام">آجل 7 أيام</SelectItem>
+                              <SelectItem value="آجل 15 يوم">آجل 15 يوم</SelectItem>
+                              <SelectItem value="آجل 30 يوم">آجل 30 يوم</SelectItem>
+                              <SelectItem value="آجل 60 يوم">آجل 60 يوم</SelectItem>
+                              <SelectItem value="آجل 90 يوم">آجل 90 يوم</SelectItem>
+                            </SelectContent>
+                          </Select>
+                        </div>
+                        <div>
+                          <Label htmlFor="discount_percentage" className="text-sm font-medium">
+                            نسبة الخصم %
+                          </Label>
+                          <Input
+                            id="discount_percentage"
+                            type="number"
+                            step="0.01"
+                            min="0"
+                            max="100"
+                            value={formData.discount_percentage}
+                            onChange={(e) => updateField("discount_percentage", e.target.value)}
+                            className="text-right"
+                            placeholder="0.00"
+                          />
+                        </div>
+                      </div>
+                    </CardContent>
+                  </Card>
+
+                  {/* بيانات الموقع الإلكتروني */}
+                  <Card>
+                    <CardHeader className="pb-4">
+                      <CardTitle className="flex items-center gap-2 text-lg">
+                        <Plus className="h-5 w-5 text-primary" />
+                        بيانات الموقع الإلكتروني
+                      </CardTitle>
+                    </CardHeader>
+                    <CardContent>
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        <div>
+                          <Label htmlFor="web_username" className="text-sm font-medium">
+                            اسم المستخدم للموقع
+                          </Label>
+                          <Input
+                            id="web_username"
+                            value={formData.web_username}
+                            onChange={(e) => updateField("web_username", e.target.value)}
+                            className="text-right"
+                            placeholder="اسم المستخدم"
+                          />
+                        </div>
+                        <div>
+                          <Label htmlFor="web_password" className="text-sm font-medium">
+                            كلمة المرور للموقع
+                          </Label>
+                          <Input
+                            id="web_password"
+                            type="password"
+                            value={formData.web_password}
+                            onChange={(e) => updateField("web_password", e.target.value)}
+                            className="text-right"
+                            placeholder="كلمة المرور"
+                          />
+                        </div>
+                      </div>
+                    </CardContent>
+                  </Card>
+
+                  {/* ملاحظات وتفاصيل إضافية */}
+                  <Card>
+                    <CardHeader className="pb-4">
+                      <CardTitle className="text-lg">ملاحظات وتفاصيل إضافية</CardTitle>
+                    </CardHeader>
+                    <CardContent className="space-y-4">
+                      <div>
+                        <Label htmlFor="transaction_notes" className="text-sm font-medium">
+                          ملاحظات الحركة
+                        </Label>
+                        <Textarea
+                          id="transaction_notes"
+                          value={formData.transaction_notes}
+                          onChange={(e) => updateField("transaction_notes", e.target.value)}
+                          className="text-right"
+                          placeholder="ملاحظات خاصة بالحركة المالية"
+                          rows={3}
+                        />
+                      </div>
+                      <div>
+                        <Label htmlFor="general_notes" className="text-sm font-medium">
+                          الملاحظات العامة
+                        </Label>
+                        <Textarea
+                          id="general_notes"
+                          value={formData.general_notes}
+                          onChange={(e) => updateField("general_notes", e.target.value)}
+                          className="text-right"
+                          placeholder="ملاحظات عامة"
+                          rows={3}
+                        />
+                      </div>
+                    </CardContent>
+                  </Card>
+
+
+                </form>
+              </div>
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={showPortalDialog} onOpenChange={setShowPortalDialog}>
+        <DialogContent className="max-w-6xl max-h-[90vh] overflow-hidden" dir="rtl">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2 text-xl">
+              <Globe className="h-6 w-6 text-primary" />
+              إدارة بوابة العميل - {selectedCustomerForPortal?.name}
+            </DialogTitle>
+          </DialogHeader>
+
+          <div className="overflow-y-auto max-h-[calc(90vh-120px)] p-4 space-y-4">
+            <Card className="border-2 border-primary/20">
+              <CardHeader className="pb-4">
+                <CardTitle className="flex items-center gap-2 text-lg">
+                  <Bell className="h-5 w-5 text-primary" />
+                  إعدادات الإشعارات التلقائية
+                </CardTitle>
+                <p className="text-sm text-muted-foreground">
+                  إرسال إشعارات تلقائية للعميل عن حالة طلبياته عبر SMS أو واتساب
+                </p>
+              </CardHeader>
+              <CardContent className="space-y-6">
+                {loadingNotificationSettings ? (
+                  <div className="text-center py-4 text-muted-foreground">جاري التحميل...</div>
+                ) : notificationSettings ? (
+                  <>
+                    {/* طريقة الإرسال ورقم الهاتف */}
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                      <div>
+                        <Label htmlFor="notification_method" className="flex items-center gap-2 mb-2">
+                          <MessageSquare className="h-4 w-4" />
+                          طريقة الإرسال
+                        </Label>
+                        <Select
+                          value={notificationSettings.notification_method}
+                          onValueChange={(value: "sms" | "whatsapp" | "both") =>
+                            setNotificationSettings({ ...notificationSettings, notification_method: value })
+                          }
+                        >
+                          <SelectTrigger>
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="sms">SMS فقط</SelectItem>
+                            <SelectItem value="whatsapp">واتساب فقط</SelectItem>
+                            <SelectItem value="both">SMS و واتساب</SelectItem>
+                          </SelectContent>
+                        </Select>
+                      </div>
+
+                      <div>
+                        <Label htmlFor="preferred_phone" className="flex items-center gap-2 mb-2">
+                          <Phone className="h-4 w-4" />
+                          رقم الهاتف المفضل
+                        </Label>
+                        <Input
+                          id="preferred_phone"
+                          value={notificationSettings.preferred_phone}
+                          onChange={(e) =>
+                            setNotificationSettings({ ...notificationSettings, preferred_phone: e.target.value })
+                          }
+                          placeholder="05xxxxxxxx"
+                          className="text-right"
+                        />
+                      </div>
+
+                      <div className="flex items-center justify-between pt-6">
+                        <Label htmlFor="is_active">تفعيل الإشعارات</Label>
+                        <Switch
+                          id="is_active"
+                          checked={notificationSettings.is_active}
+                          onCheckedChange={(checked) =>
+                            setNotificationSettings({ ...notificationSettings, is_active: checked })
+                          }
+                        />
+                      </div>
+                    </div>
+
+                    {/* إعدادات الإشعارات لكل حالة */}
+                    <div>
+                      <h4 className="font-semibold mb-3 text-sm">اختر الإشعارات التي تريد إرسالها تلقائياً:</h4>
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                        <div className="flex items-center justify-between p-3 rounded-lg border bg-card">
+                          <div>
+                            <Label htmlFor="notify_received" className="font-medium cursor-pointer">
+                              استلام الطلبية
+                            </Label>
+                            <p className="text-xs text-muted-foreground">عند استلام الطلبية من العميل</p>
+                          </div>
+                          <Switch
+                            id="notify_received"
+                            checked={notificationSettings.notify_on_received}
+                            onCheckedChange={(checked) =>
+                              setNotificationSettings({ ...notificationSettings, notify_on_received: checked })
+                            }
+                          />
+                        </div>
+
+                        <div className="flex items-center justify-between p-3 rounded-lg border bg-card">
+                          <div>
+                            <Label htmlFor="notify_preparing" className="font-medium cursor-pointer">
+                              تحضير الطلبية
+                            </Label>
+                            <p className="text-xs text-muted-foreground">عند البدء في تحضير الطلبية</p>
+                          </div>
+                          <Switch
+                            id="notify_preparing"
+                            checked={notificationSettings.notify_on_preparing}
+                            onCheckedChange={(checked) =>
+                              setNotificationSettings({ ...notificationSettings, notify_on_preparing: checked })
+                            }
+                          />
+                        </div>
+
+                        <div className="flex items-center justify-between p-3 rounded-lg border bg-card">
+                          <div>
+                            <Label htmlFor="notify_quality" className="font-medium cursor-pointer">
+                              التدقيق والمراجعة
+                            </Label>
+                            <p className="text-xs text-muted-foreground">عند مراجعة وتدقيق الطلبية</p>
+                          </div>
+                          <Switch
+                            id="notify_quality"
+                            checked={notificationSettings.notify_on_quality_check}
+                            onCheckedChange={(checked) =>
+                              setNotificationSettings({ ...notificationSettings, notify_on_quality_check: checked })
+                            }
+                          />
+                        </div>
+
+                        <div className="flex items-center justify-between p-3 rounded-lg border bg-card">
+                          <div>
+                            <Label htmlFor="notify_ready" className="font-medium cursor-pointer">
+                              جاهز للشحن
+                            </Label>
+                            <p className="text-xs text-muted-foreground">عند جاهزية الطلبية للشحن</p>
+                          </div>
+                          <Switch
+                            id="notify_ready"
+                            checked={notificationSettings.notify_on_ready_to_ship}
+                            onCheckedChange={(checked) =>
+                              setNotificationSettings({ ...notificationSettings, notify_on_ready_to_ship: checked })
+                            }
+                          />
+                        </div>
+
+                        <div className="flex items-center justify-between p-3 rounded-lg border bg-card">
+                          <div>
+                            <Label htmlFor="notify_shipped" className="font-medium cursor-pointer">
+                              تم الشحن
+                            </Label>
+                            <p className="text-xs text-muted-foreground">عند شحن الطلبية</p>
+                          </div>
+                          <Switch
+                            id="notify_shipped"
+                            checked={notificationSettings.notify_on_shipped}
+                            onCheckedChange={(checked) =>
+                              setNotificationSettings({ ...notificationSettings, notify_on_shipped: checked })
+                            }
+                          />
+                        </div>
+
+                        <div className="flex items-center justify-between p-3 rounded-lg border bg-card">
+                          <div>
+                            <Label htmlFor="notify_delivered" className="font-medium cursor-pointer">
+                              تم التسليم
+                            </Label>
+                            <p className="text-xs text-muted-foreground">عند تسليم الطلبية للعميل</p>
+                          </div>
+                          <Switch
+                            id="notify_delivered"
+                            checked={notificationSettings.notify_on_delivered}
+                            onCheckedChange={(checked) =>
+                              setNotificationSettings({ ...notificationSettings, notify_on_delivered: checked })
+                            }
+                          />
+                        </div>
+
+                        <div className="flex items-center justify-between p-3 rounded-lg border bg-card border-red-200">
+                          <div>
+                            <Label htmlFor="notify_cancelled" className="font-medium cursor-pointer text-red-700">
+                              إلغاء الطلبية
+                            </Label>
+                            <p className="text-xs text-muted-foreground">عند إلغاء الطلبية</p>
+                          </div>
+                          <Switch
+                            id="notify_cancelled"
+                            checked={notificationSettings.notify_on_cancelled}
+                            onCheckedChange={(checked) =>
+                              setNotificationSettings({ ...notificationSettings, notify_on_cancelled: checked })
+                            }
+                          />
+                        </div>
+
+                        <div className="flex items-center justify-between p-3 rounded-lg border bg-card">
+                          <div>
+                            <Label htmlFor="daily_summary" className="font-medium cursor-pointer">
+                              ملخص يومي
+                            </Label>
+                            <p className="text-xs text-muted-foreground">إرسال ملخص يومي بجميع الطلبيات</p>
+                          </div>
+                          <Switch
+                            id="daily_summary"
+                            checked={notificationSettings.send_daily_summary}
+                            onCheckedChange={(checked) =>
+                              setNotificationSettings({ ...notificationSettings, send_daily_summary: checked })
+                            }
+                          />
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* زر الحفظ */}
+                    <div className="flex justify-end pt-4 border-t">
+                      <Button
+                        onClick={handleSaveNotificationSettings}
+                        disabled={savingNotificationSettings}
+                        className="gap-2"
+                      >
+                        <Save className="h-4 w-4" />
+                        {savingNotificationSettings ? "جاري الحفظ..." : "حفظ إعدادات الإشعارات"}
+                      </Button>
+                    </div>
+                  </>
+                ) : (
+                  <div className="text-center py-4 text-muted-foreground">لا توجد إعدادات</div>
+                )}
+              </CardContent>
+            </Card>
+
+            {/* Header with Add User Button */}
+            <div className="flex items-center justify-between">
+              <div>
+                <h3 className="text-lg font-semibold">حسابات الدخول</h3>
+                <p className="text-sm text-muted-foreground">إدارة المستخدمين والصلاحيات</p>
+              </div>
+              <Button onClick={() => setShowAddUserDialog(true)} className="gap-2">
+                <UserPlus className="h-4 w-4" />
+                إضافة مستخدم
+              </Button>
+            </div>
+
+            {/* Users Table */}
+            {loadingPortalUsers ? (
+              <div className="text-center py-8 text-muted-foreground">جاري التحميل...</div>
+            ) : portalUsers.length === 0 ? (
+              <Card className="bg-blue-50 border-blue-200">
+                <CardContent className="p-6 text-center">
+                  <Globe className="h-12 w-12 text-blue-400 mx-auto mb-3" />
+                  <h3 className="font-semibold text-blue-900 mb-2">لا يوجد مستخدمون</h3>
+                  <p className="text-blue-700 text-sm mb-4">قم بإضافة أول مستخدم للعميل للوصول إلى البوابة</p>
+                  <Button onClick={() => setShowAddUserDialog(true)} className="gap-2">
+                    <UserPlus className="h-4 w-4" />
+                    إضافة أول مستخدم
+                  </Button>
+                </CardContent>
+              </Card>
+            ) : (
+              <div className="rounded-md border">
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead className="text-right">اسم المستخدم</TableHead>
+                      <TableHead className="text-right">البريد الإلكتروني</TableHead>
+                      <TableHead className="text-right">آخر تسجيل دخول</TableHead>
+                      <TableHead className="text-right">الحالة</TableHead>
+                      <TableHead className="text-right">الصلاحيات</TableHead>
+                      <TableHead className="text-right">الإجراءات</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {portalUsers.map((user) => (
+                      <TableRow key={user.id}>
+                        <TableCell className="font-medium">{user.username}</TableCell>
+                        <TableCell className="text-sm">{user.email || "-"}</TableCell>
+                        <TableCell className="text-xs text-muted-foreground">{formatDate(user.last_login)}</TableCell>
+                        <TableCell>
+                          <Badge variant={user.is_active ? "default" : "secondary"}>
+                            {user.is_active ? "مفعل" : "معطل"}
+                          </Badge>
+                        </TableCell>
+                        <TableCell>
+                          <div className="flex flex-wrap gap-1">
+                            {user.can_view_orders && (
+                              <Badge variant="outline" className="text-xs">
+                                طلبيات
+                              </Badge>
+                            )}
+                            {user.can_create_orders && (
+                              <Badge variant="outline" className="text-xs">
+                                إنشاء
+                              </Badge>
+                            )}
+                            {user.can_view_balance && (
+                              <Badge variant="outline" className="text-xs">
+                                رصيد
+                              </Badge>
+                            )}
+                            {user.can_view_products && (
+                              <Badge variant="outline" className="text-xs">
+                                أصناف
+                              </Badge>
+                            )}
+                            {user.can_view_prices && (
+                              <Badge variant="outline" className="text-xs">
+                                أسعار
+                              </Badge>
+                            )}
+                            {user.can_view_stock && (
+                              <Badge variant="outline" className="text-xs">
+                                مخزون
+                              </Badge>
+                            )}
+                          </div>
+                        </TableCell>
+                        <TableCell>
+                          <div className="flex gap-1">
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              onClick={() => openEditPermissionsDialog(user)}
+                              title="تعديل الصلاحيات"
+                            >
+                              <Shield className="h-4 w-4" />
+                            </Button>
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              onClick={() => handleResetPassword(user.id)}
+                              title="تغيير كلمة المرور"
+                            >
+                              <Key className="h-4 w-4" />
+                            </Button>
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              onClick={() => handleToggleUserStatus(user.id)}
+                              title={user.is_active ? "تعطيل" : "تفعيل"}
+                            >
+                              {user.is_active ? (
+                                <X className="h-4 w-4 text-red-600" />
+                              ) : (
+                                <CheckCircle className="h-4 w-4 text-green-600" />
+                              )}
+                            </Button>
+                          </div>
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              </div>
+            )}
+
+            {/* Info Card */}
+            <Card className="bg-blue-50 border-blue-200">
+              <CardContent className="p-4">
+                <h4 className="font-semibold text-blue-900 mb-2">معلومات مهمة</h4>
+                <ul className="text-blue-800 text-sm space-y-1">
+                  <li>• يمكن للعميل تسجيل الدخول من خلال صفحة بوابة العملاء</li>
+                  <li>• كل مستخدم له صلاحيات مستقلة يمكن تخصيصها</li>
+                  <li>• يتم تسجيل جميع عمليات الدخول لأغراض الأمان</li>
+                  <li>• يمكن تعطيل المستخدم مؤقتاً دون حذف حسابه</li>
+                </ul>
+              </CardContent>
+            </Card>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={showAddUserDialog} onOpenChange={setShowAddUserDialog}>
+        <DialogContent className="max-w-2xl" dir="rtl">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <UserPlus className="h-5 w-5" />
+              إضافة مستخدم جديد
+            </DialogTitle>
+          </DialogHeader>
+
+          <div className="space-y-6 p-4">
+            {/* User Info */}
+            <div className="space-y-4">
+              <div>
+                <Label htmlFor="new_username">اسم المستخدم *</Label>
+                <Input
+                  id="new_username"
+                  value={newUserData.username}
+                  onChange={(e) => setNewUserData({ ...newUserData, username: e.target.value })}
+                  placeholder="أدخل اسم المستخدم"
+                  className="text-right"
+                />
+              </div>
+
+              <div>
+                <Label htmlFor="new_password">كلمة المرور *</Label>
+                <Input
+                  id="new_password"
+                  type="password"
+                  value={newUserData.password}
+                  onChange={(e) => setNewUserData({ ...newUserData, password: e.target.value })}
+                  placeholder="أدخل كلمة المرور"
+                  className="text-right"
+                />
+              </div>
+
+              <div>
+                <Label htmlFor="new_email">البريد الإلكتروني</Label>
+                <Input
+                  id="new_email"
+                  type="email"
+                  value={newUserData.email}
+                  onChange={(e) => setNewUserData({ ...newUserData, email: e.target.value })}
+                  placeholder="أدخل البريد الإلكتروني (اختياري)"
+                  className="text-right"
+                />
+              </div>
+            </div>
+
+            {/* Permissions */}
+            <div className="space-y-4">
+              <h3 className="font-semibold">الصلاحيات</h3>
+
+              <div className="space-y-3">
+                <div className="flex items-center justify-between">
+                  <Label htmlFor="perm_view_orders">عرض الطلبيات</Label>
+                  <Switch
+                    id="perm_view_orders"
+                    checked={userPermissions.can_view_orders}
+                    onCheckedChange={(checked) => setUserPermissions({ ...userPermissions, can_view_orders: checked })}
+                  />
+                </div>
+
+                <div className="flex items-center justify-between">
+                  <Label htmlFor="perm_create_orders">إنشاء طلبيات</Label>
+                  <Switch
+                    id="perm_create_orders"
+                    checked={userPermissions.can_create_orders}
+                    onCheckedChange={(checked) =>
+                      setUserPermissions({ ...userPermissions, can_create_orders: checked })
+                    }
+                  />
+                </div>
+
+                <div className="flex items-center justify-between">
+                  <Label htmlFor="perm_view_balance">عرض الرصيد</Label>
+                  <Switch
+                    id="perm_view_balance"
+                    checked={userPermissions.can_view_balance}
+                    onCheckedChange={(checked) => setUserPermissions({ ...userPermissions, can_view_balance: checked })}
+                  />
+                </div>
+
+                <div className="flex items-center justify-between">
+                  <Label htmlFor="perm_view_products">عرض الأصناف</Label>
+                  <Switch
+                    id="perm_view_products"
+                    checked={userPermissions.can_view_products}
+                    onCheckedChange={(checked) =>
+                      setUserPermissions({ ...userPermissions, can_view_products: checked })
+                    }
+                  />
+                </div>
+
+                <div className="flex items-center justify-between">
+                  <Label htmlFor="perm_view_prices">عرض الأسعار</Label>
+                  <Switch
+                    id="perm_view_prices"
+                    checked={userPermissions.can_view_prices}
+                    onCheckedChange={(checked) => setUserPermissions({ ...userPermissions, can_view_prices: checked })}
+                  />
+                </div>
+
+                <div className="flex items-center justify-between">
+                  <Label htmlFor="perm_view_stock">عرض المخزون</Label>
+                  <Switch
+                    id="perm_view_stock"
+                    checked={userPermissions.can_view_stock}
+                    onCheckedChange={(checked) => setUserPermissions({ ...userPermissions, can_view_stock: checked })}
+                  />
+                </div>
+              </div>
+            </div>
+
+            <div className="flex gap-3 justify-end pt-4 border-t">
+              <Button variant="outline" onClick={() => setShowAddUserDialog(false)}>
+                إلغاء
+              </Button>
+              <Button onClick={handleAddPortalUser}>إضافة المستخدم</Button>
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={showEditPermissionsDialog} onOpenChange={setShowEditPermissionsDialog}>
+        <DialogContent className="max-w-md" dir="rtl">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <Shield className="h-5 w-5" />
+              تعديل الصلاحيات - {selectedUser?.username}
+            </DialogTitle>
+          </DialogHeader>
+
+          <div className="space-y-4 p-4">
+            <div className="flex items-center justify-between">
+              <Label htmlFor="edit_view_orders">عرض الطلبيات</Label>
+              <Switch
+                id="edit_view_orders"
+                checked={userPermissions.can_view_orders}
+                onCheckedChange={(checked) => setUserPermissions({ ...userPermissions, can_view_orders: checked })}
+              />
+            </div>
+
+            <div className="flex items-center justify-between">
+              <Label htmlFor="edit_create_orders">إنشاء طلبيات</Label>
+              <Switch
+                id="edit_create_orders"
+                checked={userPermissions.can_create_orders}
+                onCheckedChange={(checked) => setUserPermissions({ ...userPermissions, can_create_orders: checked })}
+              />
+            </div>
+
+            <div className="flex items-center justify-between">
+              <Label htmlFor="edit_view_balance">عرض الرصيد</Label>
+              <Switch
+                id="edit_view_balance"
+                checked={userPermissions.can_view_balance}
+                onCheckedChange={(checked) => setUserPermissions({ ...userPermissions, can_view_balance: checked })}
+              />
+            </div>
+
+            <div className="flex items-center justify-between">
+              <Label htmlFor="edit_view_products">عرض الأصناف</Label>
+              <Switch
+                id="edit_view_products"
+                checked={userPermissions.can_view_products}
+                onCheckedChange={(checked) => setUserPermissions({ ...userPermissions, can_view_products: checked })}
+              />
+            </div>
+
+            <div className="flex items-center justify-between">
+              <Label htmlFor="edit_view_prices">عرض الأسعار</Label>
+              <Switch
+                id="edit_view_prices"
+                checked={userPermissions.can_view_prices}
+                onCheckedChange={(checked) => setUserPermissions({ ...userPermissions, can_view_prices: checked })}
+              />
+            </div>
+
+            <div className="flex items-center justify-between">
+              <Label htmlFor="edit_view_stock">عرض المخزون</Label>
+              <Switch
+                id="edit_view_stock"
+                checked={userPermissions.can_view_stock}
+                onCheckedChange={(checked) => setUserPermissions({ ...userPermissions, can_view_stock: checked })}
+              />
+            </div>
+
+            <div className="flex gap-3 justify-end pt-4 border-t">
+              <Button variant="outline" onClick={() => setShowEditPermissionsDialog(false)}>
+                إلغاء
+              </Button>
+              <Button onClick={handleUpdatePermissions}>حفظ التغييرات</Button>
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      <ExcelImport
+        entityType={isSupplier ? "suppliers":"customers"}
+        isOpen={showImportDialog}
+        onClose={() => setShowImportDialog(false)}
+        onImportComplete={() => {
+          fetchCustomers()
+          setShowImportDialog(false)
+        }}
+      />
+    </div>
+  )
+}

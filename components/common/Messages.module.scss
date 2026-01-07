@@ -1,0 +1,63 @@
+.messageBar {
+  transition: none !important;
+
+  /* =========================
+     Global PrimeReact overrides
+     ========================= */
+  :global(.p-message) {
+    border-radius: 3px !important;
+    color: white !important;
+  }
+
+  :global(.p-message .p-message-wrapper) {
+    padding: 0.4rem 1.5rem !important;
+  }
+
+  /* ====== Colors by severity ====== */
+  :global(.p-message.p-message-error) {
+    background-color: #f44336 !important; /* red */
+  }
+
+  :global(.p-message.p-message-success) {
+    background-color: #4caf50 !important; /* green */
+  }
+
+  :global(.p-message.p-message-info) {
+    background-color: #2196f3 !important; /* blue */
+  }
+
+  :global(.p-message.p-message-warn) {
+    background-color: #ff9800 !important; /* orange */
+  }
+
+  :global(.p-message-detail) {
+    font-size: 22px !important;
+  }
+
+  /* ====== Close button on the left ====== */
+  :global(.p-message .p-messages-close) {
+    right: auto !important;
+    left: 0.5rem !important;
+  }
+
+  :global(.p-message .p-messages-close .p-link) {
+    margin-left: 0 !important;
+    margin-right: auto !important;
+  }
+
+  /* ====== RTL/LTR adjustments ====== */
+  :global(#app[dir="rtl"]) {
+    :global(.p-message .p-messages-close) {
+      left: auto !important;
+      right: 0.5rem !important;
+    }
+    :global(.p-message .p-messages-close .p-link) {
+      margin-left: auto !important;
+      margin-right: 0 !important;
+    }
+  }
+
+  :global(#app[dir="ltr"]) {
+    /* default handled above */
+  }
+}

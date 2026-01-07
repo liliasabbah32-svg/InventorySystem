@@ -1,0 +1,298 @@
+"use client";
+
+import React, { useState, useEffect, useRef, useMemo, useCallback } from "react";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import DataGridView from "../common/DataGridView";
+import * as wjGrid from "@grapecity/wijmo.grid";
+
+// -----------------------
+// Types
+// -----------------------
+interface Unit {
+  unit_id: string;
+  unit_name: string;
+  price: number;
+  barcode: string;
+}
+
+interface Product {
+  id: number;
+  product_code: string;
+  product_name: string;
+  first_unit: string;
+  first_price: number;
+  first_barcode: string;
+  units?: Unit[];
+  selected?: boolean;
+  selected_unit?: Unit;
+}
+
+interface ProductSearchPopupProps {
+  visible: boolean;
+  onClose: () => void;
+  onSelect: (products: Product[]) => void;
+  priceCategoryId: number;
+  ShowSelect: boolean;
+}
+
+const ProductSearchPopup: React.FC<ProductSearchPopupProps> = ({ visible, onClose, onSelect, priceCategoryId, ShowSelect }) => {
+  const [products, setProducts] = useState<Product[]>([]);
+  const [searchTerm, setSearchTerm] = useState("");
+  const gridProductsRef = useRef<wjGrid.FlexGrid | null>(null);
+  const gridUnitsRef = useRef<wjGrid.FlexGrid | null>(null);
+  const [selectedProduct, setSelectedProduct] = useState<Product | null>(null);
+  const searchTextRef = useRef<HTMLInputElement>(null);
+  // -----------------------
+  // Fetch products when popup opens
+  // -----------------------
+  useEffect(() => {
+    if (!visible) return;
+
+    let cancelled = false;
+
+    const fetchProducts = async () => {
+      try {
+        const res = await fetch(`/api/inventory/products?priceCategoryId=${priceCategoryId}`);
+        const data = await res.json();
+        if (!cancelled) setProducts(data || []);
+      } catch (err) {
+        console.error("Failed to fetch products:", err);
+        if (!cancelled) setProducts([]);
+      }
+    };
+
+    fetchProducts();
+    searchTextRef.current?.focus()
+    return () => {
+      cancelled = true;
+    };
+  }, [visible]);
+
+  // -----------------------
+  // Products grid scheme
+  // -----------------------
+  const productScheme = useMemo(() => ({
+    name: "ProductsScheme",
+    columns: [
+      { header: "✅", name: "selected", width: 50, isReadOnly: false, visible: ShowSelect },
+      { header: "رقم الصنف", name: "product_code", width: 120, isReadOnly: true },
+      { header: "اسم الصنف", name: "product_name", width: "*", isReadOnly: true },
+      { header: "الوحدة", name: "first_unit", width: 80, isReadOnly: true },
+      { header: "السعر", name: "first_price", width: 80, isReadOnly: true },
+      { header: "باركود", name: "first_barcode", width: 150, isReadOnly: true },
+    ]
+  }), []);
+
+  // -----------------------
+  // Units grid scheme
+  // -----------------------
+  const unitScheme = useMemo(() => ({
+    columns: [
+      { header: "الوحدة", name: "unit_name", width: "*", isReadOnly: true },
+      { header: "سعر الوحدة", name: "price", width: 90, isReadOnly: true },
+      { header: "باركود", name: "barcode", width: 150, isReadOnly: true },
+    ]
+  }), []);
+
+  // -----------------------
+  // Filtered products
+  // -----------------------
+  const filteredProducts = useMemo(() => {
+    if (!searchTerm.trim()) return products;
+    const q = searchTerm.toLowerCase();
+    return products.filter(p =>
+      p.product_name.toLowerCase().includes(q) ||
+      p.product_code.toLowerCase().includes(q)
+    );
+  }, [products, searchTerm]);
+
+  // -----------------------
+  // Select product row
+  // -----------------------
+  const handleSelectProduct = useCallback((product: Product) => {
+    setSelectedProduct(product);
+  }, []);
+
+  const handleProductDoubleClick = useCallback((product: Product) => {
+    if (!product) return;
+
+    // Automatically select first unit if available
+    const selectedUnit = product.units?.[0];
+    const updatedProduct: Product = { ...product, selected_unit: selectedUnit, selected: true };
+
+    setProducts(prev =>
+      prev.map(p => p.id === product.id ? updatedProduct : p)
+    );
+
+    onSelect([updatedProduct]);
+    onClose();
+  }, [onSelect, onClose]);
+  // -----------------------
+  // Fetch units when product selected
+  // -----------------------
+  const selectionChanged = useCallback(async (grid: wjGrid.FlexGrid) => {
+    if (!grid) return;
+    const rowIndex = grid.selection?.row ?? -1;
+    if (rowIndex < 0) return;
+
+    const item = grid.rows[rowIndex]?.dataItem as Product;
+    if (!item) return;
+
+    try {
+      const response = await fetch(`/api/products/${item.id}/units`);
+      const units: Unit[] = await response.json();
+      setSelectedProduct({ ...item, units });
+    } catch (err) {
+      console.error("Error fetching units:", err);
+      setSelectedProduct({ ...item, units: [] });
+    }
+  }, []);
+
+  // -----------------------
+  // Select unit for product
+  // -----------------------
+  const handleSelectUnit = useCallback((unit: Unit) => {
+    if (!selectedProduct) return;
+
+    setProducts(prev =>
+      prev.map(p => p.id === selectedProduct.id ? { ...p, selected_unit: unit, selected: true } : p)
+    );
+    setSelectedProduct(prev => prev ? { ...prev, selected_unit: unit } : null);
+  }, [selectedProduct]);
+
+  const handleUnitRowDoubleClick = useCallback((unit: Unit) => {
+    if (!selectedProduct || !unit) return;
+
+    // Combine product info + selected unit
+    const productWithUnit = {
+      ...selectedProduct,       // all product fields
+      selected_unit: unit,      // attach the double-clicked unit
+      unit_name: unit.unit_name,
+      unit_id: unit.unit_id,
+      first_barcode: unit.barcode,  // override barcode
+      first_price: unit.price,      // override price
+    };
+
+    // Pass it to parent and close popup
+    onSelect([productWithUnit]);
+    onClose();
+  }, [selectedProduct, onSelect, onClose]);
+  // -----------------------
+  // Confirm selection
+  // -----------------------
+  const handleConfirm = () => {
+    let selectedItems = products.filter(p => p.selected);
+
+    // If no products are selected, pick the currently focused row in the grid
+    if (selectedItems.length === 0 && selectedProduct) {
+      selectedItems.push(selectedProduct);
+
+    }
+
+    if (selectedItems.length === 0) return; // nothing to select
+
+    // Reset selection flags
+    setProducts(prev => prev.map(p => ({ ...p, selected: false })));
+
+    // Pass selected items to parent and close popup
+    onSelect(selectedItems);
+    onClose();
+  };
+
+
+  useEffect(() => {
+    if (!visible) return;
+
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        onClose();
+      }
+      if (e.key === "ArrowDown" && document.activeElement === searchTextRef.current) {
+        gridProductsRef.current?.focus();
+        e.preventDefault();
+      }
+
+      if (e.key === "Enter") {
+        e.preventDefault();
+        if (selectedProduct) {
+          handleConfirm(); // Accept selected order
+        }
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown, true);
+
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown, true);
+    };
+  }, [visible, onClose, handleConfirm]);
+  if (!visible) return null;
+
+  const gridStyleUnits = {
+    maxHeight: '20vh',
+    minHeight: '20vh',
+  };
+
+  const gridStyleItems = {
+    maxHeight: '30vh',
+    minHeight: '30vh',
+  };
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
+      <div className="bg-white rounded-lg shadow-2xl border p-6 flex flex-col w-full max-w-4xl h-[800px]  w-[95vw] max-w-7xl" dir="rtl">
+        <h3 className="text-lg font-semibold mb-4 text-right">بحث الأصناف</h3>
+
+        <Input
+          ref={searchTextRef}
+          type="text"
+          placeholder="ابحث عن صنف..."
+          value={searchTerm}
+          onChange={(e) => setSearchTerm(e.target.value)}
+          className="mb-4 p-2 border border-gray-300 rounded w-full text-right"
+        />
+
+        <div className="flex-1 flex flex-col gap-4 overflow-hidden">
+          {/* Products DataGrid (2/3) */}
+          <div className="flex-[4] overflow-none border rounded shadow-sm p-2">
+            <DataGridView
+              style={gridStyleItems}
+              ref={gridProductsRef}
+              dataSource={filteredProducts}
+              scheme={productScheme}
+              onRowDoubleClick={handleProductDoubleClick}
+              selectionChanged={selectionChanged}
+            />
+          </div>
+
+          {/* Units DataGrid (1/3) */}
+          <div className="flex-[3] overflow-hidden border rounded shadow-sm p-2 mt-2">
+            <h4 className="font-medium mb-2 text-right">
+              وحدات الصنف: {selectedProduct?.product_name || "لا يوجد صنف محدد"}
+            </h4>
+            <DataGridView
+              //style={gridStyleUnits}
+              innerRef={gridUnitsRef}
+              dataSource={selectedProduct?.units || []}
+              scheme={unitScheme}
+              onRowDoubleClick={handleUnitRowDoubleClick}
+            />
+          </div>
+        </div>
+
+
+        <div className="flex justify-center gap-2 mt-4">
+          <Button className="erp-btn-primary" onClick={handleConfirm}>
+            موافق
+          </Button>
+          <Button variant="outline" onClick={onClose}>
+            إغلاق
+          </Button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export default ProductSearchPopup;

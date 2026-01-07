@@ -1,0 +1,200 @@
+"use client";
+
+import React, { useState, useEffect, useRef, useMemo, useCallback } from "react";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import DataGrid from "../common/DataGrid";
+import * as wjGrid from "@grapecity/wijmo.grid";
+import DataGridView from "../common/DataGridView";
+
+interface Order {
+    id: number;
+    customer_name: string;
+    order_number: string;
+    order_date: Date;
+    amount: string;
+}
+
+interface OrderSearchPopupProps {
+    visible: boolean;
+    onClose: () => void;
+    onSelect: (order: Order) => void;
+    type: number;
+}
+
+const OrderSearchPopup: React.FC<OrderSearchPopupProps> = ({ visible, onClose, onSelect, type }) => {
+    const [orders, setOrders] = useState<Order[]>([]);
+    const [searchTerm, setSearchTerm] = useState("");
+    const [selectedOrder, setSelectedOrder] = useState<Order | null>(null);
+    const gridRef = useRef<wjGrid.FlexGrid | null>(null);
+    const searchInputRef = useRef<HTMLInputElement>(null);
+
+    // Load customers
+    useEffect(() => {
+        if (!visible) return;
+        let cancelled = false;
+
+        const fetchOrders = async () => {
+            let cancelled = false;
+
+            try {
+                const response = await fetch(`/api/orders/sales?type=${type}`);
+                const data = await response.json();
+                console.log("Fetched orders data:", data);
+                if (!cancelled) {
+                    // Ensure we have an array
+                    const allRecords = Array.isArray(data) ? data : data || [];
+                    console.log("All orders records:", allRecords);
+                    // Filter by type: 1 = customer, 2 = supplier
+                    const filtered = type === -1
+                        ? allRecords
+                        : allRecords.filter((c: any) => Number(c.order_type) === type);
+
+                    // Order by customer_code
+                    //filtered.sort((a: any, b: any) => a.id - b.id);
+
+                    console.log("Filtered orders data:", filtered);
+                    console.log("Number of filtered orders:", type);
+                    // Map to match grid column names
+                    const mapped = filtered.map((c: any, index: number) => ({
+                        ser: index + 1,
+                        id: c.id,
+                        order_number: c.order_number,
+                        order_date: new Date(c.order_date),
+                        customer_name: c.customer_name,
+                        amount: c.total_amount
+                    }));
+                    console.log("Mapped orders data:", mapped);
+                    setOrders(mapped);
+                }
+            } catch (err) {
+                console.error("Failed to fetch customers:", err);
+                if (!cancelled) setOrders([]);
+            }
+        };
+
+
+        fetchOrders();
+        return () => {
+            cancelled = true;
+        };
+    }, [visible]);
+
+    // Focus search input
+    useEffect(() => {
+        if (visible) setTimeout(() => searchInputRef.current?.focus(), 0);
+    }, [visible]);
+
+
+
+    // Search filter
+    const searchWordsMatch = (text: string, query: string) => {
+        const words = query.trim().toLowerCase().split(/\s+/);
+        const normalizedText = (text || "").toLowerCase();
+        return words.every((word) => normalizedText.includes(word));
+    };
+
+    const filteredOrders = useMemo(() => {
+        if (!searchTerm.trim()) return orders;
+        return orders.filter(
+            (c) =>
+                searchWordsMatch(c.customer_name, searchTerm) ||
+                searchWordsMatch(c.order_number, searchTerm) ||
+                searchWordsMatch(c.amount, searchTerm)
+        );
+    }, [orders, searchTerm]);
+
+    // DataGrid scheme
+    const OrdersScheme = useMemo(() => ({
+        name: "OrdersScheme",
+        filter: false,
+        showFooter: true,
+        sortable: true,
+        allowGrouping: false,
+        columns: [
+            { header: "##", name: "ser", width: 50 },
+            { header: "رقم الطلبية", name: "order_number", width: 120 },
+            { header: "تاريخ الطلبية", name: "order_date", width: 130 },
+            { header: "اسم الزبون", name: "customer_name", width: "*" },
+            { header: "المبلغ", name: "amount", width: 110 },
+        ],
+    }), []);
+
+    // Row click / double click
+    const handleRowClick = useCallback((order: Order) => setSelectedOrder(order), []);
+    const handleRowDoubleClick = useCallback((order: Order) => { onSelect(order); onClose(); }, [onSelect, onClose]);
+    const handleAccept = useCallback(() => { if (selectedOrder) { onSelect(selectedOrder); onClose(); } }, [selectedOrder, onSelect, onClose]);
+
+    useEffect(() => {
+        if (!visible) return;
+
+        const handleKeyDown = (e: KeyboardEvent) => {
+            if (e.key === "Escape") {
+                e.preventDefault();
+                onClose();
+            }
+            if (e.key === "Enter") {
+                e.preventDefault();
+                if (selectedOrder) {
+                    handleRowDoubleClick(selectedOrder); // Accept selected order
+                }
+            }
+        };
+
+        window.addEventListener("keydown", handleKeyDown, true);
+
+        return () => {
+            window.removeEventListener("keydown", handleKeyDown, true);
+        };
+    }, [visible, onClose, handleRowDoubleClick, selectedOrder]);
+
+    if (!visible) return null;
+
+
+    return (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
+            <div
+                className="bg-white rounded-lg shadow-2xl border p-6 flex flex-col w-full max-w-4xl"
+                dir="rtl"
+                style={{ height: "700px" }}
+            >
+                <h3 className="text-lg font-semibold mb-4 text-right">
+                    {type === 1 ? "بحث طلبيات المبيعات" : "بحث طلبيات المشتريات'"}
+                </h3>
+
+                <Input
+                    type="text"
+                    placeholder={"ابحث عن طلبية..."}
+                    value={searchTerm}
+                    onChange={(e) => setSearchTerm(e.target.value)}
+                    className="mb-4 p-2 border border-gray-300 rounded w-full text-right"
+                    ref={searchInputRef}
+                />
+
+                <div className="flex-1 flex flex-col gap-4">
+                    <div className="flex-1 border rounded shadow-sm p-2">
+                        <div className="min-w-max">
+                            <DataGridView
+                                ref={gridRef}
+                                isReport={true}
+                                dataSource={filteredOrders}
+                                scheme={OrdersScheme}
+                                onRowClick={handleRowClick}
+                                onRowDoubleClick={handleRowDoubleClick}
+                            />
+                        </div>
+                    </div>
+                </div>
+
+                <div className="flex justify-center gap-2 mt-4">
+                    <Button className="erp-btn-primary" onClick={() => selectedOrder && handleRowDoubleClick(selectedOrder)} >
+                        موافق
+                    </Button>
+                    <Button variant="outline" onClick={onClose}>إغلاق</Button>
+                </div>
+            </div>
+        </div>
+    );
+};
+
+export default OrderSearchPopup;

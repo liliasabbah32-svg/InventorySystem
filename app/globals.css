@@ -1,0 +1,936 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+@custom-variant dark (&:is(.dark *));
+
+:root {
+  /* Enhanced dynamic theme variables that can be overridden by the theme system */
+  --background: #fafbfc;
+  --foreground: #1a202c;
+  --card: #ffffff;
+  --card-foreground: #2d3748;
+  --popover: #ffffff;
+  --popover-foreground: #2d3748;
+  --primary: #3182ce;
+  --primary-foreground: #ffffff;
+  --secondary: #edf2f7;
+  --secondary-foreground: #4a5568;
+  --muted: #f7fafc;
+  --muted-foreground: #718096;
+  --accent: #e6fffa;
+  --accent-foreground: #234e52;
+  --destructive: #e53e3e;
+  --destructive-foreground: #ffffff;
+  --border: #e2e8f0;
+  --input: #ffffff;
+  --ring: rgba(49, 130, 206, 0.3);
+  --chart-1: #3182ce;
+  --chart-2: #38b2ac;
+  --chart-3: #805ad5;
+  --chart-4: #ed8936;
+  --chart-5: #48bb78;
+  --radius: 0.75rem;
+  --sidebar: #ffffff;
+  --sidebar-foreground: #2d3748;
+  --sidebar-primary: #edf2f7;
+  --sidebar-primary-foreground: #4a5568;
+  --sidebar-accent: #3182ce;
+  --sidebar-accent-foreground: #ffffff;
+  --sidebar-border: #e2e8f0;
+  --sidebar-ring: rgba(49, 130, 206, 0.3);
+
+  /* New dynamic theme variables for advanced customization */
+  --font-family-custom: var(--font-geist-sans);
+  --font-size-custom: 14px;
+  --font-weight-custom: 400;
+  --line-height-custom: 1.5;
+  --letter-spacing-custom: 0px;
+  --border-radius-custom: 8px;
+  --sidebar-width-custom: 256px;
+  --header-height-custom: 64px;
+  --animation-duration: 0.3s;
+  --spacing-default: 1rem;
+  --contrast-multiplier: 1;
+  --card-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1);
+  --card-style: elevated;
+  --button-style: rounded;
+
+  /* Enhanced analytics colors with better contrast and appeal */
+  --analytics-success: #48bb78;
+  --analytics-warning: #ed8936;
+  --analytics-danger: #e53e3e;
+  --analytics-info: #3182ce;
+  --analytics-purple: #805ad5;
+  --analytics-cyan: #38b2ac;
+
+  /* Enhanced card-specific colors for better visual hierarchy */
+  --card-primary: #ffffff;
+  --card-primary-border: #e2e8f0;
+  --card-secondary: #f7fafc;
+  --card-secondary-border: #cbd5e0;
+  --card-accent: #e6fffa;
+  --card-accent-border: #81e6d9;
+  --card-success: #f0fff4;
+  --card-success-border: #9ae6b4;
+  --card-warning: #fffaf0;
+  --card-warning-border: #fbd38d;
+  --card-danger: #fed7d7;
+  --card-danger-border: #feb2b2;
+  --card-info: #ebf8ff;
+  --card-info-border: #90cdf4;
+
+  /* Enhanced gradient colors for modern look */
+  --gradient-primary: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  --gradient-success: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
+  --gradient-warning: linear-gradient(135deg, #fa709a 0%, #fee140 100%);
+  --gradient-info: linear-gradient(135deg, #a8edea 0%, #fed6e3 100%);
+}
+
+.dark {
+  /* Dark mode colors that respect dynamic theme variables */
+  --background: #0a0a0a;
+  --foreground: #ededed;
+  --card: #111111;
+  --card-foreground: #ededed;
+  --popover: #111111;
+  --popover-foreground: #ededed;
+  --primary: #0070f3;
+  --primary-foreground: #ffffff;
+  --secondary: #1a1a1a;
+  --secondary-foreground: #ededed;
+  --muted: #1a1a1a;
+  --muted-foreground: #888888;
+  --accent: #0070f3;
+  --accent-foreground: #ffffff;
+  --destructive: #ff4444;
+  --destructive-foreground: #ffffff;
+  --border: #333333;
+  --input: #1a1a1a;
+  --ring: rgba(0, 112, 243, 0.3);
+  --chart-1: #0070f3;
+  --chart-2: #00d9ff;
+  --chart-3: #7c3aed;
+  --chart-4: #f59e0b;
+  --chart-5: #10b981;
+  --sidebar: #0a0a0a;
+  --sidebar-foreground: #ededed;
+  --sidebar-primary: #1a1a1a;
+  --sidebar-primary-foreground: #ededed;
+  --sidebar-accent: #0070f3;
+  --sidebar-accent-foreground: #ffffff;
+  --sidebar-border: #333333;
+  --sidebar-ring: rgba(0, 112, 243, 0.3);
+  --card-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.3);
+}
+
+/* Updated font configuration to use dynamic custom variables */
+@theme inline {
+  --font-sans: var(--font-family-custom, "Cairo"), "Inter", var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Consolas, "Liberation Mono", Menlo, monospace;
+  --font-heading: var(--font-family-custom, "Cairo"), "Inter", var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+  --radius-sm: calc(var(--border-radius-custom, var(--radius)) - 4px);
+  --radius-md: calc(var(--border-radius-custom, var(--radius)) - 2px);
+  --radius-lg: var(--border-radius-custom, var(--radius));
+  --radius-xl: calc(var(--border-radius-custom, var(--radius)) + 4px);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground;
+    /* Using dynamic font variables that can be controlled by theme system */
+    font-family: var(--font-family-custom, "Cairo"), "Inter", var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+    font-size: var(--font-size-custom, 14px);
+    font-weight: var(--font-weight-custom, 400);
+    line-height: var(--line-height-custom, 1.5);
+    letter-spacing: var(--letter-spacing-custom, 0px);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+    /* Adding transition for smooth theme changes */
+    transition: background-color var(--animation-duration, 0.3s) ease, color var(--animation-duration, 0.3s) ease;
+  }
+
+  /* Enhanced typography hierarchy with dynamic font variables */
+  h1,
+  .text-h1 {
+    font-family: var(--font-family-custom, "Cairo"), "Inter", var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+    @apply font-black text-2xl md:text-3xl lg:text-4xl text-foreground leading-tight;
+    font-weight: calc(var(--font-weight-custom, 400) + 400);
+  }
+
+  h2,
+  .text-h2 {
+    font-family: var(--font-family-custom, "Cairo"), "Inter", var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+    @apply font-black text-xl md:text-2xl lg:text-3xl text-foreground leading-tight;
+    font-weight: calc(var(--font-weight-custom, 400) + 300);
+  }
+
+  h3,
+  .text-h3 {
+    font-family: var(--font-family-custom, "Cairo"), "Inter", var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+    @apply font-bold text-lg md:text-xl lg:text-2xl text-foreground leading-tight;
+    font-weight: calc(var(--font-weight-custom, 400) + 200);
+  }
+
+  h4,
+  .text-h4 {
+    font-family: var(--font-family-custom, "Cairo"), "Inter", var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+    @apply font-bold text-base md:text-lg text-foreground leading-tight;
+    font-weight: calc(var(--font-weight-custom, 400) + 200);
+  }
+
+  p,
+  .text-body {
+    font-family: var(--font-family-custom, "Cairo"), "Inter", var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+    @apply text-sm md:text-base text-foreground leading-relaxed;
+    font-weight: var(--font-weight-custom, 400);
+    line-height: var(--line-height-custom, 1.5);
+    letter-spacing: var(--letter-spacing-custom, 0px);
+  }
+
+  .text-small {
+    font-family: var(--font-family-custom, "Cairo"), "Inter", var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+    @apply text-xs md:text-sm text-muted-foreground leading-relaxed;
+    font-weight: var(--font-weight-custom, 400);
+  }
+
+  /* Simplified RTL support to prevent CSS parsing errors */
+  [dir="rtl"] {
+    direction: rtl;
+    text-align: right;
+  }
+
+  [dir="rtl"] input,
+  [dir="rtl"] textarea,
+  [dir="rtl"] select {
+    text-align: right;
+    direction: rtl;
+  }
+}
+
+@layer components {
+  /* Enhanced component styles with dynamic theme variables */
+  .erp-sidebar {
+    @apply bg-sidebar border-r border-sidebar-border shadow-sm;
+    width: var(--sidebar-width-custom, 256px);
+    transition: all var(--animation-duration, 0.3s) ease;
+  }
+
+  .erp-main-content {
+    @apply bg-background min-h-screen;
+    transition: background-color var(--animation-duration, 0.3s) ease;
+  }
+
+  .erp-card {
+    @apply bg-white border border-gray-200 p-6;
+    border-radius: var(--border-radius-custom, 8px);
+    background: var(--card);
+    border: 1px solid var(--border);
+    box-shadow: var(--card-shadow, 0 1px 3px 0 rgba(0, 0, 0, 0.1));
+    transition: all var(--animation-duration, 0.3s) ease;
+    padding: var(--spacing-default, 1rem);
+  }
+
+  .erp-card:hover {
+    box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+    transform: translateY(-1px);
+  }
+
+  .erp-card-header {
+    @apply mb-6 pb-4 border-b border-border;
+    margin-bottom: var(--spacing-default, 1rem);
+  }
+
+  .erp-card-title {
+    font-family: var(--font-family-custom, "Cairo"), "Inter", var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+    @apply font-bold text-xl text-foreground mb-2;
+    font-weight: calc(var(--font-weight-custom, 400) + 200);
+  }
+
+  .erp-card-description {
+    @apply text-sm text-muted-foreground;
+    font-family: var(--font-family-custom, "Cairo"), "Inter", var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+  }
+
+  .erp-table {
+    @apply w-full border-collapse bg-card overflow-hidden shadow-sm;
+    border-radius: var(--border-radius-custom, 8px);
+  }
+
+  .erp-table th {
+    font-family: var(--font-family-custom, "Cairo"), "Inter", var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+    @apply bg-muted text-muted-foreground font-semibold text-sm p-4 text-right border-b border-border;
+    font-weight: calc(var(--font-weight-custom, 400) + 200);
+  }
+
+  .erp-table td {
+    font-family: var(--font-family-custom, "Cairo"), "Inter", var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+    @apply p-4 text-right border-b border-border text-sm;
+    font-weight: var(--font-weight-custom, 400);
+  }
+
+  .erp-table tr:hover {
+    @apply bg-muted/30;
+    transition: background-color var(--animation-duration, 0.3s) ease;
+  }
+
+  .erp-btn-primary {
+    font-family: var(--font-family-custom, "Cairo"), "Inter", var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+    @apply bg-primary text-primary-foreground hover:bg-primary/90 px-6 py-3 font-semibold text-sm shadow-sm hover:shadow-md;
+    border-radius: var(--border-radius-custom, 8px);
+    transition: all var(--animation-duration, 0.3s) ease;
+    font-weight: calc(var(--font-weight-custom, 400) + 200);
+  }
+
+  .erp-btn-secondary {
+    font-family: var(--font-family-custom, "Cairo"), "Inter", var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+    @apply bg-secondary text-secondary-foreground hover:bg-secondary/90 px-6 py-3 font-semibold text-sm shadow-sm hover:shadow-md;
+    border-radius: var(--border-radius-custom, 8px);
+    transition: all var(--animation-duration, 0.3s) ease;
+    font-weight: calc(var(--font-weight-custom, 400) + 200);
+  }
+
+  .erp-input {
+    font-family: var(--font-family-custom, "Cairo"), "Inter", var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+    @apply bg-input border border-border px-4 py-3 text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring focus:border-transparent text-sm;
+    border-radius: var(--border-radius-custom, 8px);
+    transition: all var(--animation-duration, 0.3s) ease;
+    text-align: right;
+    direction: rtl;
+    font-weight: var(--font-weight-custom, 400);
+    font-size: var(--font-size-custom, 14px);
+  }
+
+  .erp-label {
+    font-family: var(--font-family-custom, "Cairo"), "Inter", var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+    @apply font-semibold text-sm text-foreground mb-2 block;
+    text-align: right;
+    font-weight: calc(var(--font-weight-custom, 400) + 200);
+  }
+
+  .erp-section {
+    @apply space-y-6;
+    gap: var(--spacing-default, 1rem);
+  }
+
+  .erp-grid {
+    @apply grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3;
+    gap: var(--spacing-default, 1rem);
+  }
+
+  .erp-stats-card {
+    @apply p-6 shadow-sm hover:shadow-md border;
+    border-radius: var(--border-radius-custom, 8px);
+    background: var(--card);
+    border: 1px solid var(--border);
+    transition: all var(--animation-duration, 0.3s) ease;
+    padding: var(--spacing-default, 1rem);
+  }
+
+  .erp-stats-card.primary {
+    background: linear-gradient(145deg, #ebf8ff 0%, #bee3f8 100%);
+    border: 1px solid #90cdf4;
+  }
+
+  .erp-stats-card.success {
+    background: linear-gradient(145deg, #f0fff4 0%, #c6f6d5 100%);
+    border: 1px solid #9ae6b4;
+  }
+
+  .erp-stats-card.warning {
+    background: linear-gradient(145deg, #fffaf0 0%, #feebc8 100%);
+    border: 1px solid #fbd38d;
+  }
+
+  .erp-stats-card.danger {
+    background: linear-gradient(145deg, #fed7d7 0%, #feb2b2 100%);
+    border: 1px solid #fc8181;
+  }
+
+  .erp-stats-value {
+    @apply font-heading font-black text-2xl md:text-3xl text-primary mb-1;
+    font-family: var(--font-family-custom, "Cairo"), "Inter", var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+    font-weight: calc(var(--font-weight-custom, 400) + 400);
+  }
+
+  .erp-stats-label {
+    @apply text-sm text-muted-foreground font-medium;
+    font-family: var(--font-family-custom, "Cairo"), "Inter", var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+    font-weight: calc(var(--font-weight-custom, 400) + 100);
+  }
+
+  /* Enhanced analytics card with dynamic theme variables */
+  .analytics-card {
+    @apply p-6 shadow-sm border;
+    border-radius: var(--border-radius-custom, 8px);
+    background: var(--card);
+    border: 1px solid var(--border);
+    box-shadow: var(--card-shadow, 0 1px 3px 0 rgba(0, 0, 0, 0.1));
+    transition: all var(--animation-duration, 0.3s) ease;
+    padding: var(--spacing-default, 1rem);
+  }
+
+  .analytics-card:hover {
+    box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
+    transform: translateY(-2px);
+  }
+
+  /* Enhanced chart container with dynamic theme variables */
+  .analytics-chart-container {
+    @apply p-6 border;
+    border-radius: var(--border-radius-custom, 8px);
+    background: var(--card);
+    border: 1px solid var(--border);
+    box-shadow: var(--card-shadow, 0 1px 3px 0 rgba(0, 0, 0, 0.1));
+    padding: var(--spacing-default, 1rem);
+  }
+
+  .analytics-sidebar {
+    @apply bg-sidebar border-r border-sidebar-border;
+    background: linear-gradient(180deg, var(--sidebar) 0%, rgba(255, 255, 255, 0.95) 100%);
+    width: var(--sidebar-width-custom, 256px);
+  }
+
+  .analytics-nav-item {
+    @apply flex items-center gap-3 px-3 py-2 text-sm font-medium;
+    border-radius: var(--border-radius-custom, 8px);
+    transition: all var(--animation-duration, 0.3s) ease;
+    @apply hover:bg-sidebar-accent/10 hover:text-sidebar-accent;
+    font-family: var(--font-family-custom, "Cairo"), "Inter", var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+    font-weight: calc(var(--font-weight-custom, 400) + 100);
+  }
+
+  .analytics-nav-item.active {
+    @apply bg-sidebar-accent/20 text-sidebar-accent;
+  }
+
+  .analytics-header {
+    @apply flex items-center justify-between p-6 border-b border-border;
+    background: linear-gradient(90deg, var(--background) 0%, rgba(255, 255, 255, 0.95) 100%);
+    height: var(--header-height-custom, 64px);
+  }
+
+  .analytics-grid {
+    @apply grid;
+    gap: var(--spacing-default, 1rem);
+  }
+
+  .analytics-grid-2 {
+    @apply grid grid-cols-1 lg:grid-cols-2;
+    gap: var(--spacing-default, 1rem);
+  }
+
+  .analytics-grid-3 {
+    @apply grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3;
+    gap: var(--spacing-default, 1rem);
+  }
+
+  .analytics-grid-4 {
+    @apply grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4;
+    gap: var(--spacing-default, 1rem);
+  }
+
+  /* Enhanced chart styles for dark theme */
+  .recharts-cartesian-grid-horizontal line,
+  .recharts-cartesian-grid-vertical line {
+    stroke: var(--border);
+    stroke-opacity: 0.5;
+  }
+
+  .recharts-text {
+    fill: var(--muted-foreground);
+    font-family: var(--font-family-custom, "Cairo"), "Inter", var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+  }
+
+  .recharts-tooltip-wrapper {
+    background: var(--popover);
+    border: 1px solid var(--border);
+    border-radius: var(--border-radius-custom, 8px);
+  }
+
+  /* Status indicators for analytics */
+  .status-indicator {
+    @apply inline-flex items-center gap-2 px-3 py-1 text-xs font-medium;
+    border-radius: var(--border-radius-custom, 8px);
+    font-family: var(--font-family-custom, "Cairo"), "Inter", var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+    font-weight: calc(var(--font-weight-custom, 400) + 100);
+  }
+
+  .status-indicator.healthy {
+    @apply bg-green-500/20 text-green-400 border border-green-500/30;
+  }
+
+  .status-indicator.warning {
+    @apply bg-yellow-500/20 text-yellow-400 border border-yellow-500/30;
+  }
+
+  .status-indicator.critical {
+    @apply bg-red-500/20 text-red-400 border border-red-500/30;
+  }
+
+  .status-indicator.info {
+    @apply bg-blue-500/20 text-blue-400 border border-blue-500/30;
+  }
+
+  /* Enhanced mobile responsiveness for analytics */
+  @media (max-width: 768px) {
+    .analytics-grid-4 {
+      @apply grid-cols-1;
+    }
+
+    .analytics-grid-3 {
+      @apply grid-cols-1;
+    }
+
+    .analytics-grid-2 {
+      @apply grid-cols-1;
+    }
+
+    .analytics-card {
+      padding: calc(var(--spacing-default, 1rem) * 0.75);
+    }
+
+    .analytics-metric {
+      @apply text-2xl;
+    }
+  }
+
+  /* Enhanced RTL support for all form elements */
+  /* Make all forms RTL by default */
+  form {
+    direction: rtl;
+    text-align: right;
+  }
+
+  /* All input elements RTL by default */
+  input[type="text"],
+  input[type="email"],
+  input[type="password"],
+  input[type="number"],
+  input[type="tel"],
+  input[type="url"],
+  input[type="search"],
+  input[type="date"],
+  input[type="datetime-local"],
+  input[type="time"],
+  textarea,
+  select {
+    direction: rtl;
+    text-align: right;
+    font-family: var(--font-family-custom, "Cairo"), "Inter", var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+    font-size: var(--font-size-custom, 14px);
+    font-weight: var(--font-weight-custom, 400);
+  }
+
+  /* Grid containers with RTL support */
+  .grid {
+    direction: rtl;
+  }
+
+  /* Flex containers with RTL support */
+  .flex {
+    direction: rtl;
+  }
+
+  /* Date range containers specifically */
+  .date-range-container {
+    direction: rtl;
+    display: flex;
+    gap: var(--spacing-default, 1rem);
+    align-items: center;
+  }
+
+  .date-range-container > * {
+    direction: rtl;
+  }
+
+  /* Override for specific LTR elements if needed */
+  .ltr-override {
+    direction: ltr !important;
+    text-align: left !important;
+  }
+
+  .ltr-override input,
+  .ltr-override textarea,
+  .ltr-override select {
+    direction: ltr !important;
+    text-align: left !important;
+  }
+
+  /* Enhanced button groups for RTL */
+  .button-group {
+    direction: rtl;
+    display: flex;
+    gap: calc(var(--spacing-default, 1rem) * 0.5);
+  }
+
+  .button-group > button:first-child {
+    border-top-left-radius: 0;
+    border-bottom-left-radius: 0;
+  }
+
+  .button-group > button:last-child {
+    border-top-right-radius: 0;
+    border-bottom-right-radius: 0;
+  }
+
+  /* Enhanced card layouts for RTL */
+  .card-grid {
+    direction: rtl;
+    display: grid;
+    gap: var(--spacing-default, 1rem);
+  }
+
+  /* Enhanced table layouts for RTL */
+  .table-container {
+    direction: rtl;
+  }
+
+  .table-container table {
+    direction: rtl;
+  }
+
+  .table-container th,
+  .table-container td {
+    text-align: right;
+    font-family: var(--font-family-custom, "Cairo"), "Inter", var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+  }
+
+  /* Added original HTML status badge styles */
+  .status-badge {
+    @apply inline-flex items-center px-3 py-1 text-xs font-medium;
+    border-radius: var(--border-radius-custom, 8px);
+    font-family: var(--font-family-custom, "Cairo"), "Inter", var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+    font-weight: calc(var(--font-weight-custom, 400) + 100);
+  }
+
+  .status-badge.active {
+    @apply bg-green-100 text-green-800;
+  }
+
+  .status-badge.pending {
+    @apply bg-yellow-100 text-yellow-800;
+  }
+
+  .status-badge.completed {
+    @apply bg-blue-100 text-blue-800;
+  }
+
+  .status-badge.inactive {
+    @apply bg-gray-100 text-gray-800;
+  }
+
+  /* Added original HTML button styles */
+  .btn-success {
+    @apply bg-green-600 hover:bg-green-700 text-white px-4 py-2 font-medium text-sm;
+    border-radius: var(--border-radius-custom, 8px);
+    transition: all var(--animation-duration, 0.3s) ease;
+    font-family: var(--font-family-custom, "Cairo"), "Inter", var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+    font-weight: calc(var(--font-weight-custom, 400) + 100);
+  }
+
+  .btn-warning {
+    @apply bg-yellow-600 hover:bg-yellow-700 text-white px-4 py-2 font-medium text-sm;
+    border-radius: var(--border-radius-custom, 8px);
+    transition: all var(--animation-duration, 0.3s) ease;
+    font-family: var(--font-family-custom, "Cairo"), "Inter", var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+    font-weight: calc(var(--font-weight-custom, 400) + 100);
+  }
+
+  .btn-danger {
+    @apply bg-red-600 hover:bg-red-700 text-white px-4 py-2 font-medium text-sm;
+    border-radius: var(--border-radius-custom, 8px);
+    transition: all var(--animation-duration, 0.3s) ease;
+    font-family: var(--font-family-custom, "Cairo"), "Inter", var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+    font-weight: calc(var(--font-weight-custom, 400) + 100);
+  }
+
+  .btn-info {
+    @apply bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 font-medium text-sm;
+    border-radius: var(--border-radius-custom, 8px);
+    transition: all var(--animation-duration, 0.3s) ease;
+    font-family: var(--font-family-custom, "Cairo"), "Inter", var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+    font-weight: calc(var(--font-weight-custom, 400) + 100);
+  }
+
+  /* Added RTL-specific utility classes */
+  .dir-rtl {
+    direction: rtl;
+  }
+
+  .dir-ltr {
+    direction: ltr;
+  }
+
+  /* Added RTL-specific component classes */
+  .rtl-card {
+    @apply shadow-sm p-6 border;
+    border-radius: var(--border-radius-custom, 8px);
+    background: var(--card);
+    border: 1px solid var(--border);
+    direction: rtl;
+    text-align: right;
+    box-shadow: var(--card-shadow, 0 1px 3px 0 rgba(0, 0, 0, 0.1));
+    padding: var(--spacing-default, 1rem);
+  }
+
+  .rtl-input {
+    @apply bg-input border border-border px-4 py-3 text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring focus:border-transparent text-sm;
+    border-radius: var(--border-radius-custom, 8px);
+    direction: rtl;
+    text-align: right;
+    font-family: var(--font-family-custom, "Cairo"), "Inter", var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+    font-size: var(--font-size-custom, 14px);
+    font-weight: var(--font-weight-custom, 400);
+    transition: all var(--animation-duration, 0.3s) ease;
+  }
+
+  .rtl-button {
+    @apply px-6 py-3 font-semibold text-sm shadow-sm hover:shadow-md;
+    border-radius: var(--border-radius-custom, 8px);
+    direction: rtl;
+    text-align: center;
+    font-family: var(--font-family-custom, "Cairo"), "Inter", var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+    font-weight: calc(var(--font-weight-custom, 400) + 200);
+    transition: all var(--animation-duration, 0.3s) ease;
+  }
+
+  .rtl-flex {
+    @apply flex;
+    flex-direction: row-reverse;
+  }
+
+  .rtl-grid {
+    @apply grid;
+    direction: rtl;
+  }
+
+  /* Enhanced search container with better colors */
+  .search-container {
+    @apply shadow-sm p-6 space-y-6 border;
+    border-radius: var(--border-radius-custom, 8px);
+    background: var(--card);
+    border: 1px solid var(--border);
+    box-shadow: var(--card-shadow, 0 1px 3px 0 rgba(0, 0, 0, 0.1));
+    padding: var(--spacing-default, 1rem);
+  }
+
+  .search-header {
+    @apply flex items-center justify-between pb-4 border-b border-border;
+  }
+
+  .search-title {
+    @apply text-xl font-bold text-foreground;
+    font-family: var(--font-family-custom, "Cairo"), "Inter", var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+    font-weight: calc(var(--font-weight-custom, 400) + 300);
+  }
+
+  .search-input {
+    @apply w-full bg-input border border-border px-4 py-3 text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring focus:border-transparent text-sm;
+    border-radius: var(--border-radius-custom, 8px);
+    text-align: right;
+    direction: rtl;
+    font-family: var(--font-family-custom, "Cairo"), "Inter", var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+    font-size: var(--font-size-custom, 14px);
+    font-weight: var(--font-weight-custom, 400);
+    transition: all var(--animation-duration, 0.3s) ease;
+  }
+
+  .search-filters {
+    @apply grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4;
+    gap: var(--spacing-default, 1rem);
+  }
+
+  .search-results {
+    @apply space-y-4 max-h-96 overflow-y-auto;
+  }
+
+  .search-result-item {
+    @apply p-4 cursor-pointer border;
+    border-radius: var(--border-radius-custom, 8px);
+    background: var(--card);
+    border: 1px solid var(--border);
+    transition: all var(--animation-duration, 0.3s) ease;
+    padding: var(--spacing-default, 1rem);
+  }
+
+  .search-result-item:hover {
+    background: linear-gradient(145deg, #ebf8ff 0%, #bee3f8 100%);
+    border: 1px solid #3182ce;
+    box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+    transform: translateY(-1px);
+  }
+
+  .search-result-title {
+    @apply font-semibold text-foreground mb-1;
+    font-family: var(--font-family-custom, "Cairo"), "Inter", var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+    font-weight: calc(var(--font-weight-custom, 400) + 200);
+  }
+
+  .search-result-subtitle {
+    @apply text-sm text-muted-foreground;
+    font-family: var(--font-family-custom, "Cairo"), "Inter", var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+  }
+
+  .search-badge {
+    @apply inline-flex items-center px-2 py-1 text-xs font-medium;
+    border-radius: var(--border-radius-custom, 8px);
+    font-family: var(--font-family-custom, "Cairo"), "Inter", var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+    font-weight: calc(var(--font-weight-custom, 400) + 100);
+  }
+
+  .search-badge.active {
+    @apply bg-green-100 text-green-800;
+  }
+
+  .search-badge.inactive {
+    @apply bg-gray-100 text-gray-800;
+  }
+
+  /* Enhanced mobile-first responsive utilities */
+  .mobile-text-lg {
+    @apply text-base md:text-lg;
+  }
+
+  .mobile-text-xl {
+    @apply text-lg md:text-xl;
+  }
+
+  .mobile-text-2xl {
+    @apply text-xl md:text-2xl;
+  }
+
+  .mobile-p-4 {
+    @apply p-3 md:p-4;
+  }
+
+  .mobile-p-6 {
+    @apply p-4 md:p-6;
+  }
+
+  .mobile-gap-4 {
+    @apply gap-3 md:gap-4;
+  }
+
+  .mobile-gap-6 {
+    @apply gap-4 md:gap-6;
+  }
+
+  /* Enhanced responsive table styles */
+  .responsive-table-container {
+    @apply overflow-x-auto -mx-4 md:mx-0;
+  }
+
+  .responsive-table {
+    @apply min-w-full md:w-full;
+  }
+
+  .responsive-table th,
+  .responsive-table td {
+    @apply px-3 py-2 md:px-4 md:py-3 text-sm md:text-base;
+    font-family: var(--font-family-custom, "Cairo"), "Inter", var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+  }
+
+  /* Enhanced mobile form styles */
+  .mobile-form-grid {
+    @apply grid grid-cols-1 md:grid-cols-2;
+    gap: var(--spacing-default, 1rem);
+  }
+
+  .mobile-form-grid-3 {
+    @apply grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3;
+    gap: var(--spacing-default, 1rem);
+  }
+
+  .mobile-input {
+    @apply text-base md:text-sm; /* Prevent zoom on iOS */
+  }
+
+  .mobile-button {
+    @apply h-12 md:h-10 text-base md:text-sm font-medium;
+  }
+
+  .mobile-card {
+    @apply mx-2 md:mx-0;
+    border-radius: var(--border-radius-custom, 8px);
+  }
+
+  /* Enhanced responsive navigation */
+  .mobile-nav-item {
+    @apply p-3 md:p-2 text-base md:text-sm;
+  }
+
+  .mobile-sidebar {
+    @apply w-full h-full;
+    width: var(--sidebar-width-custom, 256px);
+  }
+
+  .mobile-header {
+    @apply px-4 md:px-6;
+    height: var(--header-height-custom, 64px);
+  }
+}
+
+/* Added mobile-specific media queries */
+@media (max-width: 767px) {
+  .mobile-scroll-container {
+    -webkit-overflow-scrolling: touch;
+    scroll-behavior: smooth;
+  }
+
+  .mobile-safe-area {
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+
+  .mobile-sticky-bottom {
+    position: sticky;
+    bottom: env(safe-area-inset-bottom, 0);
+  }
+}
+
+/* Enhanced touch interactions */
+@media (hover: none) and (pointer: coarse) {
+  .hover\:bg-muted\/50:hover {
+    background-color: transparent;
+  }
+
+  .mobile-touch-feedback:active {
+    @apply bg-muted/30 scale-95;
+    transition: all 0.1s ease;
+  }
+}

@@ -1,0 +1,9 @@
+
+.wj-flexgrid .wj-colfooters .wj-cell:first-child {
+    overflow: visible !important;
+    z-index: 1 !important; /* render over empty cells */
+}
+.wj-flexgrid .wj-colfooters .wj-row:last-child .wj-cell:not(.wj-cell:last-child) {
+    border-left: none;
+    width: 100vw !important;
+}

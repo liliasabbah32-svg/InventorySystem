@@ -1,0 +1,62 @@
+/* Success Toast */
+.p-toast-message.p-toast-message-success {
+  border: 2px solid #28a745;       /* nice green border */
+  background: #e6f4ea;             /* light green background */
+  color: #155724;                  /* dark green text */
+  border-radius: 8px;              /* rounded corners */
+  box-shadow: 0 4px 12px rgba(0,0,0,0.15); /* subtle shadow */
+  padding: 1rem;                   /* more padding */
+  font-weight: 600;
+  font-size: 0.95rem;
+  transition: transform 0.3s ease, opacity 0.3s ease; /* smooth animation */
+}
+
+/* Error Toast */
+.p-toast-message.p-toast-message-error {
+  border: 2px solid #dc3545;       /* red border */
+  background: #f8d7da;             /* light red/pink background */
+  color: #721c24;                  /* dark red text */
+  border-radius: 8px;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+  padding: 1rem;
+  font-weight: 600;
+  font-size: 0.95rem;
+  transition: transform 0.3s ease, opacity 0.3s ease;
+}
+
+/* Add a slight lift when toast appears */
+.p-toast-message {
+  transform: translateY(0);
+}
+
+/* Optional: success glow effect */
+.p-toast-message.p-toast-message-success {
+  animation: glow-success 0.8s ease-in-out;
+}
+
+@keyframes glow-success {
+  0% { box-shadow: 0 0 0 rgba(40, 167, 69, 0); }
+  50% { box-shadow: 0 0 10px rgba(40, 167, 69, 0.6); }
+  100% { box-shadow: 0 4px 12px rgba(0,0,0,0.15); }
+}
+
+/* Optional: error glow effect */
+.p-toast-message.p-toast-message-error {
+  animation: glow-error 0.8s ease-in-out;
+}
+
+@keyframes glow-error {
+  0% { box-shadow: 0 0 0 rgba(220, 53, 69, 0); }
+  50% { box-shadow: 0 0 10px rgba(220, 53, 69, 0.6); }
+  100% { box-shadow: 0 4px 12px rgba(0,0,0,0.15); }
+}
+.p-grid {
+  display: -webkit-box;
+  display: -ms-flexbox;
+  display: flex;
+  -ms-flex-wrap: wrap;
+  flex-wrap: wrap;
+  margin-right: -0.5em;
+  margin-left: -0.5em;
+  margin-top: -0.5em;
+}

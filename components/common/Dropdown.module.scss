@@ -1,0 +1,111 @@
+$dir: rtl;
+
+/* ===============================
+   Dropdown Wrapper (CSS Modules)
+================================ */
+.dropDownWrapper {
+  width: 100%;
+
+  /* Base component size */
+  .dropDown {
+    width: 100% !important;
+    min-height: 42px !important;
+    font-size: 14px !important;
+  }
+
+  /* PrimeReact Dropdown */
+  :global(.p-dropdown) {
+    width: 100% !important;
+    min-height: 42px !important;
+
+    display: flex !important;
+    align-items: center !important;
+
+    border: 1.5px solid #cfd4dc !important;
+    border-radius: 8px !important;
+    background-color: #fff !important;
+
+    transition: border-color 0.2s ease, box-shadow 0.2s ease;
+  }
+
+  /* Hover */
+  :global(.p-dropdown:hover) {
+    border-color: #6c8cff !important;
+  }
+
+  /* Focus */
+  :global(.p-dropdown.p-focus) {
+    border-color: #4f6cff !important;
+    box-shadow: 0 0 0 3px rgba(79, 108, 255, 0.15) !important;
+  }
+
+  /* Selected value / placeholder */
+  :global(.p-dropdown-label) {
+    display: flex !important;
+    align-items: center !important;
+
+    height: 42px !important;
+    padding-inline-start: 14px !important;
+    padding-inline-end: 40px !important; /* arrow space */
+
+    font-size: 14px !important;
+    text-align: right !important;
+    white-space: nowrap;
+
+    color: #333 !important;
+  }
+
+  /* Placeholder */
+  :global(.p-dropdown-label.p-placeholder) {
+    color: #9aa0a6 !important;
+  }
+
+  /* Dropdown arrow area */
+  :global(.p-dropdown-trigger) {
+    width: 40px !important;
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+  }
+
+  /* Arrow icon */
+  :global(.p-dropdown-trigger-icon) {
+    font-size: 14px !important;
+    color: #666 !important;
+  }
+
+  /* Panel items */
+  :global(.p-dropdown-item) {
+    padding: 10px 14px !important;
+    font-size: 14px !important;
+    text-align: right !important;
+
+    transition: background-color 0.15s ease;
+  }
+
+  /* Hover item */
+  :global(.p-dropdown-item:hover) {
+    background-color: #f4f7ff !important;
+  }
+
+  /* Selected item */
+  :global(.p-dropdown-item.p-highlight) {
+    background-color: #e3f2fd !important;
+    color: #1a1a1a !important;
+    font-weight: 800;
+  }
+
+  /* Disabled */
+  :global(.p-dropdown.p-disabled) {
+    background-color: #f0f1f3 !important;
+    color: #999 !important;
+    opacity: 1 !important;
+  }
+
+  /* ===============================
+     RTL Support
+  ================================ */
+  :global(#app[dir='rtl'] .p-dropdown) {
+    direction: rtl;
+  }
+}

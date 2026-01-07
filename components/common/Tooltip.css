@@ -1,0 +1,18 @@
+/* Tooltip.css */
+.tooltip-wrapper {
+    position: relative;
+    display: inline-block;
+}
+
+.tooltip {
+    position: absolute;
+    background-color: black;
+    color: white;
+    padding: 5px;
+    border-radius: 5px;    
+    overflow-wrap: break-word;
+    inline-size: 150px;
+    font-size: 12px;
+    z-index: 1000;
+    transform: translate(-50%, -100%);
+}

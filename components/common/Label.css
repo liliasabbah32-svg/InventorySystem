@@ -1,0 +1,48 @@
+
+.labelReport {
+    margin-right: 5px !important;
+    margin-left: 5px !important;
+    margin-top: 5px !important;
+    margin-bottom: 10px !important;
+    vertical-align: middle !important;
+    display: inline-block !important;
+    
+    overflow: hidden;
+    text-overflow: ellipsis;
+    position: relative;
+    max-height: 16.2px;
+    max-width: 100px;
+  }
+
+  
+.label {
+    margin-right: 5px !important;
+    margin-left: 5px !important;
+    margin-top: 5px !important;
+    margin-bottom: 10px !important;
+    vertical-align: middle !important;
+    display: inline-block !important;
+  }
+  
+  
+  .overflowContainer {
+    margin-right: 5px !important;
+    margin-left: 5px !important;
+    margin-top: 5px !important;
+    margin-bottom: 10px !important;
+    vertical-align: middle !important;
+    display: inline-block !important;
+    
+    overflow: hidden;
+    text-overflow: ellipsis;
+    position: relative;
+    max-height: 16.2px;
+    max-width: 100px;
+  }
+  
+
+  .clone {
+    position: absolute;
+    visibility: hidden;
+    white-space: nowrap;
+}

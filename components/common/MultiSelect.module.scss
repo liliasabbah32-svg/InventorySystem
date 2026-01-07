@@ -1,0 +1,99 @@
+/* =========================
+   MultiSelect.module.scss
+   ========================= */
+
+/* ---------- Base ---------- */
+.multiselect {
+  width: 100% !important;
+
+  /* PrimeReact MultiSelect base overrides */
+  :global(.p-multiselect) {
+    width: 100% !important;
+    min-width: 150px !important;
+    outline: none !important;
+  }
+
+  /* Error field styling */
+  &.errorField {
+    background-color: #ffcdd2 !important;
+    width: 100% !important;
+    padding: 5px !important;
+  }
+}
+
+/* ---------- RTL Overrides ---------- */
+:global(#app[dir='rtl']) {
+  .multiselect {
+    :global(.p-multiselect-filter-container) {
+      margin-right: 10px !important;
+      float: right !important;
+      direction: rtl !important;
+    }
+
+    :global(.p-multiselect-trigger) {
+      left: 0 !important;
+      right: auto !important;
+    }
+  }
+}
+
+/* ---------- Panel Right (RTL) ---------- */
+.panelClassRight {
+  direction: rtl !important;
+
+  :global(.p-multiselect-close) {
+    margin-left: 0 !important;
+  }
+
+  :global(.p-multiselect-item .p-checkbox) {
+    margin: 0 0.5em !important;
+  }
+
+  :global(.p-multiselect-filter-container) {
+    margin: 0 0.5em !important;
+  }
+
+  :global(.p-multiselect-filter-container .p-inputtext) {
+    padding-left: 0 !important;
+    padding-right: 0.2em !important;
+    min-width: 300px !important;
+  }
+
+  :global(.p-multiselect-filter-container .p-multiselect-filter-icon) {
+    left: 0.5em !important;
+    right: auto !important;
+  }
+}
+
+/* ---------- Panel Left (LTR) ---------- */
+.panelClassLeft {
+  direction: ltr !important;
+
+  :global(.p-multiselect-close) {
+    margin-left: auto !important;
+  }
+
+  :global(.p-multiselect-item .p-checkbox) {
+    margin: 0 0.5em 0 0 !important;
+  }
+
+  :global(.p-multiselect-filter-container) {
+    margin: 0 0.5em !important;
+  }
+
+  :global(.p-multiselect-filter-container .p-inputtext) {
+    padding-left: 0.5em !important;
+    padding-right: 2em !important;
+    min-width: 310px !important;
+  }
+
+  :global(.p-multiselect-filter-container .p-multiselect-filter-icon) {
+    right: 0.5em !important;
+    left: auto !important;
+  }
+}
+
+/* ---------- Rotate Icon ---------- */
+.rotateEnterIcon {
+  transform: rotateZ(90deg);
+}

@@ -1,0 +1,52 @@
+.customFlexgrid {
+  font-family: "Segoe UI", system-ui, sans-serif;
+  font-size: 15px;
+  border-radius: 10px;
+  overflow: hidden;
+  background: #ffffff;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.08);
+
+  /* set grid RTL for cell text */
+  direction: rtl;
+
+  /* make row height larger */
+  :global(.wj-cell) {
+    padding: 10px 14px !important;
+    font-size: 15px;
+    border-bottom: 1px solid #f0f0f0 !important;
+    line-height: 1.5;
+    text-align: right !important; /* right-align cell text */
+  }
+
+  /* alternating row background */
+  :global(.wj-alt) {
+    background-color: #fafafa !important;
+  }
+
+  /* header: text centered */
+  :global(.wj-header) {
+    background-color: #e0f2fe !important;
+    color: #333 !important;
+    font-weight: 600;
+    text-align: center !important; /* CENTER header text */
+    padding: 12px 8px !important;
+    border-bottom: 2px solid #d9d9d9 !important;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    direction: ltr; /* keep header layout normal so centering works */
+  }
+
+  /* row header numbers */
+  :global(.wj-rowheader) {
+    background-color: #f0f0f0 !important;
+    font-weight: 600;
+    color: #666;
+    direction: ltr; /* row numbers remain LTR */
+  }
+
+  /* selection */
+  :global(.wj-state-selected) {
+    background-color: #f4f6f7 !important;
+    color: #000 !important;
+  }
+}

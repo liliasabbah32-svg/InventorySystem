@@ -1,0 +1,110 @@
+@import '../themes';
+
+$dir: rtl;
+
+.dropDown {
+  width: 100% !important;
+  position: relative;
+
+  // PrimeDropdown overrides
+  :global(.p-dropdown) {
+    width: 100% !important;
+    min-width: 150px !important;
+    outline: none !important;
+
+    &:disabled {
+      background-color: #dbdbdb !important;
+      color: black !important;
+    }
+
+    :global(.p-inputtext) {
+      &:disabled {
+        background-color: #dbdbdb !important;
+        color: black !important;
+        font-weight: bold !important;
+      }
+    }
+
+    :global(.p-dropdown-label) {
+      padding-inline-start: 25px !important;
+    }
+
+    :global(.p-placeholder) {
+      padding-inline-start: 25px !important;
+    }
+
+    :global(.p-dropdown-clear-icon) {
+      padding-inline-start: 5px !important;
+    }
+
+    :global(.p-dropdown-items-wrapper) {
+      direction: var(--dir, $dir);
+      width: 100% !important;
+    }
+
+    :global(.p-dropdown-panel .p-dropdown-filter-container) {
+      width: 100% !important;
+      direction: var(--dir, $dir);
+    }
+
+    :global(.p-dropdown-item-empty) {
+      visibility: visible !important;
+    }
+  }
+
+  // Float label styling
+  .floatLabelWithColorStyle {
+    font-weight: normal !important;
+    position: absolute !important;
+    pointer-events: none !important;
+    left: 0.25em !important;
+    top: 50% !important;
+    margin-top: -2em !important;
+    transition: 0.3s ease all !important;
+    line-height: 1 !important;
+
+    @include themify($themes) {
+      color: themed('tableHeader') !important;
+    }
+  }
+
+  .floatLabelStyle {
+    font-weight: normal !important;
+    position: absolute !important;
+    pointer-events: none !important;
+    left: 0.25em !important;
+    top: 50% !important;
+    margin-top: -2em !important;
+    transition: 0.3s ease all !important;
+    line-height: 1 !important;
+  }
+
+  // Error messages
+  .errorField {
+    background-color: #ffcdd2 !important;
+    width: 100% !important;
+    padding: 5px !important;
+    font-size: 12px !important;
+    color: #b71c1c !important;
+    border-radius: 3px !important;
+    margin-top: 2px !important;
+  }
+}
+
+// RTL support for wrapper
+:global([dir='rtl']) .dropDown {
+  direction: rtl;
+}
+
+// Input group button styling
+.dropDown .p-inputgroup-addon {
+  vertical-align: bottom;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+// Optional: rotated enter icon
+.rotateEnterIcon {
+  transform: rotate(90deg);
+}

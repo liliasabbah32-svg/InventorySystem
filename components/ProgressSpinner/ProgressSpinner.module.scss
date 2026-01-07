@@ -1,0 +1,53 @@
+@import '../themes';
+
+.progressSpinner {
+  text-align: center !important;
+
+  width: 100% !important;
+  height: 100% !important;
+  position: fixed !important;
+  left: 0 !important;
+  top: 0 !important;
+  z-index: 9999 !important;
+ 
+}
+
+// .progressPos {
+//   //left: 43% !important;
+//   //position: fixed !important;
+//   margin: auto !important;
+//   align-self: center !important;
+//   top: 40% !important;
+// }
+.progressPos {
+  margin: auto !important;
+  align-self: center !important;
+  top: 40% !important;
+}
+
+.container {
+  display: flex !important;
+  flex-direction: column !important;
+  align-items: center !important;
+  justify-content: center !important;
+  height: 100vh; /* Optional: to center vertically in the viewport */
+}
+
+.progressVisible {
+  display: block !important;
+}
+
+.progressHide {
+  display: none !important;
+}
+
+.box {
+  width: 250px !important;
+  height: 100px !important;
+  margin: 10px !important;
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  font-size: 20px !important;
+  font-weight: bold !important;
+}

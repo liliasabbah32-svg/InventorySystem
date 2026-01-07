@@ -1,0 +1,78 @@
+/* ===============================
+   WIJMO FLEXGRID - Baseline styles (reverted)
+   This file was reverted to a conservative baseline to remove
+   experimental/override rules and button color variants.
+================================ */
+
+.wj-flexgrid {
+  width: 100%;
+  height: 500px;
+  font-family: Arial, sans-serif;
+  font-size: 18px;
+  border: 1px solid #e0e0e0;
+  background: #fff;
+  box-sizing: border-box;
+}
+
+/* Header */
+.wj-flexgrid .wj-header {
+  /* light gray header for a neutral, clean look */
+  background: #d4d4d4;
+  color: #333;
+  font-weight: 700;
+  padding: 6px 8px;
+  border-bottom: 1px solid #e6e6e6;
+  text-align: center;
+}
+
+/* Cells */
+.wj-flexgrid .wj-cell {
+  padding: 8px 10px;
+  border-bottom: 1px solid #eee;
+  white-space: nowrap;
+  text-align: left;
+}
+
+/* Alternating rows */
+.wj-flexgrid .wj-row:nth-child(even) .wj-cell {
+  //background: #fafafa;
+}
+
+/* Selected state: use button-like green and ensure selected cell/row match */
+.wj-flexgrid .wj-state-selected,
+.wj-flexgrid .wj-row .wj-cell.wj-state-selected,
+.wj-flexgrid .wj-cell.wj-state-selected {
+  /* lighter success green for selection with darker text for contrast */
+  background: #e6f6ea !important; /* light green */
+  color: #155724 !important; /* dark green text for readability */
+  border-color: transparent !important;
+}
+
+/* Focused cell should look the same as a selected cell */
+.wj-flexgrid .wj-cell:focus {
+  outline: none;
+  background: #e6f6ea !important;
+  color: #155724 !important;
+}
+
+/* Ensure icons inherit the selected text color */
+.wj-flexgrid .wj-cell.wj-state-selected i,
+.wj-flexgrid .wj-state-selected i {
+  color: inherit !important;
+}
+
+/* Group header */
+.wj-flexgrid .wj-group-row {
+  background: #fafafa;
+  font-weight: 600;
+  padding: 6px 8px;
+}
+
+/* Minimal button defaults (kept simple on purpose) */
+
+
+/* RTL support */
+html[dir="rtl"] .wj-flexgrid .wj-cell,
+html[dir="rtl"] .wj-flexgrid .wj-header {
+  text-align: right;
+}
