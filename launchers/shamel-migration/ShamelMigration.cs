@@ -557,6 +557,12 @@ namespace NoonShamelMigration
         string OwnerName { get { return ownerCheck.Checked ? ownerBox.Text : ""; } }
 
         // Btrieve 51 = اسم مالك ملفات الشامل مطلوب أو خاطئ
+        // السندات تُقرأ سطراً لكل سطر قيد (ctrans) — عدد الأسطر المقروءة يختلف عن عدد السندات التي جمعها الخادم منها
+        static string Progress(int rows, int records)
+        {
+            return records > 0 && records != rows ? rows + " سطر مقروء، " + records + " سجل" : rows + " سجل";
+        }
+
         static string OwnerHint(Exception ex)
         {
             return ex.Message.IndexOf("Btrieve Error 51", StringComparison.OrdinalIgnoreCase) >= 0 || ex.Message.IndexOf("owner name", StringComparison.OrdinalIgnoreCase) >= 0
@@ -578,17 +584,17 @@ namespace NoonShamelMigration
                     {
                         var step = steps[index];
                         SetStep("(" + (index + 1) + "/" + steps.Count + ") " + step.Title, index, steps.Count);
-                        int sent = 0, stepFailed = 0;
+                        int sent = 0, stepFailed = 0, records = 0;
                         int count = reader.Read(step, (batch, last) =>
                         {
                             var result = api.Batch(step.Key, batch, last, Log);
                             sent += batch.Count;
                             var stats = result.ContainsKey("stats") ? (Dictionary<string, object>)result["stats"] : null;
-                            if (stats != null) stepFailed += Convert.ToInt32(stats["failed"]);
-                            SetStep("(" + (index + 1) + "/" + steps.Count + ") " + step.Title + " — " + sent, index, steps.Count);
+                            if (stats != null) { stepFailed += Convert.ToInt32(stats["failed"]); records += Convert.ToInt32(stats["received"]); }
+                            SetStep("(" + (index + 1) + "/" + steps.Count + ") " + step.Title + " — " + Progress(sent, records), index, steps.Count);
                         }, () => cancelRequested);
                         failures += stepFailed;
-                        Log(step.Title + ": " + count + " سجل" + (stepFailed > 0 ? " — أخطاء: " + stepFailed + " (راجع سجل الأخطاء في نون)" : ""));
+                        Log(step.Title + ": " + Progress(count, records) + (stepFailed > 0 ? " — أخطاء: " + stepFailed + " (راجع سجل الأخطاء في نون)" : ""));
                     }
                 }
                 SetStep("انتهى الترحيل" + (failures > 0 ? " مع " + failures + " خطأ — راجع سجل الأخطاء في شاشة «ترحيل من الشامل»" : " بنجاح"), 1, 1);

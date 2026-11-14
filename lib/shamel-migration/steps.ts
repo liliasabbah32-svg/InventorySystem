@@ -170,7 +170,7 @@ const STEPS: MigrationStep[] = [
     process: (rows, ctx) => processVoucherItems(rows, ctx),
   },
   {
-    key: "vouchers", title: "السندات المختارة", group: "vouchers", batchSize: 400,
+    key: "vouchers", title: "السندات المختارة", group: "vouchers", batchSize: 1500,
     sql: (run) => voucherLinesSql(run),
     process: (rows, ctx, last) => processVoucherLines(rows, ctx, last),
   },
