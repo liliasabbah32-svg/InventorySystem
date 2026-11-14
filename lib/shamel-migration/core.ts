@@ -106,14 +106,15 @@ export function toCode10(raw: unknown, numericFill: "end" | "start" = "end") {
 // قواعد الشركات تختلف أعمدتها (القديمة ينقصها ما أُضيف لاحقاً، مثل products.last_purchase_date) — يُدرَج فقط ما
 // هو موجود فعلاً بالجدول، والأعمدة الناقصة تُتجاوز بدل إفشال السجل.
 
-const columnCache = new Map<string, Promise<Set<string>>>()
+// عمود ⇐ أقصى طول للنص (null = بلا حد): القواعد القديمة فيها أعمدة أقصر (salesmen.code varchar(8) مثلاً)
+const columnCache = new Map<string, Promise<Map<string, number | null>>>()
 
-export async function tableColumns(table: string): Promise<Set<string>> {
+export async function tableColumns(table: string): Promise<Map<string, number | null>> {
   const key = `${await resolveCurrentDbName()}|${table}`
   if (!columnCache.has(key)) {
     const load = async () => {
-      const rows = (await sql`SELECT column_name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = ${table}`) as any[]
-      return new Set(rows.map((row) => String(row.column_name)))
+      const rows = (await sql`SELECT column_name, character_maximum_length FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = ${table}`) as any[]
+      return new Map<string, number | null>(rows.map((row) => [String(row.column_name), row.character_maximum_length == null ? null : Number(row.character_maximum_length)]))
     }
     const promise = load()
     promise.catch(() => columnCache.delete(key))
@@ -122,10 +123,36 @@ export async function tableColumns(table: string): Promise<Set<string>> {
   return columnCache.get(key)!
 }
 
+/** الأعمدة الموجودة فقط، والنص الأطول من حد العمود يُقصّ (اسم/ملاحظة أطول من عمود قاعدة قديمة لا يُفشل السجل) */
+async function presentValues(table: string, values: Record<string, unknown>) {
+  const columns = await tableColumns(table)
+  return Object.entries(values)
+    .filter(([column, value]) => columns.has(column) && value !== undefined)
+    .map(([column, value]) => {
+      const max = columns.get(column)
+      return [column, typeof value === "string" && max != null && value.length > max ? value.slice(0, max) : value] as [string, unknown]
+    })
+}
+
+/**
+ * رمز (رقم حساب/عميل/صنف/مندوب...) بطول يناسب عمود قاعدة الشركة: الأطول يُقصَّر بحذف الأصفار بعد البادئة
+ * (M000000001 ⇐ M0000001)، وإن لم يكفِ فرمز الشامل الأصلي. الرمز المقصَّر المستخدم لسجل آخر ⇐ رمز الشامل.
+ */
+export async function fitCode(table: string, column: string, code: string, shamelCode: string): Promise<string> {
+  const max = (await tableColumns(table)).get(column)
+  if (max == null || code.length <= max) return code
+  const match = /^([A-Z]*)(0*)(\d+)$/.exec(code)
+  let fitted = match && match[1].length + match[3].length <= max ? match[1] + match[3].padStart(max - match[1].length, "0") : ""
+  if (fitted) {
+    const taken = await sql.unsafe(`SELECT 1 FROM ${table} WHERE "${column}" = $1 LIMIT 1`, [fitted])
+    if ((taken as any[]).length) fitted = ""
+  }
+  return fitted || shamelCode.slice(0, max)
+}
+
 /** INSERT ... RETURNING id بالأعمدة الموجودة فقط من values */
 export async function insertRow(table: string, values: Record<string, unknown>): Promise<number> {
-  const columns = await tableColumns(table)
-  const present = Object.entries(values).filter(([column, value]) => columns.has(column) && value !== undefined)
+  const present = await presentValues(table, values)
   if (!present.length) throw new Error(`لا توجد أعمدة صالحة للجدول ${table}`)
   const rows = await sql.unsafe(
     `INSERT INTO ${table} (${present.map(([column]) => `"${column}"`).join(", ")}) VALUES (${present.map((_, index) => `$${index + 1}`).join(", ")}) RETURNING id`,
@@ -136,8 +163,7 @@ export async function insertRow(table: string, values: Record<string, unknown>):
 
 /** UPDATE ... WHERE id بالأعمدة الموجودة فقط */
 export async function updateRow(table: string, id: number, values: Record<string, unknown>) {
-  const columns = await tableColumns(table)
-  const present = Object.entries(values).filter(([column, value]) => columns.has(column) && value !== undefined)
+  const present = await presentValues(table, values)
   if (!present.length) return
   await sql.unsafe(
     `UPDATE ${table} SET ${present.map(([column], index) => `"${column}" = $${index + 1}`).join(", ")} WHERE id = $${present.length + 1}`,

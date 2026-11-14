@@ -14,6 +14,8 @@ export async function POST(request: NextRequest) {
     await sql`CREATE TABLE IF NOT EXISTS product_units (id SERIAL PRIMARY KEY, product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE, unit_id INTEGER NOT NULL, to_main_qnty DOUBLE PRECISION DEFAULT 1)`
     await sql`CREATE TABLE IF NOT EXISTS product_unit_barcodes (id SERIAL PRIMARY KEY, product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE, unit_id INTEGER NOT NULL, barcode TEXT NOT NULL)`
     await sql`CREATE TABLE IF NOT EXISTS product_prices (id SERIAL PRIMARY KEY, product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE, price_category_id INTEGER NOT NULL, unit_id INTEGER NOT NULL, price NUMERIC(18,4) DEFAULT 0, currency_id INTEGER DEFAULT 1)`
+    // أدوار الوحدة: الوحدة الوحيدة للصنف المستورد هي وحدة الجرد والشراء والتقارير
+    for (const column of ["is_stock_count_unit", "is_purchase_unit", "is_report_unit"]) await sql.unsafe(`ALTER TABLE product_units ADD COLUMN IF NOT EXISTS ${column} BOOLEAN NOT NULL DEFAULT FALSE`)
 
     // أعمدة جدول الأصناف تختلف بين القواعد: القديمة (category/main_unit/currency نصية...) والجديدة المُنشأة من
     // company-bootstrap.sql (currency_id، status/type رقمية، بلا category) — كان الإدراج الثابت بالأعمدة القديمة يُفشِل
@@ -121,7 +123,7 @@ export async function POST(request: NextRequest) {
         const unitId = Number(item.unit_id || 0)
         const priceCategoryId = Number(item.price_category_id || 0)
         if (productId > 0 && unitId > 0) {
-          const productUnit = await sql`INSERT INTO product_units (product_id, unit_id, to_main_qnty) VALUES (${productId}, ${unitId}, 1) ON CONFLICT DO NOTHING RETURNING id`
+          const productUnit = await sql`INSERT INTO product_units (product_id, unit_id, to_main_qnty, is_stock_count_unit, is_purchase_unit, is_report_unit) VALUES (${productId}, ${unitId}, 1, true, true, true) ON CONFLICT DO NOTHING RETURNING id`
           const productUnitId = Number(productUnit[0]?.id || 0)
           if (String(item.barcode || "").trim()) {
             const resolvedProductUnit = productUnitId > 0 ? productUnitId : Number((await sql`SELECT id FROM product_units WHERE product_id = ${productId} AND unit_id = ${unitId} LIMIT 1`)[0]?.id || 0)

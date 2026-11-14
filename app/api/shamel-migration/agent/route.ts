@@ -1,4 +1,5 @@
 import { ensureVoucherIndexes } from "@/lib/voucher-indexes"
+import { assignDefaultUnitRoles } from "@/lib/shamel-migration/definitions"
 import { type NextRequest, NextResponse } from "next/server"
 import sql, { isPortalTenantDb, withTenantDb } from "@/lib/database"
 import { parsePortalToken, sha256Hex } from "@/lib/customer-portal"
@@ -62,6 +63,7 @@ export async function POST(request: NextRequest) {
       if (body.action === "finish") {
         // بعد ترحيل آلاف السندات والأصناف: فهارس فتح السندات وكشوف الحسابات
         await ensureVoucherIndexes().catch(() => undefined)
+        await assignDefaultUnitRoles().catch(() => undefined)
         const failed = body.status === "failed"
         await sql`
           UPDATE shamel_migration_runs SET status = ${failed ? "failed" : "done"}, message = ${String(body.message || "").slice(0, 2000) || null},

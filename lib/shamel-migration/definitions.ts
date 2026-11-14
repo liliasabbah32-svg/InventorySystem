@@ -1,6 +1,7 @@
 import sql from "@/lib/database"
+import { runSchemaOnce } from "@/lib/schema-once"
 import { ensureCustomerAccount, resolveAccountType, resolveRequiredParentAccount } from "@/app/api/customers/_lib"
-import { StepContext, date, insertRow, mapGet, mapOne, mapSet, num, text, toCode10, updateRow } from "@/lib/shamel-migration/core"
+import { StepContext, date, fitCode, insertRow, mapGet, mapOne, mapSet, num, text, toCode10, updateRow } from "@/lib/shamel-migration/core"
 
 // معالجات «التعريفات»: كل دالة تستقبل دفعة أسطر كما قرأها معالج الترحيل من الشامل (أسماء الأعمدة = الأسماء
 // المستعارة بـ SQL الخطوة في steps.ts) وتُنشئ/تربط السجل المقابل هنا. سجل موجود بنفس الرقم/الاسم يُربط ولا يُكرَّر.
@@ -155,7 +156,7 @@ export async function processStores(rows: Row[], ctx: StepContext) {
     const existing = (await sql`SELECT id FROM warehouses WHERE TRIM(warehouse_name) = ${name} LIMIT 1`)[0] as any
     if (existing) { await mapSet("store", String(pos), Number(existing.id)); return "updated" }
     let code = String(pos + 1)
-    if ((await sql`SELECT 1 FROM warehouses WHERE warehouse_code = ${code}`).length) code = `SH${pos + 1}`
+    if ((await sql`SELECT 1 FROM warehouses WHERE warehouse_code = ${code}`).length) code = await fitCode("warehouses", "warehouse_code", `SH${pos + 1}`, String(pos + 1))
     const id = await insertRow("warehouses", { warehouse_code: code, warehouse_name: name, warehouse_name_en: text(r.name_lang2) || null, is_active: true, status: 1 })
     await mapSet("store", String(pos), id)
     return "created"
@@ -201,7 +202,7 @@ async function companyIdTemplate() {
 async function accountCodeFor(shamelCode: string) {
   const converted = toCode10(shamelCode)
   const owner = (await sql`SELECT shamel_key FROM shamel_migration_map m JOIN account_tbl a ON a.id = m.web_id WHERE m.kind = 'account' AND a.code = ${converted} LIMIT 1`)[0] as any
-  return owner && text(owner.shamel_key) !== shamelCode ? text(shamelCode).toUpperCase() : converted
+  return fitCode("account_tbl", "code", owner && text(owner.shamel_key) !== shamelCode ? text(shamelCode).toUpperCase() : converted, shamelCode)
 }
 
 export async function processAccounts(rows: Row[], ctx: StepContext) {
@@ -246,7 +247,7 @@ export async function processSalesmen(rows: Row[], ctx: StepContext) {
     const shamelCode = text(r.code)
     if (!shamelCode) return "skipped"
     if (await mapOne("salesman", shamelCode)) return "skipped"
-    const code = /^\d+$/.test(shamelCode) ? `M${shamelCode.padStart(9, "0")}` : toCode10(shamelCode)
+    const code = await fitCode("salesmen", "code", /^\d+$/.test(shamelCode) ? `M${shamelCode.padStart(9, "0")}` : toCode10(shamelCode), shamelCode)
     const name = text(r.name) || code
     const existing = (await sql`SELECT id FROM salesmen WHERE code = ${code} OR TRIM(name) = ${name} LIMIT 1`)[0] as any
     if (existing) { await mapSet("salesman", shamelCode, Number(existing.id)); return "updated" }
@@ -312,7 +313,7 @@ export async function processCustomers(rows: Row[], ctx: StepContext) {
     const priceCategory = (await mapOne("price_class", String(num(r.priceclass_pos)))) || 1
     const phones = [text(r.phone), text(r.phone2), text(r.phone3)].filter(Boolean)
     const id = await insertRow("customers", {
-      customer_code: code, name, customer_name_en: text(r.name_lang2) || null, mobile1: phones[0] || null, mobile2: phones[1] || null,
+      customer_code: await fitCode("customers", "customer_code", code, shamelCode), name, customer_name_en: text(r.name_lang2) || null, mobile1: phones[0] || null, mobile2: phones[1] || null,
       city: cityName, city_id: cityId, address: text(r.address) || null, status: num(r.stopped) ? "موقوف" : "نشط", business_nature: text(r.business_description) || null,
       salesman: salesmanId ? salesmanNames.get(salesmanId) || null : null, general_notes: text(r.displayed_note) || null,
       registration_date: date(r.entry_date_) || new Date().toISOString().slice(0, 10), type, isdeleted: false, pricecategory: priceCategory,
@@ -348,7 +349,7 @@ export async function processBankBranches(rows: Row[], ctx: StepContext) {
     const name = text(r.name) || shamelCode
     const existing = (await sql`SELECT id FROM branches WHERE bank_id = ${bankId} AND TRIM(branch_name) = ${name} LIMIT 1`)[0] as any
     if (existing) { await mapSet("bank_branch", shamelCode, Number(existing.id)); return "updated" }
-    let code = shamelCode
+    let code = await fitCode("branches", "branch_code", shamelCode, shamelCode)
     if ((await sql`SELECT 1 FROM branches WHERE branch_code = ${code}`).length) code = `${shamelCode}B`
     const id = await insertRow("branches", {
       branch_code: code, branch_name: name, address: text(r.address) || null, manager: text(r.manager_name) || null, phone: text(r.phone) || null,
@@ -392,7 +393,7 @@ export async function processItemGroups(rows: Row[], ctx: StepContext) {
     const parentId = text(r.father_code) ? await mapOne("item_group", text(r.father_code)) : null
     const existing = (await sql`SELECT id FROM item_groups WHERE group_code = ${shamelCode} LIMIT 1`)[0] as any
     if (existing) { await mapSet("item_group", shamelCode, Number(existing.id)); return "updated" }
-    const id = await insertRow("item_groups", { group_code: shamelCode, group_name: name, parent_group_id: parentId, parent_id: parentId, is_active: true, status: 1 })
+    const id = await insertRow("item_groups", { group_code: await fitCode("item_groups", "group_code", shamelCode, shamelCode), group_name: name, parent_group_id: parentId, parent_id: parentId, is_active: true, status: 1 })
     await mapSet("item_group", shamelCode, id)
     return "created"
   })
@@ -411,11 +412,37 @@ async function unitIdByName(name: string) {
 async function productCodeFor(shamelCode: string) {
   const converted = toCode10(shamelCode, "start")
   const owner = (await sql`SELECT m.shamel_key FROM shamel_migration_map m JOIN products p ON p.id = m.web_id WHERE m.kind = 'item' AND p.product_code = ${converted} LIMIT 1`)[0] as any
-  return owner && text(owner.shamel_key) !== shamelCode ? shamelCode.toUpperCase().replace(/[^A-Z0-9]/g, "") : converted
+  return fitCode("products", "product_code", owner && text(owner.shamel_key) !== shamelCode ? shamelCode.toUpperCase().replace(/[^A-Z0-9]/g, "") : converted, shamelCode)
+}
+
+// أدوار الوحدة (وحدة الجرد/الشراء/التقارير) تُنشأ أعمدتها عادةً عند أول حفظ صنف من شاشة الأصناف — قاعدة لم يُحفظ
+// فيها صنف بعد كانت تُرحَّل وحداتها بلا أدوار (insertRow يتجاوز العمود غير الموجود)
+async function ensureUnitRoleColumns() { return runSchemaOnce("lib/shamel-migration/definitions.ts#ensureUnitRoleColumns", async () => {
+  for (const column of ["is_stock_count_unit", "is_purchase_unit", "is_report_unit"]) {
+    await sql.unsafe(`ALTER TABLE product_units ADD COLUMN IF NOT EXISTS ${column} BOOLEAN NOT NULL DEFAULT FALSE`)
+  }
+}) }
+
+/**
+ * صنف لا تحمل أي من وحداته دوراً ⇐ الدور لوحدته الأولى (الأصغر معاملاً) — نفس قاعدة شاشة الأصناف («دور بلا وحدة
+ * محددة يُسند للوحدة الأولى»). يُصلح أيضاً أصنافاً رُحِّلت سابقاً قبل وجود الأعمدة.
+ */
+export async function assignDefaultUnitRoles() {
+  await ensureUnitRoleColumns()
+  for (const column of ["is_stock_count_unit", "is_purchase_unit", "is_report_unit"]) {
+    await sql.unsafe(`
+      UPDATE product_units pu SET ${column} = true
+      FROM (
+        SELECT DISTINCT ON (product_id) id FROM product_units ORDER BY product_id, to_main_qnty, id
+      ) first_unit
+      WHERE pu.id = first_unit.id
+        AND NOT EXISTS (SELECT 1 FROM product_units other WHERE other.product_id = pu.product_id AND other.${column} = true)`)
+  }
 }
 
 export async function processItems(rows: Row[], ctx: StepContext) {
   unitCache.clear()
+  await ensureUnitRoleColumns()
   await eachRow(rows, ctx, (r) => r.code, async (r) => {
     const shamelCode = text(r.code)
     if (!shamelCode || (await mapOne("item", shamelCode))) return "skipped"
@@ -492,6 +519,7 @@ export async function processItems(rows: Row[], ctx: StepContext) {
  * داخل نفس الوحدة (للوحدة عدة باركودات). يُعاد تشغيلها بأمان: باركود موجود لنفس الوحدة لا يتكرر.
  */
 export async function processItemBarcodes(rows: Row[], ctx: StepContext) {
+  await assignDefaultUnitRoles()
   const items = await mapGet("item", rows.map((r) => text(r.code)))
   await eachRow(rows, ctx, (r) => `${text(r.code)} ${text(r.barcode)}`, async (r) => {
     const shamelCode = text(r.code)

@@ -16,6 +16,7 @@ import { CompanyStatusGuard } from "@/components/auth/company-status-guard"
 import { ProductVariantProvider } from "@/components/products/product-variant-provider"
 import { NativeBackButton } from "@/components/native/native-back-button"
 import { NativeVoucherPrintHost } from "@/components/native/native-voucher-print-host"
+import { RecordLoadingIndicator } from "@/components/common/record-loading-indicator"
 
 export default function ClientProviders({ children }: { children: React.ReactNode }) {
   // يُعبِّئ إعداد "عدد الخانات العشرية" (وأي إعداد نظام قديم آخر لاحقاً) بـlocalStorage عند بدء أي
@@ -83,6 +84,8 @@ export default function ClientProviders({ children }: { children: React.ReactNod
                 <ConfirmHost />
                 {/* لا يوجد لديك صلاحية ⇐ رمز تفعيل من المدير ومسؤول النظام (الكاشير والمطعم) */}
                 <PermissionApprovalHost />
+                {/* فتح سند/سجل من القوائم: «جارٍ التحميل» إن تأخر (components/common/record-loading-indicator.tsx) */}
+                <RecordLoadingIndicator />
               </GlobalSearchProvider>
             </WorkspaceProvider>
           </WindowManagerProvider>
