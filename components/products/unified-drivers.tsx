@@ -1,0 +1,330 @@
+"use client"
+
+import { tr, appDir } from "@/lib/i18n"
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog"
+import { Input } from "@/components/ui/input"
+import { Label } from "@/components/ui/label"
+import { UniversalToolbar } from "@/components/ui/universal-toolbar"
+import ConfirmDialogYesNo from "@/components/ui/ConfirmDialogYesNo"
+import { Alert, AlertDescription } from "@/components/ui/alert"
+import ProgressSpinner from "@/components/ProgressSpinner/ProgressSpinner"
+import PrimeDropdown from "@/components/common/FocusDropdown"
+import { useEffect, useRef, useState } from "react"
+import { useWorkspaceTabActive } from "@/contexts/workspace-tab-context"
+
+export interface LicenseType {
+  id: number
+  name: string
+}
+
+export interface Driver {
+  id: number
+  driver_code: string
+  name: string
+  phone?: string | null
+  licence_expiry?: string | null
+  license_type_id?: number | null
+  license_type_name?: string | null
+  status: "نشط" | "غير نشط"
+}
+
+export interface DriverFormData {
+  id: number
+  driver_code: string
+  name: string
+  phone: string
+  licence_expiry: string
+  license_type_id: number | null
+  status: "نشط" | "غير نشط"
+}
+
+interface UnifiedDriversProps {
+  dialogOpen: boolean
+  currentIndex: number
+  totalRecords: number
+  form: DriverFormData
+  licenseTypes: LicenseType[]
+  isSaving: boolean
+  loading: boolean
+  showDeleteConfirm: boolean
+  onOpenChange: (open: boolean) => void
+  onNew?: () => void
+  onSave: (options?: { afterSaveAction?: "new" | "close" }) => void | Promise<void>
+  onDelete?: () => void
+  onNavigateRecord?: (record: Driver) => void
+  onFormChange: (field: string, value: string | number | null) => void
+  onConfirmDelete: () => void
+  onCancelDelete: () => void
+  onCodeBlur?: (driver_code: string) => void
+  canSave?: boolean
+  hasDuplicateCode?: boolean
+  hasDuplicateName?: boolean
+  deleteError?: string
+  deleteConfirmMessage?: string
+  validationError?: string
+  isFirstRecord?: boolean
+  isLastRecord?: boolean
+  isNewMode?: boolean
+}
+
+export default function UnifiedDrivers({
+  dialogOpen,
+  currentIndex,
+  totalRecords,
+  form,
+  licenseTypes,
+  isSaving,
+  loading,
+  showDeleteConfirm,
+  onOpenChange,
+  onNew,
+  onSave,
+  onDelete,
+  onNavigateRecord,
+  onFormChange,
+  onConfirmDelete,
+  onCancelDelete,
+  onCodeBlur,
+  canSave,
+  hasDuplicateCode,
+  hasDuplicateName,
+  deleteError,
+  deleteConfirmMessage,
+  validationError,
+  isFirstRecord,
+  isLastRecord,
+  isNewMode,
+}: UnifiedDriversProps) {
+  const workspaceTabActive = useWorkspaceTabActive()
+  const [navLoading, setNavLoading] = useState(false)
+  const combinedLoading = Boolean(isSaving || loading || navLoading)
+  const codeInputRef = useRef<HTMLInputElement | null>(null)
+  const nameInputRef = useRef<HTMLInputElement | null>(null)
+  const focusTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const wasDialogOpenRef = useRef(false)
+  const visibleValidationMessage = validationError || ""
+
+  const handleNavigate = async (direction: "first" | "previous" | "next" | "last") => {
+    setNavLoading(true)
+    try {
+      const currentId = form.id > 0 ? form.id : 0
+      const isNewRecord = form.id <= 0
+      const effectiveDirection =
+        direction === "previous" && isNewRecord
+          ? "last"
+          : direction === "next" && isNewRecord
+            ? "first"
+            : direction
+
+      const query = new URLSearchParams()
+      if (effectiveDirection === "previous" || effectiveDirection === "next") {
+        query.set("currentId", String(currentId))
+      }
+
+      const response = await fetch(`/api/drivers/navigation/${effectiveDirection}${query.toString() ? `?${query.toString()}` : ""}`)
+      if (!response.ok) return
+
+      const record = await response.json()
+      if (record?.id) {
+        onNavigateRecord?.(record)
+      }
+    } catch (error) {
+      console.error("Failed to navigate drivers", error)
+    } finally {
+      setNavLoading(false)
+    }
+  }
+
+  useEffect(() => {
+    if (typeof window === "undefined") return
+
+    if (!dialogOpen) {
+      wasDialogOpenRef.current = false
+      return
+    }
+
+    if (wasDialogOpenRef.current) return
+    wasDialogOpenRef.current = true
+
+    if (focusTimerRef.current) {
+      clearTimeout(focusTimerRef.current)
+      focusTimerRef.current = null
+    }
+
+    focusTimerRef.current = setTimeout(() => {
+      nameInputRef.current?.focus()
+      focusTimerRef.current = null
+    }, 120)
+
+    const handleKeyDown = (event: KeyboardEvent) => { if (!workspaceTabActive.current) return;
+      // F3 حفظ / F9 حذف / F4 نسخ / F5 جديد: UniversalToolbar (lib/hotkeys.ts)
+      if (event.key === "Escape") {
+        event.preventDefault()
+        if (!combinedLoading) {
+          onOpenChange(false)
+        }
+      }
+    }
+
+    window.addEventListener("keydown", handleKeyDown)
+    return () => {
+      if (focusTimerRef.current) {
+        clearTimeout(focusTimerRef.current)
+        focusTimerRef.current = null
+      }
+      window.removeEventListener("keydown", handleKeyDown)
+    }
+  }, [dialogOpen, isNewMode, onDelete, onOpenChange, onSave, combinedLoading])
+
+  const handleDialogOpenChange = (open: boolean) => {
+    if (!open && combinedLoading) return
+    onOpenChange(open)
+  }
+
+  return (
+    <>
+      <ProgressSpinner loading={combinedLoading} />
+      <Dialog open={dialogOpen} onOpenChange={handleDialogOpenChange}>
+        <DialogContent
+          className="w-[calc(100vw-2rem)] max-w-5xl overflow-hidden p-0"
+          dir={appDir()}
+          onOpenAutoFocus={(event) => event.preventDefault()}
+          onCloseAutoFocus={(event) => event.preventDefault()}
+        >
+          <UniversalToolbar
+            currentRecord={currentIndex + 1}
+            totalRecords={totalRecords}
+            onNew={onNew}
+            onSave={onSave}
+            onDelete={onDelete}
+            onFirst={() => handleNavigate("first")}
+            onPrevious={() => handleNavigate("previous")}
+            onNext={() => handleNavigate("next")}
+            onLast={() => handleNavigate("last")}
+            isSaving={isSaving}
+            canSave={canSave}
+            canDelete={form.id > 0 && !isSaving}
+            isFirstRecord={isFirstRecord}
+            isLastRecord={isLastRecord}
+          />
+
+          <div className="rounded-b-3xl bg-background px-6 py-6">
+            <DialogHeader className="mb-4">
+              <DialogTitle className="text-xl font-semibold">{form.id > 0 ? tr("تعديل بيانات سائق") : tr("إضافة سائق جديد")}</DialogTitle>
+            </DialogHeader>
+
+            <div className="grid gap-4 py-4">
+              {visibleValidationMessage && (
+                <Alert variant="destructive" className="border-red-200 bg-red-50 text-red-700" role="alert">
+                  <AlertDescription>{visibleValidationMessage}</AlertDescription>
+                </Alert>
+              )}
+
+              <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
+                <div className="grid gap-2">
+                  <Label htmlFor="driver-code">{tr("رقم السائق")}</Label>
+                  <Input
+                    id="driver-code"
+                    value={form.driver_code}
+                    onChange={(e) => onFormChange("driver_code", e.target.value)}
+                    onBlur={() => {
+                      if (focusTimerRef.current) {
+                        clearTimeout(focusTimerRef.current)
+                        focusTimerRef.current = null
+                      }
+                      onCodeBlur?.(form.driver_code)
+                    }}
+                    ref={codeInputRef}
+                    maxLength={8}
+                    className="text-start"
+                  />
+                </div>
+                <div className="grid gap-2 md:col-span-2">
+                  <Label htmlFor="driver-name">{tr("اسم السائق *")}</Label>
+                  <Input
+                    id="driver-name"
+                    ref={nameInputRef}
+                    value={form.name}
+                    onChange={(e) => onFormChange("name", e.target.value.slice(0, 30))}
+                    maxLength={30}
+                    className={`text-start ${hasDuplicateName ? "border-red-500" : ""}`}
+                    required
+                  />
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
+                <div className="grid gap-2">
+                  <Label htmlFor="driver-phone">{tr("رقم الهاتف")}</Label>
+                  <Input
+                    id="driver-phone"
+                    value={form.phone}
+                    onChange={(e) => onFormChange("phone", e.target.value)}
+                    className="text-start"
+                  />
+                </div>
+                <div className="grid gap-2">
+                  <Label htmlFor="driver-licence-expiry">{tr("تاريخ انتهاء الرخصة")}</Label>
+                  <Input
+                    id="driver-licence-expiry"
+                    type="date"
+                    value={form.licence_expiry}
+                    onChange={(e) => onFormChange("licence_expiry", e.target.value)}
+                    className="text-start"
+                  />
+                </div>
+                <div className="grid gap-2">
+                  <Label htmlFor="driver-license-type">{tr("نوع الرخصة *")}</Label>
+                  <PrimeDropdown
+                    inputId="driver-license-type"
+                    value={form.license_type_id || null}
+                    options={licenseTypes.map((item) => ({ label: item.name, value: item.id }))}
+                    optionLabel="label"
+                    optionValue="value"
+                    placeholder={tr("اختر نوع الرخصة")}
+                    filter={true}
+                    className="invoice-currency-dropdown w-full"
+                    panelClassName="invoice-currency-dropdown-panel"
+                    appendTo="self"
+                    filterInputAutoFocus={true}
+                    onChange={(e: any) => onFormChange("license_type_id", e.value ?? null)}
+                  />
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
+                <div className="grid gap-2">
+                  <Label htmlFor="driver-status">{tr("الحالة")}</Label>
+                  <PrimeDropdown
+                    inputId="driver-status"
+                    value={form.status || "نشط"}
+                    options={[
+                      { label: tr("نشط"), value: "نشط" },
+                      { label: tr("غير نشط"), value: "غير نشط" },
+                    ]}
+                    optionLabel="label"
+                    optionValue="value"
+                    filter={false}
+                    className="invoice-currency-dropdown w-full"
+                    panelClassName="invoice-currency-dropdown-panel"
+                    appendTo="self"
+                    onChange={(e: any) => onFormChange("status", e.value || "نشط")}
+                  />
+                </div>
+              </div>
+
+              {deleteError && <p className="text-sm text-destructive">{deleteError}</p>}
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      <ConfirmDialogYesNo
+        visible={showDeleteConfirm}
+        message={deleteConfirmMessage || tr("هل تريد حذف هذا السائق؟")}
+        onConfirm={onConfirmDelete}
+        onCancel={onCancelDelete}
+      />
+    </>
+  )
+}

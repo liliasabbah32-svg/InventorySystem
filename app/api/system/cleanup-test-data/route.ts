@@ -1,11 +1,13 @@
+import { authorizeUserAdmin } from "@/lib/user-admin-access"
 import { type NextRequest, NextResponse } from "next/server"
-import { neon } from "@neondatabase/serverless"
+import sql from "@/lib/database"
 import fs from "fs"
 import path from "path"
 
-const sql = neon(process.env.DATABASE_URL!)
-
 export async function POST(request: NextRequest) {
+  // أداة إدارية/تطوير: للمسؤول فقط
+  const admin = await authorizeUserAdmin(request)
+  if (!admin.ok) return admin.response
   try {
     // قراءة سكريبت مسح البيانات التجريبية
     const scriptPath = path.join(process.cwd(), "scripts", "cleanup-test-data.sql")

@@ -1,0 +1,251 @@
+import { NextRequest, NextResponse } from "next/server"
+import sql, { withTenantTransaction } from "@/lib/database"
+import { requirePosDefinitionPermission } from "@/app/api/pos/_lib"
+import { runSchemaOnce } from "@/lib/schema-once"
+
+async function ensureTables() { return runSchemaOnce("app/api/campaigns/route.ts#ensureTables", async () => {
+  await sql`
+    CREATE TABLE IF NOT EXISTS pos_campaign_header_tbl (
+      id SERIAL PRIMARY KEY,
+      code VARCHAR(40) NOT NULL UNIQUE,
+      name VARCHAR(160) NOT NULL,
+      start_date DATE,
+      end_date DATE,
+      time_type INTEGER DEFAULT 1,
+      from_time TIME,
+      to_time TIME,
+      notes TEXT,
+      type_id INTEGER DEFAULT 1,
+      from_amount NUMERIC(18,4) DEFAULT 0,
+      to_amount NUMERIC(18,4) DEFAULT 0,
+      discount_perc NUMERIC(9,4) DEFAULT 0,
+      condition_items_opt INTEGER DEFAULT 1,
+      condition_items_val NUMERIC(18,4) DEFAULT 0,
+      added_items_option INTEGER DEFAULT 1,
+      added_items_value NUMERIC(18,4) DEFAULT 0,
+      price_class INTEGER DEFAULT 1,
+      max_campaigns INTEGER DEFAULT 1,
+      status INTEGER DEFAULT 1,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      last_modify_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `
+  await sql`
+    CREATE TABLE IF NOT EXISTS pos_campaign_items_tbl (
+      id SERIAL PRIMARY KEY,
+      campaign_id INTEGER NOT NULL REFERENCES pos_campaign_header_tbl(id) ON DELETE CASCADE,
+      item_id INTEGER NOT NULL,
+      unit_id INTEGER,
+      item_name VARCHAR(200),
+      original_unit_price NUMERIC(18,4) DEFAULT 0,
+      discount_type INTEGER DEFAULT 1,
+      unit_discount_value NUMERIC(18,4) DEFAULT 0,
+      campaign_qnty NUMERIC(18,4) DEFAULT 1,
+      notes TEXT,
+      type INTEGER NOT NULL DEFAULT 1
+    )
+  `
+  await sql`
+    CREATE TABLE IF NOT EXISTS pos_campaign_warehouses_tbl (
+      campaign_id INTEGER NOT NULL REFERENCES pos_campaign_header_tbl(id) ON DELETE CASCADE,
+      warehouse_id INTEGER NOT NULL,
+      PRIMARY KEY (campaign_id, warehouse_id)
+    )
+  `
+  await sql`
+    CREATE TABLE IF NOT EXISTS pos_campaign_branches_tbl (
+      campaign_id INTEGER NOT NULL REFERENCES pos_campaign_header_tbl(id) ON DELETE CASCADE,
+      branch_id INTEGER NOT NULL,
+      PRIMARY KEY (campaign_id, branch_id)
+    )
+  `
+}) }
+
+const number = (value: unknown, fallback = 0) => Number.isFinite(Number(value)) ? Number(value) : fallback
+const date = (value: unknown) => value ? String(value) : null
+
+async function meta(priceClass = 1) {
+  const [products, warehouses, branches, priceClasses] = await Promise.all([
+    sql`SELECT p.id,p.product_code code,p.product_name name,pu.unit_id,u.unit_name,
+      COALESCE(price.price,0) sale_price
+      FROM products p
+      LEFT JOIN LATERAL (SELECT id,unit_id FROM product_units WHERE product_id=p.id ORDER BY id LIMIT 1) pu ON TRUE
+      LEFT JOIN units u ON u.id=pu.unit_id
+      LEFT JOIN LATERAL (SELECT pp.price FROM product_prices pp WHERE pp.product_id=p.id
+        AND pp.price_category_id=${priceClass} AND pp.unit_id IN (pu.unit_id,pu.id)
+        ORDER BY CASE WHEN pp.unit_id=pu.unit_id THEN 0 ELSE 1 END,pp.id DESC LIMIT 1) price ON TRUE
+      WHERE COALESCE(p.deleted,false)=false AND (p.status IS NULL OR p.status::text IN ('1','نشط','active','ACTIVE')) ORDER BY p.product_name`,
+    sql`SELECT id, warehouse_code code, warehouse_name name FROM warehouses WHERE COALESCE(status,1)<>3 ORDER BY warehouse_name`,
+    sql`SELECT id,branch_code code,branch_name name FROM branches WHERE NOT COALESCE((to_jsonb(branches)->>'is_bank_branch')::boolean, false) AND COALESCE(status,1)<>3 ORDER BY branch_name`,
+    sql`SELECT id,name FROM pricecategory WHERE COALESCE(status,1)=1 ORDER BY id`,
+  ])
+  return { products, warehouses, branches, priceClasses }
+}
+
+async function campaignRows() {
+  return sql`
+    SELECT h.*, COALESCE((SELECT json_agg(json_build_object('id',i.id,'item_id',i.item_id,'item_name',COALESCE(i.item_name,p.product_name,''),'item_code',p.product_code,'unit_id',i.unit_id,'unit_name',u.unit_name,'price',i.original_unit_price,'discount_type',i.discount_type,'discount',i.unit_discount_value,'quantity',i.campaign_qnty,'notes',i.notes,'type',i.type) ORDER BY i.id) FROM pos_campaign_items_tbl i LEFT JOIN products p ON p.id=i.item_id LEFT JOIN units u ON u.id=i.unit_id WHERE i.campaign_id=h.id),'[]') items,
+    COALESCE((SELECT json_agg(w.warehouse_id ORDER BY w.warehouse_id) FROM pos_campaign_warehouses_tbl w WHERE w.campaign_id=h.id),'[]') warehouse_ids,
+    COALESCE((SELECT json_agg(b.branch_id ORDER BY b.branch_id) FROM pos_campaign_branches_tbl b WHERE b.campaign_id=h.id),'[]') branch_ids
+    FROM pos_campaign_header_tbl h WHERE COALESCE(h.status,1)<>3 ORDER BY h.id DESC
+  `
+}
+
+// صنف من باركود: باركود وحدة (product_unit_barcodes — unit_id فيه قد يكون معرّف سطر product_units أو
+// معرّف الوحدة) يُرجع الصنف بتلك الوحدة وسعرها، وإلا باركود الصنف الرئيسي (products.barcode) بالوحدة الأولى.
+async function productByBarcode(barcode: string, priceClass: number) {
+  const rows = await sql`
+    WITH hit AS (
+      SELECT pub.product_id, pu.id AS product_unit_id, pu.unit_id, 0 AS rank
+      FROM product_unit_barcodes pub
+      JOIN product_units pu ON pu.product_id = pub.product_id AND pub.unit_id IN (pu.id, pu.unit_id)
+      WHERE BTRIM(pub.barcode) = ${barcode}
+      UNION ALL
+      SELECT p.id, pu.id, pu.unit_id, 1
+      FROM products p
+      LEFT JOIN LATERAL (SELECT id, unit_id FROM product_units WHERE product_id = p.id ORDER BY id LIMIT 1) pu ON TRUE
+      WHERE BTRIM(p.barcode) = ${barcode}
+    )
+    SELECT p.id, p.product_code code, p.product_name name, hit.unit_id, u.unit_name, COALESCE(price.price, 0) sale_price
+    FROM hit
+    JOIN products p ON p.id = hit.product_id
+    LEFT JOIN units u ON u.id = hit.unit_id
+    LEFT JOIN LATERAL (SELECT pp.price FROM product_prices pp WHERE pp.product_id = p.id
+      AND pp.price_category_id = ${priceClass} AND pp.unit_id IN (hit.unit_id, hit.product_unit_id)
+      ORDER BY CASE WHEN pp.unit_id = hit.unit_id THEN 0 ELSE 1 END, pp.id DESC LIMIT 1) price ON TRUE
+    WHERE COALESCE(p.deleted, false) = false
+    ORDER BY hit.rank, hit.product_unit_id
+    LIMIT 1
+  `
+  return rows[0] || null
+}
+
+export async function GET(request: NextRequest) {
+  try {
+    await ensureTables()
+    const id = Number(request.nextUrl.searchParams.get("id") || 0)
+    const priceClass = Math.max(1, number(request.nextUrl.searchParams.get("price_class"), 1))
+    const barcode = String(request.nextUrl.searchParams.get("barcode") || "").trim()
+    if (barcode) return NextResponse.json({ product: await productByBarcode(barcode, priceClass) })
+    if (request.nextUrl.searchParams.get("catalog") === "1") return NextResponse.json(await meta(priceClass))
+    if (request.nextUrl.searchParams.get("meta") === "1") return NextResponse.json({ campaigns: await campaignRows(), ...(await meta(priceClass)) })
+    if (id) {
+      const rows = await campaignRows()
+      return NextResponse.json(rows.find((row: any) => Number(row.id) === id) || null)
+    }
+    return NextResponse.json({ campaigns: await campaignRows() })
+  } catch (error) {
+    return NextResponse.json({ error: error instanceof Error ? error.message : "تعذر تحميل الحملات" }, { status: 500 })
+  }
+}
+
+export async function POST(request: NextRequest) {
+  return save(request, false)
+}
+
+export async function PUT(request: NextRequest) {
+  return save(request, true)
+}
+
+async function save(request: NextRequest, updating: boolean) {
+  try {
+    const denied = await requirePosDefinitionPermission(request, updating ? "editCampaign" : "createCampaign")
+    if (denied) return denied
+    await ensureTables()
+    const data = await request.json()
+    if (!String(data.name || "").trim()) return NextResponse.json({ error: "اسم الحملة مطلوب" }, { status: 400 })
+    const typeId = number(data.type_id, 1)
+    if (![1, 2, 3, 4, 5].includes(typeId)) return NextResponse.json({ error: "نوع الحملة غير صالح" }, { status: 400 })
+    if (typeId === 5 && (!Number.isInteger(Number(data.condition_items_val)) || Number(data.condition_items_val) < 1))
+      return NextResponse.json({ error: "كمية أول كمية يجب أن تكون عدداً صحيحاً موجباً" }, { status: 400 })
+    if (!data.start_date || !data.end_date || String(data.start_date) > String(data.end_date)) return NextResponse.json({ error: "فترة الحملة غير صالحة" }, { status: 400 })
+    const buyItems = Array.isArray(data.buy_items) ? data.buy_items : []
+    const addedItems = Array.isArray(data.added_items) ? data.added_items : []
+    const activeItems = [...(typeId === 3 ? [] : buyItems), ...([1, 5].includes(typeId) ? [] : addedItems)]
+    if (activeItems.some((item: any) => !Number.isFinite(Number(item.quantity)) || Number(item.quantity) <= 0
+      || !Number.isFinite(Number(item.price)) || Number(item.price) < 0
+      || !Number.isFinite(Number(item.discount)) || Number(item.discount) < 0
+      || Number(item.discount) > Number(item.quantity) * Number(item.price))) {
+      return NextResponse.json({ error: "تحقق من الكمية والسعر؛ الخصم لا يتجاوز القيمة الأصلية للصنف" }, { status: 400 })
+    }
+    if (typeId !== 3 && !buyItems.some((item: any) => number(item.item_id) > 0)) return NextResponse.json({ error: "أضف صنف شراء واحدًا على الأقل" }, { status: 400 })
+    // ShamelWeb rules: buy items need a discount unless a bundle/"other" campaign gives added items;
+    // added items always need a discount; quantity >= 1; no repeated item in the same list.
+    const realBuy = typeId === 3 ? [] : buyItems.filter((item: any) => number(item.item_id) > 0)
+    const realAdded = [1, 5].includes(typeId) ? [] : addedItems.filter((item: any) => number(item.item_id) > 0)
+    const bundleWithGifts = (typeId === 2 || typeId === 4) && realAdded.length > 0
+    for (const [list, label, zeroAllowed] of [[realBuy, "أصناف الشراء", bundleWithGifts], [realAdded, "الأصناف المضافة", false]] as const) {
+      const seen = new Set<string>()
+      for (const item of list as any[]) {
+        const name = item.item_name || item.item_code || item.item_id
+        if (number(item.quantity) < 1) return NextResponse.json({ error: `${label}: الكمية للصنف "${name}" يجب أن تكون 1 على الأقل` }, { status: 400 })
+        if (!zeroAllowed && !(number(item.discount) > 0)) return NextResponse.json({ error: `${label}: أدخل مبلغ الخصم للصنف "${name}"` }, { status: 400 })
+        const key = `${number(item.item_id)}:${number(item.unit_id)}`
+        if (seen.has(key)) return NextResponse.json({ error: `${label}: الصنف "${name}" مكرر` }, { status: 400 })
+        seen.add(key)
+      }
+    }
+    if (![1, 5].includes(typeId) && !addedItems.some((item: any) => number(item.item_id) > 0) && number(data.discount_perc) <= 0) return NextResponse.json({ error: "حدد الأصناف المضافة أو نسبة الخصم" }, { status: 400 })
+    if (number(data.discount_perc) < 0 || number(data.discount_perc) > 100 || (typeId !== 5 && number(data.max_campaigns, 1) < 1)) return NextResponse.json({ error: "قيم الخصم أو حد التطبيق غير صالحة" }, { status: 400 })
+    const code = String(data.code || `CMP-${Date.now()}`).trim().toUpperCase()
+    const existing = await sql`SELECT id FROM pos_campaign_header_tbl WHERE code=${code} AND COALESCE(status,1)<>3 AND id<>${number(data.id)}`
+    if (existing[0]) return NextResponse.json({ error: "رمز الحملة مستخدم مسبقاً" }, { status: 400 })
+    return await withTenantTransaction(async () => {
+    let campaignId = number(data.id)
+    if (updating && campaignId) {
+      await sql`UPDATE pos_campaign_header_tbl SET code=${code},name=${String(data.name).trim()},start_date=${date(data.start_date)},end_date=${date(data.end_date)},time_type=${number(data.time_type,1)},from_time=${data.from_time||null},to_time=${data.to_time||null},notes=${data.notes||null},type_id=${number(data.type_id,1)},from_amount=${number(data.from_amount)},to_amount=${number(data.to_amount)},discount_perc=${number(data.discount_perc)},condition_items_opt=${number(data.condition_items_opt,1)},condition_items_val=${number(data.condition_items_val)},added_items_option=${number(data.added_items_option,1)},added_items_value=${number(data.added_items_value)},price_class=${number(data.price_class,1)},max_campaigns=${number(data.max_campaigns,1)},last_modify_date=NOW() WHERE id=${campaignId}`
+    } else {
+      const inserted = await sql`INSERT INTO pos_campaign_header_tbl(code,name,start_date,end_date,time_type,from_time,to_time,notes,type_id,from_amount,to_amount,discount_perc,condition_items_opt,condition_items_val,added_items_option,added_items_value,price_class,max_campaigns) VALUES(${code},${String(data.name).trim()},${date(data.start_date)},${date(data.end_date)},${number(data.time_type,1)},${data.from_time||null},${data.to_time||null},${data.notes||null},${number(data.type_id,1)},${number(data.from_amount)},${number(data.to_amount)},${number(data.discount_perc)},${number(data.condition_items_opt,1)},${number(data.condition_items_val)},${number(data.added_items_option,1)},${number(data.added_items_value)},${number(data.price_class,1)},${number(data.max_campaigns,1)}) RETURNING id`
+      campaignId = Number(inserted[0].id)
+    }
+    await sql`DELETE FROM pos_campaign_items_tbl WHERE campaign_id=${campaignId}`
+    for (const item of typeId === 3 ? [] : buyItems) {
+      if (!number(item.item_id)) continue
+      await sql`INSERT INTO pos_campaign_items_tbl(campaign_id,item_id,unit_id,item_name,original_unit_price,discount_type,unit_discount_value,campaign_qnty,notes,type) VALUES(${campaignId},${number(item.item_id)},${number(item.unit_id)||null},${item.item_name||null},${number(item.price)},${number(item.discount_type,1)},${number(item.discount)},${number(item.quantity,1)},${item.notes||null},1)`
+    }
+    for (const item of [1, 5].includes(typeId) ? [] : addedItems) {
+      if (!number(item.item_id)) continue
+      await sql`INSERT INTO pos_campaign_items_tbl(campaign_id,item_id,unit_id,item_name,original_unit_price,discount_type,unit_discount_value,campaign_qnty,notes,type) VALUES(${campaignId},${number(item.item_id)},${number(item.unit_id)||null},${item.item_name||null},${number(item.price)},${number(item.discount_type,1)},${number(item.discount)},${number(item.quantity,1)},${item.notes||null},2)`
+    }
+    await sql`DELETE FROM pos_campaign_warehouses_tbl WHERE campaign_id=${campaignId}`
+    for (const warehouseId of Array.isArray(data.warehouse_ids) ? data.warehouse_ids : []) if (number(warehouseId)) await sql`INSERT INTO pos_campaign_warehouses_tbl(campaign_id,warehouse_id) VALUES(${campaignId},${number(warehouseId)}) ON CONFLICT DO NOTHING`
+    await sql`DELETE FROM pos_campaign_branches_tbl WHERE campaign_id=${campaignId}`
+    for (const branchId of Array.isArray(data.branch_ids) ? data.branch_ids : []) if (number(branchId)) await sql`INSERT INTO pos_campaign_branches_tbl(campaign_id,branch_id) VALUES(${campaignId},${number(branchId)}) ON CONFLICT DO NOTHING`
+    return NextResponse.json({ success: true, id: campaignId })
+    })
+  } catch (error) {
+    return NextResponse.json({ error: error instanceof Error ? error.message : "تعذر حفظ الحملة" }, { status: 500 })
+  }
+}
+
+// ايقاف/تفعيل حملة (status 2/1) — صلاحية "ايقاف حملة"؛ الكاشير يطبّق الحملات ذات status = 1 فقط
+export async function PATCH(request: NextRequest) {
+  try {
+    const denied = await requirePosDefinitionPermission(request, "stopCampaign")
+    if (denied) return denied
+    await ensureTables()
+    const data = await request.json().catch(() => ({}))
+    const id = number(data.id)
+    if (!id) return NextResponse.json({ error: "معرف الحملة مطلوب" }, { status: 400 })
+    const status = data.action === "resume" ? 1 : 2
+    const rows = await sql`UPDATE pos_campaign_header_tbl SET status=${status},last_modify_date=NOW() WHERE id=${id} AND COALESCE(status,1)<>3 RETURNING id, status`
+    if (!rows[0]) return NextResponse.json({ error: "الحملة غير موجودة" }, { status: 404 })
+    return NextResponse.json({ success: true, status })
+  } catch (error) {
+    return NextResponse.json({ error: error instanceof Error ? error.message : "تعذر تحديث حالة الحملة" }, { status: 500 })
+  }
+}
+
+export async function DELETE(request: NextRequest) {
+  try {
+    const denied = await requirePosDefinitionPermission(request, "deleteCampaign")
+    if (denied) return denied
+    await ensureTables()
+    const id = number(request.nextUrl.searchParams.get("id"))
+    if (!id) return NextResponse.json({ error: "معرف الحملة مطلوب" }, { status: 400 })
+    await sql`UPDATE pos_campaign_header_tbl SET status=3,last_modify_date=NOW() WHERE id=${id}`
+    return NextResponse.json({ success: true })
+  } catch (error) {
+    return NextResponse.json({ error: error instanceof Error ? error.message : "تعذر حذف الحملة" }, { status: 500 })
+  }
+}

@@ -1,0 +1,537 @@
+"use client"
+
+import { tr, appDir } from "@/lib/i18n"
+import { useEffect, useMemo, useRef, useState } from "react"
+import { Button } from "@/components/ui/button"
+import { Dialog, DialogContent } from "@/components/ui/dialog"
+import { Label } from "@/components/ui/label"
+import AccountSearchDialog, { type AccountItem } from "@/components/customer/account-search-dialog"
+import DataGridView from "@/components/common/DataGridView"
+import { ArrowLeft, ArrowRight, PackageCheck, ShoppingCart, UserRound } from "lucide-react"
+import type { SalesVoucherItemRow } from "@/components/sales/unified-sales-delivery"
+
+interface OrderHeader {
+  id: number
+  order_number: string
+  order_date: string
+  amount: number
+  status: number
+  currency_id?: number | null
+  currency_code?: string
+  exchange_rate?: number
+  discount_type?: string
+  discount_amount?: number
+  vat_percent?: number
+}
+
+interface InvoiceFromOrderPopupProps {
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  voucherType: number
+  branchId?: number | null
+  onSelect: (order: OrderHeader, customer: AccountItem, items: SalesVoucherItemRow[], selectedOrders: OrderHeader[]) => void
+  onCancel?: () => void
+}
+
+const SALES_INVOICE_TYPE = 12
+const PURCHASE_INVOICE_TYPE = 17
+const ORDER_SOURCE_VOUCHER_TYPE = 3
+const standardGridShell = "invoice-source-grid min-w-0 overflow-hidden rounded-xl border border-slate-200 bg-white"
+// ارتفاع الجدولين يتبع ارتفاع الشاشة (لا يتجاوز النافذة على الشاشات الصغيرة/التكبير)، بين 150 و260px
+const SOURCE_GRID_HEIGHT = "clamp(130px, calc((100dvh - 560px) / 2), 240px)"
+
+const itemKey = (item: SalesVoucherItemRow) =>
+  `${item.source_voucher_id ?? "order"}:${item.order_item_id ?? `${item.product_id ?? "item"}:${item.unit ?? ""}`}`
+
+export default function InvoiceFromOrderPopup({
+  open,
+  onOpenChange,
+  voucherType,
+  branchId,
+  onSelect,
+  onCancel,
+}: InvoiceFromOrderPopupProps) {
+  const [customerSearchOpen, setCustomerSearchOpen] = useState(false)
+  const [selectedCustomer, setSelectedCustomer] = useState<AccountItem | null>(null)
+  const [orders, setOrders] = useState<OrderHeader[]>([])
+  const [selectedOrderId, setSelectedOrderId] = useState<number | null>(null)
+  const [orderItems, setOrderItems] = useState<SalesVoucherItemRow[]>([])
+  const [selectedOrderItems, setSelectedOrderItems] = useState<SalesVoucherItemRow[]>([])
+  const [selectedOrderHeaders, setSelectedOrderHeaders] = useState<OrderHeader[]>([])
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [itemsLoading, setItemsLoading] = useState(false)
+  const [itemsError, setItemsError] = useState<string | null>(null)
+  const confirmedRef = useRef(false)
+
+  // جهة المبيعات: فاتورة المبيعات وإرسالية المبيعات (13) "من طلبية" ⇐ طلبيات مبيعات وعملاء
+  const isSalesInvoice = voucherType === SALES_INVOICE_TYPE || voucherType === 13
+  const orderType = isSalesInvoice ? 1 : 2
+  // المشتريات من طلبية: المورد قد يكون معرّفاً كعميل أيضاً (عميل/مورد/مشترك)
+  const allowedAccountTypes = isSalesInvoice ? [2, 5] : [2, 3, 5]
+  const title = isSalesInvoice ? tr("تحميل عناصر من طلبية مبيعات") : tr("تحميل عناصر من طلبية مشتريات")
+  const orderLabel = isSalesInvoice ? tr("طلبية مبيعات") : tr("طلبية مشتريات")
+
+  const selectedOrder = useMemo(
+    () => orders.find((order) => order.id === selectedOrderId) || null,
+    [orders, selectedOrderId],
+  )
+
+  const selectedOrderIds = useMemo(
+    () => new Set(selectedOrderHeaders.map((order) => order.id)),
+    [selectedOrderHeaders],
+  )
+
+  const selectedOrderForHeader = useMemo(() => {
+    const firstItemOrderId = selectedOrderItems[0]?.source_voucher_id ?? null
+    return orders.find((order) => order.id === firstItemOrderId) || selectedOrder
+  }, [orders, selectedOrder, selectedOrderItems])
+
+  const handleAddOrderItems = async (order: OrderHeader) => {
+    if (selectedOrderHeaders.some((entry) => entry.id === order.id)) return
+
+    setSelectedOrderId(order.id)
+    const items = await loadOrderItems(order.id)
+    if (items.length === 0) return
+
+    const newItems = items.map((item) => ({
+      ...item,
+      source_voucher_id: order.id,
+      source_voucher_type: ORDER_SOURCE_VOUCHER_TYPE,
+      source_voucher_code: order.order_number,
+      source_currency_id: order.currency_id ?? null,
+      source_currency_code: order.currency_code ?? "",
+      source_rate: order.exchange_rate ?? 1,
+    }))
+
+    setOrderItems((current) => {
+      const existing = new Set(current.map(itemKey))
+      return [...current, ...newItems.filter((item) => !existing.has(itemKey(item)))]
+    })
+    setSelectedOrderItems((current) => {
+      const existing = new Set(current.map(itemKey))
+      return [...current, ...newItems.filter((item) => !existing.has(itemKey(item)))]
+    })
+    setSelectedOrderHeaders((current) => current.some((entry) => entry.id === order.id) ? current : [...current, order])
+  }
+
+  const toggleSelectedOrderItem = (row: SalesVoucherItemRow) => {
+    const key = itemKey(row)
+    setSelectedOrderItems((current) => {
+      const exists = current.some((item) => itemKey(item) === key)
+      return exists ? current.filter((item) => itemKey(item) !== key) : [...current, row]
+    })
+  }
+
+  const handleRemoveOrderItems = (orderId: number) => {
+    setSelectedOrderItems((prev) => prev.filter((item) => item.source_voucher_id !== orderId))
+    setOrderItems((prev) => prev.filter((item) => item.source_voucher_id !== orderId))
+    setSelectedOrderHeaders((prev) => prev.filter((entry) => entry.id !== orderId))
+  }
+
+  const ordersScheme = useMemo(
+    () => ({
+      name: "OrdersScheme",
+      columns: [
+        {
+          header: "#",
+          name: "index",
+          width: 50,
+          isReadOnly: true,
+          body: (cell: any) => <span className="block text-center text-sm">{cell.row.index + 1}</span>,
+        },
+        { header: tr("رقم الطلبية"), name: "order_number", width: 150, isReadOnly: true },
+        {
+          header: tr("التاريخ"),
+          name: "order_date",
+          width: 120,
+          isReadOnly: true,
+          body: (cell: any) => <span>{String(cell.row.dataItem.order_date || "").slice(0, 10)}</span>,
+        },
+        { header: tr("العملة"), name: "currency_code", width: 100, isReadOnly: true },
+        { header: tr("سعر الصرف"), name: "exchange_rate", width: 110, isReadOnly: true },
+        { header: tr("المبلغ"), name: "amount", width: 100, isReadOnly: true },
+        {
+          header: tr("الإجراء"),
+          name: "actions",
+          width: "*",
+          isReadOnly: true,
+          body: (cell: any) => {
+            const row = cell.row.dataItem as OrderHeader
+            const added = selectedOrderIds.has(row.id)
+            return (
+              <div className="flex items-center justify-center gap-1">
+                <button
+                  type="button"
+                  className={`rounded-md border px-2 py-1 text-sm font-semibold transition ${
+                    added
+                      ? "border-slate-300 bg-slate-100 text-slate-500"
+                      : "border-slate-300 bg-white text-slate-700 hover:bg-slate-100"
+                  }`}
+                  onClick={async (e) => {
+                    e.stopPropagation()
+                    if (!added) {
+                      await handleAddOrderItems(row)
+                    }
+                  }}
+                  disabled={added}
+                  title={added ? tr("تمت الإضافة بالفعل") : tr("أضف عناصر هذه الطلبية")}
+                >
+                  <ArrowLeft className="h-4 w-4" aria-hidden="true" />
+                </button>
+                <button
+                  type="button"
+                  className="rounded-md border border-slate-300 bg-white px-2 py-1 text-sm font-semibold text-slate-700 transition hover:bg-slate-100"
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    handleRemoveOrderItems(row.id)
+                  }}
+                  title={tr("إزالة عناصر هذه الطلبية")}
+                >
+                  <ArrowRight className="h-4 w-4" aria-hidden="true" />
+                </button>
+              </div>
+            )
+          },
+        },
+      ],
+    }),
+    [selectedOrderIds],
+  )
+
+  const selectedItemsScheme = useMemo(
+    () => ({
+      name: "SelectedItemsScheme",
+      columns: [
+        {
+          header: tr("اختيار"),
+          name: "selected",
+          width: 70,
+          isReadOnly: true,
+          body: (cell: any) => {
+            const row = cell.row.dataItem as SalesVoucherItemRow
+            const key = itemKey(row)
+            const checked = selectedOrderItems.some((item) => itemKey(item) === key)
+            return (
+              <input
+                type="checkbox"
+                checked={checked}
+                className="h-4 w-4 cursor-pointer accent-emerald-600"
+                aria-label={tr("اختيار {0}", row.item_name || row.product_name || "الصنف")}
+                onClick={(event) => event.stopPropagation()}
+                onChange={() => toggleSelectedOrderItem(row)}
+              />
+            )
+          },
+        },
+        {
+          header: tr("اسم الصنف"),
+          name: "item_name",
+          width: "*",
+          isReadOnly: true,
+          body: (cell: any) => (
+            <span>{String(cell.row.dataItem.item_name || cell.row.dataItem.product_name || "")}</span>
+          ),
+        },
+        { header: tr("الكمية"), name: "quantity", width: 90, isReadOnly: true },
+        { header: tr("البونص"), name: "bonus_quantity", width: 90, isReadOnly: true },
+        { header: tr("الكمية المرسلة"), name: "sent_quantity", width: 110, isReadOnly: true },
+        { header: tr("الوحدة"), name: "unit", width: 90, isReadOnly: true },
+        {
+          header: tr("السعر"),
+          name: "unit_price",
+          width: 110,
+          isReadOnly: true,
+          body: (cell: any) => <span>{Number(cell.row.dataItem.unit_price || 0).toFixed(2)}</span>,
+        },
+        { header: orderLabel, name: "source_voucher_code", width: 120, isReadOnly: true },
+      ],
+    }),
+    [orderLabel, selectedOrderItems],
+  )
+
+  useEffect(() => {
+    if (!open) return
+    confirmedRef.current = false
+    setSelectedCustomer(null)
+    setOrders([])
+    setSelectedOrderId(null)
+    setOrderItems([])
+    setSelectedOrderItems([])
+    setSelectedOrderHeaders([])
+    setError(null)
+    setItemsError(null)
+    setCustomerSearchOpen(true)
+  }, [open])
+
+  const loadOrders = async (accountId: number) => {
+    setLoading(true)
+    setError(null)
+    setOrders([])
+    setSelectedOrderId(null)
+    setOrderItems([])
+    setSelectedOrderItems([])
+    setSelectedOrderHeaders([])
+    try {
+      const query = new URLSearchParams({
+        order_type: String(orderType),
+        ...(orderType === 1 ? { customer_id: String(accountId) } : { supplier_id: String(accountId) }),
+      })
+      if (Number(branchId) > 0) query.set("branch_id", String(branchId))
+      const response = await fetch(`/api/sales-vouchers/order-list?${query.toString()}`)
+      const data = await response.json()
+      if (!response.ok) {
+        throw new Error(data?.error || tr("فشل في جلب الطلبات"))
+      }
+      setOrders(Array.isArray(data) ? data : [])
+    } catch (err) {
+      console.error("InvoiceFromOrderPopup loadOrders error:", err)
+      setError((err as Error).message || tr("حدث خطأ عند جلب الطلبات"))
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const loadOrderItems = async (orderId: number): Promise<SalesVoucherItemRow[]> => {
+    setItemsLoading(true)
+    setItemsError(null)
+    try {
+      const query = new URLSearchParams({ order_id: String(orderId), order_type: String(orderType) })
+      if (Number(branchId)>0) query.set("branch_id",String(branchId))
+      const response = await fetch(`/api/sales-vouchers/order-items?${query.toString()}`)
+      const data = await response.json()
+      if (!response.ok || data?.error) {
+        throw new Error(data?.error || tr("فشل في جلب عناصر الطلب"))
+      }
+      const items = Array.isArray(data.items)
+        ? data.items.map((item: any) => ({
+            product_id: Number(item.product_id || null),
+            product_code: String(item.product_code || item.current_product_code || ""),
+            product_name: String(item.product_name || item.current_product_name || ""),
+            item_name: String(item.item_name || item.product_name || item.current_product_name || ""),
+            barcode: String(item.barcode || ""),
+            warehouse_id: item.warehouse_id != null ? Number(item.warehouse_id) : null,
+            warehouse_name: String(item.warehouse_name || item.store_name || item.warehouse || ""),
+            unit_id: item.unit_id != null ? Number(item.unit_id) : null,
+            unit: String(item.unit || ""),
+            quantity: Number(item.remaining_quantity || 0),
+            bonus_quantity: Number(item.remaining_bonus || 0),
+            unit_price: Number(item.unit_price || 0),
+            discount_percent: Number(item.discount_percent || item.discount_percentage || 0),
+            total_price: Number(item.total_price || 0),
+            batch_number: String(item.batch_number || ""),
+            expiry_date: String(item.expiry_date || ""),
+            serial_numbers: Array.isArray(item.serial_numbers) ? item.serial_numbers : [],
+            source_voucher_id: Number(item.source_voucher_id || null),
+            source_voucher_type: Number(item.source_voucher_type || null),
+            source_currency_id: item.source_currency_id != null ? Number(item.source_currency_id) : null,
+            source_currency_code: String(item.source_currency_code ?? ""),
+            source_rate: item.source_rate != null ? Number(item.source_rate) : null,
+            order_item_id: item.order_item_id != null ? Number(item.order_item_id) : null,
+            delivery_item_id: item.delivery_item_id != null ? Number(item.delivery_item_id) : null,
+            sent_quantity: Number(item.sent_quantity || 0),
+            sent_bonus: Number(item.sent_bonus || 0),
+            remaining_quantity: Number(item.remaining_quantity || 0),
+            remaining_bonus: Number(item.remaining_bonus || 0),
+            note: String(item.note || ""),
+            length: item.length != null ? Number(item.length) : null,
+            width: item.width != null ? Number(item.width) : null,
+            height: item.height != null ? Number(item.height) : null,
+            count: item.count != null ? Number(item.count) : null,
+            account_id: item.account_id != null ? Number(item.account_id) : null,
+            account_code: String(item.account_code || ""),
+            account_name: String(item.account_name || ""),
+            account_cost_centers: Array.isArray(item.account_cost_centers) ? item.account_cost_centers : [],
+          }))
+        : []
+      return items
+    } catch (err) {
+      console.error("InvoiceFromOrderPopup loadOrderItems error:", err)
+      setItemsError((err as Error).message || tr("حدث خطأ عند جلب عناصر الطلب"))
+      return []
+    } finally {
+      setItemsLoading(false)
+    }
+  }
+
+  const handleCustomerSelect = (account: AccountItem) => {
+    setSelectedCustomer(account)
+    setCustomerSearchOpen(false)
+    loadOrders(Number((account as AccountItem & { account_id?: number }).account_id ?? account.id))
+  }
+
+  const handleConfirm = () => {
+    if (!selectedCustomer || selectedOrderItems.length === 0) return
+    const selectedOrderHeader = selectedOrderForHeader
+    if (!selectedOrderHeader) return
+    confirmedRef.current = true
+    onSelect(selectedOrderHeader, selectedCustomer, selectedOrderItems, selectedOrderHeaders)
+    onOpenChange(false)
+  }
+
+  const handleClose = () => {
+    if (!confirmedRef.current) {
+      onCancel?.()
+    }
+    setCustomerSearchOpen(false)
+    onOpenChange(false)
+  }
+
+  const handleDialogOpenChange = (nextOpen: boolean) => {
+    if (!nextOpen) {
+      handleClose()
+    }
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={handleDialogOpenChange}>
+      <DialogContent
+        hideCloseButton
+        className="flex h-[min(calc(100dvh-0.5rem),calc(100%-1rem))] max-h-[min(calc(100dvh-0.5rem),calc(100%-1rem))] w-[calc(100vw-0.5rem)] max-w-[1400px] flex-col overflow-hidden rounded-xl border border-slate-200 bg-slate-50 p-0 shadow-2xl sm:h-[min(92dvh,calc(100%-1.5rem))] sm:max-h-[min(92dvh,calc(100%-1.5rem))] sm:w-[96vw] sm:rounded-2xl"
+        onInteractOutside={(event) => {
+          event.preventDefault()
+        }}
+      >
+        <div className="flex h-full min-h-0 flex-col bg-slate-50" dir={appDir()}>
+          <div className="shrink-0 bg-gradient-to-l from-emerald-700 via-emerald-600 to-teal-600 px-4 py-3 text-white shadow-md sm:px-5 sm:py-4">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <p className="flex items-center gap-2 text-lg font-extrabold sm:text-xl"><span className="rounded-xl bg-white/15 p-2 ring-1 ring-white/20"><ShoppingCart className="h-4 w-4 sm:h-5 sm:w-5" /></span>{title}</p>
+                <p className="mt-1 hidden text-xs text-emerald-50 sm:block sm:text-sm">
+                  {tr("اختر ")}{isSalesInvoice ? tr("العميل") : tr("المورد")}{tr(" أولاً ثم حدد طلبية مرحَلة، ثم استخدم الأسهم لإضافة أو إزالة العناصر من القائمة.")}
+                </p>
+              </div>
+            </div>
+          </div>
+
+          <div className="min-h-0 flex-1 space-y-4 overflow-y-auto bg-slate-50/70 p-3 sm:p-5">
+            <div className="grid gap-3 sm:grid-cols-2">
+              <div className="rounded-2xl border border-emerald-100 bg-white p-3 shadow-sm sm:p-4">
+                <Label className="mb-1.5 flex items-center gap-2 text-sm font-bold text-emerald-900"><UserRound className="h-4 w-4 text-emerald-600" />{isSalesInvoice ? tr("العميل") : tr("المورد")}</Label>
+                {selectedCustomer ? (
+                  <div className="space-y-2">
+                    <div className="rounded-xl bg-emerald-50/70 px-3 py-2">
+                      <div className="text-sm font-semibold">{selectedCustomer.name}</div>
+                      <div className="text-sm text-slate-600">{tr("رقم الحساب: ")}{selectedCustomer.code}</div>
+                    </div>
+                    <Button size="sm" variant="outline" onClick={() => setCustomerSearchOpen(true)}>
+                      {tr("تغيير ")}{isSalesInvoice ? tr("العميل") : tr("المورد")}
+                    </Button>
+                  </div>
+                ) : (
+                  <div>
+                    <p className="mb-3 text-sm text-slate-600">{tr("لم يتم اختيار ")}{isSalesInvoice ? tr("عميل") : tr("مورد")}{tr(" بعد.")}</p>
+                    <Button size="sm" onClick={() => setCustomerSearchOpen(true)}>
+                      {tr("اختر ")}{isSalesInvoice ? tr("العميل") : tr("المورد")}
+                    </Button>
+                  </div>
+                )}
+              </div>
+
+              <div className="rounded-2xl border border-teal-100 bg-white p-3 shadow-sm sm:p-4">
+                <Label className="mb-1.5 flex items-center gap-2 text-sm font-bold text-emerald-900"><PackageCheck className="h-4 w-4 text-emerald-600" />{orderLabel}</Label>
+                <p className="text-sm text-slate-600">{tr("اختر طلبية لتنزيل سطور البضاعة إلى الفاتورة.")}</p>
+                <div className="mt-2 rounded-xl bg-teal-50/70 px-3 py-2 text-sm text-slate-600">
+                  {selectedOrder ? tr("{0} المحددة: {1}", orderLabel, selectedOrder.order_number) : tr("لم يتم اختيار {0} بعد.", orderLabel)}
+                </div>
+              </div>
+            </div>
+
+            <div className="grid min-w-0 gap-4">
+              <div className="min-w-0 rounded-2xl border border-emerald-100 bg-white p-3 shadow-sm sm:p-4">
+                <div className="mb-3 flex items-center justify-between gap-2"><span className="text-sm font-bold text-slate-800">{tr("الطلبيات الجاهزة")}</span><span className="rounded-full bg-slate-100 px-2.5 py-1 text-xs font-bold text-slate-600">{orders.length}</span></div>
+                <div className={standardGridShell}>
+                  {loading ? (
+                    <div className="text-sm text-slate-500">{tr("جاري تحميل الطلبات...")}</div>
+                  ) : error ? (
+                    <div className="text-sm text-red-600">{error}</div>
+                  ) : orders.length === 0 ? (
+                    <div className="text-sm text-slate-500">{tr("لا توجد طلبات متاحة.")}</div>
+                  ) : (
+                    <DataGridView
+                      dataSource={orders.map((order, index) => ({ ...order, index }))}
+                      scheme={ordersScheme}
+                      idProperty="id"
+                      isReadOnly={true}
+                      showContextMenu={false}
+                      dontConvertToCards={true}
+                      allowDragging="Rows"
+                      headersVisibility="Column"
+                      isReport={false}
+                      defaultRowHeight={38}
+                      containerStyle={{ height: SOURCE_GRID_HEIGHT }}
+                      onRowDoubleClick={(row: OrderHeader) => {
+                        if (!row) return
+                        if (selectedOrderIds.has(row.id)) {
+                          handleRemoveOrderItems(row.id)
+                        } else {
+                          void handleAddOrderItems(row)
+                        }
+                      }}
+                    />
+                  )}
+                </div>
+              </div>
+
+              <div className="min-w-0 rounded-2xl border border-teal-100 bg-white p-3 shadow-sm sm:p-4">
+                <div className="mb-3 flex items-center justify-between gap-2"><span className="text-sm font-bold text-slate-800">{tr("العناصر المحددة")}</span><span className="rounded-full bg-emerald-100 px-2.5 py-1 text-xs font-bold text-emerald-800">{selectedOrderItems.length}</span></div>
+                <div className={standardGridShell}>
+                  {itemsLoading ? (
+                    <div className="text-sm text-slate-500">{tr("جاري تحميل عناصر الطلب...")}</div>
+                  ) : itemsError ? (
+                    <div className="text-sm text-red-600">{itemsError}</div>
+                  ) : orderItems.length === 0 ? (
+                    <div className="text-sm text-slate-500">{tr("لم يتم إضافة عناصر بعد.")}</div>
+                  ) : (
+                    <DataGridView
+                      dataSource={orderItems}
+                      scheme={selectedItemsScheme}
+                      idProperty="order_item_id"
+                      isReadOnly={true}
+                      showContextMenu={false}
+                      dontConvertToCards={true}
+                      allowDragging="Rows"
+                      headersVisibility="Column"
+                      isReport={false}
+                      defaultRowHeight={38}
+                      containerStyle={{ height: SOURCE_GRID_HEIGHT }}
+                      onRowDoubleClick={(row: SalesVoucherItemRow) => {
+                        if (!row) return
+                        toggleSelectedOrderItem(row)
+                      }}
+                    />
+                  )}
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div className="mt-auto shrink-0 border-t border-slate-200 bg-white/95 px-4 py-3 backdrop-blur sm:px-5">
+            <div className="flex items-center justify-end gap-2">
+              <Button variant="outline" onClick={() => handleClose()}>{tr("إلغاء")}</Button>
+              <Button className="bg-emerald-600 px-6 hover:bg-emerald-700" disabled={!selectedCustomer || selectedOrderItems.length === 0} onClick={handleConfirm}>
+                {tr("تأكيد العناصر")}
+              </Button>
+            </div>
+          </div>
+        </div>
+      </DialogContent>
+
+      <AccountSearchDialog
+        open={customerSearchOpen}
+        onOpenChange={(open) => {
+          setCustomerSearchOpen(open)
+          if (!open) {
+            setError(null)
+          }
+        }}
+        accounts={[]}
+        allowedTypeValues={allowedAccountTypes}
+        showOrderOnlyFilter={true}
+        orderType={orderType}
+        branchId={branchId}
+        onSelect={handleCustomerSelect}
+      />
+    </Dialog>
+  )
+}

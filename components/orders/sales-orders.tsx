@@ -1,6 +1,8 @@
-"use client"
+﻿"use client"
 
+import { tr, appDir } from "@/lib/i18n"
 import { useState, useEffect, useMemo, useRef } from "react"
+import { useSearchParams } from "next/navigation"
 import { useAuth } from "@/components/auth/auth-context"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -10,7 +12,10 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Badge } from "@/components/ui/badge"
 import { Avatar, AvatarFallback } from "@/components/ui/avatar"
 import UnifiedSalesOrder from "./unified-sales-order"
+import { DraftOrderForm } from "@/components/order-drafts/draft-order-form"
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog"
 import { SearchButton } from "@/components/search/search-button"
+import { VoucherSearchButton, searchOnEnter } from "@/components/common/voucher-list-table"
 import {
   Plus,
   Search,
@@ -27,8 +32,10 @@ import {
   DollarSign,
   ArrowUpRight,
   FileText,
+  Loader2,
 } from "lucide-react"
 import { formatDateToBritish } from "@/lib/utils"
+import { VoucherListHero } from "@/components/common/voucher-list-shell"
 import Util from "../common/Util"
 interface OrdersProps {
   isPurchase?: boolean;
@@ -61,6 +68,8 @@ interface SalesOrder {
   received_by: string,
   customer_order_no: string,
   ser: number
+  source_draft_id?: number | null
+  source_draft_number?: string | null
 }
 
 interface OrderAnalytics {
@@ -75,9 +84,33 @@ interface OrderAnalytics {
 }
 
 export function SalesOrders({ isPurchase }: OrdersProps) {
+  const searchParams = useSearchParams()
   const { user } = useAuth()
+  const [sourceDraft, setSourceDraft] = useState<any>(null)
+  const [draftLoading, setDraftLoading] = useState(false)
+  const [draftError, setDraftError] = useState("")
+
+  const openSourceDraft = async (order: SalesOrder) => {
+    if (!order.source_draft_id) return
+    setDraftLoading(true)
+    setDraftError("")
+    try {
+      const response = await fetch(`/api/order-drafts/${order.source_draft_id}`, { cache: "no-store" })
+      const data = await response.json()
+      if (!response.ok) throw new Error(data.error || tr("تعذر تحميل المسودة"))
+      setSourceDraft(data)
+    } catch (error: any) {
+      setDraftError(error.message || tr("تعذر تحميل المسودة"))
+    } finally {
+      setDraftLoading(false)
+    }
+  }
   type ViewType = "grid" | "list" | "kanban";
-  const savedView = localStorage.getItem("currentView") as ViewType | null;
+  const getSavedView = (): ViewType => {
+    if (typeof window === "undefined") return "list"
+    const saved = window.localStorage.getItem("currentView") as ViewType | null
+    return saved === "grid" || saved === "list" || saved === "kanban" ? saved : "list"
+  }
 
   const [state, setState] = useState<{
     fromSearch: boolean | undefined
@@ -101,11 +134,12 @@ export function SalesOrders({ isPurchase }: OrdersProps) {
     sortBy: string;
     sortOrder: "asc" | "desc";
   }>({
+    fromSearch: false,
     salesOrders: [],
     loading: true,
     error: null, // ✅ string or null
     selectedOrder: null,
-    currentView: savedView || "list",
+    currentView: getSavedView(),
     showNewOrderDialog: false,
     filters: {
       search: "",
@@ -193,10 +227,31 @@ export function SalesOrders({ isPurchase }: OrdersProps) {
     return filtered
   }, [state.salesOrders, state.filters, state.sortBy, state.sortOrder])
 
+  // الحقول تعدّل مسودة فقط؛ زر «بحث» (أو Enter) يعيد جلب الطلبيات ثم يطبّقها. أي تغيير على الفلاتر المطبّقة
+  // (إعادة تعيين/تاريخ البداية الافتراضي) ينعكس على المسودة.
+  const [filterDraft, setFilterDraft] = useState(state.filters)
+  const [searching, setSearching] = useState(false)
+  useEffect(() => { setFilterDraft(state.filters) }, [state.filters])
+  const runSearch = async () => {
+    if (searching) return
+    const applied = filterDraft
+    setSearching(true)
+    try {
+      await fetchSalesOrders()
+      setState((prev) => ({ ...prev, filters: applied }))
+    } finally {
+      setSearching(false)
+    }
+  }
+  const setDraftFilter = (patch: Partial<typeof filterDraft>) => setFilterDraft((prev) => ({ ...prev, ...patch }))
+
+  // تاريخ البداية الافتراضي = أقدم طلبية — عند أول تحميل فقط (لا يُلغي تاريخاً اختاره المستخدم عند إعادة الجلب)
+  const initialDateFromAppliedRef = useRef(false)
   useEffect(() => {
 
     const orders = state.salesOrders || [];
-    if (orders.length === 0) return;
+    if (orders.length === 0 || initialDateFromAppliedRef.current) return;
+    initialDateFromAppliedRef.current = true
     const firstDate = new Date(
       Math.min(...orders.map(o => new Date(o.order_date).getTime()))
     )
@@ -240,6 +295,7 @@ export function SalesOrders({ isPurchase }: OrdersProps) {
     }
   }, [state.salesOrders])
   const hasFetched = useRef(false);
+  const openedOrderFromReportRef = useRef(0)
   useEffect(() => {
     if (hasFetched.current) return;
     hasFetched.current = true;
@@ -247,8 +303,31 @@ export function SalesOrders({ isPurchase }: OrdersProps) {
     console.log("AAAAA")
   }, [])
   useEffect(() => {
+    if (!isPurchase) return
+    const token = searchParams.get("purchase_prefill")
+    if (!token) return
+    try {
+      const raw = localStorage.getItem(token)
+      if (!raw) return
+      const payload = JSON.parse(raw)
+      localStorage.removeItem(token)
+      setState((prev) => ({ ...prev, showNewOrderDialog: true, fromSearch: false, selectedOrder: { id: 0, order_number: "", order_date: new Date().toISOString(), customer_name: payload.supplier_name || "", customer_id: Number(payload.supplier_account_id) || 0, total_amount: 0, order_status: 1, financial_status: "unpaid", salesman: "", delivery_date: new Date().toISOString(), created_at: new Date().toISOString(), updated_at: new Date().toISOString(), printed: 0, is_exported: 0, items: payload.items || [], general_notes: payload.notes || (payload.source_draft_number ? `احتياج مواد للمسودة ${payload.source_draft_number}` : "احتياج مواد تصنيع") } as any }))
+    } catch (error) {
+      console.error("Failed to load purchase shortage prefill", error)
+    }
+  }, [isPurchase, searchParams])
+  useEffect(() => {
     if (state.showNewOrderDialog === false) fetchSalesOrders()
   }, [state.showNewOrderDialog])
+  useEffect(() => {
+    if (isPurchase || !state.salesOrders.length) return
+    const orderId = Number(searchParams.get("open_order_id") || 0)
+    if (!orderId || openedOrderFromReportRef.current === orderId) return
+    const order = state.salesOrders.find((item) => Number(item.id) === orderId)
+    if (!order) return
+    openedOrderFromReportRef.current = orderId
+    setState((prev) => ({ ...prev, showNewOrderDialog: true, selectedOrder: order, fromSearch: true }))
+  }, [isPurchase, searchParams, state.salesOrders])
 
   const fetchSalesOrders = async () => {
     setState(prev => ({ ...prev, loading: true, error: null }));
@@ -256,13 +335,11 @@ export function SalesOrders({ isPurchase }: OrdersProps) {
     try {
       const response = await fetch(`/api/orders/sales?type=${isPurchase ? 2 : 1}`);
       console.log("response  ", response)
+      const data = await response.json();
       if (!response.ok) {
-        throw new Error(
-          !isPurchase ? "فشل في تحميل طلبيات المبيعات" : "فشل في تحميل طلبيات المشتريات"
-        );
+        throw new Error(data?.error || (!isPurchase ? tr("فشل في تحميل طلبيات المبيعات") : tr("فشل في تحميل طلبيات المشتريات")));
       }
 
-      const data: SalesOrder[] = await response.json();
       const numberedData = Array.isArray(data)
         ? data.map((order, index) => ({ ...order, ser: index + 1 }))
         : [];
@@ -274,7 +351,7 @@ export function SalesOrders({ isPurchase }: OrdersProps) {
     } catch (err) {
       setState(prev => ({
         ...prev,
-        error: err instanceof Error ? err.message : "حدث خطأ غير متوقع",
+        error: err instanceof Error ? err.message : tr("حدث خطأ غير متوقع"),
         salesOrders: [],
       }));
     } finally {
@@ -288,23 +365,23 @@ export function SalesOrders({ isPurchase }: OrdersProps) {
   const getStatusBadge = (status: string) => {
     const statusConfig = {
       notCompleted: {
-        label: "غير جاهزة",
+        label: tr("غير جاهزة"),
         variant: "secondary",
         className: "bg-amber-100 text-amber-800 border-amber-200",
       },
       Completed: {
-        label: "جاهزة",
+        label: tr("جاهزة"),
         variant: "secondary",
         className: "bg-emerald-100 text-emerald-800 border-emerald-200",
       },
-      cancelled: { label: "ملغاة", variant: "secondary", className: "bg-red-100 text-red-800 border-red-200" },
+      cancelled: { label: tr("ملغاة"), variant: "secondary", className: "bg-red-100 text-red-800 border-red-200" },
       sentPartially: {
-        label: "مرسلة جزئيا",
+        label: tr("مرسلة جزئيا"),
         variant: "secondary",
         className: "bg-blue-100 text-blue-800 border-blue-200",
       },
       sent: {
-        label: "مرسلة كليا",
+        label: tr("مرسلة كليا"),
         variant: "secondary",
         className: "bg-blue-100 text-blue-800 border-blue-200",
       },
@@ -342,9 +419,9 @@ export function SalesOrders({ isPurchase }: OrdersProps) {
 
   const getFinancialStatusBadge = (status: string) => {
     const statusConfig = {
-      paid: { label: "مدفوع", className: "bg-green-100 text-green-800 border-green-200" },
-      partial: { label: "مدفوع جزئياً", className: "bg-yellow-100 text-yellow-800 border-yellow-200" },
-      unpaid: { label: "غير مدفوع", className: "bg-red-100 text-red-800 border-red-200" },
+      paid: { label: tr("مدفوع"), className: "bg-green-100 text-green-800 border-green-200" },
+      partial: { label: tr("مدفوع جزئياً"), className: "bg-yellow-100 text-yellow-800 border-yellow-200" },
+      unpaid: { label: tr("غير مدفوع"), className: "bg-red-100 text-red-800 border-red-200" },
     }
 
     const config = statusConfig[status as keyof typeof statusConfig] || { label: status, className: "" }
@@ -391,9 +468,9 @@ export function SalesOrders({ isPurchase }: OrdersProps) {
 
   const getOrderSourceBadge = (source: string) => {
     const sourceConfig = {
-      manual: { label: "إدخال يدوي", className: "bg-blue-100 text-blue-800 border-blue-200" },
-      customer_portal: { label: "من الزبائن", className: "bg-green-100 text-green-800 border-green-200" },
-      api_import: { label: "استيراد API", className: "bg-purple-100 text-purple-800 border-purple-200" },
+      manual: { label: tr("إدخال يدوي"), className: "bg-blue-100 text-blue-800 border-blue-200" },
+      customer_portal: { label: tr("من العملاء"), className: "bg-green-100 text-green-800 border-green-200" },
+      api_import: { label: tr("استيراد API"), className: "bg-purple-100 text-purple-800 border-purple-200" },
     }
 
     const config = sourceConfig[source as keyof typeof sourceConfig] || {
@@ -456,126 +533,105 @@ export function SalesOrders({ isPurchase }: OrdersProps) {
   useEffect(() => {
     setCurrentPage(1);
   }, [filteredOrders]);
-  if (isPurchase && !Util.checkUserAccess(12)) {
+  // الدخول لشاشة طلبية المشتريات يفحصه TransactionAccessGate (app/page.tsx) بصلاحية "الدخول لشاشة طلبية مشتريات".
+  // كان هنا فحص قديم بمعرّف الصلاحية 12 ("الدخول لشاشة طلبيات المشتريات") — تحذفه مزامنة الصلاحيات كمكرر
+  // (LEGACY_DUPLICATE_PERMISSION_NAMES) فكان يمنع الجميع من الشاشة.
+  // التحميل الأول فقط يملأ الصفحة؛ إعادة الجلب (بحث/بعد الحفظ) تُظهر طبقة تحميل فوق القائمة فتبقى الفلاتر ظاهرة
+  if (state.loading && !state.salesOrders.length && !searching) {
     return (
-      <div className="flex items-center justify-center h-64">
-        <div className="text-center">
-          <h2 className="text-2xl font-semibold mb-2 text-red-600">لا يوجد صلاحية</h2>
-          <p className="text-muted-foreground">ليس لديك صلاحية للوصول إلى طلبيات المشتريات</p>
-        </div>
-      </div>
-    )
-  }
-  if (state.loading) {
-    return (
-      <div className="flex items-center justify-center min-h-[400px]" dir="rtl">
+      <div className="flex items-center justify-center min-h-[400px]" dir={appDir()}>
         <div className="text-center">
           <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-primary mx-auto mb-4"></div>
-          <p className="text-muted-foreground">
-            {isPurchase ? "جاري تحميل طلبيات المشتريات..." : "جاري تحميل طلبيات المبيعات..."}
-          </p>
+          <p className="text-muted-foreground">{tr("جاري تحميل البيانات...")}</p>
         </div>
       </div>
     )
   }
 
   return (
-    <div className="space-y-6 p-6 bg-gradient-to-br from-slate-50 to-blue-50 min-h-screen" dir="rtl">
-      {/* Header Section */}
-      <div className="flex items-center justify-between">
-        <div>
-          <h1 className="text-4xl font-bold bg-gradient-to-r from-blue-600 to-purple-600 bg-clip-text text-transparent">
-            {isPurchase ? "طلبيات المشتريات" : "طلبيات المبيعات"}
-          </h1>
-          <p className="text-slate-600 mt-2 text-lg">
-            {isPurchase
-              ? "إدارة وتتبع جميع طلبيات المشتريات بكفاءة عالية"
-              : "إدارة وتتبع جميع طلبيات المبيعات بكفاءة عالية"}
-          </p>
-        </div>
-        <div className="flex gap-3">
-
-          <Button
-            className="bg-gradient-to-r from-blue-600 to-purple-600 hover:from-blue-700 hover:to-purple-700 shadow-lg"
-            onClick={() => setState((prev) => ({ ...prev, showNewOrderDialog: true, selectedOrder: null, fromSearch: false }))}
-          >
-            <Plus className="ml-2 h-4 w-4" />
-            طلبية جديدة
-          </Button>
-        </div>
-      </div>
+    <div className="w-full max-w-full space-y-6" dir={appDir()}>
+      {state.error && <div className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm font-medium text-red-700">{state.error}</div>}
+      {/* Header Section — نفس ترويسة شاشات الحركات (VoucherListHero) */}
+      <VoucherListHero
+        title={isPurchase ? tr("طلبيات المشتريات") : tr("طلبيات المبيعات")}
+        subtitle={isPurchase ? tr("إدارة وتتبع جميع طلبيات المشتريات بكفاءة عالية") : tr("إدارة وتتبع جميع طلبيات المبيعات بكفاءة عالية")}
+        category={tr("الطلبيات")}
+        icon={ShoppingCart}
+        addLabel={tr("طلبية جديدة")}
+        onNew={() => setState((prev) => ({ ...prev, showNewOrderDialog: true, selectedOrder: null, fromSearch: false }))}
+      />
 
       {/* Analytics Dashboard */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
-        <Card className="bg-gradient-to-br from-blue-500 to-blue-600 text-white border-0 shadow-xl">
+        <Card className="border-blue-200 bg-gradient-to-br from-blue-50 to-blue-100 shadow-sm">
           <CardContent className="p-6">
             <div className="flex items-center justify-between">
               <div>
-                <p className="text-blue-100 text-sm font-medium">إجمالي الطلبيات</p>
-                <p className="text-3xl font-bold">{analytics.totalOrders}</p>
+                <p className="text-blue-700 text-sm font-medium">{tr("إجمالي الطلبيات")}</p>
+                <p className="text-3xl font-bold text-blue-900">{analytics.totalOrders}</p>
                 <div className="flex items-center mt-2">
-                  <ArrowUpRight className="h-4 w-4 text-blue-200" />
-                  <span className="text-blue-200 text-sm">+{analytics.weeklyGrowth}% هذا الأسبوع</span>
+                  <ArrowUpRight className="h-4 w-4 text-blue-500" />
+                  <span className="text-blue-600 text-xs">+{analytics.weeklyGrowth}{tr("% هذا الأسبوع")}</span>
                 </div>
               </div>
-              <div className="h-12 w-12 bg-blue-400 rounded-full flex items-center justify-center">
-                <ShoppingCart className="h-6 w-6 text-white" />
+              <div className="h-12 w-12 rounded-full bg-white/70 ring-1 ring-blue-200 flex items-center justify-center">
+                <ShoppingCart className="h-6 w-6 text-blue-600" />
               </div>
             </div>
           </CardContent>
         </Card>
 
-        <Card className="bg-gradient-to-br from-amber-500 to-orange-500 text-white border-0 shadow-xl">
+        <Card className="border-amber-200 bg-gradient-to-br from-amber-50 to-amber-100 shadow-sm">
           <CardContent className="p-6">
             <div className="flex items-center justify-between">
               <div>
-                <p className="text-amber-100 text-sm font-medium">قيد التنفيذ</p>
-                <p className="text-3xl font-bold">{analytics.pendingOrders}</p>
+                <p className="text-amber-700 text-sm font-medium">{tr("قيد التنفيذ")}</p>
+                <p className="text-3xl font-bold text-amber-900">{analytics.pendingOrders}</p>
                 <div className="flex items-center mt-2">
-                  <Clock className="h-4 w-4 text-amber-200" />
-                  <span className="text-amber-200 text-sm">يحتاج متابعة</span>
+                  <Clock className="h-4 w-4 text-amber-500" />
+                  <span className="text-amber-600 text-xs">{tr("يحتاج متابعة")}</span>
                 </div>
               </div>
-              <div className="h-12 w-12 bg-amber-400 rounded-full flex items-center justify-center">
-                <Clock className="h-6 w-6 text-white" />
+              <div className="h-12 w-12 rounded-full bg-white/70 ring-1 ring-amber-200 flex items-center justify-center">
+                <Clock className="h-6 w-6 text-amber-600" />
               </div>
             </div>
           </CardContent>
         </Card>
 
-        <Card className="bg-gradient-to-br from-emerald-500 to-green-500 text-white border-0 shadow-xl">
+        <Card className="border-emerald-200 bg-gradient-to-br from-emerald-50 to-emerald-100 shadow-sm">
           <CardContent className="p-6">
             <div className="flex items-center justify-between">
               <div>
-                <p className="text-emerald-100 text-sm font-medium">مكتملة</p>
-                <p className="text-3xl font-bold">{analytics.completedOrders}</p>
+                <p className="text-emerald-700 text-sm font-medium">{tr("مكتملة")}</p>
+                <p className="text-3xl font-bold text-emerald-900">{analytics.completedOrders}</p>
                 <div className="flex items-center mt-2">
-                  <CheckCircle className="h-4 w-4 text-emerald-200" />
-                  <span className="text-emerald-200 text-sm">
-                    معدل الإنجاز {Math.round((analytics.completedOrders / analytics.totalOrders) * 100)}%
+                  <CheckCircle className="h-4 w-4 text-emerald-500" />
+                  <span className="text-emerald-600 text-xs">
+                    {tr("معدل الإنجاز ")}{analytics.totalOrders ? Math.round((analytics.completedOrders / analytics.totalOrders) * 100) : 0}%
                   </span>
                 </div>
               </div>
-              <div className="h-12 w-12 bg-emerald-400 rounded-full flex items-center justify-center">
-                <CheckCircle className="h-6 w-6 text-white" />
+              <div className="h-12 w-12 rounded-full bg-white/70 ring-1 ring-emerald-200 flex items-center justify-center">
+                <CheckCircle className="h-6 w-6 text-emerald-600" />
               </div>
             </div>
           </CardContent>
         </Card>
 
-        <Card className="bg-gradient-to-br from-purple-500 to-pink-500 text-white border-0 shadow-xl">
+        <Card className="border-purple-200 bg-gradient-to-br from-purple-50 to-purple-100 shadow-sm">
           <CardContent className="p-6">
             <div className="flex items-center justify-between">
               <div>
-                <p className="text-purple-100 text-sm font-medium">إجمالي القيمة</p>
-                <p className="text-3xl font-bold">{analytics.totalValue.toLocaleString()}</p>
+                <p className="text-purple-700 text-sm font-medium">{tr("إجمالي القيمة")}</p>
+                <p className="text-3xl font-bold text-purple-900">{analytics.totalValue.toLocaleString("en-US")}</p>
                 <div className="flex items-center mt-2">
-                  <TrendingUp className="h-4 w-4 text-purple-200" />
-                  <span className="text-purple-200 text-sm">متوسط {analytics.avgOrderValue.toLocaleString()} </span>
+                  <TrendingUp className="h-4 w-4 text-purple-500" />
+                  <span className="text-purple-600 text-xs">{tr("متوسط ")}{analytics.avgOrderValue.toLocaleString("en-US")} </span>
                 </div>
               </div>
-              <div className="h-12 w-12 bg-purple-400 rounded-full flex items-center justify-center">
-                <DollarSign className="h-6 w-6 text-white" />
+              <div className="h-12 w-12 rounded-full bg-white/70 ring-1 ring-purple-200 flex items-center justify-center">
+                <DollarSign className="h-6 w-6 text-purple-600" />
               </div>
             </div>
           </CardContent>
@@ -583,54 +639,44 @@ export function SalesOrders({ isPurchase }: OrdersProps) {
       </div>
 
       {/* Advanced Filters */}
-      <Card className="bg-white/80 backdrop-blur-sm border-0 shadow-lg">
+      <Card className="shadow-sm">
         <CardHeader>
           <CardTitle className="flex items-center gap-2 text-slate-800">
             <Filter className="h-5 w-5" />
-            البحث والتصفية المتقدمة
+            {tr("البحث والتصفية المتقدمة")}
           </CardTitle>
         </CardHeader>
         <CardContent>
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-7 gap-4">
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-7 gap-4" onKeyDown={searchOnEnter(() => void runSearch())}>
             <div className="lg:col-span-2">
-              <Label className="text-slate-700 font-medium">البحث الذكي</Label>
+              <Label className="text-slate-700 font-medium">{tr("البحث الذكي")}</Label>
               <div className="relative">
-                <Search className="absolute right-3 top-1/2 transform -translate-y-1/2 h-4 w-4 text-slate-400" />
+                <Search className="absolute start-3 top-1/2 transform -translate-y-1/2 h-4 w-4 text-slate-400" />
                 <Input
-                  placeholder="رقم الطلبية، اسم الزبون، السند اليدوي , استلمت بواسطة..."
-                  value={state.filters.search}
-                  onChange={(e) =>
-                    setState((prev) => ({
-                      ...prev,
-                      filters: { ...prev.filters, search: e.target.value },
-                    }))
-                  }
-                  className="pr-10 bg-white border-slate-200 focus:border-blue-500 focus:ring-blue-500"
+                  placeholder={tr("رقم الطلبية، اسم العميل، السند اليدوي , استلمت بواسطة...")}
+                  value={filterDraft.search}
+                  onChange={(e) => setDraftFilter({ search: e.target.value })}
+                  className="ps-10 bg-white border-slate-200 focus:border-blue-500 focus:ring-blue-500"
                 />
               </div>
             </div>
 
             <div>
-              <Label className="text-slate-700 font-medium">حالة الطلبية</Label>
+              <Label className="text-slate-700 font-medium">{tr("حالة الطلبية")}</Label>
               <Select
-                value={state.filters.status}
-                onValueChange={(value) =>
-                  setState((prev) => ({
-                    ...prev,
-                    filters: { ...prev.filters, status: value },
-                  }))
-                }
+                value={filterDraft.status}
+                onValueChange={(value) => setDraftFilter({ status: value })}
               >
                 <SelectTrigger className="bg-white border-slate-200">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="0">جميع الحالات</SelectItem>
-                  <SelectItem value="1">غير جاهزة</SelectItem>
-                  <SelectItem value="2">جاهزة</SelectItem>
-                  <SelectItem value="3">مرسلة جزئيا</SelectItem>
-                  <SelectItem value="4">مرسلة كليا</SelectItem>
-                  <SelectItem value="5">ملغاة</SelectItem>
+                  <SelectItem value="0">{tr("جميع الحالات")}</SelectItem>
+                  <SelectItem value="1">{tr("غير جاهزة")}</SelectItem>
+                  <SelectItem value="2">{tr("جاهزة")}</SelectItem>
+                  <SelectItem value="3">{tr("مرسلة جزئيا")}</SelectItem>
+                  <SelectItem value="4">{tr("مرسلة كليا")}</SelectItem>
+
                 </SelectContent>
               </Select>
             </div>
@@ -638,56 +684,41 @@ export function SalesOrders({ isPurchase }: OrdersProps) {
 
 
             <div>
-              <Label className="text-slate-700 font-medium">قرار الإدارة</Label>
+              <Label className="text-slate-700 font-medium">{tr("قرار الإدارة")}</Label>
               <Select
-                value={state.filters.order_source}
-                onValueChange={(value) =>
-                  setState((prev) => ({
-                    ...prev,
-                    filters: { ...prev.filters, order_source: value },
-                  }))
-                }
+                value={filterDraft.order_source}
+                onValueChange={(value) => setDraftFilter({ order_source: value })}
               >
                 <SelectTrigger className="bg-white border-slate-200">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="0">جميع الحالات</SelectItem>
-                  <SelectItem value="1">مقبول</SelectItem>
-                  <SelectItem value="2">مرفوض</SelectItem>
-                  <SelectItem value="3">مؤجل</SelectItem>
-                  <SelectItem value="4">معتمدة</SelectItem>
-                  <SelectItem value="5">مدققة</SelectItem>
+                  <SelectItem value="0">{tr("جميع الحالات")}</SelectItem>
+                  <SelectItem value="1">{tr("مقبول")}</SelectItem>
+                  <SelectItem value="2">{tr("مرفوض")}</SelectItem>
+                  <SelectItem value="3">{tr("مؤجل")}</SelectItem>
+                  <SelectItem value="4">{tr("معتمدة")}</SelectItem>
+                  <SelectItem value="5">{tr("مدققة")}</SelectItem>
                 </SelectContent>
               </Select>
             </div>
 
             <div>
-              <Label className="text-slate-700 font-medium">من تاريخ</Label>
+              <Label className="text-slate-700 font-medium">{tr("من تاريخ")}</Label>
               <Input
                 type="date"
-                value={state.filters.dateFrom}
-                onChange={(e) =>
-                  setState((prev) => ({
-                    ...prev,
-                    filters: { ...prev.filters, dateFrom: e.target.value },
-                  }))
-                }
+                value={filterDraft.dateFrom}
+                onChange={(e) => setDraftFilter({ dateFrom: e.target.value })}
                 className="bg-white border-slate-200"
               />
             </div>
 
             <div>
-              <Label className="text-slate-700 font-medium">إلى تاريخ</Label>
+              <Label className="text-slate-700 font-medium">{tr("إلى تاريخ")}</Label>
               <Input
                 type="date"
-                value={state.filters.dateTo}
-                onChange={(e) =>
-                  setState((prev) => ({
-                    ...prev,
-                    filters: { ...prev.filters, dateTo: e.target.value },
-                  }))
-                }
+                value={filterDraft.dateTo}
+                onChange={(e) => setDraftFilter({ dateTo: e.target.value })}
                 className="bg-white border-slate-200"
               />
             </div>
@@ -700,32 +731,43 @@ export function SalesOrders({ isPurchase }: OrdersProps) {
                 size="sm"
                 onClick={() => handleViewChange("grid")}
               >
-                شبكة
+                {tr("شبكة")}
               </Button>
               <Button
                 variant={state.currentView === "list" ? "default" : "outline"}
                 size="sm"
                 onClick={() => handleViewChange("list")}
               >
-                قائمة
+                {tr("قائمة")}
               </Button>
             </div>
 
-            <Button variant="outline" onClick={resetFilters} className="bg-white">
-              إعادة تعيين
-            </Button>
+            <div className="flex gap-2">
+              <Button variant="outline" onClick={resetFilters} className="bg-white">
+                {tr("إعادة تعيين")}
+              </Button>
+              <VoucherSearchButton onClick={() => void runSearch()} loading={searching} />
+            </div>
           </div>
         </CardContent>
       </Card>
 
       {/* Orders Display */}
-      <Card className="bg-white/80 backdrop-blur-sm border-0 shadow-lg">
+      <Card className="relative shadow-sm" aria-busy={state.loading}>
+        {state.loading && (
+          <div role="status" aria-live="polite" className="absolute inset-0 z-[2] flex items-start justify-center rounded-[inherit] bg-white/70 pt-24 backdrop-blur-[1px] dark:bg-slate-900/70">
+            <div className="flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-5 py-3 text-sm font-semibold text-slate-700 shadow-lg dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200">
+              <Loader2 className="h-5 w-5 animate-spin text-emerald-600" />
+              {tr("جاري تحميل البيانات...")}
+            </div>
+          </div>
+        )}
         <CardHeader>
           <div className="flex justify-between items-center">
             <div>
-              <CardTitle className="text-slate-800">قائمة الطلبيات</CardTitle>
+              <CardTitle className="text-slate-800">{tr("قائمة الطلبيات")}</CardTitle>
               <CardDescription className="text-slate-600">
-                عرض {filteredOrders.length} من أصل {state.salesOrders.length} طلبية
+                {tr("عرض ")}{filteredOrders.length}{tr(" من أصل ")}{state.salesOrders.length}{tr(" طلبية")}
               </CardDescription>
             </div>
             <div className="flex gap-2">
@@ -740,12 +782,12 @@ export function SalesOrders({ isPurchase }: OrdersProps) {
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="created_at-desc">الأحدث أولاً</SelectItem>
-                  <SelectItem value="created_at-asc">الأقدم أولاً</SelectItem>
-                  <SelectItem value="total_amount-desc">الأعلى قيمة</SelectItem>
-                  <SelectItem value="total_amount-asc">الأقل قيمة</SelectItem>
-                  <SelectItem value="customer_name-asc">اسم الزبون أ-ي</SelectItem>
-                  <SelectItem value="customer_name-desc">اسم الزبون ي-أ</SelectItem>
+                  <SelectItem value="created_at-desc">{tr("الأحدث أولاً")}</SelectItem>
+                  <SelectItem value="created_at-asc">{tr("الأقدم أولاً")}</SelectItem>
+                  <SelectItem value="total_amount-desc">{tr("الأعلى قيمة")}</SelectItem>
+                  <SelectItem value="total_amount-asc">{tr("الأقل قيمة")}</SelectItem>
+                  <SelectItem value="customer_name-asc">{tr("اسم العميل أ-ي")}</SelectItem>
+                  <SelectItem value="customer_name-desc">{tr("اسم العميل ي-أ")}</SelectItem>
                 </SelectContent>
               </Select>
             </div>
@@ -757,12 +799,12 @@ export function SalesOrders({ isPurchase }: OrdersProps) {
               <div className="mx-auto h-24 w-24 bg-slate-100 rounded-full flex items-center justify-center mb-6">
                 <ShoppingCart className="h-12 w-12 text-slate-400" />
               </div>
-              <h3 className="text-xl font-semibold text-slate-800 mb-2">لا توجد طلبيات</h3>
+              <h3 className="text-xl font-semibold text-slate-800 mb-2">{tr("لا توجد طلبيات")}</h3>
               <p className="text-slate-600 mb-6">
-                لم يتم العثور على أي طلبات تطابق معايير البحث
+                {tr("لم يتم العثور على أي طلبات تطابق معايير البحث")}
               </p>
               <Button
-                className="bg-gradient-to-r from-blue-600 to-purple-600"
+                className="flex items-center gap-2"
                 onClick={() =>
                   setState((prev) => ({
                     ...prev,
@@ -772,8 +814,8 @@ export function SalesOrders({ isPurchase }: OrdersProps) {
                   }))
                 }
               >
-                <Plus className="ml-2 h-4 w-4" />
-                إنشاء طلبية جديدة
+                <Plus className="me-2 h-4 w-4" />
+                {tr("إنشاء طلبية جديدة")}
               </Button>
             </div>
           ) : state.currentView === "grid" ? (
@@ -783,7 +825,7 @@ export function SalesOrders({ isPurchase }: OrdersProps) {
                 {paginatedOrders.map((order) => (
                   <Card
                     key={order.id}
-                    className="bg-white border border-slate-200 hover:shadow-lg transition-all duration-200 hover:border-blue-300"
+                    className="border border-slate-200 bg-white shadow-sm transition-all duration-200 hover:border-blue-200 hover:bg-blue-50/30 hover:shadow-md"
                   >
                     <CardContent className="p-6">
                       <div className="flex justify-between items-start mb-4">
@@ -824,7 +866,7 @@ export function SalesOrders({ isPurchase }: OrdersProps) {
                               order.total_amount
                             )}`}
                           >
-                            {order.total_amount?.toLocaleString()}{" "}
+                            {order.total_amount?.toLocaleString("en-US")}{" "}
                             {order.currency_code || ""}
                           </span>
                         </div>
@@ -846,7 +888,7 @@ export function SalesOrders({ isPurchase }: OrdersProps) {
                           <div className="flex items-center gap-2">
                             <Calendar className="h-4 w-4 text-slate-500" />
                             <span className="text-slate-600 text-sm">
-                              تسليم: {formatDateToBritish(order.delivery_datetime)}
+                              {tr("تسليم: ")}{formatDateToBritish(order.delivery_datetime)}
                             </span>
                           </div>
                         )}
@@ -855,7 +897,7 @@ export function SalesOrders({ isPurchase }: OrdersProps) {
                           <div className="flex items-center gap-2">
                             <Clock className="h-4 w-4 text-slate-500" />
                             <span className="text-slate-600 text-sm">
-                              المرحلة: {order.current_stage}
+                              {tr("المرحلة: ")}{order.current_stage}
                             </span>
                           </div>
                         )}
@@ -863,6 +905,18 @@ export function SalesOrders({ isPurchase }: OrdersProps) {
 
                       <div className="flex justify-between items-center mt-6 pt-4 border-t border-slate-100">
                         <div className="flex gap-2">
+                          {order.source_draft_id && (
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              className="border-emerald-200 bg-emerald-50 text-emerald-700 hover:bg-emerald-100"
+                              disabled={draftLoading}
+                              onClick={() => void openSourceDraft(order)}
+                            >
+                              <FileText className="me-1 h-4 w-4" />
+                              {tr("فتح المسودة")}
+                            </Button>
+                          )}
                           <Button
                             variant="outline"
                             size="sm"
@@ -896,16 +950,16 @@ export function SalesOrders({ isPurchase }: OrdersProps) {
                 <table className="w-full">
                   <thead>
                     <tr className="border-b border-slate-200 bg-slate-50">
-                      <th className="text-right p-4">##</th>
-                      <th className="text-right p-4">رقم الطلبية</th>
-                      <th className="text-right p-4">التاريخ</th>
-                      <th className="text-right p-4">الزبون</th>
-                      <th className="text-right p-4">الحالة</th>
-                      <th className="text-right p-4">السند اليدوي</th>
-                      <th className="text-right p-4">رقم طلبية الزبون</th>
-                      <th className="text-right p-4">المبلغ</th>
-                      <th className="text-right p-4">استلمت بواسطة</th>
-                      <th className="text-center p-4">الإجراءات</th>
+                      <th className="text-start p-4">##</th>
+                      <th className="text-start p-4">{tr("رقم الطلبية")}</th>
+                      <th className="text-start p-4">{tr("التاريخ")}</th>
+                      <th className="text-start p-4">{tr("العميل")}</th>
+                      <th className="text-start p-4">{tr("الحالة")}</th>
+                      <th className="text-start p-4">{tr("السند اليدوي")}</th>
+                      <th className="text-start p-4">{tr("رقم طلبية العميل")}</th>
+                      <th className="text-start p-4">{tr("المبلغ")}</th>
+                      <th className="text-start p-4">{tr("استلمت بواسطة")}</th>
+                      <th className="text-center p-4">{tr("الإجراءات")}</th>
                     </tr>
                   </thead>
 
@@ -932,7 +986,7 @@ export function SalesOrders({ isPurchase }: OrdersProps) {
                               order.total_amount
                             )}`}
                           >
-                            {order.total_amount?.toLocaleString()}{" "}
+                            {order.total_amount?.toLocaleString("en-US")}{" "}
                             {order.currency_code || ""}
                           </span>
                         </td>
@@ -940,6 +994,18 @@ export function SalesOrders({ isPurchase }: OrdersProps) {
 
                         <td className="p-4">
                           <div className="flex justify-center gap-2">
+                            {order.source_draft_id && (
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                className="border-emerald-200 bg-emerald-50 text-emerald-700 hover:bg-emerald-100"
+                                disabled={draftLoading}
+                                onClick={() => void openSourceDraft(order)}
+                              >
+                                <FileText className="me-1 h-4 w-4" />
+                                {tr("فتح المسودة")}
+                              </Button>
+                            )}
                             <Button
                               variant="outline"
                               size="sm"
@@ -972,11 +1038,11 @@ export function SalesOrders({ isPurchase }: OrdersProps) {
                 disabled={currentPage === 1}
                 onClick={() => setCurrentPage((p) => p - 1)}
               >
-                السابق
+                {tr("السابق")}
               </Button>
 
               <div className="text-sm text-slate-600">
-                صفحة {currentPage} من {totalPages}
+                {tr("صفحة ")}{currentPage}{tr(" من ")}{totalPages}
               </div>
 
               <Button
@@ -984,7 +1050,7 @@ export function SalesOrders({ isPurchase }: OrdersProps) {
                 disabled={currentPage === totalPages}
                 onClick={() => setCurrentPage((p) => p + 1)}
               >
-                التالي
+                {tr("التالي")}
               </Button>
             </div>
           )}
@@ -1005,8 +1071,8 @@ export function SalesOrders({ isPurchase }: OrdersProps) {
           }
           order={state.selectedOrder}
           fromSearch={state.fromSearch}
-          allOrders={[]}
-          onOrderSaved={null}
+          allOrders={state.salesOrders as any}
+          onOrderSaved={() => fetchSalesOrders()}
           vch_type={isPurchase ? 2 : 1}
           onCancel={() => {
             setState((prev) => ({
@@ -1018,6 +1084,22 @@ export function SalesOrders({ isPurchase }: OrdersProps) {
           }}
         />
       )}
+      <Dialog open={!!sourceDraft} onOpenChange={(open) => !open && setSourceDraft(null)}>
+        <DialogContent className="max-h-[94vh] w-[calc(100%-1rem)] max-w-[1400px] overflow-x-hidden overflow-y-auto p-0" dir={appDir()}>
+          <DialogHeader className="sticky top-0 z-10 border-b bg-background px-6 py-4">
+            <DialogTitle>{tr("المسودة الأصلية ")}{sourceDraft?.draft_number}</DialogTitle>
+          </DialogHeader>
+          {sourceDraft && <DraftOrderForm initialDraft={sourceDraft} readOnly />}
+        </DialogContent>
+      </Dialog>
+      {draftError && (
+        <div className="fixed bottom-5 end-5 z-[100] rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700 shadow-lg">
+          {draftError}
+        </div>
+      )}
     </div>
   )
 }
+
+
+

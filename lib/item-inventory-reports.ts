@@ -1,0 +1,153 @@
+import sql, { resolveCurrentDbName } from "@/lib/database"
+import { summarizeVoucherInventory, type LineCost } from "@/lib/voucher-inventory-valuation"
+import { getSystemSettingValue } from "@/lib/system-settings"
+import { ensureLandedCostSchema } from "@/lib/landed-costs"
+
+export const reportDate = (value: string | null, fallback = new Date().toISOString().slice(0, 10)) =>
+  value && /^\d{4}-\d{2}-\d{2}$/.test(value) ? value : fallback
+
+// includeUnposted: تقييم المخزون وتقارير الأرباح تعتمد كل السندات غير المحذوفة (مرحّلة أو غير مرحّلة)؛
+// أرصدة المخزون والقوائم المالية تبقى على السندات المرحّلة فقط.
+export type InventoryReportFilters = { productIds?: number[]; excludeProductIds?: number[]; warehouseIds?: number[]; branchIds?: number[]; includeUnposted?: boolean }
+export const reportIds = (value: string | null) => [...new Set((value || "").split(",").map(Number).filter(id => Number.isSafeInteger(id) && id > 0))]
+export const inventoryFilters = (params: URLSearchParams): InventoryReportFilters => ({
+  productIds: reportIds(params.get("product_ids")), excludeProductIds: reportIds(params.get("product_ids_exclude")), warehouseIds: reportIds(params.get("warehouse_ids")), branchIds: reportIds(params.get("branch_ids")),
+})
+export async function inventoryReportMeta(organizationId: number) {
+  const [products, warehouses, branches] = await Promise.all([
+    getInventoryReportProducts(organizationId, 0, ""),
+    sql`SELECT id,warehouse_code code,warehouse_name name FROM warehouses WHERE COALESCE(status,1)<>3 ORDER BY warehouse_code`,
+    sql`SELECT id,branch_code code,branch_name name FROM branches WHERE NOT COALESCE((to_jsonb(branches)->>'is_bank_branch')::boolean, false) AND COALESCE(status,1)<>3 ORDER BY branch_code`,
+  ])
+  return { products, warehouses, branches }
+}
+
+export async function getInventoryReportProducts(organizationId: number, productId: number, search: string) {
+  return sql`
+    SELECT p.id, p.product_code, p.product_name, p.category_id, p.main_stock_id, p.type
+    FROM products p
+    WHERE COALESCE(p.deleted,false)=false AND COALESCE(p.status,1)<>3
+      AND (${productId} = 0 OR p.id = ${productId})
+      AND (${search} = '' OR p.product_code ILIKE ${`%${search}%`} OR p.product_name ILIKE ${`%${search}%`})
+    ORDER BY p.product_code, p.product_name
+  `
+}
+
+// products.initial_price اختياري (غير موجود في بعض قواعد الشركات) — كان يُقرأ عبر to_jsonb(p) لكل صنف
+// (~1 ثانية لكل 16 ألف صنف)؛ يُفحص وجوده مرة لكل قاعدة ويُقرأ مباشرة أو يُستبدل بصفر.
+const initialPriceByDb = new Map<string, Promise<boolean>>()
+async function productsHasInitialPrice() {
+  const databaseName = await resolveCurrentDbName()
+  let pending = initialPriceByDb.get(databaseName)
+  if (!pending) {
+    pending = (async () => ((await sql`SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'products' AND column_name = 'initial_price'`) as any[]).length > 0)()
+    pending.catch(() => initialPriceByDb.delete(databaseName))
+    initialPriceByDb.set(databaseName, pending)
+  }
+  return pending
+}
+
+export async function getProductBalances(_organizationId: number, toDate: string, productId: number, search: string, filters: InventoryReportFilters = {}, onLineCost?: (line: any, cost: LineCost) => void) {
+  const { productIds = [], excludeProductIds = [], warehouseIds = [], branchIds = [], includeUnposted = false } = filters
+  await ensureLandedCostSchema()
+  const initialPriceExpr = (await productsHasInitialPrice()) ? "COALESCE(p.initial_price::numeric,0)" : "0::numeric"
+  // sql is already scoped to the current company's database. Neither quantities
+  // nor prices for this report depend on the optional movement ledger.
+  const [products, lines, includePurchaseReturns] = await Promise.all([
+    sql`SELECT p.id,p.product_code,p.product_name,p.barcode,u.unit_name AS main_unit,
+               -- مجموعة الصنف: المجموعة الفرعية (category_id) وإلا المجموعة الرئيسية (main_stock_id) — كثير من الأصناف
+               -- تحفظ مجموعتها في main_stock_id فقط فكان العمود "—" (نفس منطق كتالوج نقطة البيع)
+               COALESCE(NULLIF(groups.group_name,''),NULLIF(main_group.group_name,'')) AS category,p.currency_id,p.last_purchase_price,
+               ${sql.unsafe(initialPriceExpr)} AS initial_price
+        FROM products p
+        LEFT JOIN units u ON u.id=p.measurment_unit
+        LEFT JOIN item_groups groups ON groups.id=p.category_id
+        LEFT JOIN item_groups main_group ON main_group.id=p.main_stock_id
+        WHERE COALESCE(p.deleted,false)=false AND COALESCE(p.status,1)<>3 AND COALESCE(p.type,1)=1
+          AND (${productId}=0 OR p.id=${productId})
+          AND (${productIds.length}=0 OR p.id=ANY(${productIds}::int[]))
+          AND (${excludeProductIds.length}=0 OR NOT (p.id=ANY(${excludeProductIds}::int[])))
+          AND (${search}='' OR p.product_code ILIKE ${`%${search}%`} OR p.product_name ILIKE ${`%${search}%`})
+        ORDER BY p.product_code,p.product_name`,
+    sql`
+      -- تكاليف الشحن والجمارك المحمّلة على سطر الشراء حتى تاريخ التقرير (lib/landed-costs.ts)، بعملة الفاتورة
+      WITH landed AS MATERIALIZED (
+        SELECT voucher_item_id, SUM(amount) AS amount FROM landed_cost_lines_v
+        WHERE doc_date<=${toDate}::date GROUP BY voucher_item_id
+      )
+      SELECT vi.id,vh.id AS voucher_id,vi.item_id AS product_id,vh.vch_type,vh.vch_date::date::text AS movement_date,
+             vh.from_store_id,vh.to_store_id,vi.store_id,
+             vi.qnty,vi.bonus,vi.delivery_item_id,COALESCE(NULLIF(pu.to_main_qnty,0),1) AS unit_factor,
+             cost_item.qnty AS cost_qnty,cost_item.bonus AS cost_bonus,cost_item.price AS cost_price,
+             cost_item.discount AS cost_discount,cost_item.vat_ratio AS cost_vat_ratio,
+             COALESCE((to_jsonb(cost_header)->>'vat_included')::boolean,false) AS cost_vat_included,
+             to_jsonb(cost_header)->>'discount_type' AS cost_discount_type,
+             COALESCE((to_jsonb(cost_header)->>'discount_value')::numeric,0) AS cost_discount_value,
+             COALESCE((to_jsonb(cost_header)->>'discount')::numeric,0) AS cost_header_discount,
+             COALESCE(NULLIF(cost_unit.to_main_qnty,0),1) AS cost_unit_factor,
+             cost_totals.subtotal AS cost_subtotal,COALESCE(landed.amount,0) AS cost_landed,
+             CASE WHEN cost_header.currency_id=p.currency_id THEN 1
+                  ELSE COALESCE(NULLIF(cost_header.rate,0),1)/COALESCE(NULLIF(product_rate.exchange_rate,0),1)
+             END AS currency_conversion
+      FROM voucher_items_tbl vi
+      JOIN voucher_header_tbl vh ON vh.id=vi.voucher_id
+      JOIN products p ON p.id=vi.item_id
+      LEFT JOIN LATERAL (
+        SELECT to_main_qnty FROM product_units
+        WHERE product_id=vi.item_id AND unit_id=vi.unit_id ORDER BY id LIMIT 1
+      ) pu ON TRUE
+      -- A purchase delivery owns the quantity; its posted invoice supplies the
+      -- final purchase price, only if that invoice existed by the report date.
+      LEFT JOIN LATERAL (
+        SELECT invoice_item.id
+        FROM voucher_items_tbl invoice_item
+        JOIN voucher_header_tbl invoice ON invoice.id=invoice_item.voucher_id
+        WHERE vh.vch_type=18 AND invoice_item.delivery_item_id=vi.id
+          AND invoice.vch_type=17 AND (${includeUnposted} OR invoice.vch_status=2) AND COALESCE(invoice.status,1)<>3
+          AND invoice.vch_date::date<=${toDate}::date
+        ORDER BY invoice.vch_date DESC,invoice_item.id DESC LIMIT 1
+      ) linked_invoice ON TRUE
+      JOIN voucher_items_tbl cost_item ON cost_item.id=COALESCE(linked_invoice.id,vi.id)
+      JOIN voucher_header_tbl cost_header ON cost_header.id=cost_item.voucher_id
+      LEFT JOIN LATERAL (
+        SELECT to_main_qnty FROM product_units
+        WHERE product_id=cost_item.item_id AND unit_id=cost_item.unit_id ORDER BY id LIMIT 1
+      ) cost_unit ON TRUE
+      LEFT JOIN landed ON landed.voucher_item_id=cost_item.id
+      LEFT JOIN LATERAL (
+        SELECT SUM(COALESCE(line.qnty,0)*COALESCE(line.price,0)
+          / CASE WHEN COALESCE((to_jsonb(cost_header)->>'vat_included')::boolean,false)
+              THEN NULLIF(1+COALESCE(line.vat_ratio,0)/100,0) ELSE 1 END
+          * (1-COALESCE(line.discount,0)/100)) AS subtotal
+        FROM voucher_items_tbl line WHERE line.voucher_id=cost_header.id
+      ) cost_totals ON TRUE
+      LEFT JOIN LATERAL (
+        SELECT er.exchange_rate FROM exchange_rates er
+        WHERE er.currency_id=p.currency_id AND COALESCE(er.is_active,true)
+          AND er.rate_date::date<=cost_header.vch_date::date
+        ORDER BY er.rate_date DESC,er.id DESC LIMIT 1
+      ) product_rate ON TRUE
+      WHERE (${includeUnposted} OR vh.vch_status=2) AND COALESCE(vh.status,1)<>3 AND vh.vch_date::date<=${toDate}::date
+        AND vh.vch_type IN (8,9,10,11,12,13,14,15,16,17,18,19)
+        AND (${branchIds.length}=0 OR vh.branch_id=ANY(${branchIds}::int[]))
+        AND (${warehouseIds.length}=0 OR vi.store_id=ANY(${warehouseIds}::int[]) OR (vh.vch_type=10 AND (vh.from_store_id=ANY(${warehouseIds}::int[]) OR vh.to_store_id=ANY(${warehouseIds}::int[]))))
+        AND (${productIds.length}=0 OR p.id=ANY(${productIds}::int[]))
+        AND (${excludeProductIds.length}=0 OR NOT (p.id=ANY(${excludeProductIds}::int[])))
+        AND (vh.vch_type NOT IN (12,17) OR COALESCE(vi.delivery_item_id,0)=0)
+        AND COALESCE(p.deleted,false)=false AND COALESCE(p.status,1)<>3 AND COALESCE(p.type,1)=1
+        AND (${productId}=0 OR p.id=${productId})
+        AND (${search}='' OR p.product_code ILIKE ${`%${search}%`} OR p.product_name ILIKE ${`%${search}%`})
+      ORDER BY vh.vch_date,vh.id,vi.id
+    `,
+    getSystemSettingValue("include_purchase_returns_in_cost", false),
+  ])
+  const warehouses = new Set(warehouseIds)
+  const scopedLines = lines.flatMap((line: any) => {
+    if (Number(line.vch_type) !== 10) return [line]
+    if (!warehouses.size) return []
+    const from = warehouses.has(Number(line.from_store_id)), to = warehouses.has(Number(line.to_store_id))
+    // Transfers within the selected warehouses cancel out.
+    return from === to ? [] : [{ ...line, vch_type: to ? 15 : 9 }]
+  })
+  return summarizeVoucherInventory(products, scopedLines, [true, 1, "1", "true"].includes(includePurchaseReturns), onLineCost)
+}

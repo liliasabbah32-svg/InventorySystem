@@ -1,37 +1,55 @@
 "use client"
 
-import { useState, useEffect, useRef } from "react"
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
+import { tr, appDir, currentLanguage } from "@/lib/i18n"
+import { COMPANY_LANGUAGES, countryOptions } from "@/lib/countries"
+import { confirmYesNo } from "@/components/ui/confirm-host"
+import { useState, useEffect, useRef, useCallback } from "react"
+import { Card, CardContent } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Label } from "@/components/ui/label"
 import { Textarea } from "@/components/ui/textarea"
-import { Switch } from "@/components/ui/switch"
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import AutoCompleteAccount from "@/components/customer/auto-complete-account"
 import Messages from "@/components/common/Messages"
-import Util from "@/components/common/Util"
-import { Save, Settings, Building2, Globe, Shield, Printer, FileText, Loader2, AlertCircle } from "lucide-react"
+import { Save, Settings, Building2, Globe, FileText, Loader2, AlertCircle, Wallet, Package, RefreshCw, ChevronLeft, SlidersHorizontal } from "lucide-react"
+import VouchersGeneralSettings from "@/components/settings/vouchers-general-settings"
+import { buildVoucherCode } from "@/lib/voucher-code"
+
+// حقول "حساب الأب" تُختار منها حسابات رئيسية — بقية الحسابات الافتراضية يجب أن تكون فرعية (بلا أبناء)
+const PARENT_ACCOUNT_SETTING_KEYS = new Set(["customerParentAccount", "salesmanParentAccount", "supplierParentAccount", "newEmployeeAccount", "customerSubscriptionAccount"])
 
 const defaultAccountFields = [
-  { key: "customerParentAccount", label: "حساب اب الزبائن في ملف تعريف الزبائن" },
-  { key: "customerCreditAccount", label: "حساب اب عملاء الاعتمادات في ملف تعريف عملاء الاعتمادات" },
-  { key: "salesTaxAccount", label: "حساب الضريبة على المبيعات" },
-  { key: "currencyTransferAccount", label: "حساب تحويلات عملة" },
-  { key: "earnedDiscountAccount", label: "حساب الخصم المكتسب" },
-  { key: "exchangeGainLossAccount", label: "حساب ارباح وخسائر فروقات العملة" },
-  { key: "salesmanParentAccount", label: "حساب اب المندوبين في ملف تعريف المندوبين" },
-  { key: "supplierParentAccount", label: "حساب اب الموردين في ملف تعريف الموردين" },
-  { key: "customerSubscriptionAccount", label: "حساب اب المشتركين في ملف تعريف المشتركين" },
-  { key: "purchaseTaxAccount", label: "حساب الضريبة على المشتريات" },
-  { key: "newEmployeeAccount", label: "حساب الاب الافتراضي عند تعريف موظف جديد" },
-  { key: "allowedDiscountAccount", label: "حساب خصم مسموح به" },
+  { key: "customerParentAccount", label: tr("حساب اب العملاء في ملف تعريف العملاء") },
+  { key: "salesTaxAccount", label: tr("حساب الضريبة على المبيعات") },
+  { key: "currencyTransferAccount", label: tr("حساب تحويلات عملة") },
+  { key: "earnedDiscountAccount", label: tr("حساب الخصم المكتسب") },
+  { key: "exchangeGainLossAccount", label: tr("حساب ارباح وخسائر فروقات العملة") },
+  { key: "salesmanParentAccount", label: tr("حساب اب المندوبين في ملف تعريف المندوبين") },
+  { key: "supplierParentAccount", label: tr("حساب اب الموردين في ملف تعريف الموردين") },
+  { key: "customerSubscriptionAccount", label: tr("حساب اب المشتركين في ملف تعريف المشتركين") },
+  { key: "purchaseTaxAccount", label: tr("حساب الضريبة على المشتريات") },
+  { key: "newEmployeeAccount", label: tr("حساب الاب الافتراضي عند تعريف موظف جديد") },
+  { key: "allowedDiscountAccount", label: tr("حساب خصم مسموح به") },
 ] as const
 
 type DefaultAccountFieldKey = (typeof defaultAccountFields)[number]["key"]
 
 const defaultAccountFieldKeys = defaultAccountFields.map((field) => field.key)
+
+const productAccountFields = [
+  { key: "sellingAccount", label: tr("حساب المبيعات الافتراضي") },
+  { key: "purchaseAccount", label: tr("حساب المشتريات الافتراضي") },
+  { key: "sellingReturnsAccount", label: tr("حساب مرتجعات المبيعات الافتراضي") },
+  { key: "purchaseReturnsAccount", label: tr("حساب مرتجعات المشتريات الافتراضي") },
+  { key: "stockEndAccount", label: tr("حساب تقييم بضاعة آخر المدة الافتراضي") },
+  { key: "stockStartAccount", label: tr("حساب تقييم بضاعة أول المدة الافتراضي") },
+  { key: "productionAccount", label: tr("حساب الإنتاج الافتراضي") },
+  { key: "municipalityServiceAccount", label: tr("حساب المصاريف البلدية الافتراضي") },
+  { key: "lsti3malAccount", label: tr("حساب المصروف في سند الاستعمال الافتراضي") },
+] as const
+
+type ProductAccountFieldKey = (typeof productAccountFields)[number]["key"]
 
 const toAccountIdString = (value: unknown) => {
   if (value === null || value === undefined || value === "") return ""
@@ -47,17 +65,76 @@ const emptyDefaultAccountValues = defaultAccountFields.reduce(
   {} as Record<DefaultAccountFieldKey, string>,
 )
 
-export function SystemSettings() {
+const emptyProductAccountValues = productAccountFields.reduce(
+  (accumulator, field) => {
+    accumulator[field.key] = ""
+    return accumulator
+  },
+  {} as Record<ProductAccountFieldKey, string>,
+)
+
+const SETTINGS_SECTIONS = [
+  { id: "company", title: tr("معلومات الشركة"), description: tr("الاسم، العنوان، بيانات التواصل والشعار"), icon: Building2 },
+  { id: "system", title: tr("إعدادات النظام"), description: tr("العملة، اللغة، المنطقة الزمنية والتنسيقات"), icon: Globe },
+  { id: "general", title: tr("اعدادات عامة"), description: tr("فترة العمل، القبض والصرف، الحسابات والأصناف"), icon: SlidersHorizontal },
+  { id: "accounts", title: tr("الحسابات الافتراضية"), description: tr("حسابات الأب للعملاء والموردين والضرائب"), icon: Wallet },
+  { id: "product_accounts", title: tr("حسابات الأصناف"), description: tr("الحسابات الافتراضية للأصناف"), icon: Package },
+  { id: "documents", title: tr("السندات والترقيم"), description: tr("بادئات وأرقام بداية السندات والملفات"), icon: FileText },
+] as const
+
+type SettingsSectionId = (typeof SETTINGS_SECTIONS)[number]["id"]
+const ACTIVE_SECTION_STORAGE_KEY = "system-settings:active-section"
+
+function SettingsSectionHeader({ id }: { id: SettingsSectionId }) {
+  const section = SETTINGS_SECTIONS.find((item) => item.id === id)!
+  const Icon = section.icon
+  return (
+    <div className="flex items-center gap-3 border-b border-slate-100 bg-gradient-to-l from-emerald-50/80 via-white to-white px-5 py-4">
+      <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-emerald-600 to-teal-600 text-white shadow-sm">
+        <Icon className="h-5 w-5" />
+      </span>
+      <div className="min-w-0">
+        <h2 id={`settings-section-${id}`} className="text-base font-extrabold text-slate-800">{section.title}</h2>
+        <p className="truncate text-xs text-slate-500">{section.description}</p>
+      </div>
+    </div>
+  )
+}
+
+export function SystemSettings({ initialSection }: { initialSection?: SettingsSectionId } = {}) {
+  const [activeSection, setActiveSectionState] = useState<SettingsSectionId>(initialSection ?? "company")
+  useEffect(() => {
+    // فتح مباشر لتبويب محدد (مثل section=vouchers-general-settings) يتقدّم على آخر قسم محفوظ
+    if (initialSection) return
+    try {
+      const stored = window.localStorage.getItem(ACTIVE_SECTION_STORAGE_KEY)
+      if (SETTINGS_SECTIONS.some((item) => item.id === stored)) setActiveSectionState(stored as SettingsSectionId)
+    } catch {
+      // التخزين المحلي غير متاح
+    }
+  }, [])
+  const setActiveSection = (id: SettingsSectionId) => {
+    setActiveSectionState(id)
+    try {
+      window.localStorage.setItem(ACTIVE_SECTION_STORAGE_KEY, id)
+    } catch {
+      // التخزين المحلي غير متاح — يبقى القسم المختار لهذه الجلسة فقط
+    }
+  }
   const [settings, setSettings] = useState({
     // Company Settings
-    companyName: "شركة الموارد المتكاملة",
-    companyNameEn: "Integrated Resources Company",
-    taxNumber: "123456789",
-    commercialRegister: "987654321",
-    address: "رام الله - البيرة - شارع الإرسال",
-    phone: "02-2345678",
-    email: "info@company.com",
-    website: "www.company.com",
+    companyName: "",
+    companyNameEn: "",
+    companyLogo: "",
+    licensedWorkerNumber: "",
+    taxNumber: "",
+    commercialRegister: "",
+    address: "",
+    phone: "",
+    email: "",
+    website: "",
+    companyCountry: "",
+    companyLanguage: "ar",
 
     // System Settings
     defaultCurrency: "ILS",
@@ -65,6 +142,8 @@ export function SystemSettings() {
     timeFormat: "24h",
     language: "ar",
     timezone: "Asia/Jerusalem",
+    taxRate: 16,
+    taxRateClearing: 18,
 
     // Business Settings
     fiscalYearStart: "01/01",
@@ -78,10 +157,28 @@ export function SystemSettings() {
     auditLog: true,
 
     // Document Settings - Prefixes
-    invoicePrefix: "INV",
     orderPrefix: "SO",
     purchasePrefix: "PO",
+    receiptPrefix: "R",
+    paymentPrefix: "P",
+    creditNotePrefix: "C",
+    debitNotePrefix: "D",
+    stockInPrefix: "I",
+    stockOutPrefix: "O",
+    internalDeliveryPrefix: "T",
+    useVoucherPrefix: "U",
+    salesInvoicePrefix: "INV",
+    deliverySellPrefix: "DSL",
+    deliveryConsignmentSalePrefix: "CSL",
+    returnDeliveryConsignmentSalePrefix: "RCS",
+    returnSellPrefix: "RIN",
+    purchaseInvoicePrefix: "PU",
+    deliveryPayPrefix: "DPY",
+    returnPurchasePrefix: "RPU",
+    journalPrefix: "J",
     customerPrefix: "C",
+    salesmanPrefix: "M",
+    employeePrefix: "E",
     supplierPrefix: "S",
     itemGroupPrefix: "G",
     accountPrefix: "A",
@@ -90,7 +187,26 @@ export function SystemSettings() {
     invoiceStart: 1,
     orderStart: 1,
     purchaseStart: 1,
+    receiptStart: 1,
+    paymentStart: 1,
+    creditNoteStart: 1,
+    debitNoteStart: 1,
+    stockInStart: 1,
+    stockOutStart: 1,
+    internalDeliveryStart: 1,
+    useVoucherStart: 1,
+    salesInvoiceStart: 1,
+    deliverySellStart: 1,
+    deliveryConsignmentSaleStart: 1,
+    returnDeliveryConsignmentSaleStart: 1,
+    returnSellStart: 1,
+    purchaseInvoiceStart: 1,
+    deliveryPayStart: 1,
+    returnPurchaseStart: 1,
+    journalStart: 1,
     customerStart: 1,
+    salesmanStart: 1,
+    employeeStart: 1,
     supplierStart: 1,
     itemGroupStart: 1,
     itemStart: 1,
@@ -98,6 +214,7 @@ export function SystemSettings() {
 
     // Default Accounts
     ...emptyDefaultAccountValues,
+    ...emptyProductAccountValues,
 
     // Print Settings
     defaultPrinter: "HP LaserJet",
@@ -110,6 +227,12 @@ export function SystemSettings() {
   const [initialLoading, setInitialLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const message = useRef<any>(null)
+  const savingRef = useRef(false)
+  // حفظ تبويب "اعدادات عامة" (مكوّن مستقل بمفاتيحه الخاصة) ضمن زر حفظ هذه الصفحة
+  const generalSaveRef = useRef<(() => Promise<boolean>) | null>(null)
+  const registerGeneralSave = useCallback((save: () => Promise<boolean>) => {
+    generalSaveRef.current = save
+  }, [])
   const [hasTransactions, setHasTransactions] = useState(false)
   const [numberingLocks, setNumberingLocks] = useState({
     invoice: false,
@@ -152,33 +275,81 @@ export function SystemSettings() {
         if (settingsPayload && Object.keys(settingsPayload).length > 0) {
           setSettings((prev) => ({
             ...prev,
-            companyName: settingsPayload.company_name || prev.companyName,
-            companyNameEn: settingsPayload.company_name_en || prev.companyNameEn,
-            address: settingsPayload.company_address || prev.address,
-            phone: settingsPayload.company_phone || prev.phone,
-            email: settingsPayload.company_email || prev.email,
-            website: settingsPayload.company_website || prev.website,
-            taxNumber: settingsPayload.tax_number || prev.taxNumber,
-            commercialRegister: settingsPayload.commercial_register || prev.commercialRegister,
+            companyName: String(settingsPayload.company_name ?? ""),
+            companyNameEn: String(settingsPayload.company_name_en ?? ""),
+            companyLogo: String(settingsPayload.company_logo ?? ""),
+            licensedWorkerNumber: String(settingsPayload.licensed_worker_number ?? ""),
+            address: String(settingsPayload.company_address ?? ""),
+            phone: String(settingsPayload.company_phone ?? ""),
+            email: String(settingsPayload.company_email ?? ""),
+            website: String(settingsPayload.company_website ?? ""),
+            companyCountry: String(settingsPayload.company_country ?? ""),
+            companyLanguage: String(settingsPayload.company_language || "ar"),
+            taxNumber: String(settingsPayload.tax_number ?? ""),
+            commercialRegister: String(settingsPayload.commercial_register ?? ""),
             defaultCurrency: settingsPayload.default_currency || prev.defaultCurrency,
-            invoicePrefix: settingsPayload.invoice_prefix || prev.invoicePrefix,
             orderPrefix: settingsPayload.order_prefix || prev.orderPrefix,
             purchasePrefix: settingsPayload.purchase_prefix || prev.purchasePrefix,
+            receiptPrefix: settingsPayload.receipt_prefix || prev.receiptPrefix,
+            paymentPrefix: settingsPayload.payment_prefix || prev.paymentPrefix,
+            creditNotePrefix: settingsPayload.credit_note_prefix || prev.creditNotePrefix,
+            debitNotePrefix: settingsPayload.debit_note_prefix || prev.debitNotePrefix,
+            stockInPrefix: settingsPayload.stock_in_prefix || prev.stockInPrefix,
+            stockOutPrefix: settingsPayload.stock_out_prefix || prev.stockOutPrefix,
+            internalDeliveryPrefix: settingsPayload.internal_delivery_prefix || prev.internalDeliveryPrefix,
+            useVoucherPrefix: settingsPayload.use_voucher_prefix || prev.useVoucherPrefix,
+            salesInvoicePrefix: settingsPayload.sales_invoice_prefix || prev.salesInvoicePrefix,
+            deliverySellPrefix: settingsPayload.delivery_sell_prefix || prev.deliverySellPrefix,
+            deliveryConsignmentSalePrefix: settingsPayload.delivery_consignment_sale_prefix || prev.deliveryConsignmentSalePrefix,
+            returnDeliveryConsignmentSalePrefix: settingsPayload.return_delivery_consignment_sale_prefix || prev.returnDeliveryConsignmentSalePrefix,
+            returnSellPrefix: settingsPayload.return_sell_prefix || prev.returnSellPrefix,
+            purchaseInvoicePrefix: settingsPayload.purchase_invoice_prefix || prev.purchaseInvoicePrefix,
+            deliveryPayPrefix: settingsPayload.delivery_pay_prefix || prev.deliveryPayPrefix,
+            returnPurchasePrefix: settingsPayload.return_purchase_prefix || prev.returnPurchasePrefix,
+            journalPrefix: settingsPayload.journal_prefix || prev.journalPrefix,
             customerPrefix: settingsPayload.customer_prefix || prev.customerPrefix,
+            salesmanPrefix: settingsPayload.salesman_prefix || prev.salesmanPrefix,
+            employeePrefix: settingsPayload.employee_prefix || prev.employeePrefix,
             supplierPrefix: settingsPayload.supplier_prefix || prev.supplierPrefix,
             itemGroupPrefix: settingsPayload.item_group_prefix || prev.itemGroupPrefix,
+            accountPrefix: settingsPayload.account_prefix || prev.accountPrefix,
             invoiceStart: settingsPayload.invoice_start ?? prev.invoiceStart,
             orderStart: settingsPayload.order_start ?? prev.orderStart,
             purchaseStart: settingsPayload.purchase_start ?? prev.purchaseStart,
+            receiptStart: settingsPayload.receipt_start ?? prev.receiptStart,
+            paymentStart: settingsPayload.payment_start ?? prev.paymentStart,
+            creditNoteStart: settingsPayload.credit_note_start ?? prev.creditNoteStart,
+            debitNoteStart: settingsPayload.debit_note_start ?? prev.debitNoteStart,
+            stockInStart: settingsPayload.stock_in_start ?? prev.stockInStart,
+            stockOutStart: settingsPayload.stock_out_start ?? prev.stockOutStart,
+            internalDeliveryStart: settingsPayload.internal_delivery_start ?? prev.internalDeliveryStart,
+            useVoucherStart: settingsPayload.use_voucher_start ?? prev.useVoucherStart,
+            salesInvoiceStart: settingsPayload.sales_invoice_start ?? prev.salesInvoiceStart,
+            deliverySellStart: settingsPayload.delivery_sell_start ?? prev.deliverySellStart,
+            deliveryConsignmentSaleStart: settingsPayload.delivery_consignment_sale_start ?? prev.deliveryConsignmentSaleStart,
+            returnDeliveryConsignmentSaleStart: settingsPayload.return_delivery_consignment_sale_start ?? prev.returnDeliveryConsignmentSaleStart,
+            returnSellStart: settingsPayload.return_sell_start ?? prev.returnSellStart,
+            purchaseInvoiceStart: settingsPayload.purchase_invoice_start ?? prev.purchaseInvoiceStart,
+            deliveryPayStart: settingsPayload.delivery_pay_start ?? prev.deliveryPayStart,
+            returnPurchaseStart: settingsPayload.return_purchase_start ?? prev.returnPurchaseStart,
+            journalStart: settingsPayload.journal_start ?? prev.journalStart,
             customerStart: settingsPayload.customer_start ?? prev.customerStart,
+            salesmanStart: settingsPayload.salesman_start ?? prev.salesmanStart,
+            employeeStart: settingsPayload.employee_start ?? prev.employeeStart,
             supplierStart: settingsPayload.supplier_start ?? prev.supplierStart,
             itemGroupStart: settingsPayload.item_group_start ?? prev.itemGroupStart,
             itemStart: settingsPayload.item_start ?? prev.itemStart,
+            accountStart: settingsPayload.account_start ?? prev.accountStart,
             fiscalYearStart: settingsPayload.fiscal_year_start || prev.fiscalYearStart,
             language: settingsPayload.language || prev.language,
             timezone: settingsPayload.timezone || prev.timezone,
             dateFormat: settingsPayload.date_format || prev.dateFormat,
             timeFormat: settingsPayload.time_format || prev.timeFormat,
+            taxRate: settingsPayload.tax_rate != null && settingsPayload.tax_rate !== "" ? Number(settingsPayload.tax_rate) : prev.taxRate,
+            taxRateClearing:
+              settingsPayload.tax_rate_clearing != null && settingsPayload.tax_rate_clearing !== ""
+                ? Number(settingsPayload.tax_rate_clearing)
+                : prev.taxRateClearing,
             workingDays: settingsPayload.working_days
               ? (() => {
                   try {
@@ -206,7 +377,6 @@ export function SystemSettings() {
             printFooter: settingsPayload.print_footer !== false,
             autoNumbering: settingsPayload.auto_numbering !== false,
             customerParentAccount: toAccountIdString(settingsPayload.default_customer_parent_account ?? prev.customerParentAccount),
-            customerCreditAccount: toAccountIdString(settingsPayload.default_customer_credit_account ?? prev.customerCreditAccount),
             salesTaxAccount: toAccountIdString(settingsPayload.default_sales_tax_account ?? prev.salesTaxAccount),
             currencyTransferAccount: toAccountIdString(settingsPayload.default_currency_transfer_account ?? prev.currencyTransferAccount),
             earnedDiscountAccount: toAccountIdString(settingsPayload.default_earned_discount_account ?? prev.earnedDiscountAccount),
@@ -217,6 +387,15 @@ export function SystemSettings() {
             purchaseTaxAccount: toAccountIdString(settingsPayload.default_purchase_tax_account ?? prev.purchaseTaxAccount),
             newEmployeeAccount: toAccountIdString(settingsPayload.default_new_employee_account ?? prev.newEmployeeAccount),
             allowedDiscountAccount: toAccountIdString(settingsPayload.default_allowed_discount_account ?? prev.allowedDiscountAccount),
+            sellingAccount: toAccountIdString(settingsPayload.default_selling_account_id ?? prev.sellingAccount),
+            purchaseAccount: toAccountIdString(settingsPayload.default_purchase_account_id ?? prev.purchaseAccount),
+            sellingReturnsAccount: toAccountIdString(settingsPayload.default_selling_returns_account_id ?? prev.sellingReturnsAccount),
+            purchaseReturnsAccount: toAccountIdString(settingsPayload.default_purchase_returns_account_id ?? prev.purchaseReturnsAccount),
+            stockEndAccount: toAccountIdString(settingsPayload.default_stock_end_account_id ?? prev.stockEndAccount),
+            stockStartAccount: toAccountIdString(settingsPayload.default_stock_start_account_id ?? prev.stockStartAccount),
+            productionAccount: toAccountIdString(settingsPayload.default_production_account_id ?? prev.productionAccount),
+            municipalityServiceAccount: toAccountIdString(settingsPayload.default_municipality_service_account_id ?? prev.municipalityServiceAccount),
+            lsti3malAccount: toAccountIdString(settingsPayload.default_lsti3mal_account_id ?? prev.lsti3malAccount),
           }))
         }
       }
@@ -228,6 +407,26 @@ export function SystemSettings() {
   }
 
   const handleSave = async () => {
+    if (savingRef.current) return
+    savingRef.current = true
+
+    const showMessage = (detail: string, severity: "success" | "error") => {
+      message.current?.clear?.()
+      message.current?.show?.([
+        {
+          severity,
+          summary: "",
+          detail,
+          sticky: severity === "error",
+          life: severity === "success" ? 4000 : undefined,
+        },
+      ])
+    }
+    const validationError = (detail: string) => {
+      setError(detail)
+      showMessage(detail, "error")
+    }
+
     try {
       setLoading(true)
       setError(null)
@@ -237,54 +436,99 @@ export function SystemSettings() {
 
       // Validation
       if (!settings.companyName.trim()) {
-        setError("اسم الشركة مطلوب")
+        validationError(tr("اسم الشركة مطلوب"))
         return
       }
 
       const prefixes = [
-        { label: "بادئة فواتير المبيعات", value: settings.invoicePrefix },
-        { label: "بادئة طلبات المبيعات", value: settings.orderPrefix },
-        { label: "بادئة طلبات الشراء", value: settings.purchasePrefix },
-        { label: "بادئة العملاء", value: settings.customerPrefix },
-        { label: "بادئة الموردين", value: settings.supplierPrefix },
-        { label: "بادئة مجموعات الأصناف", value: settings.itemGroupPrefix },
+        { label: tr("بادئة طلبات المبيعات"), value: settings.orderPrefix },
+        { label: tr("بادئة طلبات الشراء"), value: settings.purchasePrefix },
+        { label: tr("بادئة سندات القبض"), value: settings.receiptPrefix },
+        { label: tr("بادئة سندات الصرف"), value: settings.paymentPrefix },
+        { label: tr("بادئة الاشعار الدائن"), value: settings.creditNotePrefix },
+        { label: tr("بادئة الاشعار المدين"), value: settings.debitNotePrefix },
+        { label: tr("بادئة سند ادخال بضاعة"), value: settings.stockInPrefix },
+        { label: tr("بادئة سند اخراج بضاعة"), value: settings.stockOutPrefix },
+        { label: tr("بادئة ارسالية داخلية"), value: settings.internalDeliveryPrefix },
+        { label: tr("بادئة سند استعمال"), value: settings.useVoucherPrefix },
+        { label: tr("بادئة فاتورة مبيعات"), value: settings.salesInvoicePrefix },
+        { label: tr("بادئة إرسالية مبيعات"), value: settings.deliverySellPrefix },
+        { label: tr("بادئة إرسالية برسم البيع"), value: settings.deliveryConsignmentSalePrefix },
+        { label: tr("بادئة مرتجع إرسالية برسم البيع"), value: settings.returnDeliveryConsignmentSalePrefix },
+        { label: tr("بادئة مرتجع مبيعات"), value: settings.returnSellPrefix },
+        { label: tr("بادئة فاتورة مشتريات"), value: settings.purchaseInvoicePrefix },
+        { label: tr("بادئة إرسالية مشتريات"), value: settings.deliveryPayPrefix },
+        { label: tr("بادئة مرتجع مشتريات"), value: settings.returnPurchasePrefix },
+        { label: tr("بادئة سندات القيد"), value: settings.journalPrefix },
+        { label: tr("بادئة العملاء"), value: settings.customerPrefix },
+        { label: tr("بادئة الموظفين"), value: settings.employeePrefix },
+        { label: tr("بادئة الموردين"), value: settings.supplierPrefix },
+        { label: tr("بادئة مجموعات الأصناف"), value: settings.itemGroupPrefix },
       ]
 
       for (const prefix of prefixes) {
         if (!isValidPrefix(prefix.value)) {
-          setError(`${prefix.label}: مسموح فقط بحروف إنجليزية كبيرة A-Z وبحد أقصى 3 أحرف`)
+          validationError(tr("{0}: مسموح فقط بحروف إنجليزية كبيرة A-Z وبحد أقصى 3 أحرف، بدون أرقام أو رموز خاصة", prefix.label))
+          return
+        }
+      }
+
+      const isValidVoucherStart = (value: number) => Number.isInteger(value) && value > 0 && value <= 10000
+      const voucherStarts = [
+        { label: tr("الترقيم يبدأ من (سندات القبض)"), value: settings.receiptStart },
+        { label: tr("الترقيم يبدأ من (سندات الصرف)"), value: settings.paymentStart },
+        { label: tr("الترقيم يبدأ من (الاشعار الدائن)"), value: settings.creditNoteStart },
+        { label: tr("الترقيم يبدأ من (الاشعار المدين)"), value: settings.debitNoteStart },
+        { label: tr("الترقيم يبدأ من (سند ادخال بضاعة)"), value: settings.stockInStart },
+        { label: tr("الترقيم يبدأ من (سند اخراج بضاعة)"), value: settings.stockOutStart },
+        { label: tr("الترقيم يبدأ من (ارسالية داخلية)"), value: settings.internalDeliveryStart },
+        { label: tr("الترقيم يبدأ من (سند استعمال)"), value: settings.useVoucherStart },
+        { label: tr("الترقيم يبدأ من (فاتورة مبيعات)"), value: settings.salesInvoiceStart },
+        { label: tr("الترقيم يبدأ من (إرسالية مبيعات)"), value: settings.deliverySellStart },
+        { label: tr("الترقيم يبدأ من (إرسالية برسم البيع)"), value: settings.deliveryConsignmentSaleStart },
+        { label: tr("الترقيم يبدأ من (مرتجع إرسالية برسم البيع)"), value: settings.returnDeliveryConsignmentSaleStart },
+        { label: tr("الترقيم يبدأ من (مرتجع مبيعات)"), value: settings.returnSellStart },
+        { label: tr("الترقيم يبدأ من (فاتورة مشتريات)"), value: settings.purchaseInvoiceStart },
+        { label: tr("الترقيم يبدأ من (إرسالية مشتريات)"), value: settings.deliveryPayStart },
+        { label: tr("الترقيم يبدأ من (مرتجع مشتريات)"), value: settings.returnPurchaseStart },
+        { label: tr("الترقيم يبدأ من (سندات القيد)"), value: settings.journalStart },
+      ]
+      for (const start of voucherStarts) {
+        if (!isValidVoucherStart(start.value)) {
+          validationError(tr("{0}: يجب أن يكون رقمًا صحيحًا من 1 إلى 10000", start.label))
           return
         }
       }
 
       const starts = [
-        { label: "بداية ترقيم فواتير المبيعات", value: settings.invoiceStart },
-        { label: "بداية ترقيم طلبات المبيعات", value: settings.orderStart },
-        { label: "بداية ترقيم طلبات الشراء", value: settings.purchaseStart },
-        { label: "بداية ترقيم العملاء", value: settings.customerStart },
-        { label: "بداية ترقيم الموردين", value: settings.supplierStart },
-        { label: "بداية ترقيم مجموعات الأصناف", value: settings.itemGroupStart },
-        { label: "بداية ترقيم الأصناف", value: settings.itemStart },
+        { label: tr("بداية ترقيم طلبات المبيعات"), value: settings.orderStart },
+        { label: tr("بداية ترقيم طلبات الشراء"), value: settings.purchaseStart },
+        { label: tr("بداية ترقيم العملاء"), value: settings.customerStart },
+        { label: tr("الرقم يبدأ من (الموظفين)"), value: settings.employeeStart },
+        { label: tr("بداية ترقيم الموردين"), value: settings.supplierStart },
+        { label: tr("بداية ترقيم مجموعات الأصناف"), value: settings.itemGroupStart },
+        { label: tr("بداية ترقيم الأصناف"), value: settings.itemStart },
       ]
 
       for (const start of starts) {
         if (!isValidStart(start.value)) {
-          setError(`${start.label}: يجب أن تكون رقمًا صحيحًا من 1 إلى 999`)
+          validationError(tr("{0}: يجب أن تكون رقمًا صحيحًا من 1 إلى 999", start.label))
           return
         }
       }
 
-      if (!settings.invoiceStart || settings.invoiceStart < 1) {
-        setError("بداية ترقيم فواتير المبيعات مطلوبة ويجب أن تكون أكبر من صفر")
-        return
-      }
       if (!settings.orderStart || settings.orderStart < 1) {
-        setError("بداية ترقيم طلبات المبيعات مطلوبة ويجب أن تكون أكبر من صفر")
+        validationError(tr("بداية ترقيم طلبات المبيعات مطلوبة ويجب أن تكون أكبر من صفر"))
         return
       }
       if (!settings.purchaseStart || settings.purchaseStart < 1) {
-        setError("بداية ترقيم طلبات الشراء مطلوبة ويجب أن تكون أكبر من صفر")
+        validationError(tr("بداية ترقيم طلبات الشراء مطلوبة ويجب أن تكون أكبر من صفر"))
         return
+      }
+
+      // تبويب "اعدادات عامة" أولاً — يتحقق من سنة/أشهر العمل ويعرض سبب الفشل بنفسه
+      if (generalSaveRef.current && !(await generalSaveRef.current())) {
+        throw new Error(tr("لم يتم حفظ الاعدادات العامة — راجع تبويب اعدادات عامة"))
       }
 
       const response = await fetch("/api/settings/system", {
@@ -295,32 +539,77 @@ export function SystemSettings() {
         body: JSON.stringify({
           company_name: settings.companyName,
           company_name_en: settings.companyNameEn,
+          company_logo: settings.companyLogo,
+          licensed_worker_number: settings.licensedWorkerNumber,
           company_address: settings.address,
           company_phone: settings.phone,
           company_email: settings.email,
           company_website: settings.website,
+          company_country: settings.companyCountry,
+          company_language: settings.companyLanguage,
           tax_number: settings.taxNumber,
           commercial_register: settings.commercialRegister,
           default_currency: settings.defaultCurrency,
-          invoice_prefix: settings.invoicePrefix.trim().toUpperCase(),
           order_prefix: settings.orderPrefix.trim().toUpperCase(),
           purchase_prefix: settings.purchasePrefix.trim().toUpperCase(),
+          receipt_prefix: settings.receiptPrefix.trim().toUpperCase(),
+          payment_prefix: settings.paymentPrefix.trim().toUpperCase(),
+          credit_note_prefix: settings.creditNotePrefix.trim().toUpperCase(),
+          debit_note_prefix: settings.debitNotePrefix.trim().toUpperCase(),
+          stock_in_prefix: settings.stockInPrefix.trim().toUpperCase(),
+          stock_out_prefix: settings.stockOutPrefix.trim().toUpperCase(),
+          internal_delivery_prefix: settings.internalDeliveryPrefix.trim().toUpperCase(),
+          use_voucher_prefix: settings.useVoucherPrefix.trim().toUpperCase(),
+          sales_invoice_prefix: settings.salesInvoicePrefix.trim().toUpperCase(),
+          delivery_sell_prefix: settings.deliverySellPrefix.trim().toUpperCase(),
+          delivery_consignment_sale_prefix: settings.deliveryConsignmentSalePrefix.trim().toUpperCase(),
+          return_delivery_consignment_sale_prefix: settings.returnDeliveryConsignmentSalePrefix.trim().toUpperCase(),
+          return_sell_prefix: settings.returnSellPrefix.trim().toUpperCase(),
+          purchase_invoice_prefix: settings.purchaseInvoicePrefix.trim().toUpperCase(),
+          delivery_pay_prefix: settings.deliveryPayPrefix.trim().toUpperCase(),
+          return_purchase_prefix: settings.returnPurchasePrefix.trim().toUpperCase(),
+          journal_prefix: settings.journalPrefix.trim().toUpperCase(),
           customer_prefix: settings.customerPrefix.trim().toUpperCase(),
+          salesman_prefix: settings.salesmanPrefix.trim().toUpperCase(),
+          employee_prefix: settings.employeePrefix.trim().toUpperCase(),
           supplier_prefix: settings.supplierPrefix.trim().toUpperCase(),
           item_group_prefix: settings.itemGroupPrefix.trim().toUpperCase(),
+          account_prefix: settings.accountPrefix.trim().toUpperCase(),
           invoice_start: settings.invoiceStart,
           order_start: settings.orderStart,
           purchase_start: settings.purchaseStart,
+          receipt_start: settings.receiptStart,
+          payment_start: settings.paymentStart,
+          credit_note_start: settings.creditNoteStart,
+          debit_note_start: settings.debitNoteStart,
+          stock_in_start: settings.stockInStart,
+          stock_out_start: settings.stockOutStart,
+          internal_delivery_start: settings.internalDeliveryStart,
+          use_voucher_start: settings.useVoucherStart,
+          sales_invoice_start: settings.salesInvoiceStart,
+          delivery_sell_start: settings.deliverySellStart,
+          delivery_consignment_sale_start: settings.deliveryConsignmentSaleStart,
+          return_delivery_consignment_sale_start: settings.returnDeliveryConsignmentSaleStart,
+          return_sell_start: settings.returnSellStart,
+          purchase_invoice_start: settings.purchaseInvoiceStart,
+          delivery_pay_start: settings.deliveryPayStart,
+          return_purchase_start: settings.returnPurchaseStart,
+          journal_start: settings.journalStart,
           customer_start: settings.customerStart || null,
+          salesman_start: settings.salesmanStart || null,
+          employee_start: settings.employeeStart || null,
           supplier_start: settings.supplierStart || null,
           item_group_start: settings.itemGroupStart || null,
           item_start: settings.itemStart || null,
+          account_start: settings.accountStart || null,
           fiscal_year_start: settings.fiscalYearStart,
           numbering_system: settings.autoNumbering ? "auto" : "manual",
           language: settings.language,
           timezone: settings.timezone,
           date_format: settings.dateFormat,
           time_format: settings.timeFormat,
+          tax_rate: Number(settings.taxRate) || 0,
+          tax_rate_clearing: Number(settings.taxRateClearing) || 0,
           working_days: settings.workingDays,
           working_hours: settings.workingHours,
           sessionTimeout: settings.sessionTimeout,
@@ -333,7 +622,6 @@ export function SystemSettings() {
           printFooter: settings.printFooter,
           autoNumbering: settings.autoNumbering,
           default_customer_parent_account: settings.customerParentAccount ? Number(settings.customerParentAccount) : null,
-          default_customer_credit_account: settings.customerCreditAccount ? Number(settings.customerCreditAccount) : null,
           default_sales_tax_account: settings.salesTaxAccount ? Number(settings.salesTaxAccount) : null,
           default_currency_transfer_account: settings.currencyTransferAccount ? Number(settings.currencyTransferAccount) : null,
           default_earned_discount_account: settings.earnedDiscountAccount ? Number(settings.earnedDiscountAccount) : null,
@@ -344,42 +632,60 @@ export function SystemSettings() {
           default_purchase_tax_account: settings.purchaseTaxAccount ? Number(settings.purchaseTaxAccount) : null,
           default_new_employee_account: settings.newEmployeeAccount ? Number(settings.newEmployeeAccount) : null,
           default_allowed_discount_account: settings.allowedDiscountAccount ? Number(settings.allowedDiscountAccount) : null,
+          default_selling_account_id: settings.sellingAccount ? Number(settings.sellingAccount) : null,
+          default_purchase_account_id: settings.purchaseAccount ? Number(settings.purchaseAccount) : null,
+          default_selling_returns_account_id: settings.sellingReturnsAccount ? Number(settings.sellingReturnsAccount) : null,
+          default_purchase_returns_account_id: settings.purchaseReturnsAccount ? Number(settings.purchaseReturnsAccount) : null,
+          default_stock_end_account_id: settings.stockEndAccount ? Number(settings.stockEndAccount) : null,
+          default_stock_start_account_id: settings.stockStartAccount ? Number(settings.stockStartAccount) : null,
+          default_production_account_id: settings.productionAccount ? Number(settings.productionAccount) : null,
+          default_municipality_service_account_id: settings.municipalityServiceAccount ? Number(settings.municipalityServiceAccount) : null,
+          default_lsti3mal_account_id: settings.lsti3malAccount ? Number(settings.lsti3malAccount) : null,
         }),
       })
 
       if (!response.ok) {
-        throw new Error("فشل في حفظ الإعدادات")
+        const failure = await response.json().catch(() => null)
+        throw new Error(failure?.details || failure?.error || tr("فشل في حفظ الإعدادات"))
       }
 
       const result = await response.json()
       console.log("تم حفظ الإعدادات بنجاح:", result)
-      Util.showSuccessMessage(message, "تم حفظ الإعدادات بنجاح")
+      window.dispatchEvent(new CustomEvent("system-settings-updated", { detail: result }))
+      showMessage(tr("تم حفظ الاعدادات بنجاح"), "success")
     } catch (err) {
       console.error("Error saving settings:", err)
-      const errorMessage = err instanceof Error ? err.message : "حدث خطأ أثناء حفظ الإعدادات"
+      const errorMessage = err instanceof Error ? err.message : tr("حدث خطأ أثناء حفظ الإعدادات")
       setError(errorMessage)
-      Util.showErrorMessage(message, errorMessage)
+      showMessage(errorMessage, "error")
     } finally {
+      savingRef.current = false
       setLoading(false)
     }
   }
 
-  const handleReset = () => {
-    if (confirm("هل أنت متأكد من إعادة تعيين جميع الإعدادات؟")) {
+  const handleReset = async () => {
+    if ((await confirmYesNo(tr("هل أنت متأكد من إعادة تعيين جميع الإعدادات؟")))) {
       setSettings({
-        companyName: "شركة الموارد المتكاملة",
-        companyNameEn: "Integrated Resources Company",
-        taxNumber: "123456789",
-        commercialRegister: "987654321",
-        address: "رام الله - البيرة - شارع الإرسال",
-        phone: "02-2345678",
-        email: "info@company.com",
-        website: "www.company.com",
+        companyName: "",
+        companyNameEn: "",
+        companyLogo: "",
+            licensedWorkerNumber: "",
+            taxNumber: "",
+        commercialRegister: "",
+        address: "",
+        phone: "",
+        email: "",
+        website: "",
+        companyCountry: "",
+        companyLanguage: "ar",
         defaultCurrency: "ILS",
         dateFormat: "dd/mm/yyyy",
         timeFormat: "24h",
         language: "ar",
         timezone: "Asia/Jerusalem",
+        taxRate: 16,
+        taxRateClearing: 18,
         fiscalYearStart: "01/01",
         workingDays: ["sunday", "monday", "tuesday", "wednesday", "thursday"],
         workingHours: "08:00-17:00",
@@ -387,10 +693,27 @@ export function SystemSettings() {
         passwordPolicy: true,
         twoFactorAuth: false,
         auditLog: true,
-        invoicePrefix: "INV",
         orderPrefix: "SO",
         purchasePrefix: "PO",
+        receiptPrefix: "R",
+        paymentPrefix: "P",
+        creditNotePrefix: "C",
+        debitNotePrefix: "D",
+        stockInPrefix: "I",
+        stockOutPrefix: "O",
+        internalDeliveryPrefix: "T",
+        useVoucherPrefix: "U",
+        salesInvoicePrefix: "INV",
+        deliverySellPrefix: "DSL",
+        deliveryConsignmentSalePrefix: "CSL",
+        returnDeliveryConsignmentSalePrefix: "RCS",
+        returnSellPrefix: "RIN",
+        purchaseInvoicePrefix: "PU",
+        deliveryPayPrefix: "INV",
+        returnPurchasePrefix: "INV",
+        journalPrefix: "J",
         customerPrefix: "C",
+        employeePrefix: "E",
         supplierPrefix: "S",
         itemGroupPrefix: "G",
         accountPrefix: "A",
@@ -398,12 +721,31 @@ export function SystemSettings() {
         invoiceStart: 1,
         orderStart: 1,
         purchaseStart: 1,
+        receiptStart: 1,
+        paymentStart: 1,
+        creditNoteStart: 1,
+        debitNoteStart: 1,
+        stockInStart: 1,
+        stockOutStart: 1,
+        internalDeliveryStart: 1,
+        useVoucherStart: 1,
+        salesInvoiceStart: 1,
+        deliverySellStart: 1,
+        deliveryConsignmentSaleStart: 1,
+        returnDeliveryConsignmentSaleStart: 1,
+        returnSellStart: 1,
+        purchaseInvoiceStart: 1,
+        deliveryPayStart: 1,
+        returnPurchaseStart: 1,
+        journalStart: 1,
         customerStart: 1,
+        employeeStart: 1,
         supplierStart: 1,
         itemGroupStart: 1,
         itemStart: 1,
         accountStart: 1,
         ...emptyDefaultAccountValues,
+        ...emptyProductAccountValues,
         defaultPrinter: "HP LaserJet",
         paperSize: "A4",
         printLogo: true,
@@ -415,183 +757,275 @@ export function SystemSettings() {
 
   if (initialLoading) {
     return (
-      <div className="flex items-center justify-center p-8" dir="rtl">
-        <Loader2 className="h-8 w-8 animate-spin" />
-        <span className="mr-2">جاري تحميل الإعدادات...</span>
+      <div className="flex flex-col items-center justify-center gap-3 rounded-2xl border border-slate-200 bg-white p-12 shadow-sm" dir={appDir()}>
+        <span className="flex h-12 w-12 items-center justify-center rounded-2xl bg-gradient-to-br from-emerald-600 to-teal-600 text-white shadow-sm">
+          <Loader2 className="h-6 w-6 animate-spin" />
+        </span>
+        <span className="text-sm font-semibold text-slate-600">{tr("جاري تحميل الإعدادات...")}</span>
       </div>
     )
   }
 
   return (
-    <div className="space-y-6" dir="rtl">
+    <div className="system-settings-form space-y-5" dir={appDir()}>
       <Messages innerRef={message} />
-      {/* Header */}
-      <Card className="erp-card">
-        <CardHeader>
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-3">
-              <Settings className="h-6 w-6 text-primary" />
-              <CardTitle className="text-right">إعدادات النظام</CardTitle>
-            </div>
-            <div className="flex gap-2">
-              <Button variant="outline" onClick={() => loadSettings()} disabled={loading}>
-                إعادة تحميل
-              </Button>
-              <Button onClick={handleSave} className="erp-btn-primary" disabled={loading}>
-                {loading ? (
-                  <>
-                    <Loader2 className="h-4 w-4 ml-2 animate-spin" />
-                    جاري الحفظ...
-                  </>
-                ) : (
-                  <>
-                    <Save className="h-4 w-4 ml-2" />
-                    حفظ الإعدادات
-                  </>
-                )}
-              </Button>
+
+      {/* الرأس: نفس تدرّج الزمردي/الفيروزي المعتمد في رؤوس السندات ومعالج الاستيراد */}
+      <div className="relative overflow-hidden rounded-2xl bg-gradient-to-l from-emerald-700 via-emerald-600 to-teal-600 px-5 py-5 text-white shadow-lg sm:px-6">
+        <div className="pointer-events-none absolute -end-10 -top-12 h-40 w-40 rounded-full bg-white/10 blur-2xl" />
+        <div className="pointer-events-none absolute -bottom-16 end-1/3 h-40 w-40 rounded-full bg-teal-300/20 blur-2xl" />
+        <div className="relative flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+          <div className="flex items-center gap-3">
+            <span className="flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl bg-white/15 ring-1 ring-white/25">
+              <Settings className="h-6 w-6" />
+            </span>
+            <div className="min-w-0">
+              <h1 className="text-xl font-extrabold tracking-tight sm:text-2xl">{tr("إعدادات النظام")}</h1>
+              <p className="mt-0.5 text-xs text-emerald-50/90 sm:text-sm">{tr("بيانات الشركة، الترقيم، الحسابات الافتراضية، الأمان والطباعة — في مكان واحد")}</p>
             </div>
           </div>
-        </CardHeader>
-      </Card>
+          <div className="flex shrink-0 gap-2">
+            <Button
+              variant="outline"
+              onClick={() => loadSettings()}
+              disabled={loading}
+              className="h-10 rounded-xl border-white/30 bg-white/10 text-white hover:bg-white/20 hover:text-white"
+            >
+              <RefreshCw className="me-2 h-4 w-4" />
+              {tr("إعادة تحميل")}
+            </Button>
+            <Button onClick={handleSave} disabled={loading} className="h-10 rounded-xl bg-white font-bold text-emerald-700 shadow-sm hover:bg-emerald-50">
+              {loading ? <Loader2 className="me-2 h-4 w-4 animate-spin" /> : <Save className="me-2 h-4 w-4" />}
+              {loading ? tr("جاري الحفظ...") : tr("حفظ الإعدادات")}
+            </Button>
+          </div>
+        </div>
+      </div>
 
-      {/* Settings Tabs */}
-      <Tabs defaultValue="company" className="space-y-4">
-        <TabsList className="grid w-full grid-cols-7">
-          <TabsTrigger value="company">معلومات الشركة</TabsTrigger>
-          <TabsTrigger value="system">إعدادات النظام</TabsTrigger>
-          <TabsTrigger value="business">إعدادات العمل</TabsTrigger>
-          <TabsTrigger value="accounts">الحسابات الافتراضية</TabsTrigger>
-          <TabsTrigger value="security">الأمان</TabsTrigger>
-          <TabsTrigger value="documents">السندات</TabsTrigger>
-          <TabsTrigger value="printing">الطباعة</TabsTrigger>
-        </TabsList>
+      <div className="grid gap-5 lg:grid-cols-[260px_minmax(0,1fr)]">
+        {/* قائمة الأقسام: عمودية على الشاشات الواسعة، أفقية قابلة للتمرير على الصغيرة */}
+        <nav className="lg:sticky lg:top-4 lg:self-start" aria-label={tr("أقسام الإعدادات")}>
+          <div className="flex gap-2 overflow-x-auto rounded-2xl border border-slate-200 bg-white p-2 shadow-sm lg:flex-col lg:overflow-visible">
+            {SETTINGS_SECTIONS.map((section) => {
+              const Icon = section.icon
+              const active = activeSection === section.id
+              return (
+                <button
+                  key={section.id}
+                  type="button"
+                  onClick={() => setActiveSection(section.id)}
+                  aria-current={active ? "page" : undefined}
+                  className={`group flex min-w-max items-center gap-3 rounded-xl px-3 py-2.5 text-start transition lg:min-w-0 ${
+                    active ? "bg-emerald-50 text-emerald-800 ring-1 ring-emerald-200" : "text-slate-600 hover:bg-slate-50 hover:text-slate-900"
+                  }`}
+                >
+                  <span
+                    className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-lg transition ${
+                      active ? "bg-gradient-to-br from-emerald-600 to-teal-600 text-white shadow-sm" : "bg-slate-100 text-slate-500 group-hover:bg-white"
+                    }`}
+                  >
+                    <Icon className="h-4 w-4" />
+                  </span>
+                  <span className="min-w-0 flex-1">
+                    <span className="block text-sm font-bold">{section.title}</span>
+                    <span className="hidden truncate text-[11px] text-slate-400 lg:block">{section.description}</span>
+                  </span>
+                  <ChevronLeft className={`hidden h-4 w-4 shrink-0 transition lg:block ${active ? "text-emerald-600" : "text-transparent group-hover:text-slate-300"}`} />
+                </button>
+              )
+            })}
+          </div>
+        </nav>
 
-        <TabsContent value="company" className="space-y-4">
-          <Card className="erp-card">
-            <CardHeader>
-              <CardTitle className="flex items-center gap-2 text-right">
-                <Building2 className="h-5 w-5" />
-                معلومات الشركة
-              </CardTitle>
-            </CardHeader>
-            <CardContent className="space-y-4">
+        {/* كل الأقسام تبقى مُركَّبة (مخفية فقط) — التنقل بينها لا يعيد تحميل الحقول ولا يفقد ما كُتب */}
+        <div className="min-w-0 space-y-4">
+        <section hidden={activeSection !== "company"} className="space-y-4" aria-labelledby="settings-section-company">
+          <Card className="erp-card overflow-hidden rounded-2xl border-slate-200 shadow-sm gap-0 py-0">
+            <SettingsSectionHeader id="company" />
+            <CardContent className="space-y-4 py-5">
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div>
-                  <Label htmlFor="companyName" className="text-right block">
-                    اسم الشركة (عربي) *
+                  <Label htmlFor="companyName" className="text-start block">
+                    {tr("اسم الشركة (عربي) *")}
                   </Label>
                   <Input
                     id="companyName"
                     value={settings.companyName}
                     onChange={(e) => setSettings({ ...settings, companyName: e.target.value })}
-                    className="text-right"
-                    dir="rtl"
+                    className="text-start"
+                    dir={appDir()}
                   />
                 </div>
                 <div>
-                  <Label htmlFor="companyNameEn" className="text-right block">
-                    اسم الشركة (إنجليزي)
+                  <Label htmlFor="companyNameEn" className="text-start block">
+                    {tr("اسم الشركة (إنجليزي)")}
                   </Label>
                   <Input
                     id="companyNameEn"
                     value={settings.companyNameEn}
                     onChange={(e) => setSettings({ ...settings, companyNameEn: e.target.value })}
-                    className="text-left"
+                    className="text-end"
+                    dir="ltr"
+                  />
+                </div>
+                <div className="md:col-span-2">
+                  <Label htmlFor="companyLogo" className="mb-2 block text-start">{tr("شعار الشركة")}</Label>
+                  <div className="flex flex-wrap items-center gap-4 rounded-lg border border-slate-200 bg-slate-50 p-4">
+                    <div className="flex h-20 w-20 shrink-0 items-center justify-center overflow-hidden rounded-xl border bg-white">
+                      {settings.companyLogo ? (
+                        <img src={settings.companyLogo} alt={tr("شعار الشركة")} className="h-full w-full object-contain" />
+                      ) : (
+                        <Building2 className="h-8 w-8 text-slate-400" />
+                      )}
+                    </div>
+                    <div className="min-w-[220px] flex-1 space-y-2">
+                      <Input
+                        id="companyLogo"
+                        type="file"
+                        accept="image/png,image/jpeg,image/webp,image/svg+xml"
+                        onChange={(event) => {
+                          const file = event.target.files?.[0]
+                          if (!file) return
+                          const reader = new FileReader()
+                          reader.onload = () => setSettings((current) => ({ ...current, companyLogo: String(reader.result || "") }))
+                          reader.readAsDataURL(file)
+                        }}
+                      />
+                      <p className="text-xs text-muted-foreground">{tr("PNG أو JPG أو WEBP أو SVG. سيظهر الشعار أعلى القائمة الجانبية.")}</p>
+                      {settings.companyLogo && (
+                        <Button type="button" variant="outline" size="sm" onClick={() => setSettings((current) => ({ ...current, companyLogo: "" }))}>
+                          {tr("إزالة الشعار")}
+                        </Button>
+                      )}
+                    </div>
+                  </div>
+                </div>
+                <div>
+                  <Label htmlFor="licensedWorkerNumber" className="text-start block">
+                    {tr("رقم المشتغل المرخص")}
+                  </Label>
+                  <Input
+                    id="licensedWorkerNumber"
+                    value={settings.licensedWorkerNumber}
+                    onChange={(e) => setSettings({ ...settings, licensedWorkerNumber: e.target.value.replace(/[^A-Za-z0-9]/g, "").slice(0, 30) })}
+                    maxLength={30}
+                    className="text-end"
                     dir="ltr"
                   />
                 </div>
                 <div>
-                  <Label htmlFor="taxNumber" className="text-right block">
-                    الرقم الضريبي
+                  <Label htmlFor="taxNumber" className="text-start block">
+                    {tr("الرقم الضريبي")}
                   </Label>
                   <Input
                     id="taxNumber"
                     value={settings.taxNumber}
-                    onChange={(e) => setSettings({ ...settings, taxNumber: e.target.value })}
-                    className="text-right"
-                    dir="rtl"
+                    onChange={(e) => setSettings({ ...settings, taxNumber: e.target.value.replace(/[^A-Za-z0-9]/g, "").slice(0, 20) })}
+                    maxLength={20}
+                    className="text-end"
+                    dir="ltr"
                   />
                 </div>
                 <div>
-                  <Label htmlFor="commercialRegister" className="text-right block">
-                    السجل التجاري
+                  <Label htmlFor="commercialRegister" className="text-start block">
+                    {tr("السجل التجاري")}
                   </Label>
                   <Input
                     id="commercialRegister"
                     value={settings.commercialRegister}
                     onChange={(e) => setSettings({ ...settings, commercialRegister: e.target.value })}
-                    className="text-right"
-                    dir="rtl"
+                    className="text-start"
+                    dir={appDir()}
                   />
                 </div>
                 <div className="md:col-span-2">
-                  <Label htmlFor="address" className="text-right block">
-                    العنوان
+                  <Label htmlFor="address" className="text-start block">
+                    {tr("العنوان")}
                   </Label>
                   <Textarea
                     id="address"
                     value={settings.address}
                     onChange={(e) => setSettings({ ...settings, address: e.target.value })}
-                    className="text-right"
-                    dir="rtl"
+                    className="text-start"
+                    dir={appDir()}
                   />
                 </div>
                 <div>
-                  <Label htmlFor="phone" className="text-right block">
-                    الهاتف
+                  <Label htmlFor="phone" className="text-start block">
+                    {tr("الهاتف")}
                   </Label>
                   <Input
                     id="phone"
                     value={settings.phone}
                     onChange={(e) => setSettings({ ...settings, phone: e.target.value })}
-                    className="text-right"
-                    dir="rtl"
+                    className="text-start"
+                    dir={appDir()}
                   />
                 </div>
                 <div>
-                  <Label htmlFor="email" className="text-right block">
-                    البريد الإلكتروني
+                  <Label htmlFor="email" className="text-start block">
+                    {tr("البريد الإلكتروني")}
                   </Label>
                   <Input
                     id="email"
                     type="email"
                     value={settings.email}
                     onChange={(e) => setSettings({ ...settings, email: e.target.value })}
-                    className="text-left"
+                    className="text-end"
                     dir="ltr"
                   />
                 </div>
                 <div>
-                  <Label htmlFor="website" className="text-right block">
-                    الموقع الإلكتروني
+                  <Label htmlFor="website" className="text-start block">
+                    {tr("الموقع الإلكتروني")}
                   </Label>
                   <Input
                     id="website"
                     value={settings.website}
                     onChange={(e) => setSettings({ ...settings, website: e.target.value })}
-                    className="text-left"
+                    className="text-end"
                     dir="ltr"
                   />
+                </div>
+                <div>
+                  <Label htmlFor="companyCountry" className="text-start block">
+                    {tr("الدولة")}
+                  </Label>
+                  <select
+                    id="companyCountry"
+                    value={settings.companyCountry}
+                    onChange={(e) => setSettings({ ...settings, companyCountry: e.target.value })}
+                    className="h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
+                  >
+                    <option value="">{tr("اختر الدولة")}</option>
+                    {countryOptions(currentLanguage()).map((country) => <option key={country.value} value={country.value}>{country.label}</option>)}
+                  </select>
+                </div>
+                <div>
+                  <Label htmlFor="companyLanguage" className="text-start block">
+                    {tr("اللغة")}
+                  </Label>
+                  <select
+                    id="companyLanguage"
+                    value={settings.companyLanguage}
+                    onChange={(e) => setSettings({ ...settings, companyLanguage: e.target.value })}
+                    className="h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
+                  >
+                    {COMPANY_LANGUAGES.map((language) => <option key={language.value} value={language.value}>{language.label}</option>)}
+                  </select>
                 </div>
               </div>
             </CardContent>
           </Card>
-        </TabsContent>
-
-        <TabsContent value="system" className="space-y-4">
-          <Card className="erp-card">
-            <CardHeader>
-              <CardTitle className="flex items-center gap-2 text-right">
-                <Globe className="h-5 w-5" />
-                إعدادات النظام العامة
-              </CardTitle>
-            </CardHeader>
-            <CardContent className="space-y-4">
+        </section>
+        <section hidden={activeSection !== "system"} className="space-y-4" aria-labelledby="settings-section-system">
+          <Card className="erp-card overflow-hidden rounded-2xl border-slate-200 shadow-sm gap-0 py-0">
+            <SettingsSectionHeader id="system" />
+            <CardContent className="space-y-4 py-5">
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div>
-                  <Label htmlFor="defaultCurrency" className="text-right block">
-                    العملة الافتراضية
+                  <Label htmlFor="defaultCurrency" className="text-start block">
+                    {tr("العملة الافتراضية")}
                   </Label>
                   <Select
                     value={settings.defaultCurrency}
@@ -601,16 +1035,16 @@ export function SystemSettings() {
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
-                      <SelectItem value="ILS">شيكل إسرائيلي (ILS)</SelectItem>
-                      <SelectItem value="USD">دولار أمريكي (USD)</SelectItem>
-                      <SelectItem value="EUR">يورو (EUR)</SelectItem>
-                      <SelectItem value="JOD">دينار أردني (JOD)</SelectItem>
+                      <SelectItem value="ILS">{tr("شيكل إسرائيلي (ILS)")}</SelectItem>
+                      <SelectItem value="USD">{tr("دولار أمريكي (USD)")}</SelectItem>
+                      <SelectItem value="EUR">{tr("يورو (EUR)")}</SelectItem>
+                      <SelectItem value="JOD">{tr("دينار أردني (JOD)")}</SelectItem>
                     </SelectContent>
                   </Select>
                 </div>
                 <div>
-                  <Label htmlFor="dateFormat" className="text-right block">
-                    تنسيق التاريخ
+                  <Label htmlFor="dateFormat" className="text-start block">
+                    {tr("تنسيق التاريخ")}
                   </Label>
                   <Select
                     value={settings.dateFormat}
@@ -620,15 +1054,15 @@ export function SystemSettings() {
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
-                      <SelectItem value="dd/mm/yyyy">يوم/شهر/سنة</SelectItem>
-                      <SelectItem value="mm/dd/yyyy">شهر/يوم/سنة</SelectItem>
-                      <SelectItem value="yyyy-mm-dd">سنة-شهر-يوم</SelectItem>
+                      <SelectItem value="dd/mm/yyyy">{tr("يوم/شهر/سنة")}</SelectItem>
+                      <SelectItem value="mm/dd/yyyy">{tr("شهر/يوم/سنة")}</SelectItem>
+                      <SelectItem value="yyyy-mm-dd">{tr("سنة-شهر-يوم")}</SelectItem>
                     </SelectContent>
                   </Select>
                 </div>
                 <div>
-                  <Label htmlFor="timeFormat" className="text-right block">
-                    تنسيق الوقت
+                  <Label htmlFor="timeFormat" className="text-start block">
+                    {tr("تنسيق الوقت")}
                   </Label>
                   <Select
                     value={settings.timeFormat}
@@ -638,14 +1072,14 @@ export function SystemSettings() {
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
-                      <SelectItem value="24h">24 ساعة</SelectItem>
-                      <SelectItem value="12h">12 ساعة</SelectItem>
+                      <SelectItem value="24h">{tr("24 ساعة")}</SelectItem>
+                      <SelectItem value="12h">{tr("12 ساعة")}</SelectItem>
                     </SelectContent>
                   </Select>
                 </div>
                 <div>
-                  <Label htmlFor="language" className="text-right block">
-                    اللغة
+                  <Label htmlFor="language" className="text-start block">
+                    {tr("اللغة")}
                   </Label>
                   <Select
                     value={settings.language}
@@ -655,72 +1089,62 @@ export function SystemSettings() {
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
-                      <SelectItem value="ar">العربية</SelectItem>
+                      <SelectItem value="ar">{tr("العربية")}</SelectItem>
                       <SelectItem value="en">English</SelectItem>
                     </SelectContent>
                   </Select>
                 </div>
-              </div>
-            </CardContent>
-          </Card>
-        </TabsContent>
-
-        <TabsContent value="business" className="space-y-4">
-          <Card className="erp-card">
-            <CardHeader>
-              <CardTitle className="flex items-center gap-2 text-right">إعدادات العمل</CardTitle>
-            </CardHeader>
-            <CardContent className="space-y-4">
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div>
-                  <Label htmlFor="fiscalYearStart" className="text-right block">
-                    بداية السنة المالية
+                  <Label htmlFor="taxRate" className="text-start block">
+                    {tr("نسبة الضريبة")}
                   </Label>
                   <Input
-                    id="fiscalYearStart"
-                    value={settings.fiscalYearStart}
-                    onChange={(e) => setSettings({ ...settings, fiscalYearStart: e.target.value })}
-                    className="text-right"
-                    dir="rtl"
+                    id="taxRate"
+                    type="number"
+                    step="0.01"
+                    value={settings.taxRate}
+                    onChange={(e) => setSettings({ ...settings, taxRate: e.target.value === "" ? 0 : Number(e.target.value) })}
+                    className="text-start"
+                    dir={appDir()}
                   />
                 </div>
                 <div>
-                  <Label htmlFor="workingDays" className="text-right block">
-                    أيام العمل
-                  </Label>
-                  {/* Working Days Select Component */}
-                </div>
-                <div>
-                  <Label htmlFor="workingHours" className="text-right block">
-                    ساعات العمل
+                  <Label htmlFor="taxRateClearing" className="text-start block">
+                    {tr("نسبة الضريبة-مقاصة")}
                   </Label>
                   <Input
-                    id="workingHours"
-                    value={settings.workingHours}
-                    onChange={(e) => setSettings({ ...settings, workingHours: e.target.value })}
-                    className="text-right"
-                    dir="rtl"
+                    id="taxRateClearing"
+                    type="number"
+                    step="0.01"
+                    value={settings.taxRateClearing}
+                    onChange={(e) => setSettings({ ...settings, taxRateClearing: e.target.value === "" ? 0 : Number(e.target.value) })}
+                    className="text-start"
+                    dir={appDir()}
                   />
                 </div>
               </div>
             </CardContent>
           </Card>
-        </TabsContent>
-
-        <TabsContent value="accounts" className="space-y-4">
-          <Card className="erp-card">
-            <CardHeader>
-              <CardTitle className="flex items-center gap-2 text-right">
-                <Building2 className="h-5 w-5" />
-                الحسابات الافتراضية
-              </CardTitle>
-            </CardHeader>
-            <CardContent className="space-y-4">
+        </section>
+        <section hidden={activeSection !== "general"} className="space-y-4" aria-labelledby="settings-section-general">
+          <Card className="erp-card overflow-hidden rounded-2xl border-slate-200 shadow-sm gap-0 py-0">
+            <SettingsSectionHeader id="general" />
+            <CardContent className="py-5">
+              {/* صفحة "اعدادات عامة" (كانت بالقائمة الجانبية) — تحفظ مفاتيحها الخاصة عبر زر حفظ هذه الصفحة */}
+              <VouchersGeneralSettings embedded registerSave={registerGeneralSave} />
+            </CardContent>
+          </Card>
+        </section>
+        <section hidden={activeSection !== "accounts"} className="space-y-4" aria-labelledby="settings-section-accounts">
+          <Card className="erp-card overflow-hidden rounded-2xl border-slate-200 shadow-sm gap-0 py-0">
+            <SettingsSectionHeader id="accounts" />
+            <CardContent className="space-y-4 py-5">
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 {defaultAccountFields.map((field) => (
                   <div key={field.key} className="space-y-2">
-                    <Label className="text-right block">{field.label}</Label>
+                    <Label className="text-start block">{field.label}</Label>
                     <AutoCompleteAccount
+                      label=""
                       value={settings[field.key as DefaultAccountFieldKey]}
                       valueMode="id"
                       onValueChange={(value) =>
@@ -735,7 +1159,43 @@ export function SystemSettings() {
                           [field.key]: account ? String(account.id) : "",
                         })
                       }
-                      placeholder="اختر الحساب"
+                      placeholder={tr("اختر الحساب")}
+                      className="w-full"
+                      showCostCenterButton={false}
+                      requiredTypeValues={[1]}
+                      leafOnly={!PARENT_ACCOUNT_SETTING_KEYS.has(field.key)}
+                    />
+                  </div>
+                ))}
+              </div>
+            </CardContent>
+          </Card>
+        </section>
+        <section hidden={activeSection !== "product_accounts"} className="space-y-4" aria-labelledby="settings-section-product_accounts">
+          <Card className="erp-card overflow-hidden rounded-2xl border-slate-200 shadow-sm gap-0 py-0">
+            <SettingsSectionHeader id="product_accounts" />
+            <CardContent className="space-y-4 py-5">
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                {productAccountFields.map((field) => (
+                  <div key={field.key} className="space-y-2">
+                    <Label className="text-start block">{field.label}</Label>
+                    <AutoCompleteAccount
+                      label=""
+                      value={settings[field.key as ProductAccountFieldKey]}
+                      valueMode="id"
+                      onValueChange={(value) =>
+                        setSettings({
+                          ...settings,
+                          [field.key]: value,
+                        })
+                      }
+                      onAccountSelect={(account) =>
+                        setSettings({
+                          ...settings,
+                          [field.key]: account ? String(account.id) : "",
+                        })
+                      }
+                      placeholder=""
                       className="w-full"
                       showCostCenterButton={false}
                       requiredTypeValues={[1]}
@@ -746,230 +1206,577 @@ export function SystemSettings() {
               </div>
             </CardContent>
           </Card>
-        </TabsContent>
-
-        <TabsContent value="security" className="space-y-4">
-          <Card className="erp-card">
-            <CardHeader>
-              <CardTitle className="flex items-center gap-2 text-right">
-                <Shield className="h-5 w-5" />
-                إعدادات الأمان
-              </CardTitle>
-            </CardHeader>
-            <CardContent className="space-y-4">
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                <div>
-                  <Label htmlFor="sessionTimeout" className="text-right block">
-                    انتهاء الجلسة (دقيقة)
-                  </Label>
-                  <Input
-                    id="sessionTimeout"
-                    type="number"
-                    value={settings.sessionTimeout}
-                    onChange={(e) => setSettings({ ...settings, sessionTimeout: Number.parseInt(e.target.value) })}
-                    className="text-right"
-                    dir="rtl"
-                  />
-                </div>
-                <div className="space-y-4">
-                  <div className="flex items-center justify-between">
-                    <Label htmlFor="passwordPolicy" className="text-right block">
-                      سياسة كلمة المرور القوية
-                    </Label>
-                    <Switch
-                      id="passwordPolicy"
-                      checked={settings.passwordPolicy}
-                      onCheckedChange={(checked) => setSettings({ ...settings, passwordPolicy: checked })}
-                    />
-                  </div>
-                  <div className="flex items-center justify-between">
-                    <Label htmlFor="twoFactorAuth" className="text-right block">
-                      المصادقة الثنائية
-                    </Label>
-                    <Switch
-                      id="twoFactorAuth"
-                      checked={settings.twoFactorAuth}
-                      onCheckedChange={(checked) => setSettings({ ...settings, twoFactorAuth: checked })}
-                    />
-                  </div>
-                  <div className="flex items-center justify-between">
-                    <Label htmlFor="auditLog" className="text-right block">
-                      سجل العمليات
-                    </Label>
-                    <Switch
-                      id="auditLog"
-                      checked={settings.auditLog}
-                      onCheckedChange={(checked) => setSettings({ ...settings, auditLog: checked })}
-                    />
-                  </div>
-                </div>
-              </div>
-            </CardContent>
-          </Card>
-        </TabsContent>
-
-        <TabsContent value="documents" className="space-y-4">
-          <Card className="erp-card">
-            <CardHeader>
-              <CardTitle className="flex items-center gap-2 text-right">
-                <FileText className="h-5 w-5" />
-                إعدادات السندات والترقيم
-              </CardTitle>
-            </CardHeader>
-            <CardContent className="space-y-6">
+        </section>
+        <section hidden={activeSection !== "documents"} className="space-y-4" aria-labelledby="settings-section-documents">
+          <Card className="erp-card overflow-hidden rounded-2xl border-slate-200 shadow-sm gap-0 py-0">
+            <SettingsSectionHeader id="documents" />
+            <CardContent className="space-y-6 py-5">
               {hasTransactions && (
                 <div className="bg-amber-50 border border-amber-200 text-amber-800 px-4 py-3 rounded flex items-start gap-2">
                   <AlertCircle className="h-5 w-5 mt-0.5 flex-shrink-0" />
                   <div className="text-sm">
-                    <strong>تنبيه:</strong> لا يمكن تعديل إعدادات ترقيم السندات التي لديها حركات محفوظة
+                    <strong>{tr("تنبيه:")}</strong>{tr(" لا يمكن تعديل إعدادات ترقيم السندات التي لديها حركات محفوظة")}
                   </div>
                 </div>
               )}
 
               <div>
-                <h3 className="text-lg font-semibold mb-4 text-right">إعدادات السندات (إجبارية)</h3>
-                <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                  <div>
-                    <Label htmlFor="invoicePrefix" className="text-right block">
-                      بادئة فواتير المبيعات *
-                    </Label>
-                    <Input
-                      id="invoicePrefix"
-                      value={settings.invoicePrefix}
-                      onChange={(e) => setSettings({ ...settings, invoicePrefix: e.target.value })}
-                      className="text-right"
-                      dir="rtl"
-                      required
-                      disabled={numberingLocks.invoice}
-                    />
-                  </div>
-                  <div>
-                    <Label htmlFor="invoiceStart" className="text-right block">
-                      بداية ترقيم فواتير المبيعات *
-                    </Label>
-                    <Input
-                      id="invoiceStart"
-                      type="number"
-                      min="1"
-                      value={settings.invoiceStart}
-                      onChange={(e) => {
-                        const value = e.target.value === "" ? 1 : Number.parseInt(e.target.value)
-                        setSettings({ ...settings, invoiceStart: value })
-                      }}
-                      className="text-right"
-                      dir="rtl"
-                      required
-                      disabled={numberingLocks.invoice}
-                    />
-                  </div>
-                  <div className="flex items-end">
-                    <div className="text-sm text-muted-foreground">
-                      مثال: {settings.invoicePrefix}
-                      {String(settings.invoiceStart).padStart(4, "0")}
+                <h3 className="text-lg font-semibold mb-4 text-start">{tr("إعدادات السندات (إجبارية)")}</h3>
+                <div className="space-y-3">
+                  <div className="rounded-lg border border-border/70 bg-muted/20 p-4">
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                      <div>
+                        <Label htmlFor="orderPrefix" className="text-start block">
+                          {tr("بادئة طلبات المبيعات *")}
+                        </Label>
+                        <Input
+                          id="orderPrefix"
+                          value={settings.orderPrefix}
+                          onChange={(e) => setSettings({ ...settings, orderPrefix: e.target.value })}
+                          className="text-start"
+                          dir={appDir()}
+                          required
+                          disabled={numberingLocks.order}
+                        />
+                      </div>
+                      <div>
+                        <Label htmlFor="orderStart" className="text-start block">
+                          {tr("بداية ترقيم طلبات المبيعات *")}
+                        </Label>
+                        <Input
+                          id="orderStart"
+                          type="number"
+                          min="1"
+                          value={settings.orderStart}
+                          onChange={(e) => {
+                            const value = e.target.value === "" ? 1 : Number.parseInt(e.target.value)
+                            setSettings({ ...settings, orderStart: value })
+                          }}
+                          className="text-start"
+                          dir={appDir()}
+                          required
+                          disabled={numberingLocks.order}
+                        />
+                      </div>
+                      <div className="flex items-end">
+                        <div className="text-sm text-muted-foreground">
+                          {tr("مثال: ")}{buildVoucherCode(settings.orderPrefix, "A", settings.orderStart)}{tr(" (A = دفتر السندات، والكود الكلي لا يتجاوز 10 خانات)")}
+                        </div>
+                      </div>
                     </div>
                   </div>
 
-                  <div>
-                    <Label htmlFor="orderPrefix" className="text-right block">
-                      بادئة طلبات المبيعات *
-                    </Label>
-                    <Input
-                      id="orderPrefix"
-                      value={settings.orderPrefix}
-                      onChange={(e) => setSettings({ ...settings, orderPrefix: e.target.value })}
-                      className="text-right"
-                      dir="rtl"
-                      required
-                      disabled={numberingLocks.order}
-                    />
-                  </div>
-                  <div>
-                    <Label htmlFor="orderStart" className="text-right block">
-                      بداية ترقيم طلبات المبيعات *
-                    </Label>
-                    <Input
-                      id="orderStart"
-                      type="number"
-                      min="1"
-                      value={settings.orderStart}
-                      onChange={(e) => {
-                        const value = e.target.value === "" ? 1 : Number.parseInt(e.target.value)
-                        setSettings({ ...settings, orderStart: value })
-                      }}
-                      className="text-right"
-                      dir="rtl"
-                      required
-                      disabled={numberingLocks.order}
-                    />
-                  </div>
-                  <div className="flex items-end">
-                    <div className="text-sm text-muted-foreground">
-                      مثال: {settings.orderPrefix}
-                      {String(settings.orderStart).padStart(4, "0")}
+                  <div className="rounded-lg border border-border/70 bg-muted/20 p-4">
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                      <div>
+                        <Label htmlFor="purchasePrefix" className="text-start block">
+                          {tr("بادئة طلبات الشراء *")}
+                        </Label>
+                        <Input
+                          id="purchasePrefix"
+                          value={settings.purchasePrefix}
+                          onChange={(e) => setSettings({ ...settings, purchasePrefix: e.target.value })}
+                          className="text-start"
+                          dir={appDir()}
+                          required
+                          disabled={numberingLocks.purchase}
+                        />
+                      </div>
+                      <div>
+                        <Label htmlFor="purchaseStart" className="text-start block">
+                          {tr("بداية ترقيم طلبات الشراء *")}
+                        </Label>
+                        <Input
+                          id="purchaseStart"
+                          type="number"
+                          min="1"
+                          value={settings.purchaseStart}
+                          onChange={(e) => {
+                            const value = e.target.value === "" ? 1 : Number.parseInt(e.target.value)
+                            setSettings({ ...settings, purchaseStart: value })
+                          }}
+                          className="text-start"
+                          dir={appDir()}
+                          required
+                          disabled={numberingLocks.purchase}
+                        />
+                      </div>
+                      <div className="flex items-end">
+                        <div className="text-sm text-muted-foreground">
+                          {tr("مثال: ")}{buildVoucherCode(settings.purchasePrefix, "A", settings.purchaseStart)}{tr(" (A = دفتر السندات، والكود الكلي لا يتجاوز 10 خانات)")}
+                        </div>
+                      </div>
                     </div>
                   </div>
 
-                  <div>
-                    <Label htmlFor="purchasePrefix" className="text-right block">
-                      بادئة طلبات الشراء *
-                    </Label>
-                    <Input
-                      id="purchasePrefix"
-                      value={settings.purchasePrefix}
-                      onChange={(e) => setSettings({ ...settings, purchasePrefix: e.target.value })}
-                      className="text-right"
-                      dir="rtl"
-                      required
-                      disabled={numberingLocks.purchase}
-                    />
+                  <div className="rounded-lg border border-border/70 bg-muted/20 p-4">
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                      <div>
+                        <Label htmlFor="receiptPrefix" className="text-start block">
+                          {tr("بادئة سندات القبض *")}
+                        </Label>
+                        <Input
+                          id="receiptPrefix"
+                          value={settings.receiptPrefix}
+                          onChange={(e) => setSettings({ ...settings, receiptPrefix: e.target.value })}
+                          className="text-start"
+                          dir={appDir()}
+                          maxLength={3}
+                          required
+                        />
+                      </div>
+                      <div>
+                        <Label htmlFor="receiptStart" className="text-start block">
+                          {tr("الترقيم يبدأ من (سندات القبض) *")}
+                        </Label>
+                        <Input
+                          id="receiptStart"
+                          type="number"
+                          min="1"
+                          max="10000"
+                          value={settings.receiptStart}
+                          onChange={(e) => {
+                            const value = e.target.value === "" ? 1 : Number.parseInt(e.target.value)
+                            setSettings({ ...settings, receiptStart: value })
+                          }}
+                          className="text-start"
+                          dir={appDir()}
+                          required
+                        />
+                      </div>
+                      <div className="flex items-end">
+                        <div className="text-sm text-muted-foreground">
+                          {tr("مثال: ")}{buildVoucherCode(settings.receiptPrefix, "A", settings.receiptStart)}{tr(" (A = دفتر السندات، والكود الكلي لا يتجاوز 10 خانات)")}
+                        </div>
+                      </div>
+                    </div>
                   </div>
-                  <div>
-                    <Label htmlFor="purchaseStart" className="text-right block">
-                      بداية ترقيم طلبات الشراء *
-                    </Label>
-                    <Input
-                      id="purchaseStart"
-                      type="number"
-                      min="1"
-                      value={settings.purchaseStart}
-                      onChange={(e) => {
-                        const value = e.target.value === "" ? 1 : Number.parseInt(e.target.value)
-                        setSettings({ ...settings, purchaseStart: value })
-                      }}
-                      className="text-right"
-                      dir="rtl"
-                      required
-                      disabled={numberingLocks.purchase}
-                    />
+
+                  <div className="rounded-lg border border-border/70 bg-muted/20 p-4">
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                      <div>
+                        <Label htmlFor="paymentPrefix" className="text-start block">
+                          {tr("بادئة سندات الصرف *")}
+                        </Label>
+                        <Input
+                          id="paymentPrefix"
+                          value={settings.paymentPrefix}
+                          onChange={(e) => setSettings({ ...settings, paymentPrefix: e.target.value })}
+                          className="text-start"
+                          dir={appDir()}
+                          maxLength={3}
+                          required
+                        />
+                      </div>
+                      <div>
+                        <Label htmlFor="paymentStart" className="text-start block">
+                          {tr("الترقيم يبدأ من (سندات الصرف) *")}
+                        </Label>
+                        <Input
+                          id="paymentStart"
+                          type="number"
+                          min="1"
+                          max="10000"
+                          value={settings.paymentStart}
+                          onChange={(e) => {
+                            const value = e.target.value === "" ? 1 : Number.parseInt(e.target.value)
+                            setSettings({ ...settings, paymentStart: value })
+                          }}
+                          className="text-start"
+                          dir={appDir()}
+                          required
+                        />
+                      </div>
+                      <div className="flex items-end">
+                        <div className="text-sm text-muted-foreground">
+                          {tr("مثال: ")}{buildVoucherCode(settings.paymentPrefix, "A", settings.paymentStart)}{tr(" (A = دفتر السندات، والكود الكلي لا يتجاوز 10 خانات)")}
+                        </div>
+                      </div>
+                    </div>
                   </div>
-                  <div className="flex items-end">
-                    <div className="text-sm text-muted-foreground">
-                      مثال: {settings.purchasePrefix}
-                      {String(settings.purchaseStart).padStart(4, "0")}
+
+                  <div className="rounded-lg border border-border/70 bg-muted/20 p-4">
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                      <div>
+                        <Label htmlFor="creditNotePrefix" className="text-start block">
+                          {tr("بادئة الاشعار الدائن *")}
+                        </Label>
+                        <Input
+                          id="creditNotePrefix"
+                          value={settings.creditNotePrefix}
+                          onChange={(e) => setSettings({ ...settings, creditNotePrefix: e.target.value })}
+                          className="text-start"
+                          dir={appDir()}
+                          maxLength={3}
+                          required
+                        />
+                      </div>
+                      <div>
+                        <Label htmlFor="creditNoteStart" className="text-start block">
+                          {tr("الترقيم يبدأ من (الاشعار الدائن) *")}
+                        </Label>
+                        <Input
+                          id="creditNoteStart"
+                          type="number"
+                          min="1"
+                          max="10000"
+                          value={settings.creditNoteStart}
+                          onChange={(e) => {
+                            const value = e.target.value === "" ? 1 : Number.parseInt(e.target.value)
+                            setSettings({ ...settings, creditNoteStart: value })
+                          }}
+                          className="text-start"
+                          dir={appDir()}
+                          required
+                        />
+                      </div>
+                      <div className="flex items-end">
+                        <div className="text-sm text-muted-foreground">
+                          {tr("مثال: ")}{buildVoucherCode(settings.creditNotePrefix, "A", settings.creditNoteStart)}{tr(" (A = دفتر السندات، والكود الكلي لا يتجاوز 10 خانات)")}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="rounded-lg border border-border/70 bg-muted/20 p-4">
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                      <div>
+                        <Label htmlFor="debitNotePrefix" className="text-start block">
+                          {tr("بادئة الاشعار المدين *")}
+                        </Label>
+                        <Input
+                          id="debitNotePrefix"
+                          value={settings.debitNotePrefix}
+                          onChange={(e) => setSettings({ ...settings, debitNotePrefix: e.target.value })}
+                          className="text-start"
+                          dir={appDir()}
+                          maxLength={3}
+                          required
+                        />
+                      </div>
+                      <div>
+                        <Label htmlFor="debitNoteStart" className="text-start block">
+                          {tr("الترقيم يبدأ من (الاشعار المدين) *")}
+                        </Label>
+                        <Input
+                          id="debitNoteStart"
+                          type="number"
+                          min="1"
+                          max="10000"
+                          value={settings.debitNoteStart}
+                          onChange={(e) => {
+                            const value = e.target.value === "" ? 1 : Number.parseInt(e.target.value)
+                            setSettings({ ...settings, debitNoteStart: value })
+                          }}
+                          className="text-start"
+                          dir={appDir()}
+                          required
+                        />
+                      </div>
+                      <div className="flex items-end">
+                        <div className="text-sm text-muted-foreground">
+                          {tr("مثال: ")}{buildVoucherCode(settings.debitNotePrefix, "A", settings.debitNoteStart)}{tr(" (A = دفتر السندات، والكود الكلي لا يتجاوز 10 خانات)")}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="rounded-lg border border-border/70 bg-muted/20 p-4">
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                      <div>
+                        <Label htmlFor="stockInPrefix" className="text-start block">
+                          {tr("بادئة سند ادخال بضاعة *")}
+                        </Label>
+                        <Input
+                          id="stockInPrefix"
+                          value={settings.stockInPrefix}
+                          onChange={(e) => setSettings({ ...settings, stockInPrefix: e.target.value })}
+                          className="text-start"
+                          dir={appDir()}
+                          maxLength={3}
+                          required
+                        />
+                      </div>
+                      <div>
+                        <Label htmlFor="stockInStart" className="text-start block">
+                          {tr("الترقيم يبدأ من (سند ادخال بضاعة) *")}
+                        </Label>
+                        <Input
+                          id="stockInStart"
+                          type="number"
+                          min="1"
+                          max="10000"
+                          value={settings.stockInStart}
+                          onChange={(e) => {
+                            const value = e.target.value === "" ? 1 : Number.parseInt(e.target.value)
+                            setSettings({ ...settings, stockInStart: value })
+                          }}
+                          className="text-start"
+                          dir={appDir()}
+                          required
+                        />
+                      </div>
+                      <div className="flex items-end">
+                        <div className="text-sm text-muted-foreground">
+                          {tr("مثال: ")}{buildVoucherCode(settings.stockInPrefix, "A", settings.stockInStart)}{tr(" (A = دفتر السندات، والكود الكلي لا يتجاوز 10 خانات)")}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="rounded-lg border border-border/70 bg-muted/20 p-4">
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                      <div>
+                        <Label htmlFor="stockOutPrefix" className="text-start block">
+                          {tr("بادئة سند اخراج بضاعة *")}
+                        </Label>
+                        <Input
+                          id="stockOutPrefix"
+                          value={settings.stockOutPrefix}
+                          onChange={(e) => setSettings({ ...settings, stockOutPrefix: e.target.value })}
+                          className="text-start"
+                          dir={appDir()}
+                          maxLength={3}
+                          required
+                        />
+                      </div>
+                      <div>
+                        <Label htmlFor="stockOutStart" className="text-start block">
+                          {tr("الترقيم يبدأ من (سند اخراج بضاعة) *")}
+                        </Label>
+                        <Input
+                          id="stockOutStart"
+                          type="number"
+                          min="1"
+                          max="10000"
+                          value={settings.stockOutStart}
+                          onChange={(e) => {
+                            const value = e.target.value === "" ? 1 : Number.parseInt(e.target.value)
+                            setSettings({ ...settings, stockOutStart: value })
+                          }}
+                          className="text-start"
+                          dir={appDir()}
+                          required
+                        />
+                      </div>
+                      <div className="flex items-end">
+                        <div className="text-sm text-muted-foreground">
+                          {tr("مثال: ")}{buildVoucherCode(settings.stockOutPrefix, "A", settings.stockOutStart)}{tr(" (A = دفتر السندات، والكود الكلي لا يتجاوز 10 خانات)")}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="rounded-lg border border-border/70 bg-muted/20 p-4">
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                      <div>
+                        <Label htmlFor="internalDeliveryPrefix" className="text-start block">
+                          {tr("بادئة ارسالية داخلية *")}
+                        </Label>
+                        <Input
+                          id="internalDeliveryPrefix"
+                          value={settings.internalDeliveryPrefix}
+                          onChange={(e) => setSettings({ ...settings, internalDeliveryPrefix: e.target.value })}
+                          className="text-start"
+                          dir={appDir()}
+                          maxLength={3}
+                          required
+                        />
+                      </div>
+                      <div>
+                        <Label htmlFor="internalDeliveryStart" className="text-start block">
+                          {tr("الترقيم يبدأ من (ارسالية داخلية) *")}
+                        </Label>
+                        <Input
+                          id="internalDeliveryStart"
+                          type="number"
+                          min="1"
+                          max="10000"
+                          value={settings.internalDeliveryStart}
+                          onChange={(e) => {
+                            const value = e.target.value === "" ? 1 : Number.parseInt(e.target.value)
+                            setSettings({ ...settings, internalDeliveryStart: value })
+                          }}
+                          className="text-start"
+                          dir={appDir()}
+                          required
+                        />
+                      </div>
+                      <div className="flex items-end">
+                        <div className="text-sm text-muted-foreground">
+                          {tr("مثال: ")}{buildVoucherCode(settings.internalDeliveryPrefix, "A", settings.internalDeliveryStart)}{tr(" (A = دفتر السندات، والكود الكلي لا يتجاوز 10 خانات)")}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="rounded-lg border border-border/70 bg-muted/20 p-4">
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                      <div>
+                        <Label htmlFor="useVoucherPrefix" className="text-start block">
+                          {tr("بادئة سند استعمال *")}
+                        </Label>
+                        <Input
+                          id="useVoucherPrefix"
+                          value={settings.useVoucherPrefix}
+                          onChange={(e) => setSettings({ ...settings, useVoucherPrefix: e.target.value })}
+                          className="text-start"
+                          dir={appDir()}
+                          maxLength={3}
+                          required
+                        />
+                      </div>
+                      <div>
+                        <Label htmlFor="useVoucherStart" className="text-start block">
+                          {tr("الترقيم يبدأ من (سند استعمال) *")}
+                        </Label>
+                        <Input
+                          id="useVoucherStart"
+                          type="number"
+                          min="1"
+                          max="10000"
+                          value={settings.useVoucherStart}
+                          onChange={(e) => {
+                            const value = e.target.value === "" ? 1 : Number.parseInt(e.target.value)
+                            setSettings({ ...settings, useVoucherStart: value })
+                          }}
+                          className="text-start"
+                          dir={appDir()}
+                          required
+                        />
+                      </div>
+                      <div className="flex items-end">
+                        <div className="text-sm text-muted-foreground">
+                          {tr("مثال: ")}{buildVoucherCode(settings.useVoucherPrefix, "A", settings.useVoucherStart)}{tr(" (A = دفتر السندات، والكود الكلي لا يتجاوز 10 خانات)")}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  {([
+                    { key: "salesInvoice", label: tr("فاتورة مبيعات") },
+                    { key: "deliverySell", label: tr("إرسالية مبيعات") },
+                    { key: "deliveryConsignmentSale", label: tr("إرسالية برسم البيع") },
+                    { key: "returnDeliveryConsignmentSale", label: tr("مرتجع إرسالية برسم البيع") },
+                    { key: "returnSell", label: tr("مرتجع مبيعات") },
+                    { key: "purchaseInvoice", label: tr("فاتورة مشتريات") },
+                    { key: "deliveryPay", label: tr("إرسالية مشتريات") },
+                    { key: "returnPurchase", label: tr("مرتجع مشتريات") },
+                  ] as const).map(({ key, label }) => {
+                    const prefixKey = `${key}Prefix` as keyof typeof settings
+                    const startKey = `${key}Start` as keyof typeof settings
+                    const prefixValue = settings[prefixKey] as string
+                    const startValue = settings[startKey] as number
+                    return (
+                      <div key={key} className="rounded-lg border border-border/70 bg-muted/20 p-4">
+                        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                          <div>
+                            <Label htmlFor={`${key}Prefix`} className="text-start block">
+                              {tr("بادئة ")}{label} *
+                            </Label>
+                            <Input
+                              id={`${key}Prefix`}
+                              value={prefixValue}
+                              onChange={(e) => setSettings({ ...settings, [prefixKey]: e.target.value })}
+                              className="text-start"
+                              dir={appDir()}
+                              maxLength={3}
+                              required
+                            />
+                          </div>
+                          <div>
+                            <Label htmlFor={`${key}Start`} className="text-start block">
+                              {tr("الترقيم يبدأ من (")}{label}) *
+                            </Label>
+                            <Input
+                              id={`${key}Start`}
+                              type="number"
+                              min="1"
+                              max="10000"
+                              value={startValue}
+                              onChange={(e) => {
+                                const value = e.target.value === "" ? 1 : Number.parseInt(e.target.value)
+                                setSettings({ ...settings, [startKey]: value })
+                              }}
+                              className="text-start"
+                              dir={appDir()}
+                              required
+                            />
+                          </div>
+                          <div className="flex items-end">
+                            <div className="text-sm text-muted-foreground">
+                              {tr("مثال: ")}{buildVoucherCode(prefixValue, "A", startValue)}{tr(" (A = دفتر السندات، والكود الكلي لا يتجاوز 10 خانات)")}
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    )
+                  })}
+
+                  <div className="rounded-lg border border-border/70 bg-muted/20 p-4">
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                      <div>
+                        <Label htmlFor="journalPrefix" className="text-start block">
+                          {tr("بادئة سندات القيد *")}
+                        </Label>
+                        <Input
+                          id="journalPrefix"
+                          value={settings.journalPrefix}
+                          onChange={(e) => setSettings({ ...settings, journalPrefix: e.target.value })}
+                          className="text-start"
+                          dir={appDir()}
+                          maxLength={3}
+                          required
+                        />
+                      </div>
+                      <div>
+                        <Label htmlFor="journalStart" className="text-start block">
+                          {tr("الترقيم يبدأ من (سندات القيد) *")}
+                        </Label>
+                        <Input
+                          id="journalStart"
+                          type="number"
+                          min="1"
+                          max="10000"
+                          value={settings.journalStart}
+                          onChange={(e) => {
+                            const value = e.target.value === "" ? 1 : Number.parseInt(e.target.value)
+                            setSettings({ ...settings, journalStart: value })
+                          }}
+                          className="text-start"
+                          dir={appDir()}
+                          required
+                        />
+                      </div>
+                      <div className="flex items-end">
+                        <div className="text-sm text-muted-foreground">
+                          {tr("مثال: ")}{buildVoucherCode(settings.journalPrefix, "A", settings.journalStart)}{tr(" (A = دفتر السندات، والكود الكلي لا يتجاوز 10 خانات)")}
+                        </div>
+                      </div>
                     </div>
                   </div>
                 </div>
               </div>
 
               <div className="border-t pt-6">
-                <h3 className="text-lg font-semibold mb-4 text-right">إعدادات التعريفات (اختيارية)</h3>
+                <h3 className="text-lg font-semibold mb-4 text-start">{tr("إعدادات التعريفات (اختيارية)")}</h3>
                 <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                   <div>
-                    <Label htmlFor="accountPrefix" className="text-right block">
-                      بادئة الحسابات المحاسبية
+                    <Label htmlFor="accountPrefix" className="text-start block">
+                      {tr("بادئة الحسابات المحاسبية")}
                     </Label>
                     <Input
                       id="accountPrefix"
                       value={settings.accountPrefix}
                       onChange={(e) => setSettings({ ...settings, accountPrefix: e.target.value })}
-                      className="text-right"
-                      dir="rtl"
+                      className="text-start"
+                      dir={appDir()}
                       placeholder="A"
                     />
                   </div>
                   <div>
-                    <Label htmlFor="accountStart" className="text-right block">
-                      بداية ترقيم الحسابات المحاسبية
+                    <Label htmlFor="accountStart" className="text-start block">
+                      {tr("بداية ترقيم الحسابات المحاسبية")}
                     </Label>
                     <Input
                       id="accountStart"
@@ -980,34 +1787,34 @@ export function SystemSettings() {
                         const value = e.target.value === "" ? 1 : Number.parseInt(e.target.value)
                         setSettings({ ...settings, accountStart: value })
                       }}
-                      className="text-right"
-                      dir="rtl"
+                      className="text-start"
+                      dir={appDir()}
                       placeholder="1"
                     />
                   </div>
                   <div className="flex items-end">
                     <div className="text-sm text-muted-foreground">
-                      مثال: {settings.accountPrefix}
+                      {tr("مثال: ")}{settings.accountPrefix}
                       {String(settings.accountStart).padStart(4, "0")}
                     </div>
                   </div>
 
                   <div>
-                    <Label htmlFor="customerPrefix" className="text-right block">
-                      بادئة الزبائن
+                    <Label htmlFor="customerPrefix" className="text-start block">
+                      {tr("بادئة العملاء")}
                     </Label>
                     <Input
                       id="customerPrefix"
                       value={settings.customerPrefix}
                       onChange={(e) => setSettings({ ...settings, customerPrefix: e.target.value })}
-                      className="text-right"
-                      dir="rtl"
+                      className="text-start"
+                      dir={appDir()}
                       placeholder="C"
                     />
                   </div>
                   <div>
-                    <Label htmlFor="customerStart" className="text-right block">
-                      بداية ترقيم الزبائن
+                    <Label htmlFor="customerStart" className="text-start block">
+                      {tr("بداية ترقيم العملاء")}
                     </Label>
                     <Input
                       id="customerStart"
@@ -1018,34 +1825,58 @@ export function SystemSettings() {
                         const value = e.target.value === "" ? 1 : Number.parseInt(e.target.value)
                         setSettings({ ...settings, customerStart: value })
                       }}
-                      className="text-right"
-                      dir="rtl"
+                      className="text-start"
+                      dir={appDir()}
                       placeholder="1"
                     />
                   </div>
                   <div className="flex items-end">
                     <div className="text-sm text-muted-foreground">
-                      مثال: {settings.customerPrefix}
+                      {tr("مثال: ")}{settings.customerPrefix}
                       {String(settings.customerStart).padStart(4, "0")}
                     </div>
                   </div>
 
                   <div>
-                    <Label htmlFor="supplierPrefix" className="text-right block">
-                      بادئة الموردين
+                    <Label htmlFor="salesmanPrefix" className="text-start block">{tr("بادئة المندوبين")}</Label>
+                    <Input id="salesmanPrefix" value={settings.salesmanPrefix} onChange={(e) => setSettings({ ...settings, salesmanPrefix: e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 9) })} className="text-start" dir={appDir()} placeholder="M" />
+                  </div>
+                  <div>
+                    <Label htmlFor="salesmanStart" className="text-start block">{tr("الترقيم يبدأ من")}</Label>
+                    <Input id="salesmanStart" type="number" min="1" value={settings.salesmanStart} onChange={(e) => setSettings({ ...settings, salesmanStart: e.target.value === "" ? 1 : Number.parseInt(e.target.value) })} className="text-start" dir={appDir()} placeholder="1" />
+                  </div>
+                  <div className="flex items-end">
+                    <div className="text-sm text-muted-foreground">{tr("مثال: ")}{settings.salesmanPrefix}{String(settings.salesmanStart).padStart(Math.max(1, 10 - settings.salesmanPrefix.length), "0")}</div>
+                  </div>
+
+                  <div>
+                    <Label htmlFor="employeePrefix" className="text-start block">{tr("بادئة الموظفين")}</Label>
+                    <Input id="employeePrefix" value={settings.employeePrefix} onChange={(e) => setSettings({ ...settings, employeePrefix: e.target.value })} className="text-start" dir={appDir()} placeholder="E" />
+                  </div>
+                  <div>
+                    <Label htmlFor="employeeStart" className="text-start block">{tr("الرقم يبدأ من")}</Label>
+                    <Input id="employeeStart" type="number" min="1" value={settings.employeeStart} onChange={(e) => setSettings({ ...settings, employeeStart: e.target.value === "" ? 1 : Number.parseInt(e.target.value) })} className="text-start" dir={appDir()} placeholder="1" />
+                  </div>
+                  <div className="flex items-end">
+                    <div className="text-sm text-muted-foreground">{tr("مثال: ")}{settings.employeePrefix}{String(settings.employeeStart).padStart(Math.max(1, 10 - settings.employeePrefix.length), "0")}</div>
+                  </div>
+
+                  <div>
+                    <Label htmlFor="supplierPrefix" className="text-start block">
+                      {tr("بادئة الموردين")}
                     </Label>
                     <Input
                       id="supplierPrefix"
                       value={settings.supplierPrefix}
                       onChange={(e) => setSettings({ ...settings, supplierPrefix: e.target.value })}
-                      className="text-right"
-                      dir="rtl"
+                      className="text-start"
+                      dir={appDir()}
                       placeholder="S"
                     />
                   </div>
                   <div>
-                    <Label htmlFor="supplierStart" className="text-right block">
-                      بداية ترقيم الموردين
+                    <Label htmlFor="supplierStart" className="text-start block">
+                      {tr("بداية ترقيم الموردين")}
                     </Label>
                     <Input
                       id="supplierStart"
@@ -1056,34 +1887,34 @@ export function SystemSettings() {
                         const value = e.target.value === "" ? 1 : Number.parseInt(e.target.value)
                         setSettings({ ...settings, supplierStart: value })
                       }}
-                      className="text-right"
-                      dir="rtl"
+                      className="text-start"
+                      dir={appDir()}
                       placeholder="1"
                     />
                   </div>
                   <div className="flex items-end">
                     <div className="text-sm text-muted-foreground">
-                      مثال: {settings.supplierPrefix}
+                      {tr("مثال: ")}{settings.supplierPrefix}
                       {String(settings.supplierStart).padStart(4, "0")}
                     </div>
                   </div>
 
                   <div>
-                    <Label htmlFor="itemGroupPrefix" className="text-right block">
-                      بادئة مجموعات الأصناف
+                    <Label htmlFor="itemGroupPrefix" className="text-start block">
+                      {tr("بادئة مجموعات الأصناف")}
                     </Label>
                     <Input
                       id="itemGroupPrefix"
                       value={settings.itemGroupPrefix}
                       onChange={(e) => setSettings({ ...settings, itemGroupPrefix: e.target.value })}
-                      className="text-right"
-                      dir="rtl"
+                      className="text-start"
+                      dir={appDir()}
                       placeholder="G"
                     />
                   </div>
                   <div>
-                    <Label htmlFor="itemGroupStart" className="text-right block">
-                      بداية ترقيم مجموعات الأصناف
+                    <Label htmlFor="itemGroupStart" className="text-start block">
+                      {tr("بداية ترقيم مجموعات الأصناف")}
                     </Label>
                     <Input
                       id="itemGroupStart"
@@ -1094,21 +1925,21 @@ export function SystemSettings() {
                         const value = e.target.value === "" ? 1 : Number.parseInt(e.target.value)
                         setSettings({ ...settings, itemGroupStart: value })
                       }}
-                      className="text-right"
-                      dir="rtl"
+                      className="text-start"
+                      dir={appDir()}
                       placeholder="1"
                     />
                   </div>
                   <div className="flex items-end">
                     <div className="text-sm text-muted-foreground">
-                      مثال: {settings.itemGroupPrefix}
+                      {tr("مثال: ")}{settings.itemGroupPrefix}
                       {String(settings.itemGroupStart).padStart(4, "0")}
                     </div>
                   </div>
 
                   <div>
-                    <Label htmlFor="itemStart" className="text-right block">
-                      بداية ترقيم الأصناف
+                    <Label htmlFor="itemStart" className="text-start block">
+                      {tr("بداية ترقيم الأصناف")}
                     </Label>
                     <Input
                       id="itemStart"
@@ -1119,8 +1950,8 @@ export function SystemSettings() {
                         const value = e.target.value === "" ? 1 : Number.parseInt(e.target.value)
                         setSettings({ ...settings, itemStart: value })
                       }}
-                      className="text-right"
-                      dir="rtl"
+                      className="text-start"
+                      dir={appDir()}
                       placeholder="1"
                     />
                   </div>
@@ -1128,79 +1959,12 @@ export function SystemSettings() {
               </div>
             </CardContent>
           </Card>
-        </TabsContent>
-
-        <TabsContent value="printing" className="space-y-4">
-          <Card className="erp-card">
-            <CardHeader>
-              <CardTitle className="flex items-center gap-2 text-right">
-                <Printer className="h-5 w-5" />
-                إعدادات الطباعة
-              </CardTitle>
-            </CardHeader>
-            <CardContent className="space-y-4">
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                <div>
-                  <Label htmlFor="defaultPrinter" className="text-right block">
-                    الطابعة الافتراضية
-                  </Label>
-                  <Select
-                    value={settings.defaultPrinter}
-                    onValueChange={(value) => setSettings({ ...settings, defaultPrinter: value })}
-                  >
-                    <SelectTrigger>
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="HP LaserJet">HP LaserJet</SelectItem>
-                      <SelectItem value="Canon Printer">Canon Printer</SelectItem>
-                      <SelectItem value="Epson Printer">Epson Printer</SelectItem>
-                    </SelectContent>
-                  </Select>
-                </div>
-                <div>
-                  <Label htmlFor="paperSize" className="text-right block">
-                    حجم الورق
-                  </Label>
-                  <Select
-                    value={settings.paperSize}
-                    onValueChange={(value) => setSettings({ ...settings, paperSize: value })}
-                  >
-                    <SelectTrigger>
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="A4">A4</SelectItem>
-                      <SelectItem value="A5">A5</SelectItem>
-                      <SelectItem value="Letter">Letter</SelectItem>
-                    </SelectContent>
-                  </Select>
-                </div>
-                <div className="flex items-center justify-between">
-                  <Label htmlFor="printLogo" className="text-right block">
-                    طباعة الشعار
-                  </Label>
-                  <Switch
-                    id="printLogo"
-                    checked={settings.printLogo}
-                    onCheckedChange={(checked) => setSettings({ ...settings, printLogo: checked })}
-                  />
-                </div>
-                <div className="flex items-center justify-between">
-                  <Label htmlFor="printFooter" className="text-right block">
-                    طباعة التذييل
-                  </Label>
-                  <Switch
-                    id="printFooter"
-                    checked={settings.printFooter}
-                    onCheckedChange={(checked) => setSettings({ ...settings, printFooter: checked })}
-                  />
-                </div>
-              </div>
-            </CardContent>
-          </Card>
-        </TabsContent>
-      </Tabs>
+        </section>
+        </div>
+      </div>
     </div>
   )
 }
+
+
+

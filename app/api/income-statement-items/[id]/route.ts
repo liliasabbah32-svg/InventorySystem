@@ -1,7 +1,9 @@
-import { NextRequest, NextResponse } from "next/server"
+import { type NextRequest, NextResponse } from "next/server"
+import { findUsages, usageMessage } from "@/lib/delete-guard"
 import sql from "@/lib/database"
+import { runSchemaOnce } from "@/lib/schema-once"
 
-const ensureIncomeStatementItemsTable = async () => {
+const ensureIncomeStatementItemsTable = async () => { return runSchemaOnce("app/api/income-statement-items/[id]/route.ts#ensureIncomeStatementItemsTable", async () => {
   await sql`
     CREATE TABLE IF NOT EXISTS income_statement_items (
       id SERIAL PRIMARY KEY,
@@ -11,79 +13,101 @@ const ensureIncomeStatementItemsTable = async () => {
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
   `
+}) }
+
+export async function GET(request: NextRequest, { params }: { params: { id: string } }) {
+  try {
+    await ensureIncomeStatementItemsTable()
+
+    const itemId = Number(params.id)
+    if (!itemId) {
+      return NextResponse.json({ error: "معرف البند غير صالح" }, { status: 400 })
+    }
+
+    const result = await sql`
+      SELECT id, name, status, created_at, updated_at
+      FROM income_statement_items
+      WHERE id = ${itemId}
+    `
+
+    if (!result.length) {
+      return NextResponse.json({ error: "البند غير موجود" }, { status: 404 })
+    }
+
+    return NextResponse.json(result[0])
+  } catch (error) {
+    console.error("Error fetching income statement item:", error)
+    return NextResponse.json({ error: "فشل في جلب البند" }, { status: 500 })
+  }
 }
 
 export async function PUT(request: NextRequest, { params }: { params: { id: string } }) {
   try {
     await ensureIncomeStatementItemsTable()
 
-    const id = Number.parseInt(params.id, 10)
-    if (Number.isNaN(id)) {
-      return NextResponse.json({ error: "معرف غير صالح" }, { status: 400 })
+    const itemId = Number(params.id)
+    if (!itemId) {
+      return NextResponse.json({ error: "معرف البند غير صالح" }, { status: 400 })
     }
 
     const data = await request.json()
-    const name = String(data.name ?? "").trim()
-    const status = Number(data.status ?? 1)
-
+    const name = String(data.name || "").trim()
     if (!name) {
       return NextResponse.json({ error: "اسم البند مطلوب" }, { status: 400 })
     }
 
+    const status = Number(data.status ?? 1)
     if (![1, 2, 3].includes(status)) {
       return NextResponse.json({ error: "الحالة يجب أن تكون 1 أو 2 أو 3" }, { status: 400 })
-    }
-
-    const existing = await sql`
-      SELECT id FROM income_statement_items
-      WHERE LOWER(name) = LOWER(${name}) AND id <> ${id}
-    `
-
-    if (existing.length > 0) {
-      return NextResponse.json({ error: "اسم البند موجود مسبقاً" }, { status: 400 })
     }
 
     const result = await sql`
       UPDATE income_statement_items
       SET name = ${name}, status = ${status}, updated_at = CURRENT_TIMESTAMP
-      WHERE id = ${id}
+      WHERE id = ${itemId}
       RETURNING id, name, status, created_at, updated_at
     `
 
-    if (result.length === 0) {
+    if (!result.length) {
       return NextResponse.json({ error: "البند غير موجود" }, { status: 404 })
     }
 
     return NextResponse.json(result[0])
   } catch (error) {
     console.error("Error updating income statement item:", error)
-    return NextResponse.json({ error: "Failed to update income statement item" }, { status: 500 })
+    return NextResponse.json({ error: "فشل في تحديث البند" }, { status: 500 })
   }
 }
 
-export async function DELETE(_: NextRequest, { params }: { params: { id: string } }) {
+export async function DELETE(request: NextRequest, { params }: { params: { id: string } }) {
   try {
     await ensureIncomeStatementItemsTable()
 
-    const id = Number.parseInt(params.id, 10)
-    if (Number.isNaN(id)) {
-      return NextResponse.json({ error: "معرف غير صالح" }, { status: 400 })
+    const itemId = Number(params.id)
+    if (!itemId) {
+      return NextResponse.json({ error: "معرف البند غير صالح" }, { status: 400 })
     }
+
+    // فحص الارتباط قبل الحذف: لا يُحذف تعريف مستخدم في تعريفات أخرى أو حركات (lib/delete-guard.ts)
+    const usageRow = (await sql`SELECT * FROM income_statement_items WHERE id = ${itemId}`)[0] as any
+    const usages = await findUsages(itemId, { idColumns: /^finanical_list_income_id$/, excludeTables: ["income_statement_items"] })
+    if (usages.length) return NextResponse.json({ error: usageMessage("بند قائمة الدخل", String(usageRow?.name || ""), usages) }, { status: 400 })
 
     const result = await sql`
       UPDATE income_statement_items
       SET status = 3, updated_at = CURRENT_TIMESTAMP
-      WHERE id = ${id}
-      RETURNING id
+      WHERE id = ${itemId}
+      RETURNING id, name, status, created_at, updated_at
     `
 
-    if (result.length === 0) {
+    if (!result.length) {
       return NextResponse.json({ error: "البند غير موجود" }, { status: 404 })
     }
 
-    return NextResponse.json({ success: true })
+    return NextResponse.json(result[0])
   } catch (error) {
     console.error("Error deleting income statement item:", error)
-    return NextResponse.json({ error: "Failed to delete income statement item" }, { status: 500 })
+    return NextResponse.json({ error: "فشل في حذف البند" }, { status: 500 })
   }
 }
+

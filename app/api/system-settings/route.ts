@@ -1,8 +1,6 @@
 import { type NextRequest, NextResponse } from "next/server"
-import { neon } from "@neondatabase/serverless"
-
-const sql = neon(process.env.DATABASE_URL!)
-
+import sql from "@/lib/database"
+import { runSchemaOnce } from "@/lib/schema-once"
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
 }
@@ -67,12 +65,14 @@ function normalizePayload(data: unknown): Record<string, unknown> {
     order_prefix: ["order_prefix", "orderPrefix"],
     purchase_prefix: ["purchase_prefix", "purchasePrefix"],
     customer_prefix: ["customer_prefix", "customerPrefix"],
+    employee_prefix: ["employee_prefix", "employeePrefix"],
     supplier_prefix: ["supplier_prefix", "supplierPrefix"],
     item_group_prefix: ["item_group_prefix", "itemGroupPrefix"],
     invoice_start: ["invoice_start", "invoiceStart"],
     order_start: ["order_start", "orderStart"],
     purchase_start: ["purchase_start", "purchaseStart"],
     customer_start: ["customer_start", "customerStart"],
+    employee_start: ["employee_start", "employeeStart"],
     supplier_start: ["supplier_start", "supplierStart"],
     item_group_start: ["item_group_start", "itemGroupStart"],
     item_start: ["item_start", "itemStart"],
@@ -111,7 +111,7 @@ function normalizePayload(data: unknown): Record<string, unknown> {
   return normalized
 }
 
-async function ensureSettingsTable(): Promise<void> {
+async function ensureSettingsTable(): Promise<void> { return runSchemaOnce("app/api/system-settings/route.ts#ensureSettingsTable", async () => {
   await sql`
     CREATE TABLE IF NOT EXISTS system_settings (
       id VARCHAR(100) PRIMARY KEY,
@@ -120,8 +120,9 @@ async function ensureSettingsTable(): Promise<void> {
     )
   `
 
-  await sql`ALTER TABLE system_settings ALTER COLUMN id TYPE VARCHAR(100) USING id::TEXT`
+  await sql`ALTER TABLE system_settings ALTER COLUMN id DROP IDENTITY IF EXISTS`
   await sql`ALTER TABLE system_settings ALTER COLUMN id DROP DEFAULT`
+  await sql`ALTER TABLE system_settings ALTER COLUMN id TYPE VARCHAR(100) USING id::TEXT`
   await sql`ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS description TEXT`
   await sql`ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS value TEXT`
 
@@ -150,6 +151,8 @@ async function ensureSettingsTable(): Promise<void> {
   await sql`ALTER TABLE system_settings DROP COLUMN IF EXISTS purchase_start`
   await sql`ALTER TABLE system_settings DROP COLUMN IF EXISTS customer_prefix`
   await sql`ALTER TABLE system_settings DROP COLUMN IF EXISTS customer_start`
+  await sql`ALTER TABLE system_settings DROP COLUMN IF EXISTS employee_prefix`
+  await sql`ALTER TABLE system_settings DROP COLUMN IF EXISTS employee_start`
   await sql`ALTER TABLE system_settings DROP COLUMN IF EXISTS supplier_prefix`
   await sql`ALTER TABLE system_settings DROP COLUMN IF EXISTS supplier_start`
   await sql`ALTER TABLE system_settings DROP COLUMN IF EXISTS item_prefix`
@@ -182,7 +185,7 @@ async function ensureSettingsTable(): Promise<void> {
   await sql`ALTER TABLE system_settings DROP COLUMN IF EXISTS account_start`
   await sql`ALTER TABLE system_settings DROP COLUMN IF EXISTS created_at`
   await sql`ALTER TABLE system_settings DROP COLUMN IF EXISTS updated_at`
-}
+}) }
 
 async function loadStoredSettings(): Promise<Record<string, unknown>> {
   await ensureSettingsTable()

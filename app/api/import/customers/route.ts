@@ -1,60 +1,93 @@
-import { type NextRequest, NextResponse } from "next/server"
-import { neon } from "@neondatabase/serverless"
-import { generateCustomerNumber } from "@/lib/number-generator"
+﻿import { type NextRequest, NextResponse } from "next/server"
+import { generateCustomerNumber, getPrefixFromSettings } from "@/lib/number-generator"
+import sql from "@/lib/database"
+import { ensureCustomerAccount, resolveAccountType, resolveRequiredParentAccount, MissingParentAccountError, toNullableInt, ensureCustomerCompatibilityColumns, resolveCustomerCity } from "@/app/api/customers/_lib"
+import { loadStoredSettings } from "@/app/api/settings/system/route"
+import { authorizeCustomerType } from "@/app/api/customers/_permissions"
+import { postOpeningBalances, type OpeningBalanceLine } from "@/lib/opening-balances"
+import { authorizeTransaction } from "@/lib/transaction-permissions"
 
-import { Pool } from "pg"
+const CODE_LENGTH = 10
 
-let sql: any = null
+// نفس منطق adjustCode في شاشة العملاء (components/products/customers.tsx): تبقى حروف البادئة كما
+// كتبها المستخدم، وتُكمَّل الأرقام بأصفار من اليسار حتى 10 خانات (S0000029 -> S000000029).
+// بادئة الإعدادات حسب النوع تُستخدم فقط إن كان الرقم بلا حروف أصلاً (29 -> C000000029 لعميل).
+const normalizeImportedCode = (rawValue: unknown, defaultPrefix: string) => {
+  const cleaned = String(rawValue ?? "").trim().toUpperCase().replace(/[^A-Z0-9]/g, "")
+  if (!cleaned) return ""
 
-try {
-  if (!process.env.DATABASE_URL) {
-    console.error("[v0] DATABASE_URL environment variable is not set")
-  } else {
-    const dbUrl = process.env.DATABASE_URL
+  const match = cleaned.match(/^([A-Z]*)(\d*)$/)
+  if (!match) return cleaned // حروف بين الأرقام — يُترك كما هو
 
-    if (dbUrl.includes("localhost") || dbUrl.includes("127.0.0.1")) {
-      const pool = new Pool({ connectionString: dbUrl })
-      sql = async (strings: TemplateStringsArray, ...values: any[]) => {
-        const client = await pool.connect()
-        try {
-          const query =
-            strings.reduce(
-              (prev, curr, i) =>
-                prev + curr + (i < values.length ? `$${i + 1}` : ""),
-              ""
-            )
-          const result = await client.query(query, values)
-          return result.rows
-        } finally {
-          client.release()
-        }
-      }
-    } else {
-      console.log("[v0] Using Neon serverless client")
-      sql = neon(dbUrl)
-    }
-
-    console.log("[v0] Database client initialized successfully")
-  }
-} catch (error) {
-  console.error("[v0] Failed to initialize DB client:", error)
-  sql = null
+  const prefix = match[1] || String(defaultPrefix || "").trim().toUpperCase()
+  const digits = match[2]
+  return `${prefix}${digits.padStart(Math.max(CODE_LENGTH - prefix.length, 0), "0")}`
 }
 
-export default sql
+const entityTypeKey = (type: number) =>
+  type === 2 ? "supplier" : type === 3 ? "salesman" : type === 4 ? "subscriber" : "customer"
+
+const defaultPrefixForType = async (type: number) => {
+  try {
+    return await getPrefixFromSettings(entityTypeKey(type))
+  } catch {
+    return type === 2 ? "S" : "C"
+  }
+}
 
 export async function POST(request: NextRequest) {
   try {
-    const { data } = await request.json()
+    const body = await request.json()
+    const { data } = body
+    const types = body.check === true ? [Number(body.type) || 1] : Array.isArray(data) ? [...new Set(data.map((item: any) => Number(item?.type) || 1))] : [1]
+    let actor: { userId: string; branchId: number } | null = null
+    for (const type of types) {
+      const permission = await authorizeCustomerType(request, type, body.mode === "update" && body.check !== true ? "update" : "create")
+      if (!permission.ok) return permission.response
+      actor = { userId: String(permission.userId), branchId: Number(permission.branchId) || 0 }
+    }
+    await ensureCustomerCompatibilityColumns()
+
+    // فحص مسبق (شاشة مراجعة الاستيراد): أي الأرقام موجودة مسبقاً — بنفس تطبيع الرقم عند الحفظ.
+    if (body.check === true) {
+      const codes: string[] = Array.isArray(body.codes) ? body.codes.map((code: unknown) => String(code ?? "").trim()).filter(Boolean) : []
+      const checkPrefix = await defaultPrefixForType(Number(body.type) || 1)
+      const normalized = Object.fromEntries(codes.map((code) => [code, normalizeImportedCode(code, checkPrefix)]))
+      const values = [...new Set(Object.values(normalized).filter(Boolean))]
+      const rows = values.length ? await sql`SELECT customer_code, type FROM customers WHERE customer_code = ANY(${values}::text[]) AND COALESCE(isDeleted, false) = false` : []
+      // types: نوع كل رقم موجود — وضع التحديث يرفض رقماً لنوع آخر (مثلاً رقم مورد في تحديث العملاء)
+      return NextResponse.json({ existing: rows.map((row: any) => String(row.customer_code)), types: Object.fromEntries(rows.map((row: any) => [String(row.customer_code), Number(row.type) || 1])), normalized })
+    }
 
     if (!Array.isArray(data) || data.length === 0) {
       return NextResponse.json({ error: "لا توجد بيانات للاستيراد" }, { status: 400 })
+    }
+
+    if (body.mode === "update") return NextResponse.json(await updateImportedCustomers(data))
+
+    // حساب الأب إلزامي: يُحدَّد لكل نوع مرة واحدة قبل حفظ أي سطر، ولا يُستورد شيء إن لم يكن معرَّفاً.
+    const settings = await loadStoredSettings()
+    const parentByType = new Map<number, { fatherId: number | null; levelNo: number }>()
+    for (const type of new Set<number>(data.map((item: any) => Number(item?.type) || 1))) {
+      // حساب الأب الافتراضي للنوع (لا يُقبَل father_id من ملف Excel)
+      try {
+        parentByType.set(type, await resolveRequiredParentAccount(type, null, settings))
+      } catch (error) {
+        if (error instanceof MissingParentAccountError) return NextResponse.json({ error: error.message }, { status: 400 })
+        throw error
+      }
     }
 
     let success = 0;
     let failed = 0;
     let duplicates = 0;
     const errors: string[] = [];
+    // نتيجة كل سطر (rowIndex كما أرسله المستورِد) — تعرضها شاشة الاستيراد بجانب السطر نفسه.
+    const results: Array<{ rowIndex: number; status: "success" | "failed" | "duplicate"; error?: string }> = [];
+    const prefixByType = new Map<number, string>();
+    // الأرصدة الافتتاحية (الرصيد ≠ 0): تُقيَّد بعد حفظ الدفعة بسند قيد لكل (عملة، تاريخ) مقابل الحساب الوسيط
+    const openingLines: OpeningBalanceLine[] = [];
+    const today = new Date().toISOString().slice(0, 10);
 
     for (const item of data) {
       try {
@@ -63,24 +96,27 @@ export async function POST(request: NextRequest) {
         // Skip invalid records
         if (!item.isValid) {
           errors.push(`السطر ${rowIndex}: بيانات غير صالحة`);
+          results.push({ rowIndex, status: "failed", error: "بيانات غير صالحة" });
           failed++;
           continue;
         }
 
         // Required field check
         if (!item.customer_name) {
-          errors.push(`السطر ${rowIndex}: اسم الزبون مطلوب`);
+          errors.push(`السطر ${rowIndex}: اسم العميل مطلوب`);
+          results.push({ rowIndex, status: "failed", error: "الاسم مطلوب" });
           failed++;
           continue;
         }
 
         // Determine type: 1 = customer, 2 = supplier
-        const type = item.type || 1;
+        const type = Number(item.type) || 1;
 
-        // Generate customer code if not provided
-        let customerCode = item.customer_code;
+        // Generate customer code if not provided and normalize imported values to the same 10-digit format
+        if (!prefixByType.has(type)) prefixByType.set(type, await defaultPrefixForType(type));
+        let customerCode = normalizeImportedCode(item.customer_code, prefixByType.get(type) || "");
         if (!customerCode) {
-          customerCode = await generateCustomerNumber();
+          customerCode = await generateCustomerNumber(type);
         }
 
         // Check for duplicates
@@ -89,8 +125,29 @@ export async function POST(request: NextRequest) {
     `;
         if (existing.length > 0) {
           duplicates++;
+          results.push({ rowIndex, status: "duplicate", error: `الرقم ${customerCode} موجود مسبقاً` });
           continue;
         }
+
+        // كل عميل/مورد/مشترك مستورَد يحتاج حساباً مرتبطاً في account_tbl تماماً كما يحصل عند
+        // الإنشاء اليدوي عبر /api/customers — بلا هذا الربط كان الاستيراد الجماعي يترك العميل
+        // بلا حساب محاسبي أصلاً (account_id فارغ)، خلافاً لما يحدث عند الإدخال اليدوي.
+        const accountType = resolveAccountType(type)
+        const parent = parentByType.get(type)!
+        const accountId = await ensureCustomerAccount({
+          code: customerCode,
+          name: item.name || item.customer_name,
+          // عملة الحساب = عملة الرصيد الافتتاحي إن حُدِّدت
+          currencyId: toNullableInt(item.opening_currency_id) ?? toNullableInt(item.currency_id) ?? 1,
+          allowTransWithDiffCurr: item.allow_trans_with_diff_curr ?? 0,
+          isCalcCurrDiffRates: item.iscalc_curr_diff_rates ?? false,
+          fatherId: parent.fatherId,
+          levelNo: parent.levelNo,
+          accountType,
+        })
+
+        // المدينة من Excel بالاسم: تُطابَق مع تعريف المدن أو تُضاف إليه، ويُحفظ رقمها
+        const city = await resolveCustomerCity(item.city_id, item.city)
 
         // Insert into customers table
         const result = await sql`
@@ -102,6 +159,7 @@ export async function POST(request: NextRequest) {
         whatsapp1,
         whatsapp2,
         city,
+        city_id,
         address,
         email,
         status,
@@ -114,7 +172,8 @@ export async function POST(request: NextRequest) {
         api_key,
         type,
         isDeleted,
-        priceCategory
+        priceCategory,
+        account_id
       ) VALUES (
         ${customerCode},
         ${item.name || item.customer_name},
@@ -122,30 +181,67 @@ export async function POST(request: NextRequest) {
         ${item.mobile2 || null},
         ${item.whatsapp1 || null},
         ${item.whatsapp2 || null},
-        ${item.city || null},
+        ${city.name},
+        ${city.id},
         ${item.address || null},
         ${item.email || null},
         ${item.status || 'نشط'},
         ${item.business_nature || null},
         ${item.salesman || null},
-        ${item.classification || null},
+        ${item.classification || item.classifications || null},
         ${item.registration_date || new Date().toISOString().split('T')[0]},
         ${item.transaction_notes || null},
         ${item.general_notes || null},
         ${item.api_key || `API_${customerCode}_${Date.now()}`},
         ${type},
         ${item.isDeleted || false},
-        ${Number(item.pricecategory) || Number(item.priceCategory) || 0}
+        ${Number(item.pricecategory) || Number(item.priceCategory) || 0},
+        ${accountId}
       )
       RETURNING *;
     `;
 
         success++;
+        results.push({ rowIndex: item.rowIndex || data.indexOf(item) + 1, status: "success" });
+        const openingBalance = Number(item.opening_balance) || 0
+        if (Math.abs(openingBalance) >= 0.0005) {
+          // العميل/المشترك: موجب = مدين (عليه). المورد: موجب = دائن (له). الإشارة السالبة تعكس الاتجاه.
+          const openingDate = /^\d{4}-\d{2}-\d{2}$/.test(String(item.opening_date || "").slice(0, 10)) ? String(item.opening_date).slice(0, 10) : today
+          openingLines.push({
+            key: item.rowIndex || data.indexOf(item) + 1, accountId: Number(accountId), amount: type === 2 ? -openingBalance : openingBalance,
+            currencyId: toNullableInt(item.opening_currency_id) ?? toNullableInt(item.currency_id) ?? 1, date: openingDate, label: `${customerCode} ${item.customer_name}`,
+          })
+        }
       } catch (error: any) {
         const rowIndex = item.rowIndex || data.indexOf(item) + 1;
         errors.push(`السطر ${rowIndex}: ${error.message}`);
+        results.push({ rowIndex, status: "failed", error: error.message });
         failed++;
         console.error(`Error importing customer ${item.customer_name}:`, error);
+      }
+    }
+
+    if (openingLines.length) {
+      const failOpening = (message: string) => {
+        for (const line of openingLines) {
+          const result = results.find((entry) => entry.rowIndex === line.key)
+          if (result) { result.status = "failed"; result.error = `تم حفظ الحساب لكن لم يُقيَّد الرصيد الافتتاحي: ${message}`; success--; failed++ }
+        }
+      }
+      // قيد الأرصدة يتطلب صلاحية إدخال سند قيد
+      const journalPermission = await authorizeTransaction(request, "journal", "create")
+      if (!journalPermission.ok) failOpening("لا تملك صلاحية إدخال سند قيد")
+      else {
+        let branchId = actor?.branchId || journalPermission.branchId
+        if (!branchId) branchId = Number((await sql`SELECT branch_id FROM user_settings WHERE user_id = ${actor?.userId || ""} LIMIT 1`)[0]?.branch_id) || 0
+        const posted = await postOpeningBalances(openingLines, { userId: actor?.userId || String(journalPermission.userId), branchId, note: "أرصدة افتتاحية - استيراد من Excel" })
+        for (const line of openingLines) {
+          const outcome = posted.get(line.key)
+          const result = results.find((entry) => entry.rowIndex === line.key)
+          if (!result || !outcome) continue
+          if (outcome.ok) (result as any).voucher_code = outcome.voucherCode
+          else { result.status = "failed"; result.error = `تم حفظ الحساب لكن لم يُقيَّد الرصيد الافتتاحي: ${outcome.error}`; success--; failed++ }
+        }
       }
     }
 
@@ -157,9 +253,75 @@ export async function POST(request: NextRequest) {
       failed,
       duplicates,
       errors: errors.slice(0, 10),
+      results,
     })
   } catch (error) {
     console.error("Error importing customers:", error)
-    return NextResponse.json({ error: "خطأ في استيراد الزبائن" }, { status: 500 })
+    return NextResponse.json({ error: "خطأ في استيراد العملاء" }, { status: 500 })
   }
+}
+
+
+
+
+// وضع التحديث: تعديل عملاء/موردين موجودين برقمهم — الرقم للمطابقة فقط ولا يتغيّر، والخلية الفارغة تُبقي
+// القيمة الحالية. لا رصيد افتتاحي هنا (له سند قيد مستقل)، وتغيير الاسم ينعكس على اسم الحساب المرتبط فقط.
+const UPDATE_FIELDS = [
+  ["name", "customer_name"], ["mobile1", "mobile1"], ["mobile2", "mobile2"], ["whatsapp1", "whatsapp1"], ["city", "city"],
+  ["address", "address"], ["email", "email"], ["classification", "classification"], ["pricecategory", "priceCategory"],
+] as const
+
+async function updateImportedCustomers(data: any[]) {
+  let success = 0
+  let failed = 0
+  const results: Array<{ rowIndex: number; status: "success" | "failed"; error?: string }> = []
+  const prefixByType = new Map<number, string>()
+  for (const item of data) {
+    const rowIndex = item.rowIndex || data.indexOf(item) + 1
+    try {
+      const type = Number(item.type) || 1
+      if (!prefixByType.has(type)) prefixByType.set(type, await defaultPrefixForType(type))
+      const customerCode = normalizeImportedCode(item.customer_code, prefixByType.get(type) || "")
+      if (!customerCode) throw new Error("الرقم مطلوب في وضع التحديث")
+      const stored = (await sql`SELECT id, type, account_id, name FROM customers WHERE customer_code = ${customerCode} AND COALESCE(isDeleted, false) = false LIMIT 1`)[0]
+      if (!stored) throw new Error(`الرقم ${customerCode} غير موجود`)
+      if ((Number(stored.type) || 1) !== type) throw new Error(`الرقم ${customerCode} ليس من نفس النوع`)
+
+      const patch: Record<string, any> = {}
+      for (const [column, key] of UPDATE_FIELDS) {
+        const raw = item[key]
+        if (raw === undefined || raw === null || String(raw).trim() === "") continue
+        patch[column] = column === "pricecategory" ? Number(raw) || 0 : String(raw).trim()
+      }
+      if (!Object.keys(patch).length) throw new Error("لا توجد قيم للتحديث")
+
+      const v = (column: string) => (column in patch ? patch[column] : null)
+      const city = patch.city ? await resolveCustomerCity(null, patch.city) : { id: null, name: null }
+      if (patch.city) patch.city = city.name
+      await sql`
+        UPDATE customers SET
+          name = COALESCE(${v("name")}, name),
+          mobile1 = COALESCE(${v("mobile1")}, mobile1),
+          mobile2 = COALESCE(${v("mobile2")}, mobile2),
+          whatsapp1 = COALESCE(${v("whatsapp1")}, whatsapp1),
+          city = COALESCE(${v("city")}, city),
+          city_id = COALESCE(${city.id}::int, city_id),
+          address = COALESCE(${v("address")}, address),
+          email = COALESCE(${v("email")}, email),
+          classification = COALESCE(${v("classification")}, classification),
+          pricecategory = COALESCE(${v("pricecategory")}::int, pricecategory),
+          updated_at = CURRENT_TIMESTAMP
+        WHERE id = ${stored.id}
+      `
+      if (patch.name && patch.name !== stored.name && stored.account_id) {
+        await sql`UPDATE account_tbl SET name = ${patch.name}, last_update_date = CURRENT_TIMESTAMP WHERE id = ${stored.account_id}`
+      }
+      success++
+      results.push({ rowIndex, status: "success" })
+    } catch (error: any) {
+      failed++
+      results.push({ rowIndex, status: "failed", error: error?.message || "فشل التحديث" })
+    }
+  }
+  return { success, failed, duplicates: 0, errors: [], results }
 }

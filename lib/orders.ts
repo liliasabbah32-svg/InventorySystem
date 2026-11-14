@@ -1,51 +1,78 @@
 
-import { generateSalesOrderNumber } from "./number-generator"
-import { generatePurchaseOrderNumber } from "./number-generator"
+import { generateSalesOrderNumber, generatePurchaseOrderNumber, resolveDefaultVoucherBookName } from "./number-generator"
 import { type NextRequest, NextResponse } from "next/server"
-import { neon } from "@neondatabase/serverless"
-import { Pool } from "pg"
-import { db } from "@vercel/postgres"
 import { adjustStock } from "./inventory"
-
-let sql: any = null
-
-try {
-  if (!process.env.DATABASE_URL) {
-    console.error("[v0] DATABASE_URL environment variable is not set")
-  } else {
-    const dbUrl = process.env.DATABASE_URL
-
-    if (dbUrl.includes("localhost") || dbUrl.includes("127.0.0.1")) {
-      console.log("[v0] Using local PostgreSQL with pg Pool")
-      const pool = new Pool({ connectionString: dbUrl })
-      sql = async (strings: TemplateStringsArray, ...values: any[]) => {
-        const client = await pool.connect()
-        try {
-          const query =
-            strings.reduce(
-              (prev, curr, i) =>
-                prev + curr + (i < values.length ? `$${i + 1}` : ""),
-              ""
-            )
-          const result = await client.query(query, values)
-          return result.rows
-        } finally {
-          client.release()
-        }
-      }
-    } else {
-      console.log("[v0] Using Neon serverless client")
-      sql = neon(dbUrl)
-    }
-
-    console.log("[v0] Database client initialized successfully")
-  }
-} catch (error) {
-  console.error("[v0] Failed to initialize DB client:", error)
-  sql = null
-}
+import {
+  createCustomerOrder as createTaskCustomerOrder,
+  createOrderItem as createTaskOrderItem,
+  getCustomerOrderById as getTaskCustomerOrderById,
+  assertCustomerOrderApprovable,
+  discardEmptyCustomerOrder,
+  markCustomerOrderApproved,
+  forceCloseCustomerOrder,
+} from "./task-orders"
+import sql, { getTenantPool, resolveCurrentDbName } from "./database"
+import { ensureOrderReadColumns } from "./order-schema"
 
 export default sql
+
+const orderWorkflowColumnsEnsured = new Map<string, Promise<void>>()
+async function ensureOrderWorkflowColumns() {
+  const databaseName = await resolveCurrentDbName()
+  let ready = orderWorkflowColumnsEnsured.get(databaseName)
+  if (!ready) {
+    ready = (async () => {
+      await ensureOrderReadColumns()
+      await sql`
+        DO $$
+        BEGIN
+          IF EXISTS (
+            SELECT 1 FROM pg_constraint
+            WHERE conrelid = 'orders'::regclass AND conname = 'sales_orders_customer_id_fkey'
+          ) THEN
+            ALTER TABLE orders DROP CONSTRAINT sales_orders_customer_id_fkey;
+          END IF;
+          IF NOT EXISTS (
+            SELECT 1 FROM pg_constraint
+            WHERE conrelid = 'orders'::regclass AND contype = 'f'
+              AND pg_get_constraintdef(oid) = 'FOREIGN KEY (customer_id) REFERENCES account_tbl(id)'
+          ) THEN
+            ALTER TABLE orders ADD CONSTRAINT orders_customer_id_fkey FOREIGN KEY (customer_id) REFERENCES account_tbl(id);
+          END IF;
+        END $$;
+      `
+      // order_number كان VARCHAR(8) بالمخطط الأصلي (scripts/ME/Scripts28122025.txt) — لا يكفي
+      // للتنسيق الفعلي المولَّد بـgetNextSequentialNumber (بادئة حرفين "O"/"T" + رمز دفتر السند +
+      // 9 أرقام، انظر lib/number-generator.ts validateNumberFormat)، فيفشل الحفظ بـ"value too long
+      // for type character varying(8)". يُوسَّع هنا ليطابق نفس عرض vch_code بـvoucher_header_tbl
+      // (VARCHAR(30) — انظر app/api/receipts/_lib.ts) بدل رقم اعتباطي، لتوحيد عرض حقل رقم السند/
+      // الطلبية عبر النظام. توسيع VARCHAR بهذا الاتجاه عملية وصفية فقط بـPostgres (بلا إعادة كتابة
+      // الجدول)، فتُنفَّذ بأمان في كل إقلاع بارد لهذا الملف.
+      await sql`ALTER TABLE orders ALTER COLUMN order_number TYPE VARCHAR(30)`
+      // شركات زُوِّدت قبل إصلاح lib/provisioning.ts (cloneReferenceSchema كانت تُفوِّت أعمدة IDENTITY
+      // تماماً — انظر isIdentityColumn هناك) انتهت بـorders.id عمود INTEGER عادي بلا أي تسلسل تلقائي.
+      // أي إدراج يُغفِل id (السلوك الصحيح، يُفتَرض توليده تلقائياً) يفشل حينها بـ"null value in column
+      // \"id\" violates not-null constraint". يُصلَح هنا ذاتياً لأي قاعدة شركة قديمة لم تُصلَح يدوياً بعد.
+      await sql`
+        DO $$
+        BEGIN
+          IF NOT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name = 'orders' AND column_name = 'id' AND is_identity = 'YES'
+          ) THEN
+            ALTER TABLE orders ALTER COLUMN id ADD GENERATED ALWAYS AS IDENTITY;
+            PERFORM setval(pg_get_serial_sequence('orders', 'id'), COALESCE((SELECT MAX(id) FROM orders), 0) + 1, false);
+          END IF;
+        END$$;
+      `
+    })().catch((error: unknown) => {
+      orderWorkflowColumnsEnsured.delete(databaseName)
+      throw error
+    })
+    orderWorkflowColumnsEnsured.set(databaseName, ready)
+  }
+  return ready
+}
 
 export interface SalesOrder {
   id: number;
@@ -79,6 +106,7 @@ export interface SalesOrder {
   customer_order_no?: string;
   user_id: string;
   order_status2: number;
+  branch_id?: number | null;
 }
 
 
@@ -100,6 +128,7 @@ export interface PurchaseOrder {
   attachments?: string
   created_at: Date
   updated_at: Date
+  branch_id?: number | null
 }
 
 export interface OrderItem {
@@ -119,6 +148,8 @@ export interface OrderItem {
   barcode?: string | null;
   unit_id?: number | null;
   store_id?: number | null;
+  workflow_id?: number | null;
+  specifications?: any;
   created_at: Date;
   updated_at: Date;
 }
@@ -133,12 +164,6 @@ export interface OrderFilters {
   supplierId?: number
 }
 
-// Create pool once
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL
-});
-
-
 
 // ---------------------------------------------------------------
 // GET SALES ORDERS WITH SAFE FILTERS
@@ -146,20 +171,26 @@ const pool = new Pool({
 
 
 export async function getSalesOrders(filters: any = {}) {
-  const { search = null, status = null, salesman = null, dateFrom = null, dateTo = null, customerId = null, order_type = null } = filters;
+  await ensureOrderReadColumns()
+  // The draft table owns the durable link to the sales order created from it.
+  // Ensure older tenant databases have the table before using it in this query.
+  const { ensureOrderDraftTables } = await import("@/lib/order-drafts")
+  await ensureOrderDraftTables()
+  const { search = null, status = null, salesman = null, dateFrom = null, dateTo = null, customerId = null, order_type = null, branchId = null, branchIds = null } = filters;
 
   const whereClauses: string[] = [];
   const params: any[] = [];
   let paramIndex = 1;
 
-  whereClauses.push(` deleted = false `);
+  // Older tenant databases may have NULL in deleted for otherwise active orders.
+  whereClauses.push(` COALESCE(so.deleted, false) = false `);
   if (order_type !== null && order_type != -1) {
-    whereClauses.push(`order_type = $${paramIndex}`);
+    whereClauses.push(`so.order_type = $${paramIndex}`);
     params.push(order_type);
     paramIndex++;
   }
   if (search) {
-    whereClauses.push(`(so.order_number ILIKE $${paramIndex} OR c.name ILIKE $${paramIndex})`);
+    whereClauses.push(`(so.order_number ILIKE $${paramIndex} OR so.customer_name ILIKE $${paramIndex} OR c.name ILIKE $${paramIndex})`);
     params.push(`%${search}%`);
     paramIndex++;
   }
@@ -188,6 +219,15 @@ export async function getSalesOrders(filters: any = {}) {
     params.push(customerId);
     paramIndex++;
   }
+  if (Array.isArray(branchIds) && branchIds.length) {
+    whereClauses.push(`so.branch_id = ANY($${paramIndex}::int[])`);
+    params.push(branchIds);
+    paramIndex++;
+  } else if (branchId) {
+    whereClauses.push(`so.branch_id = $${paramIndex}`);
+    params.push(branchId);
+    paramIndex++;
+  }
 
 
   const whereSQL = whereClauses.length ? ` WHERE ${whereClauses.join(" AND ")}` : "";
@@ -195,19 +235,22 @@ export async function getSalesOrders(filters: any = {}) {
   const queryText = `
     SELECT 
       so.*,
-      COALESCE(c.name, '') AS customer_name,
+      COALESCE(NULLIF(so.customer_name, ''), c.name, '') AS customer_name,
+      draft.id AS source_draft_id,
+      draft.draft_number AS source_draft_number,
       COALESCE(COUNT(oi.id), 0) AS item_count,
       COALESCE(SUM(oi.quantity), 0) AS total_quantity
     FROM orders so
-    LEFT JOIN customers c ON so.customer_id = c.id
+    LEFT JOIN account_tbl c ON so.customer_id = c.id
     LEFT JOIN order_items oi ON so.id = oi.order_id
+    LEFT JOIN sales_order_drafts draft ON draft.confirmed_order_id = so.id
     ${whereSQL}
-    GROUP BY so.id, c.name
+    GROUP BY so.id, c.name, draft.id, draft.draft_number
     ORDER BY so.created_at DESC
   `;
 
   // Use pool.query instead of sql template tag
-  const result = await pool.query(queryText, params);
+  const result = await (await getTenantPool()).query(queryText, params);
   return result.rows;
 }
 
@@ -320,16 +363,24 @@ export async function createOrder(
   orderData: Partial<SalesOrder>,
   items: Partial<OrderItem>[]
 ) {
-  const client = await pool.connect();
+  await ensureOrderWorkflowColumns();
+  // إعداد حساب العميل/المورد "السماح بعمل حركة على الحساب بغير عملته" = ممنوع (2) ⇒ تُرفض الطلبية بعملة أخرى
+  const orderAccountId = Number(orderData.customer_id) || 0
+  const orderCurrencyId = Number(orderData.currency_id) || 0
+  if (orderAccountId && orderCurrencyId) {
+    const [account] = await sql`SELECT code, name, currency_id, allow_trans_with_diff_curr FROM account_tbl WHERE id = ${orderAccountId}`
+    if (account && account.currency_id != null && Number(account.currency_id) !== orderCurrencyId && Number(account.allow_trans_with_diff_curr) === 2) {
+      throw new Error(`عملة الطلبية تختلف عن عملة الحساب لا يمكن اختياره: ${account.code} - ${account.name}`)
+    }
+  }
+  const client = await (await getTenantPool()).connect();
   try {
     await client.query("BEGIN");
-    const vchBook = orderData.order_number?.[1] ?? "O";
-    // Generate order number if missing
-    if (!orderData.order_number) {
-      if (orderData.order_type === 1) orderData.order_number = await generateSalesOrderNumber(vchBook);
-      else orderData.order_number = await generatePurchaseOrderNumber(vchBook);
-    }
-
+    await client.query(`CREATE TABLE IF NOT EXISTS attributes_tbl (id SERIAL PRIMARY KEY, name TEXT NOT NULL UNIQUE)`)
+    await client.query(`CREATE TABLE IF NOT EXISTS attribute_values_tbl (id SERIAL PRIMARY KEY, attr_id INTEGER NOT NULL REFERENCES attributes_tbl(id) ON DELETE CASCADE, name TEXT NOT NULL, UNIQUE(attr_id, name))`)
+    await client.query(`CREATE TABLE IF NOT EXISTS product_atrributes_values_tbl (id BIGSERIAL UNIQUE, product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE, attr_id INTEGER NOT NULL REFERENCES attributes_tbl(id) ON DELETE CASCADE, value_id INTEGER NOT NULL REFERENCES attribute_values_tbl(id) ON DELETE CASCADE, image_url TEXT, PRIMARY KEY(product_id, attr_id, value_id))`)
+    await client.query(`CREATE TABLE IF NOT EXISTS order_item_attributes_tbl (id BIGSERIAL PRIMARY KEY, order_item_id INTEGER NOT NULL, product_attribute_value_id BIGINT NOT NULL REFERENCES product_atrributes_values_tbl(id) ON DELETE CASCADE, UNIQUE(order_item_id, product_attribute_value_id))`)
+    await client.query(`ALTER TABLE order_items ADD COLUMN IF NOT EXISTS specifications JSONB NOT NULL DEFAULT '{}'::jsonb`)
     // Check for duplicate reference number
     if (orderData.reference_number && orderData.reference_number.trim() !== "") {
       let queryText = `SELECT id FROM orders WHERE reference_number = $1 AND deleted = false AND id != $2`;
@@ -419,8 +470,9 @@ export async function createOrder(
     received_by = $25,
     customer_order_no= $26,
     order_status2 = $27,
+    branch_id = $28,
     updated_at = NOW()
-  WHERE id = $28
+  WHERE id = $29
   RETURNING *;
 `;
 
@@ -453,10 +505,11 @@ export async function createOrder(
         orderData.received_by || "",
         orderData.customer_order_no || "",
         orderData.order_status2 || 1,
+        orderData.branch_id ?? null,
         orderData.id, // WHERE id
       ];
 
-      const result = await pool.query(orderUpdateQuery, orderValues);
+      const result = await (await getTenantPool()).query(orderUpdateQuery, orderValues);
       order = result.rows[0];
 
     } else {
@@ -465,17 +518,22 @@ export async function createOrder(
 
       if (orderData.order_number && orderData.order_number.length >= 2) {
         // Check DB if this order_number already exists
-        const res = await pool.query(
+        const res = await (await getTenantPool()).query(
           `SELECT id FROM orders WHERE order_number = $1 LIMIT 1`,
           [orderData.order_number]
         );
         exists = res.rows.length > 0;
       }
 
-      // Generate new order number if missing or already exists
+      // Generate new order number if missing or already exists — يحصل هذا لأي طلبية لا تُرسِل رقماً
+      // جاهزاً من الواجهة (كالنافذة السريعة QuickSalesOrder التي لا تعرض دفتر سندات إطلاقاً)، أو
+      // عند تعارض رقم موجود مسبقاً. دفتر السندات هنا يُحلّ من صلاحيات المستخدم الفعلية
+      // (voucher_book_user_permissions_tbl، is_default=1) بدل الرجوع لحرف ثابت غير مرتبط بأي صلاحية.
       if (!orderData.order_number || orderData.order_number.length < 2 || exists) {
-        if (orderData.order_type === 1) orderData.order_number = await generateSalesOrderNumber(vchBook);
-        else orderData.order_number = await generatePurchaseOrderNumber(vchBook);
+        const vchBook =
+          (await resolveDefaultVoucherBookName(String(orderData.user_id || ""), orderData.order_type === 2 ? 2 : 1)) || "0";
+        if (orderData.order_type === 1) orderData.order_number = await generateSalesOrderNumber(vchBook, Number((orderData as any).branch_id) || null);
+        else orderData.order_number = await generatePurchaseOrderNumber(vchBook, Number((orderData as any).branch_id) || null);
       }
       const orderInsertQuery = `
         INSERT INTO orders (
@@ -509,12 +567,15 @@ export async function createOrder(
           printed,
           printed_count,
           order_status2,
+          branch_id,
+          deleted,
           created_at,
           updated_at
         ) VALUES (
           $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
           $11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
           $21,$22,$23,$24,$25,$26,$27,$28,$29,$30,
+          $31,$32,
           NOW(),NOW()
         )
         RETURNING *;
@@ -548,36 +609,72 @@ export async function createOrder(
         orderData.delivery_notes || "",
         orderData.received_by || "",
         orderData.customer_order_no || "",
-        orderData.user_id || "",
+        orderData.user_id || null,
         "0",
         "0",
         orderData.order_status2 || 0,
+        orderData.branch_id ?? null,
+        false,
       ];
 
 
-      const result = await pool.query(orderInsertQuery, orderValues);
+      const result = await (await getTenantPool()).query(orderInsertQuery, orderValues);
       order = result.rows[0];
     }
 
 
     console.log("[v0] Order created:", order);
+
+    // نقل workflow_id الحالي لكل بند قبل حذفه، لمطابقته لاحقاً ببند الحفظ الجديد بنفس product_id —
+    // order_items يُعاد إنشاؤه بالكامل (حذف ثم إدراج) بكل حفظ، فهذا النقل يمنع فقدان الربط بمخطط
+    // سير عمل تتبع الطلبيات المُنشأ مسبقاً لهذا البند عند أي تعديل لاحق على الطلبية — وإلا كانت
+    // مهام "لوحة تتبع الطلبيات" ستُعاد إنشاؤها من الصفر (مكرَّرة) عند كل حفظ.
+    const priorWorkflowByProduct = new Map<number, number[]>();
     if (order.id && order.id > 0) {
+      const priorItemsResult = await client.query(
+        `SELECT product_id, workflow_id FROM order_items WHERE order_id = $1 AND workflow_id IS NOT NULL`,
+        [order.id]
+      );
+      for (const row of priorItemsResult.rows) {
+        if (row.product_id == null) continue;
+        const list = priorWorkflowByProduct.get(row.product_id) || [];
+        list.push(row.workflow_id);
+        priorWorkflowByProduct.set(row.product_id, list);
+      }
+
       // Delete existing items first
+      await client.query(`DELETE FROM order_item_attributes_tbl WHERE order_item_id IN (SELECT id FROM order_items WHERE order_id = $1)`, [order.id]);
       await client.query(`DELETE FROM order_items WHERE order_id = $1`, [order.id]);
       await client.query(`DELETE FROM stock_batch WHERE order_id = $1`, [order.id]);
     }
     // Insert order items
+    const insertedItems: Array<{ dbId: number; item: Partial<OrderItem>; workflowId: number | null }> = [];
     for (const item of items) {
       if (!item.product_name || (!item.quantity && !item.delivered_quantity)) continue;
+
+      // حالة طلبية المبيعات تتحكم بحالة أصنافها: غير جاهز/جاهز يطبّقان على جميع
+      // السطور، أما إغلاق الطلبية فيلغي السطور غير المرسلة فقط ويحافظ على 3 و4.
+      if (Number(orderData.order_type) === 1) {
+        const orderStatus = Number(orderData.order_status)
+        if (orderStatus === 1 || orderStatus === 2) item.item_status = orderStatus
+        else if (orderStatus === 6 && ![4].includes(Number(item.item_status))) item.item_status = 6
+      }
+
+      let carriedWorkflowId: number | null = null;
+      if (item.product_id != null) {
+        const list = priorWorkflowByProduct.get(item.product_id);
+        if (list && list.length > 0) carriedWorkflowId = list.shift()!;
+      }
 
       const itemInsertQuery = `
         INSERT INTO order_items (
           order_id, product_id, product_name, quantity, bonus, price, discount,
           barcode, unit_id, store_id, delivered_quantity,
-          expiry_date, batch_number, item_status, created_at, updated_at
+          expiry_date, batch_number, item_status, workflow_id, specifications, created_at, updated_at
         ) VALUES (
-          $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,NOW(),NOW()
+          $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16::jsonb,NOW(),NOW()
         )
+        RETURNING id
       `;
 
       const itemValues = [
@@ -595,9 +692,20 @@ export async function createOrder(
         item.expiry_date || null,
         item.batch_number || null,
         item.item_status || 0,
+        carriedWorkflowId,
+        JSON.stringify(item.specifications || {}),
       ];
 
-      await client.query(itemInsertQuery, itemValues);
+      const insertResult = await client.query(itemInsertQuery, itemValues);
+      insertedItems.push({ dbId: insertResult.rows[0].id, item, workflowId: carriedWorkflowId });
+      const selected = (item as any).selected_attributes && typeof (item as any).selected_attributes === "object" ? Object.values((item as any).selected_attributes).map(String) : []
+      for (const value of selected) {
+        await client.query(`INSERT INTO order_item_attributes_tbl (order_item_id, product_attribute_value_id)
+          SELECT $1, pav.id FROM product_atrributes_values_tbl pav JOIN attribute_values_tbl av ON av.id = pav.value_id
+          WHERE pav.product_id = $2 AND av.name = $3 ON CONFLICT DO NOTHING`, [insertResult.rows[0].id, item.product_id, value])
+      }
+      const selectedValueIds = (item as any).specifications?.product && typeof (item as any).specifications.product === "object" ? Object.values((item as any).specifications.product).map(Number).filter(Number.isInteger) : []
+      for (const valueId of selectedValueIds) await client.query(`INSERT INTO order_item_attributes_tbl (order_item_id, product_attribute_value_id) SELECT $1,id FROM product_atrributes_values_tbl WHERE product_id=$2 AND value_id=$3 ON CONFLICT DO NOTHING`, [insertResult.rows[0].id, item.product_id, valueId])
     }
 
     if (orderData.order_type === 2) {
@@ -645,7 +753,7 @@ export async function createOrder(
         await client.query(insertLogQuery, [
           item.product_id,
           batchId,
-          orderData.user_id || '', // use the current user, fallback to 'system'
+          orderData.user_id || null, // use the current user, fallback to 'system'
           1                               // same status as stock_batch
         ]);
       }
@@ -674,7 +782,62 @@ export async function createOrder(
     await client.query("COMMIT");
     console.log("[v0] Order and items inserted successfully");
 
-    return order;
+    // فتح مراحل "لوحة تتبع الطلبيات" (task-orders) لكل صنف لم يُنقَل له سير عمل بالفعل من قبل
+    // (workflowId === null أعلاه) — سواء عند إنشاء طلبية جديدة أو عند إضافة بنود جديدة لطلبية
+    // موجودة أثناء تعديلها؛ بنود لها workflow_id منقول لا تُعاد معالجتها إطلاقاً (كانت isNewOrder
+    // وحدها تمنع إعادة الإنشاء المكرَّر بالتعديل، لكنها كانت تمنع أيضاً فتح تتبع لبنود جديدة أُضيفت
+    // ضمن تعديل لاحق). أثر جانبي أفضل جهد (best-effort) بعد نجاح commit الطلبية نفسها ولا يُسقطها
+    // عند فشله (نفس نمط safeNotify في task-orders.ts). Number(order_type) لأن orderData قد يصل
+    // أحياناً بقيم نصية من الواجهة رغم أن النوع المصرَّح Partial<SalesOrder>.
+    // taskTracking: يُرفَق على الطلبة المُعادة فقط (لا عمود بقاعدة البيانات) ليتمكن الطرف الطالب
+    // (API route ثم الواجهة، كـQuickSalesOrder) من إعلام المستخدم إن تعذّر فتح خطوات سير العمل —
+    // كانت هذه الأخطاء تُسجَّل بـconsole.error على الخادم فقط (best-effort) دون أي إشارة للمستخدم،
+    // فيبدو الأمر وكأن "الطلبية من الشاشة السريعة لا تفتح خطوات سير عمل" رغم أن الكود نفسه يعمل من
+    // كلا المسارين (الشاشة السريعة والشاشة الكاملة تستدعيان createOrder نفسها) — الفرق الفعلي غالباً
+    // عدم وجود سير عمل مطابق (عام/فرع/صنف) وليس فرقاً بالكود.
+    let taskTracking: { attempted: number; opened: number; error: string | null } | null = null;
+    if (Number(orderData.order_type) === 1) {
+      const trackedItems = insertedItems.filter(
+        (entry) => entry.workflowId == null && entry.item.product_name && (entry.item.quantity || entry.item.delivered_quantity)
+      );
+      if (trackedItems.length > 0) {
+        taskTracking = { attempted: trackedItems.length, opened: 0, error: null };
+        try {
+          const taskCustomerOrder = await createTaskCustomerOrder({
+            customerId: orderData.customer_id || null,
+            createdBy: String(orderData.user_id || ""),
+            sourceOrderId: order.id,
+          });
+          for (const entry of trackedItems) {
+            try {
+              const taskItem = await createTaskOrderItem({
+                customerOrderId: taskCustomerOrder.id,
+                title: entry.item.product_name!,
+                productId: entry.item.product_id || null,
+                qty: entry.item.quantity || null,
+                createdBy: String(orderData.user_id || ""),
+                branchId: orderData.branch_id ?? null,
+              });
+              if (taskItem?.workflow_id) {
+                await (await getTenantPool()).query(`UPDATE order_items SET workflow_id = $1 WHERE id = $2`, [taskItem.workflow_id, entry.dbId]);
+                taskTracking.opened++;
+              }
+            } catch (itemError: any) {
+              console.error("[v0] Failed to open tracking steps for order item (non-blocking):", entry.item.product_name, itemError);
+              taskTracking.error = itemError?.message || "تعذّر فتح سير العمل لأحد الأصناف";
+            }
+          }
+          if (taskTracking.opened === 0 && !taskCustomerOrder.reused) {
+            await discardEmptyCustomerOrder(taskCustomerOrder.id);
+          }
+        } catch (taskError: any) {
+          console.error("[v0] Failed to open task-order tracking for sales order (non-blocking):", taskError);
+          taskTracking.error = taskError?.message || "تعذّر فتح سير العمل لهذه الطلبية";
+        }
+      }
+    }
+
+    return { ...order, _taskTracking: taskTracking };
   } catch (error) {
     await client.query("ROLLBACK");
     console.error("[v0] Error creating order:", error);
@@ -685,6 +848,7 @@ export async function createOrder(
 }
 export async function createPurchaseOrder(orderData: Partial<PurchaseOrder>, items: Partial<OrderItem>[]) {
   try {
+    await sql`ALTER TABLE purchase_orders ADD COLUMN IF NOT EXISTS branch_id INTEGER`
     // Generate order number if not provided
     if (!orderData.order_number) {
       const lastOrder = await sql`
@@ -708,13 +872,13 @@ export async function createPurchaseOrder(orderData: Partial<PurchaseOrder>, ite
       INSERT INTO purchase_orders (
         order_number, order_date, supplier_id, supplier_name, salesman,
         total_amount, currency_code, currency_name, exchange_rate,
-        workflow_status, expected_delivery_date, manual_document, notes
+        workflow_status, expected_delivery_date, manual_document, notes, branch_id
       ) VALUES (
         ${orderData.order_number}, ${orderData.order_date}, ${orderData.supplier_id},
         ${orderData.supplier_name}, ${orderData.salesman}, ${orderData.total_amount},
         ${orderData.currency_code}, ${orderData.currency_name}, ${orderData.exchange_rate},
         ${orderData.workflow_status || "pending"}, ${orderData.expected_delivery_date || null},
-        ${orderData.manual_document || null}, ${orderData.notes || null}
+        ${orderData.manual_document || null}, ${orderData.notes || null}, ${orderData.branch_id ?? null}
       )
       RETURNING *
     `
@@ -821,10 +985,19 @@ export async function getCustomers() {
     console.log("[v0] Fetching customers from database...")
 
     const result = await sql`
-      SELECT id, customer_code, customer_name, email, mobile1, status
-      FROM customers
-      WHERE status = 'active'
-      ORDER BY customer_name
+      SELECT a.id,
+             a.id AS account_id,
+             a.code AS customer_code,
+             COALESCE(a.name, '') AS customer_name,
+             a.name,
+             a.code,
+             NULL::text AS email,
+             NULL::text AS mobile1,
+             a.status
+      FROM account_tbl a
+      WHERE a.type IN (2, 3, 5)
+        AND COALESCE(a.status::text, '1') IN ('1', '2', 'active', 'ACTIVE', 'نشط')
+      ORDER BY COALESCE(a.name, '')
     `
 
     console.log("[v0] Customers fetched:", result.length, "records")
@@ -941,9 +1114,53 @@ export async function deleteSalesOrder(
   voucherType: number,
   userId: string | null
 ) {
-  const client = await pool.connect(); // افترض أنك عندك pool
+  const client = await (await getTenantPool()).connect(); // افترض أنك عندك pool
   try {
     await client.query('BEGIN'); // بدء المعاملة
+
+    // Lock the order while checking it. This prevents another user from
+    // invoicing/changing it between validation and deletion.
+    const currentOrder = await client.query(
+      `SELECT order_status FROM orders WHERE id = $1 AND COALESCE(deleted, false) = false FOR UPDATE`,
+      [orderId]
+    );
+    if (currentOrder.rows.length === 0) {
+      throw new Error("الطلبية غير موجودة");
+    }
+    if (![1, 2].includes(Number(currentOrder.rows[0].order_status))) {
+      throw new Error("لا يمكن حذف الطلبية، تم إصدار فاتورة/فواتير من الطلبية");
+    }
+
+    const issuedInvoices = await client.query(
+      `SELECT 1
+       FROM voucher_items_tbl vi
+       JOIN voucher_header_tbl vh ON vh.id = vi.voucher_id
+       JOIN order_items oi ON oi.id = vi.order_item_id
+       WHERE oi.order_id = $1
+         AND vh.vch_type = 12
+         AND COALESCE(vh.status, 1) <> 3
+       LIMIT 1`,
+      [orderId]
+    );
+    if (issuedInvoices.rows.length > 0) {
+      throw new Error("لا يمكن حذف الطلبية، تم إصدار فاتورة/فواتير من الطلبية");
+    }
+
+    // امنع حذف السند إن كان أي بند فيه مرتبطاً بمخطط سير عمل تتبع طلبيات فعلي (workflow_id يُضبط
+    // تلقائياً عند حفظ طلبية بيع جديدة) — حذف السند دون هذا التحقق يترك مهام/مراحل "لوحة تتبع
+    // الطلبيات" يتيمة بلا طلبية بيع أصلية تتبعها.
+    const linkedItems = await client.query(
+      `SELECT oi.product_name, w.name AS workflow_name
+       FROM order_items oi
+       JOIN task_workflows w ON w.id = oi.workflow_id
+       WHERE oi.order_id = $1 AND oi.workflow_id IS NOT NULL
+       LIMIT 1`,
+      [orderId]
+    );
+    if (linkedItems.rows.length > 0) {
+      const row = linkedItems.rows[0];
+      throw new Error(`الصنف - ${row.product_name} مرتبط بمخطط سير عمل - ${row.workflow_name} لا يمكن حذف السند`);
+    }
 
     // 1️⃣ تحديث الطلب ليصبح محذوف (soft delete)
     await client.query(
@@ -987,7 +1204,7 @@ export async function updatePrintSalesOrder(
   voucherType: number,
   userId: string | null
 ) {
-  const client = await pool.connect(); // افترض أنك عندك pool
+  const client = await (await getTenantPool()).connect(); // افترض أنك عندك pool
   try {
     await client.query('BEGIN'); // بدء المعاملة
 
@@ -1036,7 +1253,7 @@ export async function UpdateOrderStatus(
   userId: string | null,
   received_by: string | null
 ) {
-  const client = await pool.connect(); // افترض أنك عندك pool
+  const client = await (await getTenantPool()).connect(); // افترض أنك عندك pool
   try {
     await client.query('BEGIN'); // بدء المعاملة
 
@@ -1086,4 +1303,31 @@ export async function UpdateOrderStatus(
   } finally {
     client.release(); // تحرير الاتصال من pool
   }
+}
+
+// اعتماد نهائي لطلبية "تتبع أوامر العمل" بعد اكتمال كل خطواتها — يُحدِّث الطلب الفعلي المرتبط بها
+// (orders.order_status2 = 2 / جاهز) عبر UpdateOrderStatus الموجودة أعلاه، ثم يُعلِّم طلبية التتبع
+// نفسها كمُعتمَدة (lib/task-orders.ts markCustomerOrderApproved) لتخرج من قائمة "قابلة للاعتماد".
+// يبقى هنا (لا في lib/task-orders.ts) لتفادي استيراد دائري: task-orders.ts لا يستورد من هذا الملف.
+export async function approveTaskCustomerOrder(customerOrderId: number, userId: string, receivedBy: string | null) {
+  // التحقق الكامل (موجودة/غير معتمدة/غير ملغاة/كل الأصناف مكتملة) قبل لمس الطلب الفعلي.
+  const order = await assertCustomerOrderApprovable(customerOrderId);
+  if (!order.source_order_id) throw new Error("لا يوجد طلب فعلي مرتبط بهذه الطلبية");
+  await UpdateOrderStatus(order.source_order_id, 0, 1, userId, receivedBy);
+  return markCustomerOrderApproved(customerOrderId, userId);
+}
+
+// إغلاق إجباري لكامل الطلبية من زر "إغلاق إجباري" بلوحة تتبع أوامر العمل (task-board.tsx) — يُلغي
+// أولاً كل مهام/أصناف/طلبية task-orders (forceCloseCustomerOrder، مدير النظام فقط)، ثم يُحدِّث الطلب
+// الفعلي المرتبط بها (orders.order_status2 = 6 / مغلق) إن وُجد. order_status2 = 6 قيمة جديدة أُضيفت
+// خصيصاً لهذا الإجراء — انظر التحديث المقابل بقوائم order_status2 المنسدلة بـ
+// unified-sales-order.tsx وunified-sale-invoices.tsx (1=غير جاهز، 2=جاهز، 3=مرسلة جزئياً،
+// 4=مرسلة كلياً، 5=ملغي، 6=مغلق).
+export async function forceCloseOrderFromTaskInstance(instanceId: number, adminUserId: string, note?: string) {
+  const { customerOrderId } = await forceCloseCustomerOrder(instanceId, adminUserId, note);
+  const order = await getTaskCustomerOrderById(customerOrderId);
+  if (order?.source_order_id) {
+    await (await getTenantPool()).query(`UPDATE orders SET order_status2 = 6, updated_at = NOW() WHERE id = $1`, [order.source_order_id]);
+  }
+  return { customerOrderId, sourceOrderId: order?.source_order_id ?? null };
 }

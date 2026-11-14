@@ -1,5 +1,36 @@
 import { type NextRequest, NextResponse } from "next/server"
-import { sql } from "@/lib/database"
+import sql from "@/lib/database"
+
+// الجدول الفعلي في القاعدة كان بحقول أقدم بكثير (id, user_id, color_scheme, primary_color,
+// accent_color, font_size, font_family, border_radius, shadows, animations, compact_mode,
+// created_at, updated_at فقط) — بلا organization_id ولا معظم الحقول التي يفترضها هذا الملف
+// أصلاً (dark_mode، secondary_color، rtl_support...)، فكان كل حفظ (POST/PUT) يفشل بـ500 دائماً.
+// إضافات فقط هنا (لا حذف/إعادة تسمية) لمطابقة الحقول التي يتوقعها الكود أدناه فعلياً.
+let tableEnsured: Promise<void> | null = null
+function ensureThemeSettingsColumns(): Promise<void> {
+  if (!tableEnsured) {
+    tableEnsured = (async () => {
+      await sql`ALTER TABLE theme_settings ADD COLUMN IF NOT EXISTS organization_id INTEGER DEFAULT 1`
+      await sql`ALTER TABLE theme_settings ADD COLUMN IF NOT EXISTS theme_name VARCHAR(50) DEFAULT 'default'`
+      await sql`ALTER TABLE theme_settings ADD COLUMN IF NOT EXISTS secondary_color VARCHAR(20) DEFAULT '#64748b'`
+      await sql`ALTER TABLE theme_settings ADD COLUMN IF NOT EXISTS background_color VARCHAR(20) DEFAULT '#ffffff'`
+      await sql`ALTER TABLE theme_settings ADD COLUMN IF NOT EXISTS text_color VARCHAR(20) DEFAULT '#1f2937'`
+      await sql`ALTER TABLE theme_settings ADD COLUMN IF NOT EXISTS font_weight INTEGER DEFAULT 400`
+      await sql`ALTER TABLE theme_settings ADD COLUMN IF NOT EXISTS line_height NUMERIC DEFAULT 1.5`
+      await sql`ALTER TABLE theme_settings ADD COLUMN IF NOT EXISTS letter_spacing NUMERIC DEFAULT 0.0`
+      await sql`ALTER TABLE theme_settings ADD COLUMN IF NOT EXISTS sidebar_width INTEGER DEFAULT 256`
+      await sql`ALTER TABLE theme_settings ADD COLUMN IF NOT EXISTS header_height INTEGER DEFAULT 64`
+      await sql`ALTER TABLE theme_settings ADD COLUMN IF NOT EXISTS dark_mode BOOLEAN DEFAULT false`
+      await sql`ALTER TABLE theme_settings ADD COLUMN IF NOT EXISTS rtl_support BOOLEAN DEFAULT true`
+      await sql`ALTER TABLE theme_settings ADD COLUMN IF NOT EXISTS card_style VARCHAR(20) DEFAULT 'elevated'`
+      await sql`ALTER TABLE theme_settings ADD COLUMN IF NOT EXISTS button_style VARCHAR(20) DEFAULT 'rounded'`
+      await sql`ALTER TABLE theme_settings ADD COLUMN IF NOT EXISTS toolbar_style VARCHAR(20) DEFAULT 'modern'`
+      await sql`ALTER TABLE theme_settings ADD COLUMN IF NOT EXISTS animation_speed VARCHAR(20) DEFAULT 'normal'`
+      await sql`ALTER TABLE theme_settings ADD COLUMN IF NOT EXISTS high_contrast BOOLEAN DEFAULT false`
+    })()
+  }
+  return tableEnsured
+}
 
 const getDefaultSettings = (organizationId = 1, userId: string | null = null) => ({
   id: null,
@@ -23,6 +54,7 @@ const getDefaultSettings = (organizationId = 1, userId: string | null = null) =>
   rtl_support: true,
   card_style: "elevated",
   button_style: "rounded",
+  toolbar_style: "modern",
   animation_speed: "normal",
   compact_mode: false,
   high_contrast: false,
@@ -30,8 +62,12 @@ const getDefaultSettings = (organizationId = 1, userId: string | null = null) =>
   updated_at: new Date().toISOString(),
 })
 
+const normalizeToolbarStyle = (value: unknown) =>
+  ["modern", "gradient", "compact", "classic"].includes(String(value)) ? String(value) : "modern"
+
 export async function GET(request: NextRequest) {
   try {
+    await ensureThemeSettingsColumns()
     const { searchParams } = new URL(request.url)
     const userId = searchParams.get("user_id")
     const organizationId = Number.parseInt(searchParams.get("organization_id") || "1")
@@ -88,7 +124,7 @@ export async function GET(request: NextRequest) {
 
     return NextResponse.json(result, {
       headers: {
-        "Cache-Control": "public, max-age=60",
+          "Cache-Control": userId ? "private, no-store, max-age=0" : "public, max-age=60",
       },
     })
   } catch (error) {
@@ -107,6 +143,7 @@ export async function GET(request: NextRequest) {
 
 export async function POST(request: NextRequest) {
   try {
+    await ensureThemeSettingsColumns()
     const data = await request.json()
     console.log("[v0] Theme API POST - data received:", Object.keys(data))
 
@@ -118,7 +155,7 @@ export async function POST(request: NextRequest) {
         organization_id, user_id, theme_name, primary_color, secondary_color, accent_color,
         background_color, text_color, font_family, font_size, font_weight,
         line_height, letter_spacing, border_radius, sidebar_width, header_height,
-        dark_mode, rtl_support, card_style, button_style, animation_speed,
+        dark_mode, rtl_support, card_style, button_style, toolbar_style, animation_speed,
         compact_mode, high_contrast
       ) VALUES (
         ${organizationId}, ${userId}, ${data.theme_name || "default"}, 
@@ -131,6 +168,7 @@ export async function POST(request: NextRequest) {
         ${data.header_height || 64}, ${data.dark_mode || false}, 
         ${data.rtl_support !== undefined ? data.rtl_support : true},
         ${data.card_style || "elevated"}, ${data.button_style || "rounded"},
+        ${normalizeToolbarStyle(data.toolbar_style)},
         ${data.animation_speed || "normal"}, ${data.compact_mode || false},
         ${data.high_contrast || false}
       )
@@ -147,6 +185,7 @@ export async function POST(request: NextRequest) {
 
 export async function PUT(request: NextRequest) {
   try {
+    await ensureThemeSettingsColumns()
     const data = await request.json()
     console.log("[v0] Theme API PUT - data received:", Object.keys(data))
 
@@ -191,6 +230,7 @@ export async function PUT(request: NextRequest) {
             rtl_support = ${data.rtl_support !== undefined ? data.rtl_support : true},
             card_style = ${data.card_style || "elevated"},
             button_style = ${data.button_style || "rounded"},
+            toolbar_style = ${normalizeToolbarStyle(data.toolbar_style)},
             animation_speed = ${data.animation_speed || "normal"},
             compact_mode = ${data.compact_mode || false},
             high_contrast = ${data.high_contrast || false},
@@ -205,7 +245,7 @@ export async function PUT(request: NextRequest) {
             organization_id, user_id, theme_name, primary_color, secondary_color, accent_color,
             background_color, text_color, font_family, font_size, font_weight,
             line_height, letter_spacing, border_radius, sidebar_width, header_height,
-            dark_mode, rtl_support, card_style, button_style, animation_speed,
+            dark_mode, rtl_support, card_style, button_style, toolbar_style, animation_speed,
             compact_mode, high_contrast
           ) VALUES (
             ${organizationId}, ${userId}, ${data.theme_name || "default"}, 
@@ -218,6 +258,7 @@ export async function PUT(request: NextRequest) {
             ${data.header_height || 64}, ${data.dark_mode || false}, 
             ${data.rtl_support !== undefined ? data.rtl_support : true},
             ${data.card_style || "elevated"}, ${data.button_style || "rounded"},
+            ${normalizeToolbarStyle(data.toolbar_style)},
             ${data.animation_speed || "normal"}, ${data.compact_mode || false},
             ${data.high_contrast || false}
           )
@@ -247,6 +288,7 @@ export async function PUT(request: NextRequest) {
           rtl_support = ${data.rtl_support !== undefined ? data.rtl_support : true},
           card_style = ${data.card_style || "elevated"},
           button_style = ${data.button_style || "rounded"},
+          toolbar_style = ${normalizeToolbarStyle(data.toolbar_style)},
           animation_speed = ${data.animation_speed || "normal"},
           compact_mode = ${data.compact_mode || false},
           high_contrast = ${data.high_contrast || false},
@@ -266,7 +308,7 @@ export async function PUT(request: NextRequest) {
           organization_id, user_id, theme_name, primary_color, secondary_color, accent_color,
           background_color, text_color, font_family, font_size, font_weight,
           line_height, letter_spacing, border_radius, sidebar_width, header_height,
-          dark_mode, rtl_support, card_style, button_style, animation_speed,
+          dark_mode, rtl_support, card_style, button_style, toolbar_style, animation_speed,
           compact_mode, high_contrast
         ) VALUES (
           ${organizationId}, ${userId}, ${data.theme_name || "default"}, 
@@ -279,6 +321,7 @@ export async function PUT(request: NextRequest) {
           ${data.header_height || 64}, ${data.dark_mode || false}, 
           ${data.rtl_support !== undefined ? data.rtl_support : true},
           ${data.card_style || "elevated"}, ${data.button_style || "rounded"},
+          ${normalizeToolbarStyle(data.toolbar_style)},
           ${data.animation_speed || "normal"}, ${data.compact_mode || false},
           ${data.high_contrast || false}
         )

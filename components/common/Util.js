@@ -1,4 +1,4 @@
-"use client";
+﻿"use client";
 
 import aesjs from 'aes-js';
 import { confirmDialog } from 'primereact/confirmdialog';
@@ -298,7 +298,7 @@ const exportDefault = {
       }
     }
     code = code.replace(prefix, '');
-    if (!codeLen) codeLen = 9;
+    if (!codeLen) codeLen = 10;
     let tempCode = '';
     if (prefix && prefix.length) {
       codeLen = codeLen - prefix.length;
@@ -424,7 +424,7 @@ const exportDefault = {
       { label: $.strings.all, value: -1 },
       { label: 'الحسابات المحاسبية', value: 0 },
       { label: 'الحسابات غير المحاسبية', value: 1 },
-      { label: 'الزبائن', value: 2 },
+      { label: 'العملاء', value: 2 },
       { label: 'الموردين', value: 3 },
       { label: 'المندوبين', value: 4 },
       { label: 'المشتركين', value: 5 },
@@ -469,7 +469,7 @@ const exportDefault = {
 
     //return `${year}${separator}${month < 10 ? `0${month}` : `${month}`}${separator}${date < 10 ? `0${date}` : `${date}`}${' '}${hours}${':'}${minutes}${':'}${seconds} `
     let d = new Date(year, month - 1, date, hours, minutes, seconds, 0);
-    return d.toLocaleString();
+    return d.toLocaleString("en-US");
   },
   getCostCenterStatusList() {
     let result = [];
@@ -805,12 +805,29 @@ const exportDefault = {
     return values;
   },
   checkUserAccess(accessId) {
-    let userAccessList = JSON.parse(localStorage.getItem('user_Access_List'));
-    const savedUser = localStorage.getItem("erp_user") || sessionStorage.getItem("erp_user")
-    if (userAccessList) {
-      let userAccess = userAccessList.find((e) => e.access_id + '' === accessId + '' && e.is_granted === true);
-      return userAccess ? true : false;
+    if (typeof window === "undefined") {
+      return false;
     }
+
+    try {
+      const savedUserRaw = sessionStorage.getItem("erp_user") || localStorage.getItem("erp_user");
+      const savedBranchRaw = sessionStorage.getItem("erp_active_branch") || localStorage.getItem("erp_active_branch");
+      const savedUser = savedUserRaw ? JSON.parse(savedUserRaw) : null;
+      const savedBranch = savedBranchRaw ? JSON.parse(savedBranchRaw) : null;
+      const userId = savedUser?.id ?? savedUser?.user_id;
+      const branchId = savedBranch?.id ?? savedUser?.branchId ?? savedUser?.branch_id ?? "default";
+      const scopedKey = userId ? `user_Access_List:${userId}:${branchId || "default"}` : null;
+      const accessListRaw = (scopedKey ? localStorage.getItem(scopedKey) : null) || (!userId ? localStorage.getItem('user_Access_List') : null);
+      const userAccessList = accessListRaw ? JSON.parse(accessListRaw) : null;
+
+      if (Array.isArray(userAccessList)) {
+        const userAccess = userAccessList.find((entry) => entry.access_id + '' === accessId + '');
+        return userAccess?.is_granted === true || userAccess?.is_granted === 1 || userAccess?.is_granted === "true";
+      }
+    } catch (error) {
+      console.warn("[Util] Failed to resolve user access", error);
+    }
+
     return false;
   },
   getUserSetting(settingId) {
@@ -883,6 +900,11 @@ const exportDefault = {
         }
       }
     }
+    // 17: عدد الخانات العشرية (مُزامَن من decimal_places_count عبر lib/system-settings-sync.ts) —
+    // قبل اكتمال أول مزامنة (أو تعذّرها) ترجع undefined بدل هذا الاحتياطي، فتتأثر بذلك كل استدعاءات
+    // .toFixed(undefined)/Intl.NumberFormat بدون minimumFractionDigits المعتمدة على هذا الإعداد
+    // (كانت تُنتِج صفر خانة عشرية أو عدداً متبايناً بدل ثابت)، لذا يُفترَض هنا افتراضٌ صريح ثابت.
+    if (settingId === 17) return 2;
     return undefined;
   },
 
@@ -922,6 +944,18 @@ const exportDefault = {
     const columnsForVoucher = voucherSettings.columns?.[voucherKey];
     if (!columnsForVoucher) return true;
     return columnsForVoucher?.[columnId] ?? false;
+  },
+  // نوع الرقم في عمود "الباركود" للسند (إعدادات السندات): barcode | factory (رقم المصنع) | original (الرقم الأصلي)
+  getVoucherBarcodeMode(voucher_id) {
+    const voucherSettings = JSON.parse(localStorage.getItem('screenData') || '{}');
+    const mode = voucherSettings.options?.[String(voucher_id)]?.barcode;
+    return mode === 'factory' || mode === 'original' ? mode : 'barcode';
+  },
+  // عنوان عمود "الباركود" حسب نوع الرقم المختار
+  getVoucherBarcodeHeader(voucher_id) {
+    const voucherSettings = JSON.parse(localStorage.getItem('screenData') || '{}');
+    const mode = voucherSettings.options?.[String(voucher_id)]?.barcode;
+    return mode === 'factory' ? 'رقم المصنع' : mode === 'original' ? 'الرقم الاصلي' : 'الباركود';
   },
 
   checkHasp(haspToCheckArr) {
@@ -1486,7 +1520,7 @@ const exportDefault = {
   getDateAsShortDate(dt) {
     if (!dt) return null;
     let isDate = dt instanceof Date;
-    const formattedDate = !isDate ? dt.toString().split('T')[0] : dt.toLocaleDateString();
+    const formattedDate = !isDate ? dt.toString().split('T')[0] : dt.toLocaleDateString("en-GB-u-nu-latn");
     return formattedDate;
   },
   getMultiSelectDropdownFilterString(list, caption, columnCaption = 'name') {
@@ -3376,9 +3410,9 @@ const exportDefault = {
         { id: 5, name: $.strings.chequesOperations.returnChequesFromBank }, // 615 ارجاع شيك من البنك
         { id: 6, name: $.strings.chequesOperations.transferEndorsementCheques }, // 613 تحويل / تجيير شيك
         { id: 7, name: $.strings.chequesOperations.returnTransferedCheques }, // 614 ارجاع شيك محول أو مجير
-        { id: 8, name: $.strings.chequesOperations.retrievingChequesFromCustomer }, // 617 استرجاع شيك من زبون
+        { id: 8, name: $.strings.chequesOperations.retrievingChequesFromCustomer }, // 617 استرجاع شيك من عميل
         { id: 9, name: $.strings.chequesOperations.transferChequesToCollectionAccount }, // 611 تحويل شيك الى حساب التحصيل
-        { id: 10, name: $.strings.chequesOperations.withdrawCustomerChequesForCash }, // 612 سحب شيك زبون نقدا
+        { id: 10, name: $.strings.chequesOperations.withdrawCustomerChequesForCash }, // 612 سحب شيك عميل نقدا
         { id: 11, name: $.strings.chequesOperations.transferChequesToOtherAccount }, // 618 تحويل شيك الى حساب اخر
       ];
     } else {
@@ -4534,10 +4568,10 @@ const exportDefault = {
   async onViewCustomer(cust_id, cust_type) {
     console.log(cust_id, cust_type)
     switch (
-    cust_type + '' // نوع الزبون من جدول object_type_captions_tbl وليس من جدول accounts_types_captions_tbl
+    cust_type + '' // نوع العميل من جدول object_type_captions_tbl وليس من جدول accounts_types_captions_tbl
     ) {
       case '0': {
-        // زبون
+        // عميل
         this.goToNewTab('Files/ChartOfAccount/' + cust_id);
         break;
       }
@@ -4547,7 +4581,7 @@ const exportDefault = {
         break;
       }
       case '2': {
-        // زبون
+        // عميل
         this.goToNewTab('Files/Customers/' + cust_id);
         break;
       }
@@ -4572,7 +4606,7 @@ const exportDefault = {
         break;
       }
       case '7': {
-        // زبون اعتمادات
+        // عميل اعتمادات
         this.goToNewTab('Files/CustomersCredits/' + cust_id);
         break;
       }
@@ -4799,14 +4833,14 @@ const exportDefault = {
   },
   getQrBarCode(qRBarCodeInfo, obj) {
     if (!qRBarCodeInfo) qRBarCodeInfo = '';
-    // qRBarCodeInfo ='اسم المؤسسة: شركة اسراء,رقم الفاتورة: فاتورة مبيعات ضريبية رقم (I00000052),اسم الزبون: السادة: zead/000000002';
+    // qRBarCodeInfo ='اسم المؤسسة: شركة اسراء,رقم الفاتورة: فاتورة مبيعات ضريبية رقم (I00000052),اسم العميل: السادة: zead/000000002';
     // اسم المؤسسة [company_name]
     qRBarCodeInfo = qRBarCodeInfo.replace('[company_name]', obj.company_name);
     // رقم الفاتورة [invoice_code]
     qRBarCodeInfo = qRBarCodeInfo.replace('[invoice_code]', obj.invoice_code);
-    // اسم الزبون ورقمه [customer_name]
+    // اسم العميل ورقمه [customer_name]
     qRBarCodeInfo = qRBarCodeInfo.replace('[customer_name]', obj.customer_name);
-    // رقم المشتغل المرخص للزبون [vatreg]
+    // رقم المشتغل المرخص للعميل [vatreg]
     qRBarCodeInfo = qRBarCodeInfo.replace('[vatreg]', obj.vatreg);
     // تاريخ ووقت الفاتورة [invoice_datetime]
     qRBarCodeInfo = qRBarCodeInfo.replace('[invoice_datetime]', obj.invoice_datetime);
@@ -4823,7 +4857,7 @@ const exportDefault = {
     //qRBarCodeInfo += "\n ";
     // qRBarCodeInfo +="johar50000000000055555555555555555555555555555555555555";
     //qRBarCodeInfo +="رقم الفاتورة:"+obj.invoice_code;
-    //qRBarCodeInfo +=" رقم الزبون:"+obj.customer_name;
+    //qRBarCodeInfo +=" رقم العميل:"+obj.customer_name;
     return qRBarCodeInfo;
   },
   connectedVatEnum: {
@@ -4837,3 +4871,6 @@ const exportDefault = {
   },
 };
 export default exportDefault;
+
+
+

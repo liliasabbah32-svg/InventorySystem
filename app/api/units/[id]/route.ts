@@ -1,76 +1,123 @@
 import { type NextRequest, NextResponse } from "next/server"
-import { neon } from "@neondatabase/serverless"
+import { findUsages, usageMessage } from "@/lib/delete-guard"
+import sql from "@/lib/database"
 
-import { Pool } from "pg"
-
-let sql: any = null
-
-try {
-  if (!process.env.DATABASE_URL) {
-    console.error("[v0] DATABASE_URL environment variable is not set")
-  } else {
-    const dbUrl = process.env.DATABASE_URL
-
-    if (dbUrl.includes("localhost") || dbUrl.includes("127.0.0.1")) {
-      console.log("[v0] Using local PostgreSQL with pg Pool")
-      const pool = new Pool({ connectionString: dbUrl })
-      sql = async (strings: TemplateStringsArray, ...values: any[]) => {
-        const client = await pool.connect()
-        try {
-          const query =
-            strings.reduce(
-              (prev, curr, i) =>
-                prev + curr + (i < values.length ? `$${i + 1}` : ""),
-              ""
-            )
-          const result = await client.query(query, values)
-          return result.rows
-        } finally {
-          client.release()
-        }
-      }
-    } else {
-      console.log("[v0] Using Neon serverless client")
-      sql = neon(dbUrl)
-    }
-
-    console.log("[v0] Database client initialized successfully")
-  }
-} catch (error) {
-  console.error("[v0] Failed to initialize DB client:", error)
-  sql = null
+function toText(value: unknown, fallback = "") {
+  if (value === null || value === undefined || value === "") return fallback
+  return String(value).trim()
 }
 
-export default sql
+function toNumber(value: unknown, fallback = 0) {
+  if (value === null || value === undefined || value === "") return fallback
+  const numeric = Number(value)
+  return Number.isFinite(numeric) ? numeric : fallback
+}
 
-export async function PUT(req: NextRequest, { params }: { params: { id: string } }) {
-  const id = parseInt(params.id, 10);
-  const data = await req.json();
-
-  if (!data.unit_name) {
-    return NextResponse.json({ error: "اسم الوحدة مطلوب" }, { status: 400 });
-  }
-
+export async function GET(_request: NextRequest, { params }: { params: { id: string } }) {
   try {
-    const result = await sql`
+    const unitId = Number(params.id)
+    if (!unitId) {
+      return NextResponse.json({ error: "معرف الوحدة غير صالح" }, { status: 400 })
+    }
+
+    const units = await sql`
+      SELECT id, unit_name, unit_name_en, description, is_active, status, created_at, updated_at
+      FROM units
+      WHERE id = ${unitId}
+      LIMIT 1
+    `
+
+    if (!units.length) {
+      return NextResponse.json({ error: "الوحدة غير موجودة" }, { status: 404 })
+    }
+
+    return NextResponse.json(units[0])
+  } catch (error) {
+    console.error("Error fetching unit:", error)
+    return NextResponse.json({ error: "فشل في جلب الوحدة" }, { status: 500 })
+  }
+}
+
+export async function PUT(request: NextRequest, { params }: { params: { id: string } }) {
+  try {
+    const unitId = Number(params.id)
+    if (!unitId) {
+      return NextResponse.json({ error: "معرف الوحدة غير صالح" }, { status: 400 })
+    }
+
+    const body = await request.json()
+    const unitName = toText(body?.unit_name ?? body?.name, "")
+    if (!unitName) {
+      return NextResponse.json({ error: "اسم الوحدة مطلوب" }, { status: 400 })
+    }
+
+    const unitNameEn = toText(body?.unit_name_en ?? body?.unit_name_e ?? unitName, unitName)
+    const description = toText(body?.description, "")
+    const status = Number(body?.status ?? 1)
+    const isActive = status === 1
+
+    const existing = await sql`
+      SELECT id
+      FROM units
+      WHERE LOWER(TRIM(unit_name)) = LOWER(TRIM(${unitName}))
+        AND id != ${unitId}
+      LIMIT 1
+    `
+
+    if (existing.length > 0) {
+      return NextResponse.json({ error: "اسم الوحدة موجود مسبقاً" }, { status: 409 })
+    }
+
+    const updated = await sql`
       UPDATE units
       SET
-        unit_name = ${data.unit_name},
-        unit_name_en = ${data.unit_name_en || null},
-        description = ${data.description || null},
-        is_active = ${data.is_active !== false},
-        updated_at = NOW()
-      WHERE id = ${id}
-      RETURNING *
-    `;
+        unit_name = ${unitName},
+        unit_name_en = ${unitNameEn},
+        description = ${description},
+        is_active = ${isActive},
+        status = ${status},
+        updated_at = CURRENT_TIMESTAMP
+      WHERE id = ${unitId}
+      RETURNING id, unit_name, unit_name_en, description, is_active, status, created_at, updated_at
+    `
 
-    if (result.length === 0) {
-      return NextResponse.json({ error: "الوحدة غير موجودة" }, { status: 404 });
+    if (!updated.length) {
+      return NextResponse.json({ error: "الوحدة غير موجودة" }, { status: 404 })
     }
 
-    return NextResponse.json(result[0]);
-  } catch (err) {
-    console.error("Error updating unit:", err);
-    return NextResponse.json({ error: "فشل في تحديث الوحدة" }, { status: 500 });
+    return NextResponse.json(updated[0])
+  } catch (error) {
+    console.error("Error updating unit:", error)
+    return NextResponse.json({ error: "فشل حفظ الوحدة" }, { status: 500 })
   }
 }
+
+export async function DELETE(_request: NextRequest, { params }: { params: { id: string } }) {
+  try {
+    const unitId = Number(params.id)
+    if (!unitId) {
+      return NextResponse.json({ error: "معرف الوحدة غير صالح" }, { status: 400 })
+    }
+
+    // فحص الارتباط قبل الحذف: لا يُحذف تعريف مستخدم في تعريفات أخرى أو حركات (lib/delete-guard.ts)
+    const usageRow = (await sql`SELECT * FROM units WHERE id = ${unitId}`)[0] as any
+    const usages = await findUsages(unitId, { idColumns: /^(unit_id|.+_unit_id|measurment_unit)$/, textColumns: /^unit$/, excludeTables: ["units"], textValues: [usageRow?.unit_name, usageRow?.unit_name_en] })
+    if (usages.length) return NextResponse.json({ error: usageMessage("الوحدة", String(usageRow?.unit_name || ""), usages) }, { status: 400 })
+
+    const deleted = await sql`
+      DELETE FROM units
+      WHERE id = ${unitId}
+      RETURNING id
+    `
+
+    if (!deleted.length) {
+      return NextResponse.json({ error: "الوحدة غير موجودة" }, { status: 404 })
+    }
+
+    return NextResponse.json({ success: true, id: unitId })
+  } catch (error) {
+    console.error("Error deleting unit:", error)
+    return NextResponse.json({ error: "فشل حذف الوحدة" }, { status: 500 })
+  }
+}
+

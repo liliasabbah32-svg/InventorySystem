@@ -1,52 +1,79 @@
 import { type NextRequest, NextResponse } from "next/server"
 
-import { createUser, hashPassword } from "@/lib/auth"
+import { createTenantEmployeeWithManagementLink, hashPassword } from "@/lib/auth"
+import { assertLicenseAllows, licenseErrorResponseBody } from "@/lib/company-license"
+import { issuePasswordCode, sendAddedToCompanyEmail } from "@/lib/password-codes"
+import { randomBytes } from "crypto"
+import sql, { resolveCurrentDbName } from "@/lib/database"
+import { ensurePermissionTables } from "@/lib/permissions"
+import { getSessionUser, isPrimaryCompanyUser, revokeUserSessions } from "@/lib/tenant-auth"
+import managementSql from "@/lib/management-db"
+import { runSchemaOnce } from "@/lib/schema-once"
+import { authorizeUserAdmin, isSelfServiceUpdate } from "@/lib/user-admin-access"
 
-import { neon } from "@neondatabase/serverless"
-import { Pool } from "pg"
-
-let sql: any = null
-
-try {
-  if (!process.env.DATABASE_URL) {
-    console.error("[v0] DATABASE_URL environment variable is not set")
-  } else {
-    const dbUrl = process.env.DATABASE_URL
-
-    if (dbUrl.includes("localhost") || dbUrl.includes("127.0.0.1")) {
-      console.log("[v0] Using local PostgreSQL with pg Pool")
-      const pool = new Pool({ connectionString: dbUrl })
-      sql = async (strings: TemplateStringsArray, ...values: any[]) => {
-        const client = await pool.connect()
-        try {
-          const query =
-            strings.reduce(
-              (prev, curr, i) =>
-                prev + curr + (i < values.length ? `$${i + 1}` : ""),
-              ""
-            )
-          const result = await client.query(query, values)
-          return result.rows
-        } finally {
-          client.release()
-        }
-      }
-    } else {
-      console.log("[v0] Using Neon serverless client")
-      sql = neon(dbUrl)
-    }
-
-    console.log("[v0] Database client initialized successfully")
+// أعمدة user_settings — مرة لكل قاعدة شركة (runSchemaOnce) لا مرة لكل الخادم: متغير وحيد على مستوى الوحدة كان
+// يُعلِّم أول شركة فقط فتبقى قواعد بقية الشركات بلا branch_id… فيفشل الاستعلام بـ500.
+function ensureBranchColumn() { return runSchemaOnce("app/api/settings/user/route.ts#ensureBranchColumn", async () => {
+  await sql`ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS branch_id INTEGER`
+  await sql`ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS phone VARCHAR(20)`
+  await sql`ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS avatar_url TEXT`
+  await sql`ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS font_family VARCHAR(100) DEFAULT 'Cairo'`
+  await sql`ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS font_size INTEGER DEFAULT 14`
+  await sql`ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS datagrid_settings JSONB DEFAULT '{}'::jsonb`
+  await sql`ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`
+  // المستخدم المحذوف (is_deleted) منفصل عن الموقوف (is_active=false فقط): الموقوف يبقى في القائمة ويمكن إعادة تفعيله.
+  // كان الحذف = is_active=false والقائمة تُخفي كل غير النشطين؛ عند إضافة العمود أول مرة يُعلَّم غير النشطين حالياً
+  // كمحذوفين حتى تبقى القائمة كما كانت.
+  const hasDeleted = (await sql`SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'user_settings' AND column_name = 'is_deleted'`)[0]
+  if (!hasDeleted) {
+    await sql`ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS is_deleted BOOLEAN NOT NULL DEFAULT FALSE`
+    await sql`UPDATE user_settings SET is_deleted = TRUE WHERE is_active = false`
   }
-} catch (error) {
-  console.error("[v0] Failed to initialize DB client:", error)
-  sql = null
-}
+  // إصلاح أنواع أعمدة قديمة: اختياري — pg_input_is_valid متوفرة في PostgreSQL 16+ فقط، فلا يُعطِّل فشلها بقية الإعداد
+  try {
+        await sql`
+          DO $$
+          BEGIN
+            IF EXISTS (
+              SELECT 1 FROM information_schema.columns
+              WHERE table_schema = current_schema() AND table_name = 'user_settings'
+                AND column_name = 'font_size' AND data_type <> 'integer'
+            ) THEN
+              ALTER TABLE user_settings ALTER COLUMN font_size TYPE INTEGER
+              USING CASE WHEN TRIM(font_size::text) ~ '^[0-9]+$' THEN font_size::integer ELSE 14 END;
+            END IF;
+  
+            IF EXISTS (
+              SELECT 1 FROM information_schema.columns
+              WHERE table_schema = current_schema() AND table_name = 'user_settings'
+                AND column_name = 'datagrid_settings' AND data_type NOT IN ('json', 'jsonb')
+            ) THEN
+              ALTER TABLE user_settings ALTER COLUMN datagrid_settings TYPE JSONB
+              USING CASE
+                WHEN datagrid_settings IS NULL OR TRIM(datagrid_settings::text) = '' THEN '{}'::jsonb
+                WHEN pg_input_is_valid(datagrid_settings::text, 'jsonb') THEN datagrid_settings::jsonb
+                ELSE '{}'::jsonb
+              END;
+            END IF;
+          END $$
+        `
+    } catch (error) {
+    console.warn("[settings/user] column type repair skipped", error)
+  }
+}) }
 
+function ensureFontColumns(): Promise<void> { return runSchemaOnce("app/api/settings/user/route.ts#ensureFontColumns", async () => {
+  await sql`ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS font_family VARCHAR(100) DEFAULT 'Cairo'`
+  await sql`ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS font_size INTEGER DEFAULT 14`
+  await sql`ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS datagrid_settings JSONB DEFAULT '{}'::jsonb`
+}) }
 
 export async function GET(request: NextRequest) {
   try {
     console.log("[v0] User API GET request started")
+    await ensureBranchColumn()
+    // user_settings.job_role_id يُنشأ مع جداول الأدوار — مطلوب لقائمة المستخدمين أدناه
+    await ensurePermissionTables(await resolveCurrentDbName())
 
     const { searchParams } = new URL(request.url)
     const userId = searchParams.get("user_id")
@@ -54,8 +81,10 @@ export async function GET(request: NextRequest) {
     if (userId) {
       console.log("[v0] Fetching specific user:", userId)
       const user = await sql`
-        SELECT * FROM user_settings 
-        WHERE user_id = ${userId} AND is_active = true
+        SELECT us.*, b.branch_name
+        FROM user_settings us
+        LEFT JOIN branches b ON b.id = us.branch_id
+        WHERE us.user_id = ${userId} AND us.is_active = true
         LIMIT 1
       `
 
@@ -68,35 +97,43 @@ export async function GET(request: NextRequest) {
 
     console.log("[v0] Fetching all users from database...")
     const users = await sql`
-      SELECT 
-        id,
-        user_id,
-        organization_id,
-        username,
-        email,
-        full_name,
-        role,
-        department,
-        phone,
-        avatar_url,
-        language,
-        timezone,
-        date_format,
-        time_format,
-        notifications_enabled,
-        email_notifications,
-        sms_notifications,
-        theme_preference,
-        sidebar_collapsed,
-        dashboard_layout,
-        permissions,
-        last_login,
-        is_active,
-        created_at,
-        updated_at
-      FROM user_settings 
-      WHERE is_active = true
-      ORDER BY created_at DESC
+      SELECT
+        us.id,
+        us.user_id,
+        us.organization_id,
+        us.username,
+        us.email,
+        us.full_name,
+        us.role,
+        us.department,
+        us.phone,
+        us.avatar_url,
+        us.language,
+        us.timezone,
+        us.date_format,
+        us.time_format,
+        us.notifications_enabled,
+        us.email_notifications,
+        us.sms_notifications,
+        us.theme_preference,
+        us.font_family,
+        us.font_size,
+        us.sidebar_collapsed,
+        us.dashboard_layout,
+        us.permissions,
+        us.branch_id,
+        b.branch_name,
+        us.job_role_id,
+        us.last_login,
+        us.is_active,
+        us.created_at,
+        us.updated_at
+      FROM user_settings us
+      LEFT JOIN branches b ON b.id = us.branch_id
+      -- النشطون والموقوفون (لإعادة التفعيل) — المحذوفون فقط مخفيّون
+      WHERE COALESCE(us.is_deleted, false) = false
+      -- رقم المستخدم تصاعدياً (رقمياً؛ user_id نصّي في بعض القواعد ورقمي في أخرى)
+      ORDER BY CASE WHEN us.user_id::text ~ '^[0-9]+$' THEN us.user_id::text::bigint END NULLS LAST, us.user_id::text
     `
     return NextResponse.json(users)
   } catch (error) {
@@ -118,8 +155,15 @@ export async function GET(request: NextRequest) {
 }
 
 export async function POST(request: NextRequest) {
+  // إعدادات المستخدمين والصلاحيات: الحفظ للمسؤول أو لمن يملك صلاحية إدارة المستخدمين والصلاحيات
+  const userAdmin = await authorizeUserAdmin(request as any)
+  if (!userAdmin.ok) return userAdmin.response
   try {
     console.log("[v0] User API POST request started")
+    if (!(await getSessionUser(request))) {
+      return NextResponse.json({ error: "يجب تسجيل الدخول" }, { status: 401 })
+    }
+    await ensureBranchColumn()
     const data = await request.json()
 
     console.log("[v0] Creating user with data:", {
@@ -128,15 +172,41 @@ export async function POST(request: NextRequest) {
       full_name: data.full_name,
     })
 
-    const result = await createUser({
+    if (!data.email || !String(data.email).trim()) {
+      return NextResponse.json({ error: "البريد الإلكتروني مطلوب" }, { status: 400 })
+    }
+
+    const existingEmailUser = await sql`
+      SELECT user_id FROM user_settings WHERE LOWER(email) = LOWER(${String(data.email).trim()})
+    `
+    if (existingEmailUser.length > 0) {
+      return NextResponse.json({ error: "البريد الإلكتروني مستخدَم بالفعل لمستخدم آخر في هذه الشركة" }, { status: 400 })
+    }
+
+    try {
+      await assertLicenseAllows("users")
+    } catch (error) {
+      const body = licenseErrorResponseBody(error)
+      if (body) return NextResponse.json(body, { status: 409 })
+      throw error
+    }
+
+    // بلا كلمة مرور من المسؤول: كلمة مرور عشوائية مؤقتة، ويعيّن المستخدم كلمة مروره بنفسه عبر بريد الدعوة.
+    const invite = !String(data.password || "").trim()
+    const password = invite ? randomBytes(24).toString("base64url") : String(data.password)
+
+    // Reuse the management identity while keeping the new user local to this company.
+    const result = await createTenantEmployeeWithManagementLink({
       username: data.username,
       email: data.email,
-      password: data.password,
+      password,
       fullName: data.full_name,
-      role: data.role || "مدير النظام",
+      role: data.role || "مستخدم",
       department: data.department || "الإدارة",
       organizationId: data.organization_id || 1,
-      permissions: data.permissions || ["جميع الصلاحيات"],
+      permissions: data.permissions || [],
+      branchId: data.branch_id ? Number(data.branch_id) : null,
+      jobRoleId: data.job_role_id ? Number(data.job_role_id) : null,
     })
 
     if (!result.success) {
@@ -152,9 +222,18 @@ export async function POST(request: NextRequest) {
     `
 
     console.log("[v0] User created successfully with sequential ID:", result.userId)
+    let invitation: { sent: boolean; existing: boolean } | null = null
+    if (invite) {
+      const dbName = await resolveCurrentDbName()
+      const companyName = (await managementSql`SELECT name FROM companies WHERE db_name = ${dbName} LIMIT 1`.catch(() => []))[0]?.name
+      invitation = result.existingIdentity
+        ? { sent: await sendAddedToCompanyEmail(String(data.email), data.full_name, companyName), existing: true }
+        : { ...(await issuePasswordCode({ email: String(data.email), purpose: "invite", tenantDb: dbName, fullName: data.full_name, companyName })), existing: false }
+    }
     return NextResponse.json({
       success: true,
       user: createdUser[0],
+      invitation,
     });
   } catch (error) {
     console.error("Database insert error:", error)
@@ -164,14 +243,38 @@ export async function POST(request: NextRequest) {
 
 export async function PUT(request: NextRequest) {
   try {
+    const sessionUser = await getSessionUser(request)
+    if (!sessionUser) {
+      return NextResponse.json({ error: "يجب تسجيل الدخول" }, { status: 401 })
+    }
+    await ensureFontColumns()
+    await ensureBranchColumn()
+    await ensurePermissionTables(await resolveCurrentDbName())
     const data = await request.json()
+    // تعديل مستخدم (أو صلاحياته) للمسؤول فقط؛ المستخدم يعدّل لنفسه الصورة والخطوط وشكل الجداول فقط
+    if (!isSelfServiceUpdate(data, sessionUser.user_id)) {
+      const userAdmin = await authorizeUserAdmin(request)
+      if (!userAdmin.ok) return userAdmin.response
+    }
+    // كلمة المرور لا تُغيَّر من تعريف المستخدم — يعيّنها المستخدم من شاشة الدخول عبر "نسيت كلمة المرور" (رمز بالبريد)
+    if ((typeof data?.password === "string" && data.password.trim()) || (typeof data?.password_hash === "string" && data.password_hash.trim())) {
+      return NextResponse.json({ error: "لا يمكن تغيير كلمة المرور من تعريف المستخدم؛ يستخدم المستخدم \"نسيت كلمة المرور\" من شاشة الدخول" }, { status: 400 })
+    }
     console.log("[v0] PUT request data:", data)
-    
+
+    if (!data?.user_id) {
+      return NextResponse.json({ error: "User ID is required" }, { status: 400 })
+    }
+
+    // أول مستخدم في الشركة (مدير النظام) لا يُوقف — حتى لا تبقى الشركة بلا من يديرها
+    if (data.is_active === false && (await isPrimaryCompanyUser(data.user_id))) {
+      return NextResponse.json({ error: "لا يمكن إيقاف مستخدم مدير النظام الأول" }, { status: 400 })
+    }
+
     if (data.permissions && Object.keys(data).length === 2 && data.user_id) {
-      // Only update permissions
       const result = await sql`
-        UPDATE user_settings 
-        SET 
+        UPDATE user_settings
+        SET
           permissions = ${JSON.stringify(data.permissions)},
           updated_at = CURRENT_TIMESTAMP
         WHERE user_id = ${data.user_id}
@@ -185,11 +288,172 @@ export async function PUT(request: NextRequest) {
       return NextResponse.json(result[0])
     }
 
-    if (!data.username || !data.email) {
-      return NextResponse.json({ error: "Username and email are required" }, { status: 400 })
+    if (data.language !== undefined && Object.keys(data).filter((key) => key !== "user_id" && key !== "language").length === 0) {
+      const result = await sql`
+        UPDATE user_settings
+        SET
+          language = ${data.language},
+          updated_at = CURRENT_TIMESTAMP
+        WHERE user_id = ${data.user_id}
+        RETURNING *
+      `
+
+      if (result.length === 0) {
+        return NextResponse.json({ error: "User not found" }, { status: 404 })
+      }
+
+      return NextResponse.json({ success: true, user: result[0] })
     }
 
-    // Update password only when a new non-empty password is explicitly provided.
+    if (data.avatar_url !== undefined && Object.keys(data).filter((key) => key !== "user_id" && key !== "avatar_url").length === 0) {
+      if (data.avatar_url !== null && (
+        typeof data.avatar_url !== "string" ||
+        !/^data:image\/(png|jpeg|webp|gif);base64,/.test(data.avatar_url) ||
+        data.avatar_url.length > 3 * 1024 * 1024
+      )) {
+        return NextResponse.json({ error: "ملف الصورة غير صالح أو يتجاوز الحجم المسموح" }, { status: 400 })
+      }
+      const result = await sql`
+        UPDATE user_settings
+        SET
+          avatar_url = ${data.avatar_url},
+          updated_at = CURRENT_TIMESTAMP
+        WHERE user_id = ${sessionUser.user_id}
+        RETURNING *
+      `
+
+      if (result.length === 0) {
+        return NextResponse.json({ error: "User not found" }, { status: 404 })
+      }
+
+      return NextResponse.json({ success: true, user: result[0] })
+    }
+
+    const fontPreferenceKeys = Object.keys(data).filter((key) => key !== "user_id")
+    if (
+      fontPreferenceKeys.length > 0 &&
+      fontPreferenceKeys.every((key) => key === "font_family" || key === "font_size" || key === "datagrid_settings")
+    ) {
+      await ensureFontColumns()
+      const fontFamily = String(data.font_family || "Cairo").trim().slice(0, 100)
+      const requestedFontSize = Number(data.font_size ?? 14)
+      const fontSize = Math.min(24, Math.max(10, Number.isFinite(requestedFontSize) ? Math.round(requestedFontSize) : 14))
+      const datagridSettings = data.datagrid_settings && typeof data.datagrid_settings === "object"
+        ? data.datagrid_settings
+        : {}
+      const result = await sql`
+        UPDATE user_settings
+        SET font_family = ${fontFamily}, font_size = ${fontSize},
+            datagrid_settings = ${JSON.stringify(datagridSettings)}::jsonb,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE user_id = ${data.user_id}
+        RETURNING *
+      `
+      if (result.length === 0) return NextResponse.json({ error: "User not found" }, { status: 404 })
+      return NextResponse.json({ success: true, user: result[0] })
+    }
+
+    // فرع ضيّق مطابق للأنماط أعلاه (avatar_url/language) — بلا هذا الفرع كان تحديث dashboard_layout
+    // وحده (مثلاً تفضيل عرض مساحة العمل الشخصي) يسقط بالتحديث العام أدناه الذي يُصفِّر كل عمود آخر
+    // (username/email/full_name...) لـnull لعدم وجوده بالـbody، ما كان سيمحو بيانات المستخدم فعلياً.
+    if (data.dashboard_layout !== undefined && Object.keys(data).filter((key) => key !== "user_id" && key !== "dashboard_layout").length === 0) {
+      const result = await sql`
+        UPDATE user_settings
+        SET
+          dashboard_layout = ${JSON.stringify(data.dashboard_layout)},
+          updated_at = CURRENT_TIMESTAMP
+        WHERE user_id = ${data.user_id}
+        RETURNING *
+      `
+
+      if (result.length === 0) {
+        return NextResponse.json({ error: "User not found" }, { status: 404 })
+      }
+
+      return NextResponse.json({ success: true, user: result[0] })
+    }
+
+    const hasProfileFields =
+      data.username !== undefined ||
+      data.email !== undefined ||
+      data.full_name !== undefined ||
+      data.role !== undefined ||
+      data.department !== undefined ||
+      data.phone !== undefined ||
+      data.branch_id !== undefined ||
+      data.job_role_id !== undefined ||
+      data.password_hash !== undefined ||
+      data.password !== undefined
+
+    const hasPreferenceFields =
+      data.avatar_url !== undefined ||
+      data.language !== undefined ||
+      data.timezone !== undefined ||
+      data.date_format !== undefined ||
+      data.time_format !== undefined ||
+      data.notifications_enabled !== undefined ||
+      data.email_notifications !== undefined ||
+      data.sms_notifications !== undefined ||
+      data.theme_preference !== undefined ||
+      data.sidebar_collapsed !== undefined ||
+      data.dashboard_layout !== undefined ||
+      data.permissions !== undefined ||
+      data.is_active !== undefined
+
+    if (!hasProfileFields && !hasPreferenceFields) {
+      return NextResponse.json({ error: "No updatable fields provided" }, { status: 400 })
+    }
+
+    // إعادة تفعيل مستخدم موقوف تستهلك مقعداً من الترخيص كإضافة مستخدم جديد.
+    if (data.is_active === true) {
+      const current = (await sql`SELECT is_active FROM user_settings WHERE user_id = ${data.user_id} LIMIT 1`)[0]
+      if (current && current.is_active === false) {
+        try {
+          await assertLicenseAllows("users")
+        } catch (error) {
+          const body = licenseErrorResponseBody(error)
+          if (body) return NextResponse.json(body, { status: 409 })
+          throw error
+        }
+      }
+    }
+
+    // إيقاف/إعادة تفعيل فقط (أزرار قائمة المستخدمين): تحديث ضيّق لحالة المستخدم — التحديث العام أدناه يُصفِّر كل عمود
+    // غير مُرسَل. إعادة التفعيل مرّت بفحص الترخيص أعلاه؛ عضوية "شركاتي" لهذه الشركة تتبع الحالة نفسها.
+    if (data.is_active !== undefined && Object.keys(data).every((key) => key === "user_id" || key === "is_active")) {
+      const updated = (await sql`
+        UPDATE user_settings SET is_active = ${data.is_active === true}, updated_at = CURRENT_TIMESTAMP
+        WHERE user_id = ${data.user_id} AND COALESCE(is_deleted, false) = false
+        RETURNING *
+      `)[0] as any
+      if (!updated) return NextResponse.json({ error: "User not found" }, { status: 404 })
+      // إيقاف ⇐ خروج فوري من كل الأجهزة (يرى رسالة «تم إيقاف حسابك»)
+      if (data.is_active === false) await revokeUserSessions(data.user_id, "account_disabled")
+      if (updated.management_user_id) {
+        try {
+          const currentDbName = await resolveCurrentDbName()
+          await managementSql`
+            UPDATE user_company SET is_active = ${data.is_active === true}
+            WHERE user_id = ${updated.management_user_id}
+              AND company_id = (SELECT id FROM companies WHERE db_name = ${currentDbName})
+          `
+        } catch (syncError) {
+          console.error("[settings/user PUT status] Failed to sync management DB:", syncError)
+        }
+      }
+      return NextResponse.json({ success: true, user: updated })
+    }
+
+    if (data.email && String(data.email).trim()) {
+      const existingEmailUser = await sql`
+        SELECT user_id FROM user_settings
+        WHERE LOWER(email) = LOWER(${String(data.email).trim()}) AND user_id != ${data.user_id}
+      `
+      if (existingEmailUser.length > 0) {
+        return NextResponse.json({ error: "البريد الإلكتروني مستخدَم بالفعل لمستخدم آخر في هذه الشركة" }, { status: 400 })
+      }
+    }
+
     const rawPassword =
       typeof data.password_hash === "string" && data.password_hash.trim().length > 0
         ? data.password_hash
@@ -198,30 +462,36 @@ export async function PUT(request: NextRequest) {
           : null
 
     const passwordHash = rawPassword ? await hashPassword(rawPassword) : null
+    // البريد وربط حساب الإدارة قبل التعديل — لنقل العضوية/الدعوة إن تغيّر البريد (lib/company-invitations.ts)
+    const beforeUpdate = data.email !== undefined
+      ? (await sql`SELECT email, management_user_id FROM user_settings WHERE user_id = ${data.user_id} LIMIT 1`)[0] as any
+      : null
 
     const result = await sql`
-      UPDATE user_settings 
-      SET 
-        username = ${data.username},
-        email = ${data.email},
-        full_name = ${data.full_name},
-        role = ${data.role},
-        department = ${data.department},
-        phone = ${data.phone},
-        avatar_url = ${data.avatar_url},
-        language = ${data.language},
-        timezone = ${data.timezone},
-        date_format = ${data.date_format},
-        time_format = ${data.time_format},
-        notifications_enabled = ${data.notifications_enabled},
-        email_notifications = ${data.email_notifications},
-        sms_notifications = ${data.sms_notifications},
-        theme_preference = ${data.theme_preference},
-        sidebar_collapsed = ${data.sidebar_collapsed},
-        dashboard_layout = ${JSON.stringify(data.dashboard_layout || {})},
-        permissions = ${JSON.stringify(data.permissions || {})},
-        is_active = ${data.is_active},
+      UPDATE user_settings
+      SET
+        username = ${data.username ?? null},
+        email = ${data.email ?? null},
+        full_name = ${data.full_name ?? null},
+        role = ${data.role ?? null},
+        department = ${data.department ?? null},
+        phone = ${data.phone ?? null},
+        avatar_url = ${data.avatar_url ?? null},
+        language = ${data.language ?? null},
+        timezone = ${data.timezone ?? null},
+        date_format = ${data.date_format ?? null},
+        time_format = ${data.time_format ?? null},
+        notifications_enabled = ${data.notifications_enabled ?? null},
+        email_notifications = ${data.email_notifications ?? null},
+        sms_notifications = ${data.sms_notifications ?? null},
+        theme_preference = ${data.theme_preference ?? null},
+        sidebar_collapsed = ${data.sidebar_collapsed ?? null},
+        dashboard_layout = ${data.dashboard_layout ? JSON.stringify(data.dashboard_layout) : null},
+        permissions = ${data.permissions ? JSON.stringify(data.permissions) : null},
+        is_active = ${data.is_active ?? null},
         password_hash = COALESCE(${passwordHash}, password_hash),
+        branch_id = ${data.branch_id ?? null},
+        job_role_id = ${data.job_role_id ?? null},
         updated_at = CURRENT_TIMESTAMP
       WHERE user_id = ${data.user_id}
       RETURNING *
@@ -231,18 +501,77 @@ export async function PUT(request: NextRequest) {
       return NextResponse.json({ error: "User not found" }, { status: 404 })
     }
 
-     return NextResponse.json({
-      success: true,
-      user: result[0],
-    });
+    // Company administrators can change local credentials and this company membership only.
+    const updatedUser = result[0]
+    if (data.is_active === false) await revokeUserSessions(data.user_id, "account_disabled")
+    if (updatedUser.management_user_id) {
+      try {
+        if (data.is_active !== undefined) {
+          const currentDbName = await resolveCurrentDbName()
+          await managementSql`
+            UPDATE user_company SET is_active = ${data.is_active}
+            WHERE user_id = ${updatedUser.management_user_id}
+              AND company_id = (SELECT id FROM companies WHERE db_name = ${currentDbName})
+          `
+        }
+      } catch (syncError) {
+        console.error("[settings/user PUT] Failed to sync management DB:", syncError)
+      }
+    }
+
+    // تغيّر البريد (أو ربط حساب الإدارة لا يطابق البريد الحالي): تُنقل عضوية الشركة لحساب البريد الجديد إن وُجد،
+    // وإلا تُنشأ دعوة له (ويُرسل بريد الدعوة) — فتظهر الشركة للمستخدم عند الدخول بالبريد الجديد.
+    let invitation: { sent: boolean } | null = null
+    if (beforeUpdate && String(updatedUser.email || "").trim()) {
+      try {
+        const newEmail = String(updatedUser.email).trim().toLowerCase()
+        const linked = updatedUser.management_user_id
+          ? (await managementSql`SELECT LOWER(email) AS email FROM users WHERE id = ${Number(updatedUser.management_user_id)} LIMIT 1`)[0] as any
+          : null
+        const emailChanged = String(beforeUpdate.email || "").trim().toLowerCase() !== newEmail
+        const linkMismatch = Boolean(linked && linked.email !== newEmail)
+        if (emailChanged || linkMismatch) {
+          const dbName = await resolveCurrentDbName()
+          const company = (await managementSql`SELECT id, name FROM companies WHERE db_name = ${dbName} LIMIT 1`)[0] as any
+          if (company?.id) {
+            const { relinkTenantUserEmail } = await import("@/lib/company-invitations")
+            const outcome = await relinkTenantUserEmail({
+              dbName, companyId: Number(company.id), tenantUserId: updatedUser.user_id, email: newEmail,
+              fullName: updatedUser.full_name, previousManagementUserId: Number(beforeUpdate.management_user_id) || null,
+            })
+            if (outcome.invited) {
+              invitation = await issuePasswordCode({ email: newEmail, purpose: "invite", tenantDb: dbName, fullName: updatedUser.full_name, companyName: company.name })
+            } else if (outcome.linked) {
+              invitation = { sent: await sendAddedToCompanyEmail(newEmail, updatedUser.full_name, company.name) }
+            }
+          }
+        }
+      } catch (relinkError) {
+        console.error("[settings/user PUT] email relink failed:", relinkError)
+      }
+    }
+
+    return NextResponse.json({ success: true, user: result[0], invitation })
   } catch (error) {
     console.error("Database update error:", error)
-    return NextResponse.json({ error: "Failed to update user settings" }, { status: 500 })
+    return NextResponse.json(
+      {
+        error: "Failed to update user settings",
+        details: error instanceof Error ? error.message : String(error),
+      },
+      { status: 500 },
+    )
   }
 }
 
 export async function DELETE(request: NextRequest) {
+  // إعدادات المستخدمين والصلاحيات: الحفظ للمسؤول أو لمن يملك صلاحية إدارة المستخدمين والصلاحيات
+  const userAdmin = await authorizeUserAdmin(request as any)
+  if (!userAdmin.ok) return userAdmin.response
   try {
+    if (!(await getSessionUser(request))) {
+      return NextResponse.json({ error: "يجب تسجيل الدخول" }, { status: 401 })
+    }
     const { searchParams } = new URL(request.url)
     const userId = searchParams.get("user_id")
 
@@ -250,11 +579,30 @@ export async function DELETE(request: NextRequest) {
       return NextResponse.json({ error: "User ID is required" }, { status: 400 })
     }
 
-    await sql`
-      UPDATE user_settings 
-      SET is_active = false, updated_at = CURRENT_TIMESTAMP
+    await ensureBranchColumn()
+    if (await isPrimaryCompanyUser(userId)) {
+      return NextResponse.json({ error: "لا يمكن حذف مستخدم مدير النظام الأول" }, { status: 400 })
+    }
+    const deleted = (await sql`
+      UPDATE user_settings
+      SET is_active = false, is_deleted = true, updated_at = CURRENT_TIMESTAMP
       WHERE user_id = ${userId}
-    `
+      RETURNING management_user_id
+    `)[0] as any
+    if (deleted) await revokeUserSessions(userId, "account_disabled")
+    // عضوية "شركاتي" لهذه الشركة تُعطَّل أيضاً — كان المستخدم المحذوف يرى الشركة ويدخلها من بوابة الإدارة
+    if (deleted?.management_user_id) {
+      try {
+        const currentDbName = await resolveCurrentDbName()
+        await managementSql`
+          UPDATE user_company SET is_active = false
+          WHERE user_id = ${deleted.management_user_id}
+            AND company_id = (SELECT id FROM companies WHERE db_name = ${currentDbName})
+        `
+      } catch (syncError) {
+        console.error("[settings/user DELETE] Failed to sync management DB:", syncError)
+      }
+    }
 
     return NextResponse.json({ message: "User deactivated successfully" })
   } catch (error) {

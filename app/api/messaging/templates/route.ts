@@ -1,8 +1,5 @@
 import { NextResponse } from "next/server"
-import { neon } from "@neondatabase/serverless"
-
-const sql = neon(process.env.DATABASE_URL!)
-
+import sql from "@/lib/database"
 export async function GET() {
   try {
     const templates = await sql`
@@ -25,7 +22,7 @@ export async function GET() {
     return NextResponse.json(templates)
   } catch (error) {
     console.error("[v0] Error fetching templates:", error)
-    return NextResponse.json({ error: "فشل في جلب القوالب" }, { status: 500 })
+    return NextResponse.json({ error: "فشل في جلب النماذج" }, { status: 500 })
   }
 }
 
@@ -59,6 +56,6 @@ export async function POST(request: Request) {
     return NextResponse.json(result[0])
   } catch (error) {
     console.error("[v0] Error creating template:", error)
-    return NextResponse.json({ error: "فشل في إنشاء القالب" }, { status: 500 })
+    return NextResponse.json({ error: "فشل في إنشاء النموذج" }, { status: 500 })
   }
 }

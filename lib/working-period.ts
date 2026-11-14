@@ -1,0 +1,176 @@
+import sql, { resolveCurrentDbName } from "@/lib/database"
+import { runSchemaOnce } from "@/lib/schema-once"
+
+// + إقفال الفترات (period_locks_tbl: فترة لفرع أو لكل الفروع) بنفس الـTrigger — شاشة "إقفال الفترات".
+// فترة العمل (سنة العمل + أشهر العمل من "إعدادات النظام ← اعدادات عامة") تُفرَض على كل الحركات عبر
+// Trigger على voucher_header_tbl — نقطة واحدة تغطي كل مسارات إنشاء/تعديل/حذف السندات (مخزون، مبيعات،
+// قبض/صرف، قيود، شيكات، نقاط البيع، القيود الآلية، الرواتب...) بدل تكرار الفحص في كل مسار API.
+//   • إنشاء سند: تاريخه يجب أن يقع في سنة العمل وأحد أشهر العمل.
+//   • تعديل التاريخ/الحالة/المبلغ (يشمل الترحيل والإلغاء): التاريخ القديم والجديد معاً داخل الفترة.
+//   • حذف فعلي: تاريخ السند داخل الفترة.
+//   الطباعة (is_printed) وبقية الحقول لا تُفحَص. بلا سنة عمل محفوظة ⇐ لا قيود إطلاقاً.
+// + ملاحظة السند الإجبارية لكل نوع سند (voucher_note_rules في اعدادات عامة: [{vch_type, required, min_length}])
+//   تُفحَص عند الإنشاء والتعديل (لا عند الترحيل/الإلغاء — تغيّر الحالة). السندات الآلية (internal_voucher_id،
+//   نقاط البيع، المطاعم، عمليات الشيكات) مستثناة لأن المستخدم لا يكتب لها ملاحظة.
+
+const preparedDatabases = new Set<string>()
+
+export async function ensureWorkingPeriodGuard() { return runSchemaOnce("lib/working-period.ts#ensureWorkingPeriodGuard", async () => {
+  const databaseName = await resolveCurrentDbName()
+  if (preparedDatabases.has(databaseName)) return
+  const tables = await sql`SELECT to_regclass('voucher_header_tbl') IS NOT NULL AS vouchers`
+  if (!tables[0]?.vouchers) return
+
+  // إقفال الفترات: فترة (من/إلى) لفرع محدد أو لكل الفروع (branch_id فارغ). is_active=false ⇐ فُتحت (يبقى السجل للأرشفة)
+  await sql`
+    CREATE TABLE IF NOT EXISTS period_locks_tbl (
+      id SERIAL PRIMARY KEY,
+      branch_id INTEGER,
+      from_date DATE NOT NULL,
+      to_date DATE NOT NULL,
+      note TEXT,
+      is_active BOOLEAN NOT NULL DEFAULT true,
+      created_by VARCHAR(100),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_by VARCHAR(100),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      CHECK (to_date >= from_date)
+    )
+  `
+  await sql`CREATE INDEX IF NOT EXISTS idx_period_locks_dates ON period_locks_tbl(from_date, to_date) WHERE is_active`
+
+  await sql.unsafe(`
+    CREATE OR REPLACE FUNCTION period_lock_violation(p_date date, p_branch int) RETURNS text AS $fn$
+    DECLARE
+      v_lock record;
+    BEGIN
+      IF p_date IS NULL OR to_regclass('period_locks_tbl') IS NULL THEN RETURN NULL; END IF;
+      SELECT l.from_date, l.to_date, l.branch_id, b.branch_name INTO v_lock
+        FROM period_locks_tbl l LEFT JOIN branches b ON b.id = l.branch_id
+        WHERE l.is_active AND p_date BETWEEN l.from_date AND l.to_date
+          AND (l.branch_id IS NULL OR l.branch_id = p_branch)
+        ORDER BY l.branch_id NULLS FIRST, l.from_date LIMIT 1;
+      IF NOT FOUND THEN RETURN NULL; END IF;
+      RETURN format('الفترة من %s إلى %s مقفلة%s — لا يمكن إضافة أو تعديل أو ترحيل أو حذف سند بتاريخ %s (إقفال الفترات)',
+        to_char(v_lock.from_date, 'YYYY-MM-DD'), to_char(v_lock.to_date, 'YYYY-MM-DD'),
+        CASE WHEN v_lock.branch_id IS NULL THEN ' لكل الفروع' ELSE ' للفرع ' || COALESCE(v_lock.branch_name, v_lock.branch_id::text) END,
+        to_char(p_date, 'YYYY-MM-DD'));
+    END;
+    $fn$ LANGUAGE plpgsql STABLE
+  `)
+
+  await sql.unsafe(`
+    CREATE OR REPLACE FUNCTION working_period_violation(p_date date) RETURNS text AS $fn$
+    DECLARE
+      v_year_text text;
+      v_months_text text;
+      v_year int;
+      v_months int[];
+    BEGIN
+      IF p_date IS NULL OR to_regclass('system_settings') IS NULL THEN RETURN NULL; END IF;
+
+      SELECT value INTO v_year_text FROM system_settings
+        WHERE id::text = 'working_year' OR description = 'working_year'
+        ORDER BY (id::text = 'working_year') DESC LIMIT 1;
+      v_year := NULLIF(regexp_replace(COALESCE(v_year_text, ''), '[^0-9]', '', 'g'), '')::int;
+      IF v_year IS NULL THEN RETURN NULL; END IF;
+
+      IF EXTRACT(YEAR FROM p_date)::int <> v_year THEN
+        RETURN format('تاريخ السند %s خارج سنة العمل (%s) — راجع إعدادات النظام ← اعدادات عامة', to_char(p_date, 'YYYY-MM-DD'), v_year);
+      END IF;
+
+      SELECT value INTO v_months_text FROM system_settings
+        WHERE id::text = 'working_months' OR description = 'working_months'
+        ORDER BY (id::text = 'working_months') DESC LIMIT 1;
+      IF COALESCE(btrim(v_months_text), '') IN ('', 'null', '[]') THEN RETURN NULL; END IF;
+      BEGIN
+        SELECT array_agg(x::int) INTO v_months FROM json_array_elements_text(v_months_text::json) AS x;
+      EXCEPTION WHEN others THEN
+        SELECT array_agg(btrim(x)::int) INTO v_months
+          FROM unnest(string_to_array(regexp_replace(v_months_text, '[^0-9,]', '', 'g'), ',')) AS x
+          WHERE btrim(x) <> '';
+      END;
+      IF v_months IS NULL OR array_length(v_months, 1) IS NULL THEN RETURN NULL; END IF;
+
+      IF NOT (EXTRACT(MONTH FROM p_date)::int = ANY(v_months)) THEN
+        RETURN format('تاريخ السند %s في شهر غير مفتوح للعمل (الأشهر المفتوحة: %s) — راجع إعدادات النظام ← اعدادات عامة',
+          to_char(p_date, 'YYYY-MM-DD'), array_to_string(v_months, '، '));
+      END IF;
+      RETURN NULL;
+    END;
+    $fn$ LANGUAGE plpgsql STABLE
+  `)
+
+  await sql.unsafe(`
+    CREATE OR REPLACE FUNCTION voucher_note_violation(p_row jsonb) RETURNS text AS $fn$
+    DECLARE
+      v_rules_text text;
+      v_rule jsonb;
+      v_min int;
+      v_note text;
+      v_type_name text;
+    BEGIN
+      IF to_regclass('system_settings') IS NULL THEN RETURN NULL; END IF;
+      IF COALESCE(p_row->>'internal_voucher_id', p_row->>'pos_point_id', p_row->>'pos_session_id',
+                  p_row->>'location_id', p_row->>'cheq_operation_id') IS NOT NULL THEN RETURN NULL; END IF;
+      SELECT value INTO v_rules_text FROM system_settings
+        WHERE id::text = 'voucher_note_rules' OR description = 'voucher_note_rules'
+        ORDER BY (id::text = 'voucher_note_rules') DESC LIMIT 1;
+      IF COALESCE(btrim(v_rules_text), '') IN ('', 'null', '[]') THEN RETURN NULL; END IF;
+      BEGIN
+        SELECT r INTO v_rule FROM jsonb_array_elements(v_rules_text::jsonb) r
+          WHERE (r->>'vch_type')::int = (p_row->>'vch_type')::int AND COALESCE((r->>'required')::boolean, false)
+          LIMIT 1;
+      EXCEPTION WHEN others THEN RETURN NULL;
+      END;
+      IF v_rule IS NULL THEN RETURN NULL; END IF;
+      v_min := GREATEST(COALESCE(NULLIF(v_rule->>'min_length', '')::int, 0), 0);
+      v_note := btrim(COALESCE(p_row->>'note', ''));
+      IF v_note <> '' AND char_length(v_note) > v_min THEN RETURN NULL; END IF;
+      SELECT name INTO v_type_name FROM voucher_types_tbl WHERE id = (p_row->>'vch_type')::int;
+      IF v_note = '' THEN
+        RETURN format('ملاحظة السند اجبارية لـ %s (ملاحظة السند)', COALESCE(v_type_name, 'هذا النوع من السندات'));
+      END IF;
+      RETURN format('طول ملاحظة السند يجب أن يزيد عن %s حرفاً لـ %s (ملاحظة السند)', v_min, COALESCE(v_type_name, 'هذا النوع من السندات'));
+    END;
+    $fn$ LANGUAGE plpgsql STABLE
+  `)
+
+  await sql.unsafe(`
+    CREATE OR REPLACE FUNCTION check_voucher_working_period() RETURNS trigger AS $fn$
+    DECLARE
+      v_error text;
+    BEGIN
+      IF TG_OP IN ('INSERT', 'UPDATE') THEN
+        v_error := COALESCE(working_period_violation(NEW.vch_date::date), period_lock_violation(NEW.vch_date::date, NEW.branch_id));
+        IF v_error IS NOT NULL THEN RAISE EXCEPTION '%', v_error USING ERRCODE = 'P0001'; END IF;
+        -- ملاحظة السند: عند الإنشاء والتعديل فقط (الترحيل/الإلغاء يغيّران الحالة فلا يُفحصان)
+        IF COALESCE(NEW.status, 1) <> 3 AND (TG_OP = 'INSERT' OR COALESCE(OLD.status, 1) = COALESCE(NEW.status, 1)) THEN
+          v_error := voucher_note_violation(to_jsonb(NEW));
+          IF v_error IS NOT NULL THEN RAISE EXCEPTION '%', v_error USING ERRCODE = 'P0001'; END IF;
+        END IF;
+      END IF;
+      IF TG_OP IN ('UPDATE', 'DELETE') THEN
+        v_error := COALESCE(working_period_violation(OLD.vch_date::date), period_lock_violation(OLD.vch_date::date, OLD.branch_id));
+        IF v_error IS NOT NULL THEN RAISE EXCEPTION '%', v_error USING ERRCODE = 'P0001'; END IF;
+      END IF;
+      IF TG_OP = 'DELETE' THEN RETURN OLD; END IF;
+      RETURN NEW;
+    END;
+    $fn$ LANGUAGE plpgsql
+  `)
+
+  await sql`DROP TRIGGER IF EXISTS voucher_working_period_trigger ON voucher_header_tbl`
+  await sql.unsafe(`
+    CREATE TRIGGER voucher_working_period_trigger
+    BEFORE INSERT OR UPDATE OF vch_date, status, amount, branch_id, note OR DELETE ON voucher_header_tbl
+    FOR EACH ROW EXECUTE FUNCTION check_voucher_working_period()
+  `)
+  preparedDatabases.add(databaseName)
+}) }
+
+/** نص الخطأ إن كانت الرسالة صادرة عن فحص فترة العمل (لعرضها كما هي بدل رسالة عامة). */
+export const workingPeriodErrorMessage = (error: unknown): string | null => {
+  const message = String((error as any)?.message || "")
+  return message.includes("فترة العمل") || message.includes("سنة العمل") || message.includes("غير مفتوح للعمل") || message.includes("إقفال الفترات") || message.includes("(ملاحظة السند)") ? message : null
+}

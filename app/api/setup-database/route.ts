@@ -1,7 +1,11 @@
-import { sql } from "@vercel/postgres"
-import { NextResponse } from "next/server"
+import { authorizeUserAdmin } from "@/lib/user-admin-access"
+import sql from "@/lib/database"
+import { NextResponse, type NextRequest } from "next/server"
 
-export async function POST() {
+export async function POST(request: NextRequest) {
+  // أداة إدارية/تطوير: للمسؤول فقط
+  const admin = await authorizeUserAdmin(request)
+  if (!admin.ok) return admin.response
   try {
     // Create tables
     await sql`
@@ -80,7 +84,7 @@ export async function POST() {
         currency VARCHAR(10) DEFAULT 'USD',
         category VARCHAR(255),
         status VARCHAR(50) DEFAULT 'نشط',
-        product_type VARCHAR(50) DEFAULT 'صنف',
+        product_type INTEGER DEFAULT 1,
         type INTEGER DEFAULT 1,
         service_type INTEGER DEFAULT 0,
         has_expiry BOOLEAN DEFAULT false,
@@ -91,8 +95,27 @@ export async function POST() {
         product_image TEXT,
         general_notes TEXT,
         classifications VARCHAR(255),
+        tax_classification_id INTEGER,
         entry_date DATE DEFAULT CURRENT_DATE,
         attachments TEXT,
+        selling_account_id INTEGER,
+        selling_account_code VARCHAR(100),
+        purchase_account_id INTEGER,
+        purchase_account_code VARCHAR(100),
+        selling_returns_account_id INTEGER,
+        selling_returns_account_code VARCHAR(100),
+        purchase_returns_account_id INTEGER,
+        purchase_returns_account_code VARCHAR(100),
+        stock_end_account_id INTEGER,
+        stock_end_account_code VARCHAR(100),
+        stock_start_account_id INTEGER,
+        stock_start_account_code VARCHAR(100),
+        production_account_id INTEGER,
+        production_account_code VARCHAR(100),
+        municipality_service_account_id INTEGER,
+        municipality_service_account_code VARCHAR(100),
+        lsti3mal_account_id INTEGER,
+        lsti3mal_account_code VARCHAR(100),
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
     `
@@ -115,10 +138,21 @@ export async function POST() {
     await sql`
       CREATE TABLE IF NOT EXISTS item_groups (
         id SERIAL PRIMARY KEY,
-        group_code VARCHAR(20) UNIQUE NOT NULL,
+        group_code VARCHAR(10) UNIQUE NOT NULL,
         group_name VARCHAR(100) NOT NULL,
         description TEXT,
         status VARCHAR(20) DEFAULT 'نشط',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `
+
+    await sql`
+      CREATE TABLE IF NOT EXISTS tax_classifications (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(255) NOT NULL UNIQUE,
+        tax_percent DECIMAL(5,2) DEFAULT 0,
+        status INTEGER DEFAULT 1,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )

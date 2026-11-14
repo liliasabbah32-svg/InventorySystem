@@ -1,0 +1,147 @@
+"use client"
+
+import { tr, appDir } from "@/lib/i18n"
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog"
+import { Button } from "@/components/ui/button"
+import { Input } from "@/components/ui/input"
+import { Label } from "@/components/ui/label"
+import { PosDialogMessages } from "./pos-dialog-messages"
+import { ArrowDownToLine, ArrowUpFromLine, Check, HandCoins, LockKeyhole, X } from "lucide-react"
+
+type Currency = { currency_id: number; currency_code: string; currency_name: string; rate_to_point: number }
+type Session = { details_hidden?: boolean; movement_totals?: Array<{ movement_type: string; amount: number }>; shift_guid?: string; opening_cash: number; expected_cash: number; opened_at?: string; payments?: Array<{ payment_method: string; amount: number; sale_amount?: number; refund_amount?: number }>; currencies?: Array<{ currency_id: number; expected_amount: number; currency_code: string; rate_to_point?: number }>; movements?: Array<{ id: number; movement_type: string; currency_code?: string; currency_amount?: number; amount: number; created_at?: string; note?: string }> }
+type Props = { open: boolean; onOpenChange: (open: boolean) => void; session: Session | null; userName: string; currencyCode: string; currencies: Currency[]; action: string; onActionChange: (action: string) => void; amount: number; onAmountChange: (amount: number) => void; currencyId: number; onCurrencyIdChange: (id: number) => void; amounts: Record<number, number>; onCurrencyAmountChange: (id: number, amount: number) => void; movementAmounts: Record<number, number>; onMovementAmountChange: (id: number, amount: number) => void; note: string; onNoteChange: (value: string) => void; onConfirm: () => void; busy: boolean; error?: string }
+const money = (value: number) => Number(value || 0).toFixed(2)
+const methods = [{ key: "cash", label: tr("الفواتير النقدية") }, { key: "cheque", label: tr("الشيكات") }, { key: "card", label: tr("البطاقات") }, { key: "account", label: tr("الذمم") }, { key: "gift_card", label: tr("بطاقات الهدايا") }, { key: "aid_voucher", label: tr("قسائم المساعدة") }]
+// تسليم العهدة أُلغي من النافذة: إيداع، سحب، وإغلاق الوردية فقط
+const actions = [{ key: "cash_in", label: tr("إيداع"), icon: ArrowDownToLine }, { key: "cash_out", label: tr("سحب"), icon: ArrowUpFromLine }, { key: "close", label: tr("إغلاق الوردية"), icon: LockKeyhole }]
+const movementLabels: Record<string, string> = { opening: tr("فتح الوردية"), receive: tr("استلام العهدة"), sale: tr("بيع"), refund: tr("مردود"), cash_in: tr("إيداع"), cash_out: tr("سحب"), handover: tr("تسليم العهدة"), close: tr("إغلاق الوردية") }
+
+export function PosHandoverDialog(p: Props) {
+  const { open, onOpenChange, session, userName, currencyCode, currencies, action, onActionChange, amounts, onCurrencyAmountChange, movementAmounts, onMovementAmountChange, note, onNoteChange, onConfirm, busy, error } = p
+  const closing = action === "close"
+  // بلا صلاحية "السماح بمشاهدة تفاصيل العهدة": الخادم لا يرسل المبيعات/المتوقع/الحركات، وتُعرض حقول الإدخال فقط
+  const showDetails = !session?.details_hidden
+  const payments = session?.payments || []
+  const sales = (method: string) => payments.filter(row => row.payment_method === method).reduce((sum, row) => sum + Number(row.sale_amount ?? row.amount ?? 0), 0)
+  const refunds = (method: string) => payments.filter(row => row.payment_method === method).reduce((sum, row) => sum + Number(row.refund_amount || 0), 0)
+  const totalSales = methods.reduce((sum, row) => sum + sales(row.key), 0)
+  const totalRefunds = methods.reduce((sum, row) => sum + refunds(row.key), 0)
+  const netCashSales = sales("cash") - refunds("cash")
+  const available = (id: number) => Number(session?.currencies?.find(row => row.currency_id === id)?.expected_amount || 0)
+  const rate = (id: number) => Number(session?.currencies?.find(row => row.currency_id === id)?.rate_to_point || currencies.find(row => row.currency_id === id)?.rate_to_point || 1)
+  const totalEntered = currencies.reduce((sum, row) => sum + Number(amounts[row.currency_id] || 0) * rate(row.currency_id), 0)
+  const validAmount = (value: number) => Number.isFinite(value) && value >= 0 && Math.abs(value * 100 - Math.round(value * 100)) < 0.000001
+  const valid = closing
+    ? currencies.length > 0 && currencies.every(row => validAmount(Number(amounts[row.currency_id] ?? 0)))
+    : currencies.some(row => Number(movementAmounts[row.currency_id] || 0) > 0) && currencies.every(row => { const value = Number(movementAmounts[row.currency_id] || 0); return validAmount(value) && (action !== "cash_out" || !showDetails || value <= available(row.currency_id) + 0.009) })
+  const movements = session?.movements || []
+  const movementTotal = (type: string) => (session?.movement_totals || movements).filter(row => row.movement_type === type).reduce((sum, row) => sum + Number(row.amount || 0), 0)
+  const totalRequired = Math.round((Number(session?.opening_cash || 0) + netCashSales + movementTotal("cash_in") - movementTotal("cash_out")) * 100) / 100
+  const difference = Math.round((totalEntered - totalRequired) * 100) / 100
+  const moveToNextField = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    if (event.key !== "Enter" || event.altKey || event.ctrlKey || event.metaKey) return
+    const target = event.target
+    if (!(target instanceof HTMLInputElement || target instanceof HTMLSelectElement || target instanceof HTMLTextAreaElement)) return
+    if (target.disabled || target instanceof HTMLTextAreaElement || (target instanceof HTMLInputElement && target.readOnly)) return
+    event.preventDefault()
+    const controls = Array.from(new Set(event.currentTarget.querySelectorAll<HTMLElement>(
+      'input:not([disabled]):not([readonly]), select:not([disabled]), textarea:not([disabled]), button:not([disabled]), [tabindex]:not([tabindex="-1"])',
+    ))).filter(control => control.offsetWidth > 0 || control.offsetHeight > 0)
+    const index = controls.indexOf(target)
+    controls[(index + 1) % controls.length]?.focus()
+  }
+  const totalsSummary = <div className="grid gap-3 rounded-xl border border-slate-800 bg-slate-900 px-4 py-4 text-sm font-semibold text-white sm:grid-cols-3" aria-live="polite">
+    <div className="flex items-center justify-between gap-3"><span className="text-slate-300">{tr("إجمالي المبلغ المعدود (")}{currencyCode})</span><strong dir="ltr" className="text-lg tabular-nums text-cyan-300">{money(totalEntered)}</strong></div>
+    <div className="flex items-center justify-between gap-3"><span className="text-slate-300">{tr("إجمالي المبلغ المطلوب (")}{currencyCode})</span><strong dir="ltr" className="text-lg tabular-nums">{money(totalRequired)}</strong></div>
+    <div className={"flex items-center justify-between gap-3 border-t border-slate-700 pt-3 sm:border-e sm:border-t-0 sm:pe-3 " + (difference > 0 ? "text-emerald-300" : difference < 0 ? "text-rose-300" : "text-slate-200")}><span>{tr("الفرق (")}{currencyCode})</span><strong dir="ltr" className="text-lg tabular-nums">{difference > 0 ? "+" : ""}{money(difference)}</strong></div>
+  </div>
+
+  return <Dialog open={open} onOpenChange={onOpenChange}>
+    <DialogContent dir={appDir()} className="pos-custody-dialog flex h-[calc(100%-1.5rem)] max-h-[820px] w-[calc(100%-1.5rem)] max-w-[1040px] flex-col gap-0 overflow-hidden rounded-xl border border-slate-300 bg-white p-0 shadow-[0_28px_80px_-28px_rgba(15,23,42,.55)] sm:rounded-2xl dark:border-slate-700 dark:bg-slate-950" onKeyDown={event => { if (event.key === "F3") { event.preventDefault(); if (valid && !busy) onConfirm(); return } moveToNextField(event) }}>
+      <DialogHeader className="shrink-0 border-b border-[#6967c4] bg-gradient-to-l from-[#262653] via-[#433b91] to-[#5950b2] px-6 py-5 text-start text-white">
+        <div className="flex items-center gap-3"><span className="flex size-11 shrink-0 items-center justify-center rounded-lg border border-white/30 bg-white/15 text-white">{closing ? <LockKeyhole className="size-5" /> : <HandCoins className="size-5" />}</span><div><DialogTitle className="text-lg font-bold text-white">{closing ? tr("إغلاق الوردية") : tr("العهدة")}</DialogTitle><DialogDescription className="mt-1 text-xs text-indigo-100">{closing ? tr("المبلغ المعدود حسب المبالغ المدخلة في تفاصيل التسليم حسب العملة") : tr("إدارة عهدة الوردية والأرصدة حسب العملة")}</DialogDescription></div><span className="ms-auto hidden rounded-md border border-white/25 bg-white/10 px-3 py-1.5 text-xs text-indigo-100 sm:inline">{userName || tr("الكاشير")}</span></div>
+      </DialogHeader>
+      <PosDialogMessages error={error} open={open} />
+      <style jsx global>{`
+        .pos-custody-dialog section {
+          border-color: #cbd5e1 !important;
+          border-radius: 8px !important;
+          box-shadow: none !important;
+        }
+        .dark .pos-custody-dialog section { border-color: #334155 !important; }
+        .pos-custody-dialog section > h3 {
+          background: #f8fafc;
+          color: #0f172a;
+          font-size: 13px;
+        }
+        .dark .pos-custody-dialog section > h3 { background: #111c2c; color: #f8fafc; }
+        .pos-custody-dialog table thead { background: #433b91 !important; color: #f8fafc !important; }
+        .pos-custody-dialog table tbody tr { border-color: #e2e8f0 !important; }
+        .pos-custody-dialog table tbody tr:nth-child(even) { background: #f1f5f9; }
+        .dark .pos-custody-dialog table tbody tr:nth-child(even) { background: #111c2c; }
+        .pos-custody-dialog table input:not([disabled]) {
+          border-color: #94a3b8;
+          background: #fff;
+          color: #0f172a;
+          font-variant-numeric: tabular-nums;
+        }
+        .pos-custody-dialog table input:not([disabled]):focus-visible {
+          border-color: #5146b9;
+          box-shadow: 0 0 0 2px rgb(81 70 185 / 18%);
+        }
+        .dark .pos-custody-dialog table input:not([disabled]) { border-color: #475569; background: #0b1220; color: #f8fafc; }
+        .pos-custody-dialog > div:last-child {
+          border-color: #cbd5e1;
+          background: #fff;
+        }
+        .dark .pos-custody-dialog > div:last-child { border-color: #334155; background: #020617; }
+        .pos-custody-dialog > div:last-child button:first-child {
+          border-color: #cbd5e1;
+          border-radius: 6px;
+          background: #fff;
+          color: #334155;
+        }
+        .pos-custody-dialog > div:last-child button:last-child {
+          border-radius: 6px;
+          background: #5146b9;
+          color: #fff;
+        }
+        .pos-custody-dialog > div:last-child button:last-child:hover { background: #433b91; }
+        .dark .pos-custody-dialog > div:last-child button:first-child { border-color: #475569; background: #0f172a; color: #e2e8f0; }
+        .dark .pos-custody-dialog > div:last-child button:last-child { background: #655bc9; color: #fff; }
+        .dark .pos-custody-dialog > div:last-child button:last-child:hover { background: #5146b9; }
+        .pos-custody-dialog [aria-live="polite"] {
+          border-color: #6967c4 !important;
+          background: linear-gradient(115deg, #262653, #433b91 60%, #5950b2) !important;
+        }
+        .pos-custody-dialog [class*="border-cyan-"] { border-color: #5146b9 !important; }
+        .pos-custody-dialog [class*="text-cyan-"] { color: #eeecff !important; }
+        .pos-custody-dialog [class*="bg-cyan-"] { background: #5146b9 !important; color: #fff !important; }
+        .pos-custody-dialog section > h3 { border-color: #dfe4f1 !important; }
+        .dark .pos-custody-dialog section > h3 { border-color: #5146b9 !important; }
+      `}</style>
+      <div className="min-h-0 flex-1 space-y-5 overflow-y-auto bg-slate-100 p-4 sm:p-6 dark:bg-slate-900">
+        <div role="tablist" className="grid grid-cols-2 gap-2 sm:flex sm:justify-center">{actions.map(row => <button key={row.key} type="button" role="tab" aria-selected={action === row.key} onClick={() => onActionChange(row.key)} className={`flex min-w-0 items-center justify-center gap-2 rounded-xl border px-3 py-2 text-sm font-bold transition-colors sm:px-5 ${action === row.key ? "border-indigo-600 bg-indigo-600 text-white shadow-sm" : "border-slate-200 bg-white text-slate-700 hover:border-indigo-300 hover:bg-indigo-50 hover:text-indigo-700 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200 dark:hover:bg-slate-800"}`}><row.icon className="size-4 shrink-0" /><span className="truncate">{row.label}</span></button>)}</div>
+        {closing ? <section className="border-t-2 border-slate-900 bg-white p-5 dark:border-cyan-500 dark:bg-slate-950">
+          <h3 className="mb-4 flex items-center gap-2 text-sm font-bold text-slate-900 dark:text-white"><span className="flex size-8 items-center justify-center rounded-lg bg-slate-900 text-cyan-300 dark:bg-cyan-500 dark:text-slate-950"><LockKeyhole className="size-4" /></span>{tr("المبلغ المعدود")}</h3>
+          <div className="grid gap-4 sm:grid-cols-2">{currencies.map(row => <div key={row.currency_id} className="min-w-0 border-b border-slate-200 p-3 dark:border-slate-800"><Label htmlFor={`counted-${row.currency_id}`} className="mb-2 block text-xs font-semibold text-slate-600 dark:text-slate-300">{row.currency_name} ({row.currency_code})</Label><Input id={`counted-${row.currency_id}`} aria-label={tr("المبلغ المعدود {0}", row.currency_code)} type="number" min="0" step="0.01" value={amounts[row.currency_id] ?? 0} onFocus={event => event.currentTarget.select()} onChange={event => onCurrencyAmountChange(row.currency_id, Number(event.target.value))} className="h-12 rounded-lg border-slate-300 bg-white text-end text-xl font-bold tabular-nums dark:border-slate-700 dark:bg-slate-900" dir="ltr" /></div>)}</div>
+          {showDetails && <div className="mt-4">{totalsSummary}</div>}
+        </section> : <>
+          <div className="grid gap-px overflow-hidden border border-slate-300 bg-slate-300 sm:grid-cols-2 lg:grid-cols-3 dark:border-slate-700 dark:bg-slate-700">{[{ label: tr("رقم الوردية"), value: session?.shift_guid || "" }, { label: tr("تاريخ العملية"), value: new Date().toLocaleString("en-GB") }, { label: tr("المستخدم"), value: userName }, { label: tr("الرصيد الافتتاحي"), value: `${money(Number(session?.opening_cash || 0))} ${currencyCode}` }, ...(showDetails ? [{ label: tr("مجموع المبيعات"), value: `${money(totalSales)} ${currencyCode}` }, { label: tr("الرصيد المتوقع"), value: `${money(Number(session?.expected_cash || 0))} ${currencyCode}` }] : [])].map(card => <div key={card.label} className="min-w-0 bg-white px-4 py-3 dark:bg-slate-950"><div className="mb-1 text-[11px] font-medium text-slate-500 dark:text-slate-400">{card.label}</div><div className="truncate text-sm font-bold text-slate-900 dark:text-white" title={card.value}>{card.value}</div></div>)}</div>
+          {showDetails && <>
+            <section className="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm dark:border-slate-800 dark:bg-slate-900"><h3 className="border-b border-slate-100 px-4 py-3 text-sm font-bold dark:border-slate-800">{tr("ملخص حركة الوردية")}</h3><div className="overflow-x-auto"><table className="w-full min-w-[540px] text-xs"><thead className="bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300"><tr><th className="p-3 text-start">{tr("التفاصيل")}</th><th className="p-3 text-center">{tr("المبيعات")}</th><th className="p-3 text-center">{tr("المردودات")}</th><th className="p-3 text-center">{tr("الصافي")}</th></tr></thead><tbody>{methods.map(row => <tr key={row.key} className="border-t border-slate-100 dark:border-slate-800"><th className="p-3 text-start font-medium">{row.label}</th><td className="p-3 text-center">{money(sales(row.key))}</td><td className="p-3 text-center">{money(refunds(row.key))}</td><td className="p-3 text-center">{money(sales(row.key) - refunds(row.key))}</td></tr>)}<tr className="border-t border-emerald-200 bg-emerald-50 font-bold text-emerald-900 dark:border-emerald-900 dark:bg-emerald-950/30 dark:text-emerald-100"><th className="p-3 text-start">{tr("المجموع")}</th><td className="p-3 text-center">{money(totalSales)}</td><td className="p-3 text-center">{money(totalRefunds)}</td><td className="p-3 text-center">{money(totalSales - totalRefunds)}</td></tr></tbody></table></div></section>
+          </>}
+          {false && <>
+            <section className="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm dark:border-slate-800 dark:bg-slate-900"><h3 className="border-b border-slate-100 px-4 py-3 text-sm font-bold dark:border-slate-800">{tr("تفاصيل التسليم حسب العملة")}</h3><div className="overflow-x-auto"><table className="w-full min-w-[620px] text-xs"><thead className="bg-sky-50 text-sky-900 dark:bg-sky-950/30 dark:text-sky-100"><tr><th className="p-3 text-start">{tr("العملة")}</th><th className="p-3 text-center">{tr("الرصيد المتاح")}</th><th className="p-3 text-center">{tr("المبلغ المسلم")}</th><th className="p-3 text-center">{tr("سعر الصرف")}</th><th className="p-3 text-center">{tr("المبلغ المقيم")}</th></tr></thead><tbody>{currencies.map(row => <tr key={row.currency_id} className="border-t border-slate-100 dark:border-slate-800"><th className="p-3 text-start font-medium">{row.currency_name} · {row.currency_code}</th><td className="p-3 text-center">{money(available(row.currency_id))}</td><td className="p-2"><Input aria-label={tr("المبلغ المسلم {0}", row.currency_code)} type="number" min="0" max={available(row.currency_id)} step="0.01" value={amounts[row.currency_id] ?? 0} onChange={event => onCurrencyAmountChange(row.currency_id, Number(event.target.value))} className="h-9 min-w-24 rounded-lg text-center" /></td><td className="p-3 text-center">{rate(row.currency_id).toFixed(4)}</td><td className="p-3 text-center font-bold">{money(Number(amounts[row.currency_id] || 0) * rate(row.currency_id))}</td></tr>)}</tbody></table></div></section>
+            {totalsSummary}
+          </>}
+          <section className="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm dark:border-slate-800 dark:bg-slate-900"><h3 className="border-b border-slate-100 px-4 py-3 text-sm font-bold dark:border-slate-800">{action === "cash_in" ? tr("تفاصيل الإيداع") : tr("تفاصيل السحب")}</h3><div className="overflow-x-auto"><table className="w-full min-w-[440px] text-xs"><thead className="bg-sky-50 text-sky-900 dark:bg-sky-950/30 dark:text-sky-100"><tr><th className="p-3 text-start">{tr("العملة")}</th>{showDetails && <th className="p-3 text-center">{tr("الرصيد المتاح")}</th>}<th className="p-3 text-center">{action === "cash_in" ? tr("مبلغ الإيداع") : tr("مبلغ السحب")}</th><th className="p-3 text-center">{tr("المبلغ المقيم (")}{currencyCode})</th></tr></thead><tbody>{currencies.map(row => <tr key={row.currency_id} className="border-t border-slate-100 dark:border-slate-800"><th className="p-3 text-start">{row.currency_code} · {row.currency_name}</th>{showDetails && <td className="p-3 text-center">{money(available(row.currency_id))}</td>}<td className="p-2"><Input aria-label={tr("{0} {1}", action === "cash_in" ? "إيداع" : "سحب", row.currency_code)} type="number" min="0" max={action === "cash_out" && showDetails ? available(row.currency_id) : undefined} step="0.01" value={movementAmounts[row.currency_id] ?? 0} onChange={event => onMovementAmountChange(row.currency_id, Number(event.target.value))} className="h-9 min-w-24 rounded-lg text-center" /></td><td className="p-3 text-center">{money(Number(movementAmounts[row.currency_id] || 0) * rate(row.currency_id))}</td></tr>)}</tbody></table></div></section>
+        </>}
+        {showDetails && <section className="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm dark:border-slate-800 dark:bg-slate-900"><div className="flex items-center gap-2 border-b border-slate-100 px-4 py-3 dark:border-slate-800"><span className="size-2 rounded-full bg-emerald-500" /><h3 className="text-sm font-bold text-slate-900 dark:text-white">{tr("سجل العهدة في هذه الوردية")}</h3></div><div className="max-h-64 overflow-auto"><table className="w-full min-w-[540px] text-xs"><thead className="sticky top-0 bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300"><tr><th className="p-3 text-start">{tr("التاريخ والوقت")}</th><th className="p-3 text-start">{tr("العملية")}</th><th className="p-3 text-start">{tr("العملة")}</th><th className="p-3 text-end">{tr("المبلغ")}</th><th className="p-3 text-start">{tr("ملاحظات")}</th></tr></thead><tbody>{movements.map(row => <tr key={row.id} className="border-t border-slate-100 dark:border-slate-800"><td dir="ltr" className="p-3 text-start text-slate-500 dark:text-slate-400">{row.created_at ? new Date(row.created_at).toLocaleString("en-GB") : "—"}</td><td className="p-3 font-medium">{movementLabels[row.movement_type] || row.movement_type}</td><td className="p-3">{row.currency_code || currencyCode}</td><td dir="ltr" className="p-3 text-end font-bold tabular-nums">{money(Number(row.currency_amount ?? row.amount))}</td><td className="max-w-48 truncate p-3 text-slate-500" title={row.note || ""}>{row.note || "—"}</td></tr>)}</tbody></table>{movements.length === 0 && <p className="p-6 text-center text-xs text-slate-500">{tr("لا توجد حركات مسجلة في هذه الوردية")}</p>}</div></section>}
+        {!closing && <div className="space-y-2"><Label htmlFor="custody-note">{tr("ملاحظات")}</Label><Input id="custody-note" value={note} onChange={event => onNoteChange(event.target.value)} placeholder={tr("أضف ملاحظة لهذه العملية (اختياري)")} className="h-10 rounded-xl border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-900" /></div>}
+      </div>
+      <div className="flex shrink-0 items-center justify-center gap-2 border-t border-slate-200 bg-white px-4 py-3 sm:px-5 sm:py-4 dark:border-slate-800 dark:bg-slate-950"><Button disabled={busy || !valid} onClick={onConfirm} className="h-11 flex-1 rounded-xl sm:h-10 sm:w-36 sm:flex-none bg-emerald-600 font-bold shadow-sm hover:bg-emerald-700"><Check className="me-2 size-4" />{tr("موافق")}</Button><Button variant="outline" disabled={busy} onClick={() => onOpenChange(false)} className="h-11 flex-1 rounded-xl sm:h-10 sm:w-36 sm:flex-none"><X className="me-2 size-4" />{tr("إلغاء")}</Button></div>
+    </DialogContent>
+  </Dialog>
+}

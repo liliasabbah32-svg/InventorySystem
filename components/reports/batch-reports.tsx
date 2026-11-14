@@ -1,4 +1,10 @@
 "use client"
+
+import { tr } from "@/lib/i18n"
+import { showAlert } from "@/components/ui/confirm-host"
+import { ReportPage, ReportHeader } from "@/components/reports/report-page"
+
+import { ReportFilters } from "@/components/reports/report-filters"
 import { useState, useEffect } from "react"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
@@ -186,7 +192,7 @@ export function BatchReports() {
       }
     } catch (error) {
       console.error("Error exporting report:", error)
-      alert("فشل في تصدير التقرير")
+      showAlert(tr("فشل في تصدير التقرير"))
     }
   }
 
@@ -243,27 +249,22 @@ export function BatchReports() {
   }
 
   return (
-    <div className="space-y-6">
-      <div className="flex justify-between items-center">
-        <div>
-          <h2 className="text-2xl font-bold">تقارير حركات الدفعات</h2>
-          <p className="text-muted-foreground">تقارير شاملة وإحصائيات مفصلة لحركات الدفعات</p>
-        </div>
-        <div className="flex gap-2">
+    <ReportPage loading={loading}>
+<ReportHeader title={tr("تقارير حركات الدفعات")} description={<>{tr("تقارير شاملة وإحصائيات مفصلة لحركات الدفعات")}</>} actions={<>
           <SearchButton type="products" onSelect={handleProductSelect} variant="outline" />
           <Button onClick={() => exportReport(activeTab)} variant="outline">
-            <Download className="ml-2 h-4 w-4" />
-            تصدير التقرير
+            <Download className="me-2 h-4 w-4" />
+            {tr("تصدير التقرير")}
           </Button>
-        </div>
-      </div>
+        </>} />
+
 
       <Tabs value={activeTab} onValueChange={setActiveTab} className="w-full">
         <TabsList className="grid w-full grid-cols-4">
-          <TabsTrigger value="summary">الملخص العام</TabsTrigger>
-          <TabsTrigger value="movements">حركات الدفعات</TabsTrigger>
-          <TabsTrigger value="expiry">تقرير الصلاحية</TabsTrigger>
-          <TabsTrigger value="analytics">التحليلات</TabsTrigger>
+          <TabsTrigger value="summary">{tr("الملخص العام")}</TabsTrigger>
+          <TabsTrigger value="movements">{tr("حركات الدفعات")}</TabsTrigger>
+          <TabsTrigger value="expiry">{tr("تقرير الصلاحية")}</TabsTrigger>
+          <TabsTrigger value="analytics">{tr("التحليلات")}</TabsTrigger>
         </TabsList>
 
         <TabsContent value="summary" className="space-y-6">
@@ -275,8 +276,8 @@ export function BatchReports() {
                   <CardContent className="p-6">
                     <div className="flex items-center justify-between">
                       <div>
-                        <p className="text-sm font-medium text-muted-foreground">إجمالي الدفعات</p>
-                        <p className="text-2xl font-bold">{summary.statistics.totalLots.toLocaleString()}</p>
+                        <p className="text-sm font-medium text-muted-foreground">{tr("إجمالي الدفعات")}</p>
+                        <p className="text-2xl font-bold">{summary.statistics.totalLots.toLocaleString("en-US")}</p>
                       </div>
                       <Package className="h-8 w-8 text-blue-600" />
                     </div>
@@ -287,9 +288,9 @@ export function BatchReports() {
                   <CardContent className="p-6">
                     <div className="flex items-center justify-between">
                       <div>
-                        <p className="text-sm font-medium text-muted-foreground">الدفعات النشطة</p>
+                        <p className="text-sm font-medium text-muted-foreground">{tr("الدفعات النشطة")}</p>
                         <p className="text-2xl font-bold text-green-600">
-                          {(summary.statistics.newLots + summary.statistics.inUseLots).toLocaleString()}
+                          {(summary.statistics.newLots + summary.statistics.inUseLots).toLocaleString("en-US")}
                         </p>
                       </div>
                       <CheckCircle className="h-8 w-8 text-green-600" />
@@ -301,9 +302,9 @@ export function BatchReports() {
                   <CardContent className="p-6">
                     <div className="flex items-center justify-between">
                       <div>
-                        <p className="text-sm font-medium text-muted-foreground">الدفعات التالفة</p>
+                        <p className="text-sm font-medium text-muted-foreground">{tr("الدفعات التالفة")}</p>
                         <p className="text-2xl font-bold text-red-600">
-                          {summary.statistics.damagedLots.toLocaleString()}
+                          {summary.statistics.damagedLots.toLocaleString("en-US")}
                         </p>
                       </div>
                       <AlertTriangle className="h-8 w-8 text-red-600" />
@@ -315,9 +316,9 @@ export function BatchReports() {
                   <CardContent className="p-6">
                     <div className="flex items-center justify-between">
                       <div>
-                        <p className="text-sm font-medium text-muted-foreground">القيمة الإجمالية</p>
+                        <p className="text-sm font-medium text-muted-foreground">{tr("القيمة الإجمالية")}</p>
                         <p className="text-2xl font-bold text-blue-600">
-                          ${summary.statistics.totalValue.toLocaleString()}
+                          ${summary.statistics.totalValue.toLocaleString("en-US")}
                         </p>
                       </div>
                       <DollarSign className="h-8 w-8 text-blue-600" />
@@ -329,7 +330,7 @@ export function BatchReports() {
               {/* Status Distribution Chart */}
               <Card>
                 <CardHeader>
-                  <CardTitle>توزيع حالات الدفعات</CardTitle>
+                  <CardTitle>{tr("توزيع حالات الدفعات")}</CardTitle>
                 </CardHeader>
                 <CardContent>
                   <div className="h-80">
@@ -367,21 +368,21 @@ export function BatchReports() {
               {/* Product Breakdown */}
               <Card>
                 <CardHeader>
-                  <CardTitle>تفصيل حسب المنتج</CardTitle>
+                  <CardTitle>{tr("تفصيل حسب المنتج")}</CardTitle>
                 </CardHeader>
                 <CardContent>
                   <div className="overflow-x-auto">
                     <table className="w-full">
                       <thead className="bg-gray-50">
                         <tr>
-                          <th className="text-right p-4 font-semibold">المنتج</th>
-                          <th className="text-right p-4 font-semibold">إجمالي الدفعات</th>
-                          <th className="text-right p-4 font-semibold">جديد</th>
-                          <th className="text-right p-4 font-semibold">قيد الاستخدام</th>
-                          <th className="text-right p-4 font-semibold">منتهي</th>
-                          <th className="text-right p-4 font-semibold">تالف</th>
-                          <th className="text-right p-4 font-semibold">الكمية المتاحة</th>
-                          <th className="text-right p-4 font-semibold">القيمة الإجمالية</th>
+                          <th className="text-start p-4 font-semibold">{tr("المنتج")}</th>
+                          <th className="text-start p-4 font-semibold">{tr("إجمالي الدفعات")}</th>
+                          <th className="text-start p-4 font-semibold">{tr("جديد")}</th>
+                          <th className="text-start p-4 font-semibold">{tr("قيد الاستخدام")}</th>
+                          <th className="text-start p-4 font-semibold">{tr("منتهي")}</th>
+                          <th className="text-start p-4 font-semibold">{tr("تالف")}</th>
+                          <th className="text-start p-4 font-semibold">{tr("الكمية المتاحة")}</th>
+                          <th className="text-start p-4 font-semibold">{tr("القيمة الإجمالية")}</th>
                         </tr>
                       </thead>
                       <tbody>
@@ -407,9 +408,9 @@ export function BatchReports() {
                               <Badge className="bg-red-100 text-red-800">{product.damaged_lots}</Badge>
                             </td>
                             <td className="p-4 font-medium text-green-600">
-                              {product.available_quantity.toLocaleString()}
+                              {product.available_quantity.toLocaleString("en-US")}
                             </td>
-                            <td className="p-4 font-medium">${product.total_value.toLocaleString()}</td>
+                            <td className="p-4 font-medium">${product.total_value.toLocaleString("en-US")}</td>
                           </tr>
                         ))}
                       </tbody>
@@ -423,26 +424,21 @@ export function BatchReports() {
 
         <TabsContent value="movements" className="space-y-4">
           {/* Filters */}
-          <Card>
-            <CardHeader>
-              <CardTitle className="flex items-center gap-2">
-                <Filter className="h-5 w-5" />
-                فلاتر التقرير
-              </CardTitle>
-            </CardHeader>
+          <ReportFilters>
+
             <CardContent>
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-4">
                 <div>
-                  <Label>المنتج</Label>
+                  <Label>{tr("المنتج")}</Label>
                   <Select
                     value={filters.product_id}
                     onValueChange={(value) => setFilters((prev) => ({ ...prev, product_id: value }))}
                   >
                     <SelectTrigger>
-                      <SelectValue placeholder="جميع المنتجات" />
+                      <SelectValue placeholder={tr("جميع المنتجات")} />
                     </SelectTrigger>
                     <SelectContent>
-                      <SelectItem value="all">جميع المنتجات</SelectItem>
+                      <SelectItem value="all">{tr("جميع المنتجات")}</SelectItem>
                       {products.map((product) => (
                         <SelectItem key={product.id} value={product.id.toString()}>
                           {product.product_name}
@@ -453,30 +449,30 @@ export function BatchReports() {
                 </div>
 
                 <div>
-                  <Label>نوع الحركة</Label>
+                  <Label>{tr("نوع الحركة")}</Label>
                   <Select
                     value={filters.transaction_type}
                     onValueChange={(value) => setFilters((prev) => ({ ...prev, transaction_type: value }))}
                   >
                     <SelectTrigger>
-                      <SelectValue placeholder="جميع الأنواع" />
+                      <SelectValue placeholder={tr("جميع الأنواع")} />
                     </SelectTrigger>
                     <SelectContent>
-                      <SelectItem value="all">جميع الأنواع</SelectItem>
-                      <SelectItem value="purchase">شراء</SelectItem>
-                      <SelectItem value="sale">بيع</SelectItem>
-                      <SelectItem value="adjustment">تعديل</SelectItem>
-                      <SelectItem value="transfer">تحويل</SelectItem>
-                      <SelectItem value="return">مرتجع</SelectItem>
-                      <SelectItem value="status_change">تغيير حالة</SelectItem>
-                      <SelectItem value="damage">تلف</SelectItem>
-                      <SelectItem value="close">إغلاق</SelectItem>
+                      <SelectItem value="all">{tr("جميع الأنواع")}</SelectItem>
+                      <SelectItem value="purchase">{tr("شراء")}</SelectItem>
+                      <SelectItem value="sale">{tr("بيع")}</SelectItem>
+                      <SelectItem value="adjustment">{tr("تعديل")}</SelectItem>
+                      <SelectItem value="transfer">{tr("تحويل")}</SelectItem>
+                      <SelectItem value="return">{tr("مرتجع")}</SelectItem>
+                      <SelectItem value="status_change">{tr("تغيير حالة")}</SelectItem>
+                      <SelectItem value="damage">{tr("تلف")}</SelectItem>
+                      <SelectItem value="close">{tr("إغلاق")}</SelectItem>
                     </SelectContent>
                   </Select>
                 </div>
 
                 <div>
-                  <Label>من تاريخ</Label>
+                  <Label>{tr("من تاريخ")}</Label>
                   <Input
                     type="date"
                     value={filters.date_from}
@@ -485,7 +481,7 @@ export function BatchReports() {
                 </div>
 
                 <div>
-                  <Label>إلى تاريخ</Label>
+                  <Label>{tr("إلى تاريخ")}</Label>
                   <Input
                     type="date"
                     value={filters.date_to}
@@ -494,21 +490,21 @@ export function BatchReports() {
                 </div>
 
                 <div className="flex items-end">
-                  <Button onClick={fetchMovements} className="w-full">
-                    <Search className="ml-2 h-4 w-4" />
-                    تطبيق الفلاتر
+                  <Button data-report-apply onClick={fetchMovements} className="w-full">
+                    <Search className="me-2 h-4 w-4" />
+                    {tr("تطبيق الفلاتر")}
                   </Button>
                 </div>
               </div>
             </CardContent>
-          </Card>
+          </ReportFilters>
 
           {/* Movements Table */}
           <Card>
             <CardHeader>
               <div className="flex justify-between items-center">
-                <CardTitle>تقرير حركات الدفعات</CardTitle>
-                <Badge variant="outline">{movements.length} حركة</Badge>
+                <CardTitle>{tr("تقرير حركات الدفعات")}</CardTitle>
+                <Badge variant="outline">{movements.length}{tr(" حركة")}</Badge>
               </div>
             </CardHeader>
             <CardContent>
@@ -516,15 +512,15 @@ export function BatchReports() {
                 <table className="w-full">
                   <thead className="bg-gray-50">
                     <tr>
-                      <th className="text-right p-4 font-semibold">التاريخ</th>
-                      <th className="text-right p-4 font-semibold">المنتج</th>
-                      <th className="text-right p-4 font-semibold">رقم الدفعة</th>
-                      <th className="text-right p-4 font-semibold">نوع الحركة</th>
-                      <th className="text-right p-4 font-semibold">الكمية</th>
-                      <th className="text-right p-4 font-semibold">سعر الوحدة</th>
-                      <th className="text-right p-4 font-semibold">القيمة الإجمالية</th>
-                      <th className="text-right p-4 font-semibold">المرجع</th>
-                      <th className="text-right p-4 font-semibold">المستخدم</th>
+                      <th className="text-start p-4 font-semibold">{tr("التاريخ")}</th>
+                      <th className="text-start p-4 font-semibold">{tr("المنتج")}</th>
+                      <th className="text-start p-4 font-semibold">{tr("رقم الدفعة")}</th>
+                      <th className="text-start p-4 font-semibold">{tr("نوع الحركة")}</th>
+                      <th className="text-start p-4 font-semibold">{tr("الكمية")}</th>
+                      <th className="text-start p-4 font-semibold">{tr("سعر الوحدة")}</th>
+                      <th className="text-start p-4 font-semibold">{tr("القيمة الإجمالية")}</th>
+                      <th className="text-start p-4 font-semibold">{tr("المرجع")}</th>
+                      <th className="text-start p-4 font-semibold">{tr("المستخدم")}</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -545,10 +541,10 @@ export function BatchReports() {
                             {getMovementTypeDisplay(movement.transaction_type)}
                           </Badge>
                         </td>
-                        <td className="p-4 font-medium">{movement.quantity?.toLocaleString() || "-"}</td>
-                        <td className="p-4">${movement.unit_cost?.toLocaleString() || "-"}</td>
+                        <td className="p-4 font-medium">{movement.quantity?.toLocaleString("en-US") || "-"}</td>
+                        <td className="p-4">${movement.unit_cost?.toLocaleString("en-US") || "-"}</td>
                         <td className="p-4 font-medium text-green-600">
-                          ${movement.total_value?.toLocaleString() || "-"}
+                          ${movement.total_value?.toLocaleString("en-US") || "-"}
                         </td>
                         <td className="p-4">
                           {movement.reference_type && movement.reference_id
@@ -571,7 +567,7 @@ export function BatchReports() {
               {/* Expiry Status Chart */}
               <Card>
                 <CardHeader>
-                  <CardTitle>توزيع حالة الصلاحية</CardTitle>
+                  <CardTitle>{tr("توزيع حالة الصلاحية")}</CardTitle>
                 </CardHeader>
                 <CardContent>
                   <div className="h-80">
@@ -583,7 +579,7 @@ export function BatchReports() {
                         <Tooltip
                           labelFormatter={(value) => getExpiryStatusDisplay(value)}
                           formatter={(value: any, name: string) => [
-                            value.toLocaleString(),
+                            value.toLocaleString("en-US"),
                             name === "lot_count" ? "عدد الدفعات" : "القيمة الإجمالية",
                           ]}
                         />
@@ -597,18 +593,18 @@ export function BatchReports() {
               {/* Expiry Details Table */}
               <Card>
                 <CardHeader>
-                  <CardTitle>تفاصيل حالة الصلاحية</CardTitle>
+                  <CardTitle>{tr("تفاصيل حالة الصلاحية")}</CardTitle>
                 </CardHeader>
                 <CardContent>
                   <div className="overflow-x-auto">
                     <table className="w-full">
                       <thead className="bg-gray-50">
                         <tr>
-                          <th className="text-right p-4 font-semibold">حالة الصلاحية</th>
-                          <th className="text-right p-4 font-semibold">عدد الدفعات</th>
-                          <th className="text-right p-4 font-semibold">إجمالي الكمية</th>
-                          <th className="text-right p-4 font-semibold">القيمة الإجمالية</th>
-                          <th className="text-right p-4 font-semibold">النسبة المئوية</th>
+                          <th className="text-start p-4 font-semibold">{tr("حالة الصلاحية")}</th>
+                          <th className="text-start p-4 font-semibold">{tr("عدد الدفعات")}</th>
+                          <th className="text-start p-4 font-semibold">{tr("إجمالي الكمية")}</th>
+                          <th className="text-start p-4 font-semibold">{tr("القيمة الإجمالية")}</th>
+                          <th className="text-start p-4 font-semibold">{tr("النسبة المئوية")}</th>
                         </tr>
                       </thead>
                       <tbody>
@@ -628,9 +624,9 @@ export function BatchReports() {
                                   {getExpiryStatusDisplay(item.expiry_status)}
                                 </Badge>
                               </td>
-                              <td className="p-4 font-medium">{item.lot_count.toLocaleString()}</td>
-                              <td className="p-4">{item.total_quantity.toLocaleString()}</td>
-                              <td className="p-4 font-medium">${item.total_value.toLocaleString()}</td>
+                              <td className="p-4 font-medium">{item.lot_count.toLocaleString("en-US")}</td>
+                              <td className="p-4">{item.total_quantity.toLocaleString("en-US")}</td>
+                              <td className="p-4 font-medium">${item.total_value.toLocaleString("en-US")}</td>
                               <td className="p-4">
                                 <div className="flex items-center gap-2">
                                   <div className="flex-1 bg-gray-200 rounded-full h-2">
@@ -663,7 +659,7 @@ export function BatchReports() {
               {/* Recent Movements Chart */}
               <Card>
                 <CardHeader>
-                  <CardTitle>حركات الشهر الماضي</CardTitle>
+                  <CardTitle>{tr("حركات الشهر الماضي")}</CardTitle>
                 </CardHeader>
                 <CardContent>
                   <div className="h-80">
@@ -675,7 +671,7 @@ export function BatchReports() {
                         <Tooltip
                           labelFormatter={(value) => getMovementTypeDisplay(value)}
                           formatter={(value: any, name: string) => [
-                            value.toLocaleString(),
+                            value.toLocaleString("en-US"),
                             name === "movement_count" ? "عدد الحركات" : "إجمالي الكمية",
                           ]}
                         />
@@ -690,7 +686,7 @@ export function BatchReports() {
               {/* Movement Analysis */}
               <Card>
                 <CardHeader>
-                  <CardTitle>تحليل الحركات الأخيرة</CardTitle>
+                  <CardTitle>{tr("تحليل الحركات الأخيرة")}</CardTitle>
                 </CardHeader>
                 <CardContent>
                   <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
@@ -702,16 +698,16 @@ export function BatchReports() {
                         </div>
                         <div className="space-y-1">
                           <div className="flex justify-between text-sm">
-                            <span>عدد الحركات:</span>
-                            <span className="font-medium">{movement.movement_count.toLocaleString()}</span>
+                            <span>{tr("عدد الحركات:")}</span>
+                            <span className="font-medium">{movement.movement_count.toLocaleString("en-US")}</span>
                           </div>
                           <div className="flex justify-between text-sm">
-                            <span>إجمالي الكمية:</span>
-                            <span className="font-medium">{movement.total_quantity.toLocaleString()}</span>
+                            <span>{tr("إجمالي الكمية:")}</span>
+                            <span className="font-medium">{movement.total_quantity.toLocaleString("en-US")}</span>
                           </div>
                           <div className="flex justify-between text-sm">
-                            <span>القيمة الإجمالية:</span>
-                            <span className="font-medium text-green-600">${movement.total_value.toLocaleString()}</span>
+                            <span>{tr("القيمة الإجمالية:")}</span>
+                            <span className="font-medium text-green-600">${movement.total_value.toLocaleString("en-US")}</span>
                           </div>
                         </div>
                       </div>
@@ -723,6 +719,6 @@ export function BatchReports() {
           )}
         </TabsContent>
       </Tabs>
-    </div>
+    </ReportPage>
   )
 }

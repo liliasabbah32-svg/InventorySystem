@@ -1,115 +1,27 @@
-
 import { NextRequest, NextResponse } from "next/server"
+import { requestBranchId } from "@/lib/branch-symbol"
+import { generateSalesOrderNumber, generatePurchaseOrderNumber } from "@/lib/number-generator"
 
-import { neon } from "@neondatabase/serverless"
-import { Pool } from "pg"
-
-let sql: any = null
-
-try {
-  if (!process.env.DATABASE_URL) {
-    console.error("[v0] DATABASE_URL environment variable is not set")
-  } else {
-    const dbUrl = process.env.DATABASE_URL
-
-    if (dbUrl.includes("localhost") || dbUrl.includes("127.0.0.1")) {
-      const pool = new Pool({ connectionString: dbUrl })
-      sql = async (strings: TemplateStringsArray, ...values: any[]) => {
-        const client = await pool.connect()
-        try {
-          const query =
-            strings.reduce(
-              (prev, curr, i) =>
-                prev + curr + (i < values.length ? `$${i + 1}` : ""),
-              ""
-            )
-          const result = await client.query(query, values)
-          return result.rows
-        } finally {
-          client.release()
-        }
-      }
-    } else {
-      console.log("[v0] Using Neon serverless client")
-      sql = neon(dbUrl)
-    }
-
-    console.log("[v0] Database client initialized successfully")
-  }
-} catch (error) {
-  console.error("[v0] Failed to initialize DB client:", error)
-  sql = null
-}
-
-export default sql
-
-
+// يستدعي نفس دالة الترقيم المستخدَمة فعلياً عند الحفظ (lib/orders.ts createOrder، عبر
+// lib/number-generator.ts) — مصدر وحيد للصيغة (بادئة الطلبية من الإعدادات + رمز الدفتر + تسلسل)
+// بدل تكرارها هنا بمنطق مختلف قد ينحرف عن صيغة الحفظ الفعلية.
 export async function GET(request: NextRequest) {
   try {
-    console.log("[v0] API: Starting order number generation")
+    const { searchParams } = new URL(request.url)
+    const vchBook = searchParams.get("vch_book") ?? ""
+    const vchType = Number(searchParams.get("vch_type") ?? 1)
+    const branchId = await requestBranchId(request, searchParams.get("branch_id"))
 
-    if (!process.env.DATABASE_URL) {
-      console.error("[v0] API: DATABASE_URL not found")
-      return NextResponse.json({ error: "DATABASE_URL environment variable is not set" }, { status: 500 })
-    }
-    const { searchParams } = new URL(request.url);
-    const vch_book = searchParams.get("vch_book") ?? "0";
-    const vch_type = Number(searchParams.get("vch_type") ?? 1);
+    const orderNumber =
+      vchType === 2 ? await generatePurchaseOrderNumber(vchBook, branchId) : await generateSalesOrderNumber(vchBook, branchId)
 
-    
-   
-
-    const prefix =  vch_type === 1 ? "O" + vch_book : "T" + vch_book
-
-    // Get the latest order number with this prefix
-    const result = await sql`
-      SELECT order_number
-      FROM orders 
-      WHERE order_number LIKE ${prefix + "%"} 
-      order by order_number desc LIMIT 1
-    `
-
-    console.log("[v0] API: Query result:", result)
-    let orderNumber = "";
-    let nextNumber = 1
-    if (result.length > 0 && result[0].order_number) {
-      const currentCode = result[0].order_number as string
-      // Extract numeric part after prefix
-      const numericPart = currentCode.substring(prefix.length)
-      const parsedNumber = Number.parseInt(numericPart, 10)
-
-      if (!isNaN(parsedNumber)) {
-        nextNumber = parsedNumber + 1
-        console.log("[v0] API: Found existing code:", currentCode, "next number:", nextNumber)
-      }
-      const paddedNumber = nextNumber.toString().padStart(6, "0")
-      orderNumber = `${prefix}${paddedNumber}`
-
-    } else {
-      const paddedNumber = nextNumber.toString().padStart(6, "0")
-      orderNumber = `${prefix}${paddedNumber}`
-    }
-
-    //const paddedNumber = nextNumber.toString().padStart(6, "0")
-    //const orderNumber = `${prefix}${paddedNumber}`
-
-
-    return NextResponse.json({
-      orderNumber,
-      autoNumbering: true,
-      prefix: prefix,
-    })
+    return NextResponse.json({ orderNumber, autoNumbering: true })
   } catch (error) {
-    console.error("[v0] API: Error generating sales order number:", error)
-
-    const fallbackNumber = "O0000001"
-
-    console.log("[v0] API: Using fallback number:", fallbackNumber)
-
+    console.error("Error generating order number:", error)
     return NextResponse.json({
-      orderNumber: fallbackNumber,
+      orderNumber: "SO00000001",
       autoNumbering: true,
-      warning: "Generated fallback number due to database error",
+      warning: "Generated fallback number due to error",
     })
   }
 }

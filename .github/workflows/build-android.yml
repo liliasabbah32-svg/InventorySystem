@@ -1,0 +1,188 @@
+name: Build Android APK
+
+# تطبيق أندرويد لـ NoonERP System (android-app/): غلاف Capacitor يفتح النظام من الخادم.
+# ثلاثة تطبيقات (matrix.variant): النظام كاملاً NoonERP-System، والكاشير NoonERP-Cashier، والمطعم NoonERP-Restaurant.
+# الناتج لكل منها: <الاسم>-debug.apk (يُثبَّت مباشرة على الجوال)، و <الاسم>-release.apk
+# الموقَّع إن وُجدت أسرار التوقيع (ANDROID_KEYSTORE_BASE64 ...). يُنزَّل من صفحة التشغيل ← Artifacts.
+# عنوان الخادم: متغير المستودع ANDROID_SERVER_URL أو قيمة الإدخال اليدوي، وإلا capacitor.config.json.
+
+on:
+  workflow_dispatch:
+    inputs:
+      server_url:
+        description: "عنوان الخادم (https) — اتركه فارغاً لاستخدام الافتراضي"
+        required: false
+        default: ""
+  push:
+    paths:
+      - "android-app/**"
+      - "public/icon-512.jpg"
+      - ".github/workflows/build-android.yml"
+
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    # صورة 24.04 تحوي Android SDK مثبتاً (ubuntu-latest ينتقل إلى 26 وقد لا يحويه)
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [system, cashier, restaurant]
+    defaults:
+      run:
+        working-directory: android-app
+    env:
+      SERVER_URL: ${{ github.event.inputs.server_url || vars.ANDROID_SERVER_URL }}
+      APP_VARIANT: ${{ matrix.variant }}
+      APK_BASE: ${{ matrix.variant == 'cashier' && 'NoonERP-Cashier' || matrix.variant == 'restaurant' && 'NoonERP-Restaurant' || 'NoonERP-System' }}
+      APP_VERSION_CODE: ${{ github.run_number }}
+      APP_VERSION_NAME: 1.0.${{ github.run_number }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+
+      - name: Set up Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: 20
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+
+      # SDK المثبت مسبقاً على الصورة؛ قبول التراخيص وتنزيل منصة 34 وأدوات البناء التي يحتاجها Capacitor 6
+      - name: Prepare Android SDK
+        run: |
+          sdk="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          echo "ANDROID_HOME=$sdk" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$sdk" >> "$GITHUB_ENV"
+          manager="$(ls "$sdk"/cmdline-tools/*/bin/sdkmanager | sort -V | tail -1)"
+          yes | "$manager" --licenses > /dev/null || true
+          "$manager" "platforms;android-34" "build-tools;34.0.0" "platform-tools" > /dev/null
+
+      - name: Install Capacitor
+        run: npm install --no-audit --no-fund
+
+      - name: Generate Android project
+        run: |
+          npm run configure
+          npx cap add android
+          node scripts/patch-android.mjs
+          npx cap sync android
+
+      # أيقونة التطبيق من android-app/assets (icon.png كاملة، icon-background.png + icon-foreground.png للأيقونة
+      # التكيّفية في أندرويد 8+ التي يقصّها المشغّل دائرةً أو مربعاً — الحرف داخل المنطقة الآمنة فلا يُقص).
+      - name: App icons from android-app/assets
+        run: |
+          sudo apt-get update -qq > /dev/null
+          sudo apt-get install -y -qq --no-install-recommends imagemagick > /dev/null
+          res=android/app/src/main/res
+          for pair in mdpi:48:108 hdpi:72:162 xhdpi:96:216 xxhdpi:144:324 xxxhdpi:192:432; do
+            IFS=: read -r density size layer <<< "$pair"
+            dir="$res/mipmap-$density"
+            mkdir -p "$dir"
+            convert assets/icon.png -resize ${size}x${size}! "$dir/ic_launcher.png"
+            cp "$dir/ic_launcher.png" "$dir/ic_launcher_round.png"
+            convert assets/icon-background.png -resize ${layer}x${layer}! "$dir/ic_launcher_background.png"
+            convert assets/icon-foreground.png -background none -resize ${layer}x${layer}! "$dir/ic_launcher_foreground.png"
+          done
+          mkdir -p "$res/mipmap-anydpi-v26"
+          for name in ic_launcher ic_launcher_round; do
+            cat > "$res/mipmap-anydpi-v26/$name.xml" <<'XML'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@mipmap/ic_launcher_background"/>
+              <foreground android:drawable="@mipmap/ic_launcher_foreground"/>
+          </adaptive-icon>
+          XML
+          done
+
+      - name: Build debug APK
+        working-directory: android-app/android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon
+          cp app/build/outputs/apk/debug/app-debug.apk "$GITHUB_WORKSPACE/$APK_BASE-debug.apk"
+
+      # خطوتان منفصلتان ليظهر موضع أي فشل من اسم الخطوة نفسها
+      - name: Build release APK (when signing secrets exist)
+        id: release
+        working-directory: android-app/android
+        env:
+          HAS_KEY: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' }}
+        run: |
+          if [ "$HAS_KEY" != "true" ]; then echo "No signing secrets — skipping release APK"; echo "build=false" >> "$GITHUB_OUTPUT"; exit 0; fi
+          ./gradlew assembleRelease --no-daemon
+          ls -l app/build/outputs/apk/release/
+          echo "build=true" >> "$GITHUB_OUTPUT"
+
+      - name: Sign release APK
+        if: steps.release.outputs.build == 'true'
+        working-directory: android-app/android
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          # السر قد يُلصق بأسطر/مسافات زائدة — تُزال قبل فك base64
+          cleaned="$(printf '%s' "$KEYSTORE_BASE64" | tr -d '[:space:]')"
+          echo "ANDROID_KEYSTORE_BASE64 length: ${#cleaned} (expected about 3568 for noonerp-release.p12)"
+          if ! printf '%s' "$cleaned" | base64 -d > "$RUNNER_TEMP/release.keystore" 2> "$RUNNER_TEMP/b64.err"; then
+            echo "::error::ANDROID_KEYSTORE_BASE64 is not valid base64 (length ${#cleaned}) - paste the ENTIRE contents of noonerp-release.p12.base64.txt"; cat "$RUNNER_TEMP/b64.err"; exit 1
+          fi
+          echo "keystore bytes: $(wc -c < "$RUNNER_TEMP/release.keystore")"
+          if [ -z "$KEY_ALIAS" ] || [ -z "$KEYSTORE_PASSWORD" ] || [ -z "$KEY_PASSWORD" ]; then
+            echo "::error::One of ANDROID_KEYSTORE_PASSWORD / ANDROID_KEY_ALIAS / ANDROID_KEY_PASSWORD is empty"; exit 1
+          fi
+          # المفتاح PKCS12 (.p12) أو JKS — يُكتشف النوع من أول 4 بايت
+          ks_type=PKCS12
+          magic="$(head -c 4 "$RUNNER_TEMP/release.keystore" | od -An -tx1 | tr -d '[:space:]')"
+          if [ "$magic" = "feedfeed" ]; then ks_type=JKS; fi
+          echo "keystore type: $ks_type"
+          if ! keytool -list -keystore "$RUNNER_TEMP/release.keystore" -storetype "$ks_type" -storepass "$KEYSTORE_PASSWORD" > /dev/null; then
+            echo "::error::Cannot open signing keystore - check ANDROID_KEYSTORE_BASE64 and ANDROID_KEYSTORE_PASSWORD"; exit 1
+          fi
+          unsigned="$(ls app/build/outputs/apk/release/*.apk | head -n 1)"
+          apksigner="$(ls -d "$ANDROID_HOME"/build-tools/*/ | sort -V | tail -n 1)apksigner"
+          if ! "$apksigner" sign --ks "$RUNNER_TEMP/release.keystore" --ks-type "$ks_type" --ks-pass env:KEYSTORE_PASSWORD --ks-key-alias "$KEY_ALIAS" --key-pass env:KEY_PASSWORD --out "$GITHUB_WORKSPACE/$APK_BASE-release.apk" "$unsigned"; then
+            echo "::error::APK signing failed - check ANDROID_KEY_ALIAS and ANDROID_KEY_PASSWORD"; exit 1
+          fi
+          "$apksigner" verify --print-certs "$GITHUB_WORKSPACE/$APK_BASE-release.apk" > "$RUNNER_TEMP/verify.txt"
+          cat "$RUNNER_TEMP/verify.txt"
+          rm -f "$RUNNER_TEMP/release.keystore"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APK_BASE }}-android-${{ github.run_number }}
+          path: |
+            ${{ env.APK_BASE }}-debug.apk
+            ${{ env.APK_BASE }}-release.apk
+          if-no-files-found: error
+
+      # رابط ثابت لآخر نسخة: releases/download/android-latest/NoonERP-System.apk
+      # (ضعه في ANDROID_APK_URL على الخادم ليظهر زر "تطبيق أندرويد" في الشاشة الرئيسية — المستودع يجب أن يكون عاماً،
+      # وإلا انسخ الملف إلى public/downloads/NoonERP-System.apk على الخادم)
+      - name: Publish to release "android-latest"
+        working-directory: ${{ github.workspace }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          apk="$APK_BASE-release.apk"
+          [ -f "$apk" ] || apk="$APK_BASE-debug.apk"
+          cp "$apk" "$APK_BASE.apk"
+          # الأنواع الثلاثة تُبنى بالتوازي — قد يُنشئ أحدها الإصدار قبل الآخر
+          if ! gh release view android-latest > /dev/null 2>&1; then
+            gh release create android-latest --title "NoonERP System — Android" --notes "آخر نسخة من تطبيق أندرويد (تُحدَّث تلقائياً مع كل بناء)" --prerelease --target "$GITHUB_SHA" || true
+          fi
+          gh release upload android-latest "$APK_BASE.apk" --clobber
+          gh release edit android-latest --notes "آخر نسخة من تطبيق أندرويد — الإصدار 1.0.${{ github.run_number }} ($(date -u +%Y-%m-%d))"

@@ -1,8 +1,13 @@
 "use client";
 
+import { appDir } from "@/lib/i18n"
 import React, { useState, useEffect } from "react";
-import { Sidebar } from "./sidebar";
+import dynamic from "next/dynamic";
+import { Sidebar, SIDEBAR_COLLAPSED_WIDTH, SIDEBAR_WIDTH } from "./sidebar";
 import { Header } from "./header";
+import { MenuThemeProvider } from "@/contexts/menu-theme-context";
+
+const ChatWidget = dynamic(() => import("./chat/chat-widget").then((module) => module.ChatWidget), { ssr: false });
 
 interface ERPLayoutProps {
   children: React.ReactNode;
@@ -13,10 +18,13 @@ interface ERPLayoutProps {
 export function ERPLayout({ children, activeSection, onSectionChange }: ERPLayoutProps) {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [isMobile, setIsMobile] = useState(false);
+  const [deferredToolsReady, setDeferredToolsReady] = useState(false);
 
   useEffect(() => {
     const checkMobile = () => {
-      const mobile = window.innerWidth < 768;
+      // Tablet browsers can report a 1024px or 1280px CSS viewport depending on
+      // device scale. Keep the sidebar as a drawer until the layout has desktop room.
+      const mobile = window.innerWidth < 1280;
       setIsMobile(mobile);
       setSidebarOpen(!mobile); // open sidebar by default on desktop
     };
@@ -26,63 +34,74 @@ export function ERPLayout({ children, activeSection, onSectionChange }: ERPLayou
     return () => window.removeEventListener("resize", checkMobile);
   }, []);
 
+  useEffect(() => {
+    const activate = () => setDeferredToolsReady(true);
+    const idleCallback = (window as any).requestIdleCallback?.(activate, { timeout: 1200 });
+    const timeout = idleCallback == null ? window.setTimeout(activate, 500) : null;
+    return () => {
+      if (idleCallback != null) (window as any).cancelIdleCallback?.(idleCallback);
+      if (timeout != null) window.clearTimeout(timeout);
+    };
+  }, []);
+
   const handleSidebarToggle = () => setSidebarOpen(!sidebarOpen);
   const handleOverlayClick = () => isMobile && sidebarOpen && setSidebarOpen(false);
 
   const handleProfileClick = () => onSectionChange("user-profile");
   const handleSettingsClick = () => onSectionChange("user-settings");
-  const sidebarOffset = isMobile ? 0 : sidebarOpen ? 384 : 112;
-
+  const sidebarOffset = isMobile ? 0 : sidebarOpen ? SIDEBAR_WIDTH : SIDEBAR_COLLAPSED_WIDTH;
   return (
-    <div className="flex h-screen bg-background" dir="rtl">
-      {/* Mobile overlay */}
-      {isMobile && sidebarOpen && (
+    <MenuThemeProvider>
+      <div className="flex h-screen bg-background" dir={appDir()}>
+        {/* Mobile overlay */}
+        {isMobile && sidebarOpen && (
+          <div
+            className="fixed inset-0 bg-black/50 z-40 md:hidden backdrop-blur-sm"
+            onClick={handleOverlayClick}
+            onTouchStart={handleOverlayClick}
+          />
+        )}
+
+        {/* Sidebar */}
         <div
-          className="fixed inset-0 bg-black/50 z-40 md:hidden backdrop-blur-sm"
-          onClick={handleOverlayClick}
-          onTouchStart={handleOverlayClick}
-        />
-      )}
+          className={`${
+            isMobile
+              ? "fixed start-0 top-0 h-full z-50 transform transition-transform duration-300 ease-in-out"
+              : "relative"
+          } ${isMobile ? (sidebarOpen ? "translate-x-0" : "rtl:translate-x-full ltr:-translate-x-full") : "block"}`}
+        >
+          <Sidebar
+            isOpen={sidebarOpen}
+            onToggle={handleSidebarToggle}
+            activeSection={activeSection}
+            onSectionChange={(section) => {
+              onSectionChange(section);
+              if (isMobile) setSidebarOpen(false);
+            }}
+            isMobile={isMobile}
+          />
+        </div>
 
-      {/* Sidebar */}
-      <div
-        className={`${
-          isMobile
-            ? "fixed right-0 top-0 h-full z-50 transform transition-transform duration-300 ease-in-out"
-            : "relative"
-        } ${sidebarOpen ? (isMobile ? "translate-x-0" : "block") : isMobile ? "translate-x-full" : "hidden"}`}
-      >
-        <Sidebar
-          isOpen={sidebarOpen}
-          onToggle={handleSidebarToggle}
-          activeSection={activeSection}
-          onSectionChange={(section) => {
-            onSectionChange(section);
-            if (isMobile) setSidebarOpen(false);
-          }}
-          isMobile={isMobile}
-        />
+        {/* Main content */}
+        <div
+          className="min-w-0 flex-1 flex flex-col overflow-hidden transition-all duration-300"
+          style={{ marginInlineStart: sidebarOffset }}
+        >
+          <Header
+            onMenuClick={handleSidebarToggle}
+            activeSection={activeSection}
+            onProfileClick={handleProfileClick}
+            onSettingsClick={handleSettingsClick}
+            onSectionChange={onSectionChange}
+          />
+
+          <main className="flex min-h-0 flex-1 flex-col overflow-hidden erp-main-content mobile-safe-area">
+            <div className="flex min-h-0 flex-1 flex-col overflow-auto p-3 md:p-6 mobile-scroll-container">{children}</div>
+          </main>
+        </div>
+
+        {deferredToolsReady && <ChatWidget />}
       </div>
-
-      {/* Main content */}
-      <div
-        className="flex-1 flex flex-col overflow-hidden transition-all duration-300"
-        style={{
-          marginRight: sidebarOffset,
-          marginLeft: 0,
-        }}
-      >
-        <Header
-          onMenuClick={handleSidebarToggle}
-          activeSection={activeSection}
-          onProfileClick={handleProfileClick}
-          onSettingsClick={handleSettingsClick}
-        />
-
-        <main className="flex-1 overflow-auto erp-main-content mobile-safe-area">
-          <div className="p-3 md:p-6 mobile-scroll-container">{children}</div>
-        </main>
-      </div>
-    </div>
+    </MenuThemeProvider>
   );
 }

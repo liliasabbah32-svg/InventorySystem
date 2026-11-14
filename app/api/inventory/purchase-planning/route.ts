@@ -1,0 +1,223 @@
+import { type NextRequest, NextResponse } from "next/server"
+import sql from "@/lib/database"
+import { getGrantedBranchIds, hasNamedPermission } from "@/lib/permissions"
+import { authorizeTransaction } from "@/lib/transaction-permissions"
+import { authorizeProductType } from "@/app/api/inventory/products/_permissions"
+import { PURCHASE_PRICE_PERMISSION_CATEGORY, PURCHASE_PRICE_VIEW_PERMISSION } from "@/lib/transaction-permission-definitions"
+import { ensureTables as ensureSalesVoucherTables } from "@/app/api/sales-vouchers/_lib"
+import { ensureOrderReadColumns } from "@/lib/order-schema"
+import { ensureLastPurchaseColumns } from "@/lib/last-purchase"
+import { runSchemaOnce } from "@/lib/schema-once"
+
+const intersect = (left: number[], right: number[]) => left.filter((id) => right.includes(id))
+
+async function ensurePurchasePlanningSchema() {
+  await ensureSalesVoucherTables()
+  await ensureOrderReadColumns()
+  await runSchemaOnce("app/api/inventory/purchase-planning/route.ts#schema", async () => {
+    // These fields were added after the original company bootstrap. Keep older tenant
+    // databases usable without requiring a separate manual migration.
+    await sql`
+      ALTER TABLE products
+        ADD COLUMN IF NOT EXISTS supplier_id INTEGER,
+        ADD COLUMN IF NOT EXISTS default_store INTEGER,
+        ADD COLUMN IF NOT EXISTS currency_id INTEGER,
+        ADD COLUMN IF NOT EXISTS last_purchase_price NUMERIC(18,4) DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS min_stock_level NUMERIC(15,2) DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS max_stock_level NUMERIC(15,2) DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS reorder_point NUMERIC(15,2) DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS type INTEGER DEFAULT 1,
+        ADD COLUMN IF NOT EXISTS deleted BOOLEAN DEFAULT false
+    `
+    await sql`
+      ALTER TABLE product_stock
+        ADD COLUMN IF NOT EXISTS organization_id INTEGER DEFAULT 1,
+        ADD COLUMN IF NOT EXISTS current_stock NUMERIC(15,2) DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS available_stock NUMERIC(15,2) DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS reserved_stock NUMERIC(15,2) DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS reorder_level NUMERIC(15,2),
+        ADD COLUMN IF NOT EXISTS max_stock_level NUMERIC(15,2)
+    `
+    await sql`
+      CREATE TABLE IF NOT EXISTS product_units (
+        id SERIAL PRIMARY KEY,
+        product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+        unit_id INTEGER NOT NULL,
+        to_main_qnty DOUBLE PRECISION DEFAULT 1
+      )
+    `
+    await sql`
+      CREATE TABLE IF NOT EXISTS product_branches (
+        product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+        branch_id INTEGER NOT NULL REFERENCES branches(id) ON DELETE CASCADE,
+        PRIMARY KEY (product_id, branch_id)
+      )
+    `
+  })
+  await ensureLastPurchaseColumns()
+}
+
+export async function GET(request: NextRequest) {
+  try {
+    const productAccess = await authorizeProductType(request, 1, "lookup")
+    if (!productAccess.ok) return productAccess.response
+
+    const planningScreenAccess = await authorizeTransaction(request, "purchase_planning", "access")
+    if (!planningScreenAccess.ok) return planningScreenAccess.response
+
+    const planningAccess = await authorizeTransaction(request, "purchase_planning", "view")
+    if (!planningAccess.ok) return planningAccess.response
+
+    const authorizedProductBranches = productAccess.lookupOnly
+      ? [productAccess.branchId]
+      : await getGrantedBranchIds(productAccess.userId, productAccess.accessId)
+    const productBranchIds = intersect(authorizedProductBranches, planningAccess.branchIds)
+    const salesAccess = await authorizeTransaction(request, "sales_invoice", "view")
+    const salesReturnAccess = await authorizeTransaction(request, "sales_return", "view")
+    const purchaseAccess = await authorizeTransaction(request, "purchase_order", "view")
+    const purchaseBranchIds = purchaseAccess.ok
+      ? intersect(productBranchIds, purchaseAccess.branchIds)
+      : []
+    const createPurchaseAccess = purchaseAccess.ok
+      ? await authorizeTransaction(request, "purchase_order", "create", purchaseAccess.branchId)
+      : null
+    const canViewPurchasePrices = await hasNamedPermission(
+      productAccess.userId,
+      PURCHASE_PRICE_VIEW_PERMISSION,
+      PURCHASE_PRICE_PERMISSION_CATEGORY,
+      planningAccess.branchId,
+    )
+
+    await ensurePurchasePlanningSchema()
+
+    const requestedDays = Number(new URL(request.url).searchParams.get("days") || 90)
+    const periodDays = Number.isInteger(requestedDays) ? Math.min(365, Math.max(30, requestedDays)) : 90
+    const products = await sql`
+      SELECT
+        p.id,
+        p.product_code,
+        p.product_name,
+        p.supplier_id,
+        COALESCE(NULLIF(to_jsonb(s)->>'supplier_name', ''), to_jsonb(s)->>'name', '') AS supplier_name,
+        CASE WHEN COALESCE(to_jsonb(s)->>'account_id', '') ~ '^[0-9]+$'
+          THEN (to_jsonb(s)->>'account_id')::integer ELSE NULL END AS supplier_account_id,
+        p.default_store,
+        COALESCE(ps.current_stock, 0)::float AS current_stock,
+        COALESCE(ps.reserved_stock, 0)::float AS reserved_stock,
+        COALESCE(ps.available_stock, COALESCE(ps.current_stock, 0) - COALESCE(ps.reserved_stock, 0))::float AS available_stock,
+        COALESCE(ps.reorder_level, p.reorder_point, p.min_stock_level, 0)::float AS reorder_point,
+        COALESCE(ps.max_stock_level, p.max_stock_level, 0)::float AS max_stock_level,
+        ${canViewPurchasePrices}::boolean AS can_view_purchase_price,
+        CASE WHEN ${canViewPurchasePrices}::boolean THEN COALESCE(p.last_purchase_price, 0)::float ELSE NULL END AS last_purchase_price,
+        CASE WHEN ${canViewPurchasePrices}::boolean THEN COALESCE(lpc.currency_name, c.currency_name, '') ELSE '' END AS purchase_currency_name,
+        pu.unit_id,
+        u.unit_name
+      FROM products p
+      LEFT JOIN product_stock ps ON ps.product_id = p.id AND COALESCE(ps.organization_id, 1) = 1
+      LEFT JOIN suppliers s ON s.id = p.supplier_id
+      LEFT JOIN currency c ON c.id = p.currency_id
+      LEFT JOIN currency lpc ON lpc.id = p.last_purchase_currency_id
+      LEFT JOIN LATERAL (
+        SELECT product_unit.unit_id
+        FROM product_units product_unit
+        WHERE product_unit.product_id = p.id
+        ORDER BY product_unit.id ASC
+        LIMIT 1
+      ) pu ON TRUE
+      LEFT JOIN units u ON u.id = pu.unit_id
+      WHERE COALESCE(p.type, 1) = 1
+        AND (p.deleted IS NULL OR p.deleted = false)
+        AND LOWER(COALESCE(p.status::text, '')) IN ('1', 'نشط', 'active')
+        -- الفروع لا تُستخدم في تعريف الأصناف (لا تصفية حسب product_branches)
+      ORDER BY p.product_name ASC
+    `
+
+    const productIds = products.map((product: any) => Number(product.id)).filter((id: number) => Number.isInteger(id) && id > 0)
+    if (!productIds.length) {
+      return NextResponse.json({
+        period_days: periodDays,
+        sales_history_available: salesAccess.ok,
+        purchase_orders_available: purchaseBranchIds.length > 0,
+        can_create_purchase_order: Boolean(createPurchaseAccess?.ok),
+        products: [],
+      })
+    }
+
+    const salesBranchIds = salesAccess.ok ? intersect(productBranchIds, salesAccess.branchIds) : []
+    const returnBranchIds = salesReturnAccess.ok ? intersect(productBranchIds, salesReturnAccess.branchIds) : []
+    const [salesRows, incomingRows] = await Promise.all([
+      salesBranchIds.length || returnBranchIds.length
+        ? sql`
+            SELECT vi.item_id AS product_id,
+                   GREATEST(COALESCE(SUM(
+                     CASE WHEN vh.vch_type = 16 THEN -1 ELSE 1 END
+                     * (COALESCE(vi.qnty, 0) + COALESCE(vi.bonus, 0))
+                   ), 0), 0)::float AS sold_quantity
+            FROM voucher_header_tbl vh
+            JOIN voucher_items_tbl vi ON vi.voucher_id = vh.id
+            WHERE vh.vch_type IN (12, 16)
+              AND COALESCE(vh.status, 1) <> 3
+              AND (
+                (vh.vch_type = 12 AND vh.branch_id = ANY(${salesBranchIds}::int[]))
+                OR (vh.vch_type = 16 AND vh.branch_id = ANY(${returnBranchIds}::int[]))
+              )
+              AND vh.vch_date >= CURRENT_DATE - (${periodDays}::int * INTERVAL '1 day')
+              AND vi.item_id = ANY(${productIds}::int[])
+            GROUP BY vi.item_id
+          `
+        : Promise.resolve([]),
+      purchaseBranchIds.length
+        ? sql`
+            WITH received AS (
+              SELECT vi.order_item_id,
+                     COALESCE(SUM(COALESCE(vi.qnty, 0) + COALESCE(vi.bonus, 0)), 0) AS received_quantity
+              FROM voucher_items_tbl vi
+              JOIN voucher_header_tbl vh ON vh.id = vi.voucher_id
+              WHERE vh.vch_type IN (17, 18)
+                AND COALESCE(vh.status, 1) <> 3
+                AND vi.order_item_id IS NOT NULL
+                AND vh.branch_id = ANY(${purchaseBranchIds}::int[])
+              GROUP BY vi.order_item_id
+            )
+            SELECT oi.product_id,
+                   COALESCE(SUM(GREATEST(
+                     COALESCE(oi.quantity, 0) + COALESCE(oi.bonus, 0) - COALESCE(received.received_quantity, 0),
+                     0
+                   )), 0)::float AS incoming_quantity
+            FROM orders o
+            JOIN order_items oi ON oi.order_id = o.id
+            LEFT JOIN received ON received.order_item_id = oi.id
+            WHERE o.order_type = 2
+              AND COALESCE(o.deleted, false) = false
+              AND o.branch_id = ANY(${purchaseBranchIds}::int[])
+              AND COALESCE(o.order_status, 1) IN (1, 2, 3)
+              AND COALESCE(oi.item_status, 1) IN (1, 2, 3)
+              AND oi.product_id = ANY(${productIds}::int[])
+            GROUP BY oi.product_id
+          `
+        : Promise.resolve([]),
+    ])
+
+    const soldByProduct = new Map((salesRows as any[]).map((row) => [Number(row.product_id), Number(row.sold_quantity) || 0]))
+    const incomingByProduct = new Map((incomingRows as any[]).map((row) => [Number(row.product_id), Number(row.incoming_quantity) || 0]))
+    const result = products.map((product: any) => ({
+      ...product,
+      sold_quantity: soldByProduct.get(Number(product.id)) || 0,
+      incoming_quantity: incomingByProduct.get(Number(product.id)) || 0,
+    }))
+
+    return NextResponse.json({
+      period_days: periodDays,
+      sales_history_available: salesAccess.ok,
+      purchase_orders_available: purchaseBranchIds.length > 0,
+      can_create_purchase_order: Boolean(createPurchaseAccess?.ok),
+      products: result,
+    })
+  } catch (error) {
+    console.error("Purchase planning data error:", error)
+    const errorMessage = process.env.NODE_ENV === "development" && error instanceof Error
+      ? `تعذر تحميل بيانات تخطيط المشتريات: ${error.message}`
+      : "تعذر تحميل بيانات تخطيط المشتريات"
+    return NextResponse.json({ error: errorMessage }, { status: 500 })
+  }
+}

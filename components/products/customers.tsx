@@ -1,11 +1,15 @@
 "use client"
 
+import { tr, appDir } from "@/lib/i18n"
+import { showAlert } from "@/components/ui/confirm-host"
+import { VoucherListHero, VoucherStats } from "@/components/common/voucher-list-shell"
 import { useState, useEffect, useCallback, useMemo, useRef } from "react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog"
+import { useWorkspace } from "@/contexts/workspace-context"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Textarea } from "@/components/ui/textarea"
 import { Badge } from "@/components/ui/badge"
@@ -30,10 +34,12 @@ import {
   Bell,
   MessageSquare,
   Phone,
+  Users as UsersIcon,
 } from "lucide-react"
 import { ExcelImport } from "@/components/ui/excel-import"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { useAuth } from "../auth/auth-context"
+import { useFileAccess } from "@/components/auth/use-file-access"
 import CustomerSearchPopup from "./CustomerSearchPopup"
 import ConfirmDialogYesNo from "../ui/ConfirmDialogYesNo"
 import DataGrid from "../common/DataGrid"
@@ -41,8 +47,48 @@ import * as wjGrid from "@grapecity/wijmo.grid";
 import DataGridView from "../common/DataGridView"
 import Util from "../common/Util"
 import UnifiedCustomers from "./unified-customers"
+import { ImageThumbnail } from "@/components/common/ImageUploadField"
+import { useNavigationGuard } from "@/lib/navigation-guard"
+import { openReceivablesStatement } from "@/lib/statement-prefill"
+import { consumeNewRecordParam } from "@/lib/new-record-param"
 interface CustomersProps {
   isSupplier?: boolean;
+  isSubscriber?: boolean;
+  isSalesman?: boolean;
+}
+
+// لقطة مُطبَّعة لما يُحفَظ فعلاً من النموذج — تُقارَن بلقطة السجل لحظة تحميله/تفريغه لمعرفة وجود
+// تعديل غير محفوظ. بدل هاش JSON للنموذج الخام (كسابقاً) الذي كان يتأثر بمزامنة النافذة لصفوف
+// مراكز التكلفة/إيقاف الحركات (تُرسَل كاملةً بما فيها الصفوف غير المُفعَّلة) وبترتيب/نوع القيم
+// (0 مقابل "0"، null مقابل "")، فيُظهر "تم تعديل السجل" دون أي تعديل حقيقي من المستخدم.
+const DIRTY_ROW_FIELDS = new Set(["cost_centers", "stop_transactions", "voucherType", "branch_ids"])
+const normalizeDirtyScalar = (value: unknown) => (value == null || value === false ? "" : String(value).trim())
+
+const buildCustomerDirtySnapshot = (data: Record<string, any> | null | undefined) => {
+  if (!data) return ""
+  const scalars: Record<string, string> = {}
+  Object.keys(data).sort().forEach((key) => {
+    const value = data[key]
+    if (DIRTY_ROW_FIELDS.has(key) || (typeof value === "object" && value !== null)) return
+    const normalized = normalizeDirtyScalar(value)
+    if (normalized) scalars[key] = normalized
+  })
+
+  // نفس منطق الحفظ: تُحفَظ الحركات الموقوفة فقط، ومراكز التكلفة ذات المركز الافتراضي فقط.
+  const stopTransactions = (Array.isArray(data.stop_transactions) ? data.stop_transactions : [])
+    .filter((row: any) => (row?.is_stopped == null ? true : Boolean(row.is_stopped)))
+    .map((row: any) => `${Number(row.voucher_types_id)}:${String(row.stop_date || "").slice(0, 10)}`)
+    .sort()
+  const costCenters = (Array.isArray(data.cost_centers) ? data.cost_centers : [])
+    .map((row: any) => ({ typeId: Number(row?.cost_center_type_id ?? row?.id), centerId: row?.default_cost_center_id ?? row?.cost_center_id, required: Number(row?.required_in_transactions ?? 1) }))
+    .filter((row: any) => row.centerId != null && row.centerId !== "")
+    .map((row: any) => `${row.typeId}:${Number(row.centerId)}:${row.required}`)
+    .sort()
+  const voucherBooks = (Array.isArray(data.voucherType) ? data.voucherType : [])
+    .map((row: any) => `${Number(row?.type_id) || 0}:${Number(row?.book_id) || 0}`)
+  const branchIds = (Array.isArray(data.branch_ids) ? data.branch_ids : []).map(Number).sort((a: number, b: number) => a - b)
+
+  return JSON.stringify({ scalars, stopTransactions, costCenters, voucherBooks, branchIds })
 }
 interface Customer {
   id: number
@@ -53,6 +99,7 @@ interface Customer {
   whatsapp1: string
   whatsapp2: string
   city: string
+  city_id?: string
   address: string
   email: string
   status: string
@@ -66,12 +113,18 @@ interface Customer {
   general_notes: string
   // Added for new fields
   tax_number?: string
+  id_number?: string
   commercial_registration?: string
   credit_limit?: string
   payment_terms?: string
   discount_percentage?: string,
+  job_title?: string
+  region?: string
+  sales_commission?: string
+  collection_commission?: string
   type?: number
   account_id?: number | null
+  image_url?: string | null
 }
 
 interface Classification {
@@ -104,11 +157,13 @@ interface CustomerFormData {
   id: number,
   customer_code: string
   name: string
+  name_en: string
   mobile1: string
   mobile2: string
   whatsapp1: string
   whatsapp2: string
   city: string
+  city_id?: string
   address: string
   email: string
   status: string
@@ -121,10 +176,15 @@ interface CustomerFormData {
   transaction_notes: string
   general_notes: string
   tax_number: string
+  id_number: string
   commercial_registration: string
   credit_limit: string
   payment_terms: string
   discount_percentage: string,
+  job_title: string
+  region: string
+  sales_commission: string
+  collection_commission: string
   pricecategory: number,
   account_id?: number | null,
   father_id?: string,
@@ -135,20 +195,11 @@ interface CustomerFormData {
   cost_centers?: Array<{ id: number; name: string; state_status: string; required_in_transactions: number; cost_center_name?: string; default_cost_center_id?: number | null }>,
   stop_transactions?: Array<{ voucher_types_id: number; voucher_type_name: string; is_stopped: boolean; stop_date: string }>,
   voucherType?: VoucherItem[],
-}
-
-interface CustomerUser {
-  id: number
-  username: string
-  email: string | null
-  is_active: boolean
-  last_login: string | null
-  can_view_orders: boolean
-  can_create_orders: boolean
-  can_view_balance: boolean
-  can_view_products: boolean
-  can_view_prices: boolean
-  can_view_stock: boolean
+  image_url?: string | null,
+  // فروع تقييد ظهور العميل بالبحث (اختياري) — مصفوفة فارغة = يظهر لكل الفروع (الافتراضي/الحالي)،
+  // وإلا يظهر فقط لمستخدم فرعه أحد هذه المعرّفات (انظر customer_branches بـapp/api/customers/
+  // route.ts وتصفية x-branch-id بـauth-context.tsx).
+  branch_ids?: number[],
 }
 
 interface NotificationSettings {
@@ -168,10 +219,25 @@ interface NotificationSettings {
   daily_summary_time: string
 }
 
-export default function Customers({ isSupplier }: CustomersProps) {
+export default function Customers({ isSupplier, isSubscriber, isSalesman }: CustomersProps) {
+  const { fullscreenEnabled } = useWorkspace()
+  const { hasPermission } = useAuth()
+  const can = useFileAccess(isSupplier ? "suppliers" : isSubscriber ? "subscribers" : isSalesman ? null : "customers")
+  const canView = isSalesman ? Util.checkUserAccess(15) : can("view")
+  const canCreate = can("create"), canUpdate = can("update"), canDelete = isSalesman ? hasPermission("products-edit") : can("delete")
+  // نوع الجهة (customers.type) بحسب أي تبويب/شاشة فتحت هذا المكوّن المشترك — عميل=1، مورد=2،
+  // مندوب=3، مشترك=4. كان الكود سابقاً يفترض في عدة أماكن أن "ليس مورداً" تعني "عميل" حصراً،
+  // فيُخطئ في شاشتي المندوبين والمشتركين (يحفظ/يبحث/يولّد رقماً بنوع "عميل" بدلاً من نوعها الفعلي).
+  const entityTypeCode = isSupplier ? 2 : isSubscriber ? 4 : isSalesman ? 3 : 1
+  const entityTypeLabel = isSupplier ? tr("المورد") : isSubscriber ? tr("المشترك") : isSalesman ? tr("المندوب") : tr("العميل")
+  const parentAccountLabel = isSupplier ? tr("للموردين") : isSubscriber ? tr("للمشتركين") : isSalesman ? tr("للمندوبين") : tr("للعملاء")
+  // نصوص الشاشة حسب نوع الجهة (عميل/مورد/مشترك/مندوب) — نفس المكوّن يخدم الأنواع الأربعة.
+  const entityPlural = isSupplier ? "الموردين" : isSubscriber ? "المشتركين" : isSalesman ? "المندوبين" : "العملاء"
+  const entityPluralIndef = isSupplier ? "مورّدين" : isSubscriber ? "مشتركين" : isSalesman ? "مندوبين" : "عملاء"
+  const entitySingleIndef = isSupplier ? "مورد" : isSubscriber ? "مشترك" : isSalesman ? "مندوب" : "عميل"
   const [customers, setCustomers] = useState<Customer[]>([])
   const [isloading, setIsLoading] = useState(false)
-  const toast = useRef<Toast | null>(null)
+  const toast = useRef(null);
   const [currentIndex, setCurrentIndex] = useState(0)
   const [showCustomerDialog, setShowCustomerDialog] = useState(false)
   const [showNewCustomerDialog, setShowNewCustomerDialog] = useState(false)
@@ -179,28 +245,17 @@ export default function Customers({ isSupplier }: CustomersProps) {
   const [showImportDialog, setShowImportDialog] = useState(false) // Added import dialog state
   const [showPortalDialog, setShowPortalDialog] = useState(false)
   const [selectedCustomerForPortal, setSelectedCustomerForPortal] = useState<Customer | null>(null)
-  const [portalUsers, setPortalUsers] = useState<CustomerUser[]>([])
-  const [loadingPortalUsers, setLoadingPortalUsers] = useState(false)
-  const [showAddUserDialog, setShowAddUserDialog] = useState(false)
-  const [showEditPermissionsDialog, setShowEditPermissionsDialog] = useState(false)
-  const [selectedUser, setSelectedUser] = useState<CustomerUser | null>(null)
+  // رابط بوابة العملاء الجديدة (كشف حساب + إشعار تحويل) — يُعرض مرة واحدة بعد إنشائه
+  const [portalLink, setPortalLink] = useState<string | null>(null)
+  const [creatingPortalLink, setCreatingPortalLink] = useState(false)
   const customer_name = useRef<HTMLInputElement>(null);
   const [showCustomerSearch, setShowCustomerSearch] = useState(false);
   const [showConfirm, setShowConfirm] = useState(false);
+  const [showUnsaved, setShowUnsaved] = useState(false);
+  // الإجراء المؤجَّل (تنقل/جديد/إغلاق/نسخ...) حتى يجيب المستخدم على تنبيه "تم تعديل السجل".
+  const pendingActionRef = useRef<(() => void | Promise<void>) | null>(null);
+  const [deleting, setDeleting] = useState(false);
   const bookGridRef = useRef<wjGrid.FlexGrid>(null);
-  const [newUserData, setNewUserData] = useState({
-    username: "",
-    password: "",
-    email: "",
-  })
-  const [userPermissions, setUserPermissions] = useState({
-    can_view_orders: true,
-    can_create_orders: true,
-    can_view_balance: true,
-    can_view_products: true,
-    can_view_prices: true,
-    can_view_stock: true,
-  })
 
   const [notificationSettings, setNotificationSettings] = useState<NotificationSettings | null>(null)
   const [loadingNotificationSettings, setLoadingNotificationSettings] = useState(false)
@@ -211,11 +266,14 @@ export default function Customers({ isSupplier }: CustomersProps) {
   const [customerAccountClassifications, setCustomerAccountClassifications] = useState<Array<{ id: number; name: string; classification_id: number | null; classification_name: string }>>([])
 
   const [salesmen, setSalesmen] = useState<Salesman[]>([])
+  // خيارات حقل "الفروع" (تقييد ظهور العميل بالبحث) — انظر branch_ids بـCustomerFormData.
+  const [branches, setBranches] = useState<Array<{ id: number; branch_name: string }>>([])
 
   const [formData, setFormData] = useState<CustomerFormData>({
     id: 0,
     customer_code: "",
     name: "",
+    name_en: "",
     mobile1: "",
     mobile2: "",
     whatsapp1: "",
@@ -233,16 +291,29 @@ export default function Customers({ isSupplier }: CustomersProps) {
     transaction_notes: "",
     general_notes: "",
     tax_number: "",
+    id_number: "",
     commercial_registration: "",
     credit_limit: "",
     payment_terms: "نقدي",
     discount_percentage: "",
+    job_title: "",
+    region: "",
+    sales_commission: "0",
+    collection_commission: "0",
     pricecategory: 0,
     account_id: null,
     cost_centers: [],
     stop_transactions: [],
-    voucherType: []
+    voucherType: [],
+    image_url: null,
   })
+  // مرجع دوماً بآخر formData حيّة — يتجنّب مشكلة الإغلاق المتجمِّد (stale closure) عند قراءتها من
+  // داخل setTimeout/دوال غير متزامنة معرَّفة في عرض (render) سابق، وهو ما كان يجعل initialHash
+  // يُحسَب من بيانات السجل القديم بدل السجل المُحمَّل للتو أو المُفرَّغ حديثاً.
+  const formDataRef = useRef(formData)
+  useEffect(() => {
+    formDataRef.current = formData
+  }, [formData])
 
   const [searchFilters, setSearchFilters] = useState({
     name: "",
@@ -261,9 +332,27 @@ export default function Customers({ isSupplier }: CustomersProps) {
   const [editingCustomer, setEditingCustomer] = useState(false)
   const editingCustomerRef = useRef(false)
   const [validationErrors, setValidationErrors] = useState<Record<string, string>>({})
-  const [showSuccessMessage, setShowSuccessMessage] = useState(false)
+  // اعدادات النظام ← العملاء: رقم الهوية/الهاتف/الايميل اجباري (الخادم يتحقق منها أيضاً)
+  const [requiredContactFields, setRequiredContactFields] = useState({ idNumber: false, phone: false, email: false })
+  useEffect(() => {
+    fetch("/api/settings/system")
+      .then((response) => (response.ok ? response.json() : null))
+      .then((data) => {
+        const settings = data?.settings ?? data
+        if (!settings) return
+        setRequiredContactFields({
+          idNumber: Boolean(settings.customer_id_number_required),
+          phone: Boolean(settings.customer_phone_required),
+          email: Boolean(settings.customer_email_required),
+        })
+      })
+      .catch(() => undefined)
+  }, [])
+  const [popupMessage, setPopupMessage] = useState<{ severity: "success" | "info" | "warn" | "error"; detail: string } | null>(null)
+  const [requestedTab, setRequestedTab] = useState<{ tab: string; nonce: number } | null>(null)
 
   const filteredCustomers = useMemo(() => {
+    if (!canView) return []
     const cityFilter = searchFilters.city === "__all__" ? "" : searchFilters.city
     const statusFilter = searchFilters.status === "__all__" ? "" : searchFilters.status
     const salesmanFilter = searchFilters.salesman === "__all__" ? "" : searchFilters.salesman
@@ -276,7 +365,7 @@ export default function Customers({ isSupplier }: CustomersProps) {
         (!salesmanFilter || customer.salesman === salesmanFilter)
       )
     })
-  }, [customers, searchFilters])
+  }, [canView, customers, searchFilters])
 
   const totalPages = Math.max(1, Math.ceil(filteredCustomers.length / pageSize))
   const pageStart = filteredCustomers.length === 0 ? 0 : (currentPage - 1) * pageSize + 1
@@ -343,7 +432,7 @@ export default function Customers({ isSupplier }: CustomersProps) {
         { header: "id", name: "id", width: 150, visible: false },
 
         {
-          header: "نوع السند",
+          header: tr("نوع السند"),
           name: "type_name",
           width: "*",
           minWidth: 150,
@@ -389,7 +478,7 @@ export default function Customers({ isSupplier }: CustomersProps) {
 
         { header: "type_id", name: "type_id", width: 150, visible: false },
         {
-          header: "دفتر السندات",
+          header: tr("دفتر السندات"),
           name: "book_name",
           width: 250,
           visible: true,
@@ -448,34 +537,6 @@ export default function Customers({ isSupplier }: CustomersProps) {
     return scheme;
   }
 
-  const fetchPortalUsers = useCallback(async (customerId: number) => {
-    try {
-      console.log("[v0] ========== START fetchPortalUsers ==========")
-      console.log("[v0] fetchPortalUsers called with customerId:", customerId)
-      setLoadingPortalUsers(true)
-      setError(null) // إضافة reset للخطأ
-
-      const url = `/api/admin/customer-users?customerId=${customerId}`
-
-      const response = await fetch(url)
-
-      if (response.ok) {
-        const data = await response.json()
-
-        setPortalUsers(data.users || [])
-      } else {
-        const errorData = await response.json()
-        console.error("[v0] Error response:", errorData)
-        setError(errorData.error || "فشل في تحميل المستخدمين")
-      }
-    } catch (error) {
-
-      setError("حدث خطأ في تحميل المستخدمين")
-    } finally {
-      setLoadingPortalUsers(false)
-      console.log("[v0] Loading state set to false")
-    }
-  }, [])
   const doHotKeys = useRef(true)
   const popupHasCalled = () => {
     doHotKeys.current = false
@@ -486,6 +547,7 @@ export default function Customers({ isSupplier }: CustomersProps) {
   };
 
   const fetchNotificationSettings = useCallback(async (customerId: number) => {
+    if (!canView) return
     try {
       console.log("[v0] Fetching notification settings for customer:", customerId)
       setLoadingNotificationSettings(true)
@@ -520,131 +582,31 @@ export default function Customers({ isSupplier }: CustomersProps) {
     } finally {
       setLoadingNotificationSettings(false)
     }
-  }, [])
+  }, [canView])
 
-  const handleAddPortalUser = useCallback(async () => {
-    if (!selectedCustomerForPortal || !newUserData.username || !newUserData.password) {
-      setError("اسم المستخدم وكلمة المرور مطلوبان")
+  const createPortalLink = useCallback(async () => {
+    const accountId = Number(selectedCustomerForPortal?.account_id)
+    if (!accountId) {
+      setError(tr("لا يوجد حساب محاسبي مرتبط بهذا العميل"))
       return
     }
-
+    setCreatingPortalLink(true)
     try {
-      console.log("[v0] ========== START handleAddPortalUser ==========")
-      console.log("[v0] Adding portal user:", {
-        customerId: selectedCustomerForPortal.id,
-        username: newUserData.username,
-        email: newUserData.email,
-        permissions: userPermissions,
-      })
-
-      const response = await fetch("/api/admin/customer-users", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          customerId: selectedCustomerForPortal.id,
-          username: newUserData.username,
-          password: newUserData.password,
-          email: newUserData.email || null,
-          permissions: userPermissions,
-        }),
-      })
-
-      console.log("[v0] Add user response status:", response.status)
-
-      if (response.ok) {
-        const data = await response.json()
-        console.log("[v0] User added successfully:", data)
-        setShowAddUserDialog(false)
-        setNewUserData({ username: "", password: "", email: "" })
-        setUserPermissions({
-          can_view_orders: true,
-          can_create_orders: true,
-          can_view_balance: true,
-          can_view_products: true,
-          can_view_prices: true,
-          can_view_stock: true,
-        })
-        setError(null) // إضافة reset للخطأ
-        await fetchPortalUsers(selectedCustomerForPortal.id)
-        console.log("[v0] ========== END handleAddPortalUser (SUCCESS) ==========")
-      } else {
-        const data = await response.json()
-        console.error("[v0] Error adding user:", data)
-        setError(data.error || "فشل في إضافة المستخدم")
-      }
+      const response = await fetch("/api/customer-portal/links", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ account_id: accountId }) })
+      const data = await response.json()
+      if (!response.ok) throw new Error(data?.error || tr("تعذر إنشاء رابط البوابة"))
+      const url = `${window.location.origin}${data.path}`
+      setPortalLink(url)
+      try { await navigator.clipboard.writeText(url) } catch { /* clipboard blocked */ }
     } catch (error) {
-      console.error("[v0] ========== ERROR in handleAddPortalUser ==========")
-      console.error("[v0] Error adding portal user:", error)
-      setError("حدث خطأ في إضافة المستخدم")
+      setError(error instanceof Error ? error.message : tr("تعذر إنشاء رابط البوابة"))
+    } finally {
+      setCreatingPortalLink(false)
     }
-  }, [selectedCustomerForPortal, newUserData, userPermissions, fetchPortalUsers])
-
-  const handleUpdatePermissions = useCallback(async () => {
-    if (!selectedUser) return
-
-    try {
-      const response = await fetch(`/api/admin/customer-users/${selectedUser.id}/permissions`, {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(userPermissions),
-      })
-
-      if (response.ok) {
-        setShowEditPermissionsDialog(false)
-        if (selectedCustomerForPortal) {
-          fetchPortalUsers(selectedCustomerForPortal.id)
-        }
-      } else {
-        const data = await response.json()
-        setError(data.error || "فشل في تحديث الصلاحيات")
-      }
-    } catch (error) {
-      console.error("Error updating permissions:", error)
-      setError("حدث خطأ في تحديث الصلاحيات")
-    }
-  }, [selectedUser, userPermissions, selectedCustomerForPortal, fetchPortalUsers])
-
-  const handleToggleUserStatus = useCallback(
-    async (userId: number) => {
-      try {
-        const response = await fetch(`/api/admin/customer-users/${userId}/toggle`, {
-          method: "PUT",
-        })
-
-        if (response.ok && selectedCustomerForPortal) {
-          fetchPortalUsers(selectedCustomerForPortal.id)
-        }
-      } catch (error) {
-        console.error("Error toggling user status:", error)
-      }
-    },
-    [selectedCustomerForPortal, fetchPortalUsers],
-  )
-
-  const handleResetPassword = useCallback(async (userId: number) => {
-    const newPassword = prompt("أدخل كلمة المرور الجديدة:")
-    if (!newPassword) return
-
-    try {
-      const response = await fetch(`/api/admin/customer-users/${userId}/password`, {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ password: newPassword }),
-      })
-
-      if (response.ok) {
-        alert("تم تغيير كلمة المرور بنجاح")
-      } else {
-        const data = await response.json()
-        setError(data.error || "فشل في تغيير كلمة المرور")
-      }
-    } catch (error) {
-      console.error("Error resetting password:", error)
-      setError("حدث خطأ في تغيير كلمة المرور")
-    }
-  }, [])
+  }, [selectedCustomerForPortal])
 
   const handleSaveNotificationSettings = useCallback(async () => {
+    if (!canUpdate) return
     if (!notificationSettings || !selectedCustomerForPortal) return
 
     try {
@@ -662,23 +624,23 @@ export default function Customers({ isSupplier }: CustomersProps) {
         const data = await response.json()
         console.log("[v0] Notification settings saved successfully:", data)
         setNotificationSettings(data.settings)
-        alert("تم حفظ إعدادات الإشعارات بنجاح")
+        showAlert(tr("تم حفظ إعدادات الإشعارات بنجاح"))
       } else {
         const errorData = await response.json()
         console.error("[v0] Error saving notification settings:", errorData)
-        setError(errorData.error || "فشل في حفظ إعدادات الإشعارات")
+        setError(errorData.error || tr("فشل في حفظ إعدادات الإشعارات"))
       }
     } catch (error) {
       console.error("[v0] Error saving notification settings:", error)
-      setError("حدث خطأ في حفظ إعدادات الإشعارات")
+      setError(tr("حدث خطأ في حفظ إعدادات الإشعارات"))
     } finally {
       setSavingNotificationSettings(false)
     }
-  }, [notificationSettings, selectedCustomerForPortal])
+  }, [canUpdate, notificationSettings, selectedCustomerForPortal])
 
   const formatDate = (date: string | null) => {
     if (!date) return "لم يسجل دخول بعد"
-    return new Date(date).toLocaleDateString("ar-SA", {
+    return new Date(date).toLocaleDateString("en-GB", {
       year: "numeric",
       month: "short",
       day: "numeric",
@@ -687,54 +649,65 @@ export default function Customers({ isSupplier }: CustomersProps) {
     })
   }
 
+  // مبنية كدالة (لا كائن ثابت) لأنها تعتمد على pricecategory (حالة تُحمَّل من الخادم) — تُستخدَم هنا
+  // وأيضاً في reset_fields لحساب هاش النموذج الفارغ المتوقَّع فوراً بلا انتظار إعادة عرض React (انظر
+  // تعليق initialHash في reset_fields لسبب أهمية ذلك تحديداً).
+  const buildEmptyCustomerFormData = useCallback((): CustomerFormData => ({
+    id: 0,
+    customer_code: "",
+    name: "",
+    name_en: "",
+    mobile1: "",
+    mobile2: "",
+    whatsapp1: "",
+    whatsapp2: "",
+    city: "",
+    address: "",
+    email: "",
+    status: "نشط",
+    business_nature: "",
+    salesman: "",
+    classification: "",
+    registration_date: new Date().toISOString().split("T")[0],
+    web_username: "",
+    web_password: "",
+    transaction_notes: "",
+    general_notes: "",
+    tax_number: "",
+    id_number: "",
+    commercial_registration: "",
+    credit_limit: "",
+    payment_terms: "نقدي",
+    discount_percentage: "",
+    pricecategory: pricecategory?.[0]?.id || 0,
+    account_id: null,
+    father_id: defaultParentAccountRef.current || undefined,
+    cost_centers: [],
+    stop_transactions: [],
+    voucherType: [],
+    image_url: null,
+    branch_ids: [],
+  }), [pricecategory])
+
   const updateFormData = useCallback((customer: Customer | null) => {
     if (!customer) {
-      const emptyCustomer: CustomerFormData = {
-        id: 0,
-        customer_code: "",
-        name: "",
-        mobile1: "",
-        mobile2: "",
-        whatsapp1: "",
-        whatsapp2: "",
-        city: "",
-        address: "",
-        email: "",
-        status: "نشط",
-        business_nature: "",
-        salesman: "",
-        classification: "",
-        registration_date: new Date().toISOString().split("T")[0],
-        web_username: "",
-        web_password: "",
-        transaction_notes: "",
-        general_notes: "",
-        tax_number: "",
-        commercial_registration: "",
-        credit_limit: "",
-        payment_terms: "نقدي",
-        discount_percentage: "",
-        pricecategory: pricecategory?.[0]?.id || 0,
-        account_id: null,
-        cost_centers: [],
-        stop_transactions: [],
-        voucherType: []
-      }
-
-      setFormData(emptyCustomer)
-      return
+      setFormData(buildEmptyCustomerFormData())
+      return buildEmptyCustomerFormData()
     }
 
+    const customerRecord = customer as Customer & { customer_name?: string; customer_name_en?: string }
 
-    setFormData({
+    const nextFormData: CustomerFormData = {
       id: customer.id || 0,
       customer_code: customer.customer_code || "",
-      name: customer.name || "",
+      name: customer.name || customerRecord.customer_name || "",
+      name_en: customerRecord.customer_name_en || (customer as any).name_en || "",
       mobile1: customer.mobile1 || "",
       mobile2: customer.mobile2 || "",
       whatsapp1: customer.whatsapp1 || "",
       whatsapp2: customer.whatsapp2 || "",
       city: customer.city || "",
+      city_id: (customer as any).city_id ? String((customer as any).city_id) : "",
       address: customer.address || "",
       email: customer.email || "",
       status: customer.status || "نشط",
@@ -747,17 +720,33 @@ export default function Customers({ isSupplier }: CustomersProps) {
       transaction_notes: customer.transaction_notes || "",
       general_notes: customer.general_notes || "",
       tax_number: (customer as any).tax_number || "",
+      id_number: (customer as any).id_number || "",
       commercial_registration: (customer as any).commercial_registration || "",
       credit_limit: (customer as any).credit_limit || "",
       payment_terms: (customer as any).payment_terms || "نقدي",
       discount_percentage: (customer as any).discount_percentage || "",
+      job_title: (customer as any).job_title || customer.business_nature || "",
+      region: (customer as any).region || customer.city || "",
+      sales_commission: String((customer as any).sales_commission ?? "0"),
+      collection_commission: String((customer as any).collection_commission ?? "0"),
       pricecategory: (customer as any).pricecategory || 0,
       account_id: (customer as any).account_id || null,
-      cost_centers: Array.isArray((customer as any).cost_centers) ? (customer as any).cost_centers : [],
-      stop_transactions: Array.isArray((customer as any).stop_transactions) ? (customer as any).stop_transactions : [],
-      voucherType: Array.isArray((customer as any).voucherType) ? (customer as any).voucherType : [],
-    })
-  }, [])
+      father_id: customerRecord.father_id ? String(customerRecord.father_id) : "",
+      finanical_list_id: customerRecord.finanical_list_id ? String(customerRecord.finanical_list_id) : "",
+      currency_id: customerRecord.currency_id ? String(customerRecord.currency_id) : "",
+      allow_trans_with_diff_curr: customerRecord.allow_trans_with_diff_curr != null
+        ? String(customerRecord.allow_trans_with_diff_curr)
+        : "0",
+      iscalc_curr_diff_rates: Boolean(customerRecord.iscalc_curr_diff_rates),
+      cost_centers: (customerRecord as any).cost_centers || [],
+      stop_transactions: (customerRecord as any).stop_transactions || [],
+      voucherType: (customerRecord as any).voucherType || [],
+      branch_ids: (customerRecord as any).branch_ids || [],
+      image_url: (customer as any).image_url || null,
+    }
+    setFormData(nextFormData)
+    return nextFormData
+  }, [buildEmptyCustomerFormData])
   const [definitions, setDefinitions] = useState({
     voucher_types: [] as Array<{ id: number; name: string }>,
     voucher_books: [] as Array<{ id: number; name: string }>,
@@ -768,8 +757,111 @@ export default function Customers({ isSupplier }: CustomersProps) {
     voucher_books: [] as Array<{ id: number; name: string; }>,
 
   });
+
+  // الحساب الاب الافتراضي لكل سجل جديد يُقرأ مرة واحدة من إعدادات النظام حسب نوع هذه الشاشة (عميل/
+  // مورد/مشترك/مندوب) — بدل تركه فارغاً دوماً كما كان، مما كان يجبر كل مستخدم على اختياره يدوياً في
+  // كل مرة رغم وجود قيمة افتراضية واحدة ثابتة لكل نوع مُعرَّفة مسبقاً في إعدادات النظام.
+  const defaultParentAccountRef = useRef("")
+  useEffect(() => {
+    fetch("/api/settings/system")
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => {
+        const settings = data?.settings ?? data
+        if (!settings) return
+        const value = isSupplier
+          ? settings.default_supplier_parent_account
+          : isSubscriber
+            ? settings.default_customer_subscription_account
+            : isSalesman
+              ? settings.default_salesman_parent_account
+              : settings.default_customer_parent_account
+        defaultParentAccountRef.current = value ? String(value) : ""
+      })
+      .catch(() => {
+        // تجاهل — تبقى خانة الحساب الاب فارغة قابلة للتعبئة يدوياً كالسابق
+      })
+  }, [isSupplier, isSubscriber, isSalesman])
+
   const [currentCustomerId, setCurrentCustomerId] = useState<number>(0);
-  const unifiedCustomerLoadDataRef = useRef<((navigationType: "first" | "previous" | "next" | "last" | "ById" | "ByIdEdit", customerId?: number, isSupplier?: boolean, checkUnsaved?: boolean) => Promise<void>) | null>(null);
+
+  const loadData = async (
+    navigationType: "first" | "previous" | "next" | "last" | "ById" | "ByIdEdit",
+    customerId?: number,
+    isSupplier: boolean = false,
+    checkUnsaved: boolean = true
+  ) => {
+    if (!canView) return
+    if (checkUnsaved && isFormDirty()) {
+      askToSaveChanges(() => loadData(navigationType, customerId, isSupplier, false));
+      return;
+    }
+
+    try {
+      let dont_check = false;
+      if (navigationType === "ByIdEdit") {
+        dont_check = true;
+        navigationType = "ById"
+      }
+      const url = new URL(`/api/customer/navigations/${navigationType}`, location.origin);
+
+      // Determine ID for navigation
+      if (navigationType === "ById" && customerId) {
+        url.searchParams.set("id", String(customerId));
+      } else if (navigationType === "previous" || navigationType === "next") {
+        const navigationCurrentId = currentCustomerId || Number(customers[currentIndex]?.id || 0)
+        url.searchParams.set("currentId", String(navigationCurrentId));
+      }
+
+      // Pass type (customer/supplier/salesman/subscriber)
+      url.searchParams.set("type", String(entityTypeCode));
+
+      const res = await fetch(url.toString());
+      const customer = await res.json();
+      if (!res.ok) {
+        setPopupMessage({ severity: "error", detail: customer?.error || tr("تعذر تحميل سجل {0}", entityTypeLabel) })
+        return
+      }
+      console.log("navigationType ", navigationType)
+      if (!customer.id || (customer.id === currentCustomerId && !dont_check)) {
+
+        let msg = navigationType === "previous" || navigationType === "first"
+          ? 'بداية السجلات'
+          : 'نهاية السجلات';
+        setPopupMessage({ severity: "info", detail: msg })
+        return;
+      }
+
+
+      const nextFormData = updateFormData(customer);
+      console.log("newFormData ", customer)
+
+      // Establish the baseline from the exact payload being committed. Keeping
+      // this inside a timer allowed user input (or child synchronization) to
+      // happen first and made genuine edits look unchanged intermittently.
+      markFormClean(nextFormData)
+      setCurrentCustomerId(Number(customer.id))
+      const customerIndex = customers.findIndex((item) => Number(item.id) === Number(customer.id))
+      if (customerIndex >= 0) setCurrentIndex(customerIndex)
+
+      setTimeout(() => {
+        customer_name.current?.focus();
+      }, 200);
+
+    } catch (err) {
+      console.error("Error loading customer:", err);
+      setPopupMessage({ severity: "error", detail: tr("تعذر تحميل سجل {0}", entityTypeLabel) })
+    }
+  };
+
+  const navigateToCustomerIndex = (targetIndex: number) => {
+    if (!canView) return
+    const target = customers[targetIndex]
+    if (!target) {
+      setPopupMessage({ severity: "info", detail: targetIndex <= 0 ? tr("بداية السجلات") : tr("نهاية السجلات") })
+      return
+    }
+    void loadData("ById", Number(target.id), isSupplier, true)
+  }
 
   const handleFirst = useCallback(() => {
     if (customers.length > 0) {
@@ -791,8 +883,8 @@ export default function Customers({ isSupplier }: CustomersProps) {
   }, [customers])
 
   const handleNext = useCallback(() => {
-    if (customers.length > 0 && currentIndex >= 0) {
-      const newIndex = currentIndex + 1
+    if (customers.length > 0 && currentIndex >= 0 && currentIndex < customers.length - 1) {
+      const newIndex = Math.min(currentIndex + 1, customers.length - 1)
       console.log("newIndex ", newIndex)
       setCurrentIndex(newIndex)
       setEditingCustomer(true)
@@ -801,9 +893,8 @@ export default function Customers({ isSupplier }: CustomersProps) {
   }, [customers, currentIndex])
 
   const handlePrevious = useCallback(() => {
-
-    if (customers.length > 0 && currentIndex <= customers.length - 1) {
-      let newIndex = currentIndex - 1
+    if (customers.length > 0 && currentIndex > 0) {
+      const newIndex = Math.max(currentIndex - 1, 0)
       console.log("currentCustomer ", editingCustomer)
       if (!editingCustomerRef.current) {
         handleLast();
@@ -833,8 +924,36 @@ export default function Customers({ isSupplier }: CustomersProps) {
     const errors: Record<string, string> = {}
 
     if (!formData.name.trim()) {
-      errors.customer_name = "اسم الزبون مطلوب"
+      errors.customer_name = `اسم ${entityTypeLabel} مطلوب`
     }
+
+    const currencyId = formData.currency_id ? Number(formData.currency_id) : 0
+    if (!currencyId || currencyId <= 0) {
+      errors.currency_id = "يجب تحديد العملة"
+      setPopupMessage({ severity: "error", detail: tr("يجب تحديد العملة") })
+    }
+
+    // الحساب الرئيسي (تابع ل) إلزامي لكل عميل/مورد/مشترك/مندوب — يُعبَّأ تلقائياً لسجل جديد من
+    // "الحسابات الافتراضية"، فإن لم يكن معرَّفاً هناك يُوجَّه المستخدم لتعريفه أولاً.
+    if (!Number(formData.father_id || 0)) {
+      const message = defaultParentAccountRef.current
+        ? tr("يجب اختيار الحساب الرئيسي (تابع ل) في تبويب المعلومات المالية والضريبية")
+        : tr("يجب الذهاب الى الحسابات الافتراضية واختيار حساب الاب {0}", parentAccountLabel)
+      errors.father_id = message
+      setPopupMessage({ severity: "error", detail: message })
+    }
+
+    // رقم الهوية: فارغ أو أرقام فقط و9 أرقام على الأقل (التكرار يفحصه الخادم)؛ الهوية/الهاتف/الإيميل إجبارية للعملاء حسب اعدادات النظام
+    const idNumber = String(formData.id_number || "").trim()
+    const email = String(formData.email || "").trim()
+    const required = entityTypeCode === 1 ? requiredContactFields : { idNumber: false, phone: false, email: false }
+    if (idNumber && !/^\d{9,20}$/.test(idNumber)) errors.id_number = tr("رقم الهوية يجب أن يكون أرقاماً فقط و9 أرقام على الأقل")
+    else if (required.idNumber && !idNumber) errors.id_number = tr("رقم الهوية اجباري")
+    if (required.phone && !String(formData.mobile1 || "").trim()) errors.mobile1 = tr("رقم الهاتف اجباري")
+    if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) errors.email = tr("البريد الإلكتروني غير صحيح")
+    else if (required.email && !email) errors.email = tr("البريد الإلكتروني اجباري")
+    const contactError = errors.id_number || errors.mobile1 || errors.email
+    if (contactError) setPopupMessage({ severity: "error", detail: contactError })
 
     /*if (!formData.mobile1.trim()) {
       errors.mobile1 = "رقم الجوال مطلوب"
@@ -850,49 +969,64 @@ export default function Customers({ isSupplier }: CustomersProps) {
     (formData.voucherType ?? []).forEach((v, index) => {
       if (typeSet.has(v.type_id)) {
 
-        Util.showErrorToast(toast.current, 'لا يمكن تكرار نفس نوع السند في دفاتر السندات الافتراضية للزبون');
-        errors.vocherType = "ا يمكن تكرار نفس نوع السند في دفاتر السندات الافتراضية للزبون"
+        const message = tr("لا يمكن تكرار نفس نوع السند في دفاتر السندات الافتراضية للعميل")
+        setPopupMessage({ severity: "error", detail: message })
+        errors.vocherType = message
       } else {
         typeSet.add(v.type_id);
       }
     });
 
     setValidationErrors(errors)
+    // الحفظ متاح من أي تبويب: عند الخطأ يُعرض التبويب الذي فيه الحقل المطلوب
+    const errorTab = errors.currency_id || errors.father_id ? "financial-tax" : contactError ? "address-location" : errors.vocherType ? "default-voucher-books" : null
+    if (errorTab) setRequestedTab({ tab: errorTab, nonce: Date.now() })
     return Object.keys(errors).length === 0
-  }, [formData])
+  }, [formData, requiredContactFields, entityTypeCode])
 
   const fetchCustomers = useCallback(
-    async () => {
+    async (silent = false) => {
+      if (!canView) {
+        setCustomers([])
+        setCurrentCustomerId(0)
+        updateFormData(null)
+        setShowNewCustomerDialog(false)
+        setIsLoading(false)
+        return
+      }
       try {
-        setIsLoading(true);
-        setError(null);
+        if (!silent) {
+          setIsLoading(true);
+          setError(null);
+        }
 
-        const url = `/api/customers?type=${isSupplier ? 2 : 1}`;
+        const url = `/api/customers?type=${entityTypeCode}`;
         const response = await fetch(url);
 
         if (response.ok) {
           const data = await response.json();
           const allRecords = Array.isArray(data) ? data : data.customers || [];
           const filteredRecords = allRecords.filter((record: { type: number }) =>
-            isSupplier ? record.type === 2 : record.type === 1
+            Number(record.type ?? 1) === entityTypeCode
           );
-          filteredRecords.sort((a: Customer, b: Customer) => a.id - b.id);
+          filteredRecords.sort((a: Customer, b: Customer) => String(a.customer_code || "").localeCompare(String(b.customer_code || ""), "en", { numeric: true }) || a.id - b.id);
           setCustomers(filteredRecords);
 
           if (filteredRecords.length > 0) {
             setCurrentIndex((prevIndex) => (prevIndex >= filteredRecords.length ? 0 : prevIndex));
+              setCurrentCustomerId((currentId) => currentId || Number(filteredRecords[0].id));
           }
         } else {
-          setError(isSupplier ? "فشل في تحميل بيانات الموردين" : "فشل في تحميل بيانات الزبائن");
+          setError(tr("فشل في تحميل بيانات {0}", entityPlural));
         }
       } catch (error) {
         console.error("Error fetching data:", error);
-        setError(isSupplier ? "حدث خطأ في تحميل الموردين" : "حدث خطأ في تحميل الزبائن");
+        setError(tr("حدث خطأ في تحميل {0}", entityPlural));
       } finally {
-        setIsLoading(false);
+        if (!silent) setIsLoading(false);
       }
     },
-    [isSupplier]
+    [canView, entityTypeCode, isSupplier]
   );
 
 
@@ -947,49 +1081,66 @@ export default function Customers({ isSupplier }: CustomersProps) {
     }
   }, [])
 
+  const fetchBranches = useCallback(async () => {
+    try {
+      const response = await fetch("/api/branches")
+      if (response.ok) {
+        const data = await response.json()
+        setBranches(Array.isArray(data) ? data : [])
+      }
+    } catch (error) {
+      console.error("Error fetching branches:", error)
+      setBranches([])
+    }
+  }, [])
+
   const generateCustomerNumber = useCallback(
-    async () => {
+    async (): Promise<string> => {
+      if (!canCreate) return ""
       try {
         setGeneratingNumber(true);
-        console.log("[v0] Generating number...", isSupplier ? "Supplier" : "Customer");
+        console.log("[v0] Generating number...", entityTypeLabel);
 
-        // Pass isSupplier as query param
-        const response = await fetch(`/api/customers/generate-number?isSupplier=${isSupplier}`);
+        const response = await fetch(
+          `/api/customers/generate-number?isSupplier=${!!isSupplier}&isSalesman=${!!isSalesman}&isSubscriber=${!!isSubscriber}`,
+        );
         if (response.ok) {
           const contentType = response.headers.get("content-type");
 
           if (contentType && contentType.includes("application/json")) {
             const data = await response.json();
             updateField("customer_code", data.customerNumber);
+            return data.customerNumber ?? "";
           } else {
             const text = await response.text();
-            setError("خطأ في الخادم - تم إرجاع صفحة HTML بدلاً من JSON");
+            setError(tr("خطأ في الخادم - تم إرجاع صفحة HTML بدلاً من JSON"));
           }
         } else {
           const contentType = response.headers.get("content-type");
           if (contentType && contentType.includes("application/json")) {
             const errorData = await response.json();
-            setError(errorData.message || "فشل في توليد الرقم");
+            setError(errorData.message || tr("فشل في توليد الرقم"));
           } else {
             const text = await response.text();
-            setError("خطأ في الخادم - لا يمكن توليد الرقم");
+            setError(tr("خطأ في الخادم - لا يمكن توليد الرقم"));
           }
         }
       } catch (error) {
         console.error("Error generating number:", error);
         if (error instanceof SyntaxError && error.message.includes("JSON")) {
-          setError("خطأ في تحليل استجابة الخادم - يرجى المحاولة مرة أخرى");
+          setError(tr("خطأ في تحليل استجابة الخادم - يرجى المحاولة مرة أخرى"));
         } else {
-          setError("خطأ في الاتصال بالخادم");
+          setError(tr("خطأ في الاتصال بالخادم"));
         }
       } finally {
         setGeneratingNumber(false);
       }
+      return "";
     },
-    [updateField]
+    [canCreate, updateField]
   );
 
-  const adjustCode = (code: string, codeLen: number = 8): string => {
+  const adjustCode = (code: string, codeLen: number = 10): string => {
     if (!code || !code.trim()) return '';
 
     code = code.trim().toUpperCase();
@@ -1013,38 +1164,44 @@ export default function Customers({ isSupplier }: CustomersProps) {
     if (adjustedCode !== formData.customer_code) {
       updateField("customer_code", adjustedCode);
     }
+    if (!canView) return
 
-    // Search for customer by code
+    // كتابة رقم في حقل الرقم طلب تنقّل، والرقم نفسه ليس "تعديلاً" — فيُفحَص باقي النموذج فقط بمقارنته
+    // باللقطة بعد إعادة الرقم الأصلي إليه.
+    const baseline = baselineSnapshotRef.current
+    const originalCode: string = baseline ? JSON.parse(baseline).scalars.customer_code ?? "" : ""
+    if (adjustedCode === originalCode) return
+    const hasOtherEdits = baseline !== null && buildCustomerDirtySnapshot({ ...formDataRef.current, customer_code: originalCode }) !== baseline
+    // يُعاد الرقم الأصلي قبل السؤال كي لا يُحفَظ السجل الحالي برقم سجل آخر عند اختيار "نعم".
+    const navigate = (action: () => void | Promise<void>) => {
+      if (!hasOtherEdits) return void action()
+      updateField("customer_code", originalCode)
+      askToSaveChanges(action)
+    }
+
     try {
       const response = await fetch(`/api/customers/by-code/${encodeURIComponent(adjustedCode)}`);
       const data = await response.json();
-      console.log("Search by code response:", data);
       if (data.found) {
-        // Load the customer data
-        if(isSupplier && data.customer.type !== 2) {
-          await reset_fields();
-          Util.showErrorToast(toast.current, "الرقم المدخل  لزبون وليس مورد")
+        if (Number(data.customer.type) !== entityTypeCode) {
+          updateField("customer_code", originalCode)
+          setPopupMessage({ severity: "error", detail: tr("الرقم المدخل ليس لـ{0}", entityTypeLabel) })
           return
         }
-        else if(!isSupplier && data.customer.type !== 1) {  
-          await reset_fields();
-          Util.showErrorToast(toast.current, "الرقم المدخل  لمورد وليس زبون")
-          return
-        }
-        setFormData((prev) => ({
-          ...prev,
-          id: Number(data.customer.id), // use customer.id
-        }));
-        await unifiedCustomerLoadDataRef.current?.("ById", data.customer.id, isSupplier);
-
-      } else {
-        // Reset the form since customer not found
-        await reset_fields(1, adjustedCode);
+        const foundId = Number(data.customer.id)
+        navigate(() => loadData("ByIdEdit", foundId, isSupplier, false))
+      } else if (currentCustomerId > 0) {
+        // رقم غير موجود أثناء عرض سجل قائم = سجل جديد بهذا الرقم.
+        navigate(async () => {
+          setCustomerAccountClassifications([])
+          await reset_fields(1, adjustedCode)
+        })
       }
+      // سجل جديد برقم غير مستخدم: يبقى ما كتبه المستخدم كما هو مع الرقم الجديد.
     } catch (error) {
       console.error("Error searching customer by code:", error);
       // Optionally show error message
-      setError("حدث خطأ في البحث عن العميل");
+      setError(tr("حدث خطأ في البحث عن {0}", entityTypeLabel));
     }
   }
 
@@ -1052,6 +1209,10 @@ export default function Customers({ isSupplier }: CustomersProps) {
     customerData: CustomerFormData,
     accountClassifications = customerAccountClassifications,
   ) => {
+    if (!(currentCustomerId > 0 ? canUpdate : canCreate)) {
+      setPopupMessage({ severity: "error", detail: tr("لا يوجد لديك صلاحية {0} {1}", currentCustomerId > 0 ? "تعديل" : "إضافة", entityTypeLabel) })
+      return false
+    }
     if (!validateForm()) return false;
 
     if (savingRef.current) return false;
@@ -1061,7 +1222,10 @@ export default function Customers({ isSupplier }: CustomersProps) {
     setError(null);
 
     try {
-      const url = currentCustomerId > 0 ? `/api/customers/${currentCustomerId}` : "/api/customers";
+      // PUT الحقيقي لتحديث العملاء معرَّف على /api/customers (المعرّف id يُقرأ من جسم الطلب، لا من
+      // المسار) — لا يوجد PUT إطلاقاً على /api/customers/[id]، فكان استهدافه هنا يُسبّب 405 Method
+      // Not Allowed عند تعديل أي سجل موجود (id > 0).
+      const url = "/api/customers";
       const method = currentCustomerId > 0 ? "PUT" : "POST";
 
       const voucher = (customerData.voucherType ?? []).map((v) => ({
@@ -1093,11 +1257,13 @@ export default function Customers({ isSupplier }: CustomersProps) {
         id: customerData.id,
         customer_code: customerData.customer_code,
         customer_name: customerData.name,
+        customer_name_en: customerData.name_en,
         mobile1: customerData.mobile1,
         mobile2: customerData.mobile2,
         whatsapp1: customerData.whatsapp1,
         whatsapp2: customerData.whatsapp2,
         city: customerData.city,
+        city_id: customerData.city_id || null,
         address: customerData.address,
         email: customerData.email,
         status: customerData.status,
@@ -1108,15 +1274,27 @@ export default function Customers({ isSupplier }: CustomersProps) {
         movement_notes: customerData.transaction_notes,
         general_notes: customerData.general_notes,
         tax_number: customerData.tax_number,
+        id_number: customerData.id_number,
         commercial_registration: customerData.commercial_registration,
         credit_limit: customerData.credit_limit,
         payment_terms: customerData.payment_terms,
         discount_percentage: customerData.discount_percentage,
-        type: isSupplier ? 2 : 1,
+        job_title: customerData.job_title,
+        region: customerData.region,
+        sales_commission: customerData.sales_commission,
+        collection_commission: customerData.collection_commission,
+        type: entityTypeCode,
         pricecategory: customerData.pricecategory,
         account_id: customerData.account_id,
         cost_centers: costCenters,
-        stop_transactions: customerData.stop_transactions || [],
+        // account_stop_transactions_tbl stores stopped movements only. Sending
+        // unchecked grid rows would make them appear checked after reopening.
+        stop_transactions: (customerData.stop_transactions || [])
+          .filter((row) => Boolean(row.is_stopped))
+          .map((row) => ({
+            voucher_types_id: row.voucher_types_id,
+            stop_date: row.stop_date || null,
+          })),
         currency_id: customerData.currency_id,
         allow_trans_with_diff_curr: customerData.allow_trans_with_diff_curr,
         iscalc_curr_diff_rates: customerData.iscalc_curr_diff_rates,
@@ -1124,6 +1302,8 @@ export default function Customers({ isSupplier }: CustomersProps) {
         level_no: customerData.father_id ? undefined : 1,
         account_classifications: accountClassifications.filter((row) => row.classification_id != null),
         voucher,
+        image_url: customerData.image_url,
+        branch_ids: customerData.branch_ids || [],
       };
 
       console.log("[v0] Sending customer data:", dataToSend);
@@ -1138,17 +1318,13 @@ export default function Customers({ isSupplier }: CustomersProps) {
         let errorMessage = response.statusText;
         try {
           const errorData = await response.json();
-          if (errorData?.message) errorMessage = errorData.message;
+          // الخادم يُرجع سبب الفشل في error (وأحياناً message) — بدونها يظهر فقط "Internal Server Error".
+          if (errorData?.error || errorData?.message) errorMessage = errorData.error || errorData.message;
         } catch (err) {
           // ignore
         }
 
-        toast.current?.show({
-          severity: "error",
-          summary: "",
-          detail: errorMessage,
-          life: 3000,
-        });
+        setPopupMessage({ severity: "error", detail: errorMessage })
 
         throw new Error(errorMessage);
       }
@@ -1156,42 +1332,29 @@ export default function Customers({ isSupplier }: CustomersProps) {
       const savedCustomer = await response.json();
 
       if (savedCustomer?.success === false) {
-        const message = savedCustomer?.message || "حدث خطأ أثناء حفظ بيانات العميل";
+        const message = savedCustomer?.message || tr("حدث خطأ أثناء حفظ بيانات {0}", entityTypeLabel);
         throw new Error(message);
       }
 
       console.log("[v0] Customer saved successfully:", savedCustomer);
 
-      setShowSuccessMessage(true);
-      setTimeout(() => setShowSuccessMessage(false), 3000);
+      setPopupMessage({ severity: "success", detail: tr("تم حفظ البيانات بنجاح") })
 
       setEditingCustomer(false);
       editingCustomerRef.current = false;
 
-      if (savedCustomer?.data?.id) {
-        setCurrentCustomerId(Number(savedCustomer.data.id));
-        await unifiedCustomerLoadDataRef.current?.("ById", savedCustomer.data.id, isSupplier);
-      } else {
-        reset_fields();
-      }
+      await fetchCustomers(true)
+      setCustomerAccountClassifications([])
+      await reset_fields(0, "", false)
 
       return true;
     } catch (errorDataOrError) {
-      if (typeof errorDataOrError === "object" && errorDataOrError !== null && "message" in errorDataOrError) {
-        toast.current?.show({
-          severity: "error",
-          summary: "",
-          detail: (errorDataOrError as Error).message,
-          life: 3000,
-        });
-      } else {
-        toast.current?.show({
-          severity: "error",
-          summary: "",
-          detail: "حدث خطأ أثناء حفظ بيانات العميل",
-          life: 3000,
-        });
-      }
+      setPopupMessage({
+        severity: "error",
+        detail: typeof errorDataOrError === "object" && errorDataOrError !== null && "message" in errorDataOrError
+          ? (errorDataOrError as Error).message
+          : tr("حدث خطأ أثناء حفظ بيانات {0}", entityTypeLabel),
+      })
 
       return false;
     } finally {
@@ -1200,14 +1363,20 @@ export default function Customers({ isSupplier }: CustomersProps) {
     }
   };
 
+  // الحفظ من أي تبويب: يُنهى التحرير الجاري أولاً (حقل نشط/خلية شبكة تُطبَّق قيمتها عند فقد التركيز)،
+  // ثم يُحفظ بأحدث نسخة من الدالة والبيانات — لا بالنسخة الملتقطة لحظة النقر قبل تطبيق التعديل الأخير.
+  const handleSaveCustomerRef = useRef(handleSaveCustomer)
+  handleSaveCustomerRef.current = handleSaveCustomer
+  const saveFromAnyTab = useCallback(() => {
+    const active = document.activeElement as HTMLElement | null
+    if (active && typeof active.blur === "function") active.blur()
+    window.setTimeout(() => { void handleSaveCustomerRef.current(formDataRef.current) }, 60)
+  }, [])
+
   const handleDeleteClick = (checkPermission = true) => {
-    if (checkPermission && !hasPermission("products-edit")) {
-      toast.current?.show({
-        severity: "error",
-        summary: "",
-        detail: "لا يوجد لديك صلاحية حذف زبون",
-        life: 3000,
-      });
+    if (currentCustomerId <= 0) return;
+    if (!canDelete) {
+      setPopupMessage({ severity: "error", detail: tr("لا يوجد لديك صلاحية حذف {0}", entityTypeLabel) })
       return;
     }
 
@@ -1222,85 +1391,178 @@ export default function Customers({ isSupplier }: CustomersProps) {
   };
 
   const handleDeleteCustomer = async () => {
-    setIsLoading(true)
-    if (!formData.id) {
-      toast.current?.show({
-        severity: 'warn',
-        summary: 'تنبيه',
-        detail: 'لا يوجد سجل لحذفه',
-        life: 3000
-      });
+    if (!canDelete) return
+    const customerId = Number(formDataRef.current.id || 0)
+    if (!customerId) {
+      setPopupMessage({ severity: "warn", detail: tr("لا يوجد سجل لحذفه") })
       return;
     }
 
+    // deleting بدل setIsLoading: الأخير يستبدل الصفحة كلها بنص التحميل فيُزيل النافذة المفتوحة.
+    setDeleting(true)
     try {
-      const response = await fetch(`/api/customers/${formData.id}`, {
+      const response = await fetch(`/api/customers/${customerId}`, {
         method: "DELETE",
       })
 
       const result = await response.json();
 
       if (!response.ok) {
-        throw new Error(result.error || "فشل في حذف السجل");
+        throw new Error(result.error || tr("فشل في حذف السجل"));
       }
 
-      toast.current?.show({
-        severity: 'success',
-        summary: 'نجاح',
-        detail: 'تم حذف السجل بنجاح ✅',
-        life: 3000
-      });
+      setPopupMessage({ severity: "success", detail: tr("تم حذف السجل بنجاح") })
 
-      reset_fields(); // clear form
+      // تحديث القائمة أولاً (عدد السجلات/التنقل) ثم تفريغ النموذج — fetchCustomers يُعيِّن أول سجل
+      // كسجل حالي إن كان المعرّف 0، لذا يجب أن يسبق reset_fields التي تُعيده إلى 0.
+      await fetchCustomers(true)
+      setCustomerAccountClassifications([])
+      await reset_fields(0, "", false)
 
     } catch (err) {
       console.error("Error deleting customer:", err);
-      toast.current?.show({
-        severity: 'error',
-        summary: 'خطأ',
-        detail: 'فشلت العملية ❌',
-        life: 5000
-      });
+      setPopupMessage({ severity: "error", detail: err instanceof Error ? err.message : tr("فشلت العملية") })
     } finally {
-      setIsLoading(false)
+      setDeleting(false)
     }
   };
 
 
 
 
-  const handleNewCustomer = useCallback((openDialog = true) => {
+  // لقطة السجل كما حُمِّل/فُرِّغ آخر مرة — null = لا سجل مفتوح بعد (لا شيء للمقارنة).
+  const baselineSnapshotRef = useRef<string | null>(null);
+  // آخر القيم الافتراضية التي وضعتها النافذة لسجل جديد (كالعملة) — تُدمَج في لقطة أي سجل جديد
+  // لاحق لأن النافذة قد تضعها قبل أخذ اللقطة (أثناء انتظار توليد الرقم بعد الحفظ) فلا تُحتسب تعديلاً.
+  const formDefaultsRef = useRef<Partial<CustomerFormData>>({});
+  const withNewRecordDefaults = (data: Partial<CustomerFormData>) => {
+    if (Number(data.id || 0) > 0) return data;
+    const merged: Record<string, any> = { ...data };
+    for (const [key, value] of Object.entries(formDefaultsRef.current)) {
+      if (merged[key] == null || merged[key] === "") merged[key] = value;
+    }
+    return merged as Partial<CustomerFormData>;
+  };
+  const markFormClean = (data: Partial<CustomerFormData>) => {
+    baselineSnapshotRef.current = buildCustomerDirtySnapshot(withNewRecordDefaults(data));
+  };
+  const isFormDirty = () =>
+    baselineSnapshotRef.current !== null && buildCustomerDirtySnapshot(formDataRef.current) !== baselineSnapshotRef.current;
+
+  const askToSaveChanges = (action: () => void | Promise<void>) => {
+    // تنبيه مفتوح بالفعل: لا يُستبدَل إجراؤه المؤجَّل بإجراء لاحق.
+    if (pendingActionRef.current) return;
+    pendingActionRef.current = action;
+    setShowUnsaved(true);
+    popupHasCalled();
+  };
+  // يُنفِّذ الإجراء فوراً إن لم يكن هناك تعديل، وإلا يسأل أولاً (نعم = حفظ ثم متابعة، لا = متابعة دون حفظ، رجوع = إلغاء).
+  const runAfterUnsavedCheck = (action: () => void | Promise<void>) => {
+    if (isFormDirty()) askToSaveChanges(action);
+    else void action();
+  };
+
+  // قيم افتراضية تضعها النافذة نفسها (كالعملة الافتراضية لسجل جديد) — ليست تعديلاً من المستخدم،
+  // فإن كان النموذج غير مُعدَّل قبلها يبقى كذلك بعدها.
+  const applyFormDefaults = useCallback((patch: Partial<CustomerFormData>) => {
+    formDefaultsRef.current = { ...formDefaultsRef.current, ...patch };
+    setFormData((prev) => {
+      const next = { ...prev, ...patch };
+      if (baselineSnapshotRef.current !== null && buildCustomerDirtySnapshot(withNewRecordDefaults(prev)) === baselineSnapshotRef.current) {
+        baselineSnapshotRef.current = buildCustomerDirtySnapshot(next);
+      }
+      return next;
+    });
+  }, []);
+
+  /*const handleNewCustomer = useCallback(() => {
     console.log("AAAAa")
+    setLoading(true)
+    updateFormData(null)
     setEditingCustomer(false)
     editingCustomerRef.current = false
     setValidationErrors({})
-    if (openDialog) {
-      setShowNewCustomerDialog(true)
-    }
-    updateFormData(null)
+    setShowNewCustomerDialog(true)
     generateCustomerNumber()
-    customer_name.current?.focus()
+    setLoading(false)
+    customer_name.current?.focus();
   }, [updateFormData, generateCustomerNumber])
-
-  const reset_fields = async (from_code = 0, code = "", showLoading = true) => {
+*/
+  // showLoading افتراضياً false: كل المستدعين يعملون والنافذة مفتوحة، وisloading يستبدل الصفحة كلها
+  // بنص "جاري التحميل" فيُزيل النافذة من الشجرة (تُفقَد حالتها وتُعاد تهيئتها).
+  const reset_fields = async (from_code = 0, code = "", showLoading = false) => {
+    if (!canCreate) { setShowNewCustomerDialog(false); setCurrentCustomerId(0); updateFormData(null); return }
     if (showLoading) setIsLoading(true)
     updateFormData(null)
     setEditingCustomer(false)
     editingCustomerRef.current = false
     setValidationErrors({})
     setShowNewCustomerDialog(true)
-    if (from_code == 0) {
-      await generateCustomerNumber()
-    }
-    else updateField("customer_code", code);
+    const generatedCode = from_code == 0 ? await generateCustomerNumber() : code
+    if (from_code != 0) updateField("customer_code", code)
     if (showLoading) setIsLoading(false)
 
-
+    // يُبنى النموذج الفارغ المتوقَّع (بنفس رقم مُولَّد للتو) مباشرة ويُحسَب هاشه فوراً، بدل قراءته من
+    // formDataRef بعد فاصل زمني ثابت (200ms) كسابقاً — تلك القراءة المؤجَّلة كانت عرضة لسباق حقيقي:
+    // ضغط "السابق/التالي" بسرعة بعد "جديد" (قبل انقضاء الفاصل) يقارن هاشاً قديماً بنموذج فارغ فعلاً،
+    // فيُظهر خطأً تنبيه "تم تعديل السجل هل تريد الحفظ؟" رغم عدم وجود أي تعديل حقيقي من المستخدم.
+    markFormClean({ ...buildEmptyCustomerFormData(), customer_code: generatedCode })
+    setCurrentCustomerId(0)
 
     setTimeout(() => {
       customer_name.current?.focus();
     }, 200);
-    setCurrentCustomerId(0)
+  }
+  // تبديل الشاشة من القائمة/إغلاق التبويب/رجوع المتصفح/تحديث الصفحة مع تغييرات غير محفوظة ⇐ نفس نافذة
+  // التحقق من التغييرات — كما في كاشير نقطة البيع (lib/navigation-guard.ts)
+  useNavigationGuard(
+    () => Boolean(showNewCustomerDialog && isFormDirty()),
+    (continueNavigation) => runAfterUnsavedCheck(continueNavigation),
+  )
+
+  const handleNewCustomer = async (checkUnsaved: boolean) => {
+    if (!canCreate) return
+    const startNew = async () => {
+      setShowNewCustomerDialog(true)
+      setCustomerAccountClassifications([])
+      await reset_fields(0, "", false)
+    }
+    if (checkUnsaved) runAfterUnsavedCheck(startNew)
+    else await startNew()
+  }
+
+  // /?section=customers&new=1 (زر "تعريف عميل" في بحث الحسابات): سجل عميل جديد بعد تحميل الصلاحيات
+  const newFromUrlHandledRef = useRef(false)
+  useEffect(() => {
+    if (newFromUrlHandledRef.current || !canCreate || entityTypeCode !== 1) return
+    newFromUrlHandledRef.current = true
+    if (consumeNewRecordParam("customers")) void handleNewCustomer(false)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [canCreate])
+
+  // نسخ: سجل جديد برقم جديد يحمل بيانات السجل الحالي (بلا معرّف/حساب) — يُعدّ تعديلاً غير محفوظ.
+  const handleCloneCustomer = () => {
+    if (!canCreate || !canView) return
+    if (currentCustomerId <= 0) return
+    const source = formDataRef.current
+    runAfterUnsavedCheck(async () => {
+      const generatedCode = await generateCustomerNumber()
+      markFormClean({ ...buildEmptyCustomerFormData(), customer_code: generatedCode })
+      setFormData({ ...source, id: 0, account_id: null, customer_code: generatedCode })
+      setCurrentCustomerId(0)
+      setEditingCustomer(false)
+      editingCustomerRef.current = false
+      setValidationErrors({})
+      setTimeout(() => customer_name.current?.focus(), 200)
+    })
+  }
+
+  // إغلاق النافذة يمر بنفس فحص التعديلات غير المحفوظة.
+  const requestCloseCustomerDialog = () => {
+    runAfterUnsavedCheck(() => {
+      setShowNewCustomerDialog(false)
+      void fetchCustomers()
+    })
   }
 
   const fetch_Definitions = async () => {
@@ -1346,19 +1608,20 @@ export default function Customers({ isSupplier }: CustomersProps) {
 
   const handleEditCustomer = useCallback(
     (customer: Customer) => {
+      if (!canView) return
       updateFormData(customer)
       setCurrentCustomerId(customer.id)
       setEditingCustomer(true)
       editingCustomerRef.current = true
       setValidationErrors({})
       setShowNewCustomerDialog(true)
-      console.log("customer customer ", customer)
-      setTimeout(() => {
-        void unifiedCustomerLoadDataRef.current?.("ByIdEdit", customer.id, isSupplier)
-      }, 200);
+      // Editing a row is an explicit navigation request. Do not compare the
+      // selected row with the hash of whichever record happened to be open
+      // previously, otherwise the edit is mistaken for an unsaved change.
+      void loadData("ByIdEdit", customer.id, isSupplier, false)
 
     },
-    [updateFormData, isSupplier],
+    [canView, isSupplier, updateFormData],
   )
 
   const handleManagePortal = useCallback(
@@ -1370,29 +1633,15 @@ export default function Customers({ isSupplier }: CustomersProps) {
         code: customer.customer_code,
       })
       setSelectedCustomerForPortal(customer)
-      setPortalUsers([]) // إضافة reset للمستخدمين السابقين
       setError(null) // إضافة reset للخطأ
       setNotificationSettings(null)
       setShowPortalDialog(true)
       console.log("[v0] Dialog opened, fetching users and notification settings...")
-      fetchPortalUsers(customer.id)
+      setPortalLink(null)
       fetchNotificationSettings(customer.id)
     },
-    [fetchPortalUsers, fetchNotificationSettings],
+    [fetchNotificationSettings],
   )
-
-  const openEditPermissionsDialog = useCallback((user: CustomerUser) => {
-    setSelectedUser(user)
-    setUserPermissions({
-      can_view_orders: user.can_view_orders,
-      can_create_orders: user.can_create_orders,
-      can_view_balance: user.can_view_balance,
-      can_view_products: user.can_view_products,
-      can_view_prices: user.can_view_prices,
-      can_view_stock: user.can_view_stock,
-    })
-    setShowEditPermissionsDialog(true)
-  }, [])
 
   const statistics = useMemo(() => {
     const totalCustomers = customers.length
@@ -1413,19 +1662,13 @@ export default function Customers({ isSupplier }: CustomersProps) {
     fetchClassifications()
     fetchSalesmen()
     fetchPriceClass()
-  }, [fetchCustomers, fetchClassifications, fetchSalesmen, fetchPriceClass])
+    fetchBranches()
+  }, [fetchCustomers, fetchClassifications, fetchSalesmen, fetchPriceClass, fetchBranches])
 
-  useEffect(() => {
-    console.log("[v0] Current customer changed:", currentCustomer)
-    if (currentCustomer) {
-      updateFormData(currentCustomer)
-    }
-  }, [currentCustomer, updateFormData])
-  const { isAuthenticated, hasPermission } = useAuth()
   if (isloading) {
     return (
       <div className="flex items-center justify-center h-64">
-        <div className="text-lg">جاري التحميل...</div>
+        <div className="text-lg">{tr("جاري التحميل...")}</div>
       </div>
     )
   }
@@ -1440,207 +1683,161 @@ export default function Customers({ isSupplier }: CustomersProps) {
       </div>
     )
   }*/
-  if ((!isSupplier && !Util.checkUserAccess(15)) || (isSupplier && !Util.checkUserAccess(16))) {
+  if (!(isSalesman ? Util.checkUserAccess(15) : can("access"))) {
     return (
       <div className="flex items-center justify-center h-64">
         <div className="text-center">
-          <h2 className="text-2xl font-semibold mb-2 text-red-600">لا يوجد صلاحية</h2>
-          <p className="text-muted-foreground">ليس لديك صلاحية للوصول إلى هذه الصفحة</p>
+          <h2 className="text-2xl font-semibold mb-2 text-red-600">{tr("لا يوجد صلاحية")}</h2>
+          <p className="text-muted-foreground">{tr("ليس لديك صلاحية للوصول إلى هذه الصفحة")}</p>
         </div>
       </div>
     )
   }
   return (
 
-    <div className="container mx-auto p-6 space-y-6" dir="rtl">
+    <div className="voucher-list-page w-full space-y-5 p-3 sm:p-5" dir={appDir()}>
       {/* Success Message */}
       <ConfirmDialogYesNo
+        useAppDialog
         visible={showConfirm}
         onConfirm={confirmDelete}
         onCancel={() => { setShowConfirm(false); popupHasClosed() }}
-        message="هل تريد حذف هذا السجل؟"
+        title={tr("تأكيد الحذف")}
+        message={tr("هل تريد حذف هذا السجل؟")}
       />
 
-      {showSuccessMessage && (
-        <div className="fixed top-4 right-4 bg-green-500 text-white px-4 py-2 rounded-lg shadow-lg flex items-center gap-2 z-50">
-          <CheckCircle className="h-4 w-4" />
-          تم حفظ البيانات بنجاح
-        </div>
-      )}
+      <ConfirmDialogYesNo
+        useAppDialog
+        visible={showUnsaved}
+        onConfirm={async () => {
+          // نعم: حفظ ثم متابعة الإجراء المؤجَّل — فقط إن نجح الحفظ (وإلا يبقى المستخدم على سجله).
+          const action = pendingActionRef.current
+          pendingActionRef.current = null
+          setShowUnsaved(false); popupHasClosed();
+          const saved = await handleSaveCustomer(formDataRef.current)
+          if (saved && action) await action()
+        }}
+        onCancel={async () => {
+          // لا: متابعة الإجراء دون حفظ.
+          const action = pendingActionRef.current
+          pendingActionRef.current = null
+          setShowUnsaved(false); popupHasClosed();
+          if (action) await action()
+        }}
+        title={tr("حفظ التعديلات")}
+        message={tr("تم تعديل السجل هل تريد الحفظ؟")}
+        onBack={() => { pendingActionRef.current = null; setShowUnsaved(false); popupHasClosed(); }}
+        showBack={true}
+      />
       <ProgressSpinner loading={isloading} />
       <Toast ref={toast} position={'top-left'} style={{ top: 100, whiteSpace: 'pre-line' }} />
       {/* Error Message */}
       {error && <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded-lg">{error}</div>}
 
-      {/* Header */}
-      <div className="flex justify-between items-center">
-        <h1 className="text-3xl font-bold">{isSupplier ? "إدارة الموردين" : "إدارة الزبائن"} </h1>
-        <div className="flex gap-2">
-          <Button onClick={() => handleNewCustomer(true)} className="flex items-center gap-2">
-            <Plus className="h-4 w-4" />
-            {isSupplier ? "مورد جديد" : "زبون جديد"}
-          </Button>
-          <Button
-            variant="outline"
-            onClick={() => setShowImportDialog(true)}
-            className="flex items-center gap-2 bg-transparent"
+      {/* Header: نفس تصميم صفحات الحركات (VoucherListHero) */}
+      <VoucherListHero
+        category={tr("الملفات")}
+        icon={UsersIcon}
+        title={tr("إدارة {0}", entityPlural)}
+        addLabel={tr("{0} جديد", entitySingleIndef)}
+        onNew={() => handleNewCustomer(false)}
+        addDisabled={!canCreate}
+        actions={
+          <button
+            type="button"
+            disabled={!canCreate}
+            onClick={() => { if (canCreate) setShowImportDialog(true) }}
+            className="inline-flex h-11 items-center gap-2 rounded-xl bg-white/15 px-4 text-sm font-bold text-white ring-1 ring-white/30 transition hover:bg-white/25 disabled:cursor-not-allowed disabled:opacity-60"
           >
             <Upload className="h-4 w-4" />
-            استيراد من Excel
-          </Button>
-          <Dialog open={showReportDialog} onOpenChange={setShowReportDialog}>
-            <DialogTrigger asChild>
-              <Button variant="outline" className="flex items-center gap-2 bg-transparent">
-                <FileText className="h-4 w-4" />
-                التقارير
-              </Button>
-            </DialogTrigger>
-            <DialogContent className="max-w-4xl">
-              <DialogHeader>
-                <DialogTitle>تقارير الزبائن</DialogTitle>
-              </DialogHeader>
-              <div className="p-4">
-                <p>سيتم إضافة التقارير هنا</p>
-              </div>
-            </DialogContent>
-          </Dialog>
-        </div>
-      </div>
+            {tr("استيراد من Excel")}
+          </button>
+        }
+      />
 
       {/* Statistics Cards */}
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
-        <Card className="bg-gradient-to-br from-blue-50 to-blue-100 border-blue-200">
-          <CardContent className="p-6">
-            <div className="flex items-center justify-between">
-              <div>
-                <p className="text-sm font-medium text-blue-700">{isSupplier ? "إجمالي الموردين" : "إجمالي الزبائن"}</p>
-                <p className="text-3xl font-bold text-blue-900">{statistics.total}</p>
-              </div>
-              <div className="h-10 w-10 bg-blue-200 rounded-full flex items-center justify-center">
-                <span className="text-blue-700 text-lg font-bold">{statistics.total}</span>
-              </div>
-            </div>
-          </CardContent>
-        </Card>
-
-        <Card className="bg-gradient-to-br from-green-50 to-green-100 border-green-200">
-          <CardContent className="p-6">
-            <div className="flex items-center justify-between">
-              <div>
-                <p className="text-sm font-medium text-green-700"> {isSupplier ? "الموردين النشطين" : "الزبائن النشطين"}</p>
-                <p className="text-3xl font-bold text-green-900">{statistics.active}</p>
-              </div>
-              <div className="h-10 w-10 bg-green-200 rounded-full flex items-center justify-center">
-                <span className="text-green-700 text-lg font-bold">{statistics.active}</span>
-              </div>
-            </div>
-          </CardContent>
-        </Card>
-
-        <Card className="bg-gradient-to-br from-red-50 to-red-100 border-red-200">
-          <CardContent className="p-6">
-            <div className="flex items-center justify-between">
-              <div>
-                <p className="text-sm font-medium text-red-700">{isSupplier ? "الموردين غير النشطين" : "الزبائن غير النشطين"}</p>
-                <p className="text-3xl font-bold text-red-900">{statistics.inactive}</p>
-              </div>
-              <div className="h-10 w-10 bg-red-200 rounded-full flex items-center justify-center">
-                <span className="text-red-700 text-lg font-bold">{statistics.inactive}</span>
-              </div>
-            </div>
-          </CardContent>
-        </Card>
-
-        <Card className="bg-gradient-to-br from-purple-50 to-purple-100 border-purple-200">
-          <CardContent className="p-6">
-            <div className="flex items-center justify-between">
-              <div>
-                <p className="text-sm font-medium text-purple-700">{isSupplier ? "مورّدين VIP" : "زبائن VIP"}</p>
-                <p className="text-3xl font-bold text-purple-900">{statistics.vip}</p>
-              </div>
-              <div className="h-10 w-10 bg-purple-200 rounded-full flex items-center justify-center">
-                <span className="text-purple-700 text-lg font-bold">{statistics.vip}</span>
-              </div>
-            </div>
-          </CardContent>
-        </Card>
-      </div>
+      <VoucherStats stats={[
+        { label: tr("إجمالي {0}", entityPlural), value: statistics.total },
+        { label: tr("{0} النشطين", entityPlural), value: statistics.active },
+        { label: tr("{0} غير النشطين", entityPlural), value: statistics.inactive },
+        { label: `${entityPluralIndef} VIP`, value: statistics.vip },
+      ]} />
 
       {/* Advanced Search */}
       <Card>
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
             <Search className="h-5 w-5" />
-            البحث المتقدم
+            {tr("البحث المتقدم")}
           </CardTitle>
         </CardHeader>
         <CardContent>
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
             <div>
-              <Label htmlFor="search-name"> {isSupplier ? "اسم المورد" : "اسم الزبون"}</Label>
+              <Label htmlFor="search-name"> {tr("اسم {0}", entityTypeLabel)}</Label>
               <Input
                 id="search-name"
                 value={searchFilters.name}
                 onChange={(e) => setSearchFilters((prev) => ({ ...prev, name: e.target.value }))}
-                className="text-right"
-                placeholder="ابحث بالاسم..."
+                className="text-start"
+                placeholder={tr("ابحث بالاسم...")}
               />
             </div>
             <div>
-              <Label htmlFor="search-city">المدينة</Label>
+              <Label htmlFor="search-city">{tr("المدينة")}</Label>
               <Select
                 value={searchFilters.city}
                 onValueChange={(value) => setSearchFilters((prev) => ({ ...prev, city: value }))}
               >
-                <SelectTrigger className="text-right">
-                  <SelectValue placeholder="اختر المدينة" />
+                <SelectTrigger className="text-start">
+                  <SelectValue placeholder={tr("اختر المدينة")} />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="__all__">جميع المدن</SelectItem>
-                  <SelectItem value="الرياض">الرياض</SelectItem>
-                  <SelectItem value="جدة">جدة</SelectItem>
-                  <SelectItem value="الدمام">الدمام</SelectItem>
-                  <SelectItem value="مكة المكرمة">مكة المكرمة</SelectItem>
-                  <SelectItem value="المدينة المنورة">المدينة المنورة</SelectItem>
-                  <SelectItem value="الطائف">الطائف</SelectItem>
-                  <SelectItem value="تبوك">تبوك</SelectItem>
-                  <SelectItem value="بريدة">بريدة</SelectItem>
-                  <SelectItem value="خميس مشيط">خميس مشيط</SelectItem>
-                  <SelectItem value="حائل">حائل</SelectItem>
+                  <SelectItem value="__all__">{tr("جميع المدن")}</SelectItem>
+                  <SelectItem value="الرياض">{tr("الرياض")}</SelectItem>
+                  <SelectItem value="جدة">{tr("جدة")}</SelectItem>
+                  <SelectItem value="الدمام">{tr("الدمام")}</SelectItem>
+                  <SelectItem value="مكة المكرمة">{tr("مكة المكرمة")}</SelectItem>
+                  <SelectItem value="المدينة المنورة">{tr("المدينة المنورة")}</SelectItem>
+                  <SelectItem value="الطائف">{tr("الطائف")}</SelectItem>
+                  <SelectItem value="تبوك">{tr("تبوك")}</SelectItem>
+                  <SelectItem value="بريدة">{tr("بريدة")}</SelectItem>
+                  <SelectItem value="خميس مشيط">{tr("خميس مشيط")}</SelectItem>
+                  <SelectItem value="حائل">{tr("حائل")}</SelectItem>
                 </SelectContent>
               </Select>
             </div>
             <div>
-              <Label htmlFor="search-status">الحالة</Label>
+              <Label htmlFor="search-status">{tr("الحالة")}</Label>
               <Select
                 value={searchFilters.status}
                 onValueChange={(value) =>
                   setSearchFilters((prev) => ({ ...prev, status: value }))
                 }
               >
-                <SelectTrigger className="text-right">
-                  <SelectValue placeholder="اختر الحالة" />
+                <SelectTrigger className="text-start">
+                  <SelectValue placeholder={tr("اختر الحالة")} />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="__all__">جميع الحالات</SelectItem>
-                  <SelectItem value="نشط">نشط</SelectItem>
-                  <SelectItem value="غير نشط">غير نشط</SelectItem>
+                  <SelectItem value="__all__">{tr("جميع الحالات")}</SelectItem>
+                  <SelectItem value="نشط">{tr("نشط")}</SelectItem>
+                  <SelectItem value="غير نشط">{tr("غير نشط")}</SelectItem>
                 </SelectContent>
               </Select>
             </div>
             <div>
-              <Label htmlFor="search-salesman">المندوب</Label>
+              <Label htmlFor="search-salesman">{tr("المندوب")}</Label>
               <Select
                 value={searchFilters.salesman}
                 onValueChange={(value) =>
                   setSearchFilters((prev) => ({ ...prev, salesman: value }))
                 }
               >
-                <SelectTrigger className="text-right">
-                  <SelectValue placeholder="اختر المندوب" />
+                <SelectTrigger className="text-start">
+                  <SelectValue placeholder={tr("اختر المندوب")} />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="__all__">جميع المندوبين</SelectItem>
+                  <SelectItem value="__all__">{tr("جميع المندوبين")}</SelectItem>
                   {salesmen.map((salesman) => (
                     <SelectItem key={salesman.id} value={salesman.name}>
                       {salesman.name}
@@ -1657,7 +1854,7 @@ export default function Customers({ isSupplier }: CustomersProps) {
       <Card>
         <CardHeader>
           <CardTitle>
-            {isSupplier ? `قائمة الموردين (${filteredCustomers.length})` : `قائمة الزبائن (${filteredCustomers.length})`}
+            {tr("قائمة {0} ({1})", entityPlural, filteredCustomers.length)}
           </CardTitle>
         </CardHeader>
         <CardContent>
@@ -1665,21 +1862,25 @@ export default function Customers({ isSupplier }: CustomersProps) {
             <table className="w-full border-collapse border border-gray-300">
               <thead>
                 <tr className="bg-gray-50">
-                  <th className="border border-gray-300 px-4 py-2 text-right">
-                    {isSupplier ? "رقم المورد" : "رقم الزبون"}
+                  <th className="border border-gray-300 px-4 py-2 text-start w-12"></th>
+                  <th className="border border-gray-300 px-4 py-2 text-start">
+                    {tr("رقم {0}", entityTypeLabel)}
                   </th>
-                  <th className="border border-gray-300 px-4 py-2 text-right">
-                    {isSupplier ? "اسم المورد" : "اسم الزبون"}
+                  <th className="border border-gray-300 px-4 py-2 text-start">
+                    {tr("اسم {0}", entityTypeLabel)}
                   </th>
-                  <th className="border border-gray-300 px-4 py-2 text-right">الجوال</th>
-                  <th className="border border-gray-300 px-4 py-2 text-right">المدينة</th>
-                  <th className="border border-gray-300 px-4 py-2 text-right">الحالة</th>
-                  <th className="border border-gray-300 px-4 py-2 text-center">الإجراءات</th>
+                  <th className="border border-gray-300 px-4 py-2 text-start">{tr("الجوال")}</th>
+                  <th className="border border-gray-300 px-4 py-2 text-start">{tr("المدينة")}</th>
+                  <th className="border border-gray-300 px-4 py-2 text-start">{tr("الحالة")}</th>
+                  <th className="border border-gray-300 px-4 py-2 text-center">{tr("الإجراءات")}</th>
                 </tr>
               </thead>
               <tbody>
                 {pagedCustomers.map((customer) => (
                   <tr key={customer.id} className="hover:bg-gray-50">
+                    <td className="border border-gray-300 px-2 py-2">
+                      <ImageThumbnail value={(customer as any).image_url} size={32} alt={customer.name} />
+                    </td>
                     <td className="border border-gray-300 px-4 py-2">{customer.customer_code}</td>
                     <td className="border border-gray-300 px-4 py-2">{customer.name}</td>
                     <td className="border border-gray-300 px-4 py-2">{customer.mobile1}</td>
@@ -1689,19 +1890,19 @@ export default function Customers({ isSupplier }: CustomersProps) {
                     </td>
                     <td className="border border-gray-300 px-4 py-2 text-center">
                       <div className="flex justify-center gap-2">
+                        <Button size="sm" variant="outline" onClick={() => handleEditCustomer(customer)} title={tr("تعديل")}>
+                          <Edit className="h-4 w-4" />
+                        </Button>
                         <Button
                           size="sm"
                           variant="outline"
-                          onClick={() => handleManagePortal(customer)}
-                          title="إدارة بوابة العميل"
+                          className="gap-1.5 text-teal-700"
+                          disabled={!(customer as any).account_id}
+                          onClick={() => openReceivablesStatement(Number((customer as any).account_id))}
+                          title={tr("بيان حساب الذمة")}
                         >
-                          <Globe className="h-4 w-4" />
-                        </Button>
-                        <Button size="sm" variant="outline" onClick={() => handleEditCustomer(customer)}>
-                          <Edit className="h-4 w-4" />
-                        </Button>
-                        <Button size="sm" variant="outline" onClick={() => confirmDelete}>
-                          <Trash2 className="h-4 w-4" />
+                          <FileText className="h-4 w-4" />
+                          <span className="hidden text-xs xl:inline">{tr("بيان حساب الذمة")}</span>
                         </Button>
                       </div>
                     </td>
@@ -1711,7 +1912,7 @@ export default function Customers({ isSupplier }: CustomersProps) {
             </table>
             <div className="mt-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
               <div className="text-sm text-muted-foreground">
-                عرض {pageStart} إلى {pageEnd} من {filteredCustomers.length}
+                {tr("عرض ")}{pageStart}{tr(" إلى ")}{pageEnd}{tr(" من ")}{filteredCustomers.length}
               </div>
               <div className="flex items-center gap-2">
                 <Button
@@ -1720,7 +1921,7 @@ export default function Customers({ isSupplier }: CustomersProps) {
                   disabled={currentPage === 1}
                   onClick={() => setCurrentPage((prev) => Math.max(prev - 1, 1))}
                 >
-                  السابق
+                  {tr("السابق")}
                 </Button>
                 <Button
                   size="sm"
@@ -1728,7 +1929,7 @@ export default function Customers({ isSupplier }: CustomersProps) {
                   disabled={currentPage === totalPages}
                   onClick={() => setCurrentPage((prev) => Math.min(prev + 1, totalPages))}
                 >
-                  التالي
+                  {tr("التالي")}
                 </Button>
                 <Select value={String(pageSize)} onValueChange={(value) => setPageSize(Number(value))}>
                   <SelectTrigger className="h-10 w-24">
@@ -1750,53 +1951,74 @@ export default function Customers({ isSupplier }: CustomersProps) {
       <Dialog
         open={showNewCustomerDialog}
         onOpenChange={(open) => {
-          if (open) {
-            setShowNewCustomerDialog(true)
-          }
+          if (open) setShowNewCustomerDialog(true)
+          else requestCloseCustomerDialog()
         }}
       >
-        <DialogContent hideCloseButton className="max-w-[75vw] sm:max-w-[70vw] md:max-w-[62vw] lg:max-w-[110vh] max-h-[95vh] overflow-hidden p-0" dir="rtl">
-          <UnifiedCustomers
-            open={showNewCustomerDialog}
-            onOpenChange={(nextOpen: boolean) => {
-              setShowNewCustomerDialog(nextOpen)
-            }}
-            isSupplier={!!isSupplier}
-            showCustomerSearch={showCustomerSearch}
-            setShowCustomerSearch={setShowCustomerSearch}
-            formData={formData}
-            updateField={updateField as any}
-            validationErrors={validationErrors}
-            classifications={classifications}
-            pricecategory={pricecategory}
-            salesmen={salesmen}
-            currentCustomerId={currentCustomerId}
-            currentIndex={currentIndex}
-            totalRecords={customers.length}
-            isSaving={saving}
-            loadDataRef={unifiedCustomerLoadDataRef}
-            onNew={() => handleNewCustomer(true)}
-            onSave={async () => {
-              await fetchCustomers()
-            }}
-            onDelete={fetchCustomers}
-            onReport={() => console.log("Generate customer report")}
-            onExportExcel={() => console.log("Export to Excel")}
-            onPrint={() => console.log("Print customer")}
-            customerNameRef={customer_name}
-            customers={customers}
-            setCurrentIndex={setCurrentIndex}
-            setCurrentCustomerId={setCurrentCustomerId}
-          />
+        <DialogContent inline={fullscreenEnabled && showNewCustomerDialog} className="h-[86dvh] max-h-[86dvh] w-[96vw] max-w-[1400px] overflow-hidden p-0 sm:h-[84dvh] sm:max-h-[84dvh]" dir={appDir()}
+          onPointerDownOutside={(event) => event.preventDefault()}
+          // نوافذ التأكيد (حفظ التعديلات/الحذف) تُفتح خارج شجرة هذه النافذة، فانتقال التركيز إليها
+          // كان يُعدّ "تفاعلاً خارجياً" يُغلق النافذة ويستبدل الإجراء المؤجَّل (جديد) بإجراء الإغلاق.
+          onInteractOutside={(event) => event.preventDefault()}
+          onEscapeKeyDown={(event) => event.preventDefault()}
+        >
+          <div className="flex h-full min-h-0 min-w-0 flex-col overflow-hidden bg-background">
+            <UnifiedCustomers
+              open={showNewCustomerDialog}
+              onOpenChange={(open) => {
+                if (open) setShowNewCustomerDialog(true)
+                else requestCloseCustomerDialog()
+              }}
+              isSupplier={!!isSupplier}
+              isSalesman={!!isSalesman}
+              isSubscriber={!!isSubscriber}
+              showCustomerSearch={showCustomerSearch}
+              setShowCustomerSearch={(open) => { if (!open || canView) setShowCustomerSearch(open) }}
+              formData={formData}
+              updateField={updateField as any}
+              validationErrors={validationErrors}
+              requiredContactFields={entityTypeCode === 1 ? requiredContactFields : undefined}
+              classifications={classifications}
+              pricecategory={pricecategory}
+              salesmen={salesmen}
+              branches={branches}
+              currentCustomerId={currentCustomerId}
+              currentIndex={currentIndex}
+              totalRecords={customers.length}
+              isSaving={saving || deleting}
+              hotkeysDisabled={showUnsaved || showConfirm}
+              onFirst={() => navigateToCustomerIndex(0)}
+              onPrevious={() => navigateToCustomerIndex(Math.max(0, currentIndex - 1))}
+              onNext={() => navigateToCustomerIndex(Math.min(customers.length - 1, currentIndex + 1))}
+              onLast={() => navigateToCustomerIndex(Math.max(0, customers.length - 1))}
+              isNewRecord={currentCustomerId <= 0}
+              onNew={() => handleNewCustomer(true)}
+              onSave={saveFromAnyTab}
+              requestedTab={requestedTab}
+              onDelete={() => handleDeleteClick(true)}
+              onClone={handleCloneCustomer}
+              applyFormDefaults={applyFormDefaults as any}
+              popupMessage={popupMessage}
+              onCustomerSelect={(customer) => {
+                const customerId = Number(customer.id)
+                runAfterUnsavedCheck(() => loadData("ByIdEdit", customerId, isSupplier, false))
+              }}
+              onClassificationRowsChange={setCustomerAccountClassifications}
+              onCostCenterRowsChange={(rows) => setFormData((prev) => ({ ...prev, cost_centers: rows }))}
+              onStopTransactionRowsChange={(rows) => setFormData((prev) => ({ ...prev, stop_transactions: rows }))}
+              onCustomerCodeBlur={handleCustomerBlur}
+              customerNameRef={customer_name}
+            />
+          </div>
         </DialogContent>
       </Dialog>
 
       <Dialog open={showPortalDialog} onOpenChange={setShowPortalDialog}>
-        <DialogContent className="max-w-6xl max-h-[90vh] overflow-hidden" dir="rtl">
+        <DialogContent className="max-w-6xl max-h-[90vh] overflow-hidden" dir={appDir()}>
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2 text-xl">
               <Globe className="h-6 w-6 text-primary" />
-              إدارة بوابة العميل - {selectedCustomerForPortal?.name}
+              {tr("إدارة بوابة العميل - ")}{selectedCustomerForPortal?.name}
             </DialogTitle>
           </DialogHeader>
 
@@ -1805,15 +2027,15 @@ export default function Customers({ isSupplier }: CustomersProps) {
               <CardHeader className="pb-4">
                 <CardTitle className="flex items-center gap-2 text-lg">
                   <Bell className="h-5 w-5 text-primary" />
-                  إعدادات الإشعارات التلقائية
+                  {tr("إعدادات الإشعارات التلقائية")}
                 </CardTitle>
                 <p className="text-sm text-muted-foreground">
-                  إرسال إشعارات تلقائية للعميل عن حالة طلبياته عبر SMS أو واتساب
+                  {tr("إرسال إشعارات تلقائية للعميل عن حالة طلبياته عبر SMS أو واتساب")}
                 </p>
               </CardHeader>
               <CardContent className="space-y-6">
                 {loadingNotificationSettings ? (
-                  <div className="text-center py-4 text-muted-foreground">جاري التحميل...</div>
+                  <div className="text-center py-4 text-muted-foreground">{tr("جاري التحميل...")}</div>
                 ) : notificationSettings ? (
                   <>
                     {/* طريقة الإرسال ورقم الهاتف */}
@@ -1821,7 +2043,7 @@ export default function Customers({ isSupplier }: CustomersProps) {
                       <div>
                         <Label htmlFor="notification_method" className="flex items-center gap-2 mb-2">
                           <MessageSquare className="h-4 w-4" />
-                          طريقة الإرسال
+                          {tr("طريقة الإرسال")}
                         </Label>
                         <Select
                           value={notificationSettings.notification_method}
@@ -1833,9 +2055,9 @@ export default function Customers({ isSupplier }: CustomersProps) {
                             <SelectValue />
                           </SelectTrigger>
                           <SelectContent>
-                            <SelectItem value="sms">SMS فقط</SelectItem>
-                            <SelectItem value="whatsapp">واتساب فقط</SelectItem>
-                            <SelectItem value="both">SMS و واتساب</SelectItem>
+                            <SelectItem value="sms">{tr("SMS فقط")}</SelectItem>
+                            <SelectItem value="whatsapp">{tr("واتساب فقط")}</SelectItem>
+                            <SelectItem value="both">{tr("SMS و واتساب")}</SelectItem>
                           </SelectContent>
                         </Select>
                       </div>
@@ -1843,7 +2065,7 @@ export default function Customers({ isSupplier }: CustomersProps) {
                       <div>
                         <Label htmlFor="preferred_phone" className="flex items-center gap-2 mb-2">
                           <Phone className="h-4 w-4" />
-                          رقم الهاتف المفضل
+                          {tr("رقم الهاتف المفضل")}
                         </Label>
                         <Input
                           id="preferred_phone"
@@ -1852,12 +2074,12 @@ export default function Customers({ isSupplier }: CustomersProps) {
                             setNotificationSettings({ ...notificationSettings, preferred_phone: e.target.value })
                           }
                           placeholder="05xxxxxxxx"
-                          className="text-right"
+                          className="text-start"
                         />
                       </div>
 
                       <div className="flex items-center justify-between pt-6">
-                        <Label htmlFor="is_active">تفعيل الإشعارات</Label>
+                        <Label htmlFor="is_active">{tr("تفعيل الإشعارات")}</Label>
                         <Switch
                           id="is_active"
                           checked={notificationSettings.is_active}
@@ -1870,14 +2092,14 @@ export default function Customers({ isSupplier }: CustomersProps) {
 
                     {/* إعدادات الإشعارات لكل حالة */}
                     <div>
-                      <h4 className="font-semibold mb-3 text-sm">اختر الإشعارات التي تريد إرسالها تلقائياً:</h4>
+                      <h4 className="font-semibold mb-3 text-sm">{tr("اختر الإشعارات التي تريد إرسالها تلقائياً:")}</h4>
                       <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
                         <div className="flex items-center justify-between p-3 rounded-lg border bg-card">
                           <div>
                             <Label htmlFor="notify_received" className="font-medium cursor-pointer">
-                              استلام الطلبية
+                              {tr("استلام الطلبية")}
                             </Label>
-                            <p className="text-xs text-muted-foreground">عند استلام الطلبية من العميل</p>
+                            <p className="text-xs text-muted-foreground">{tr("عند استلام الطلبية من العميل")}</p>
                           </div>
                           <Switch
                             id="notify_received"
@@ -1891,9 +2113,9 @@ export default function Customers({ isSupplier }: CustomersProps) {
                         <div className="flex items-center justify-between p-3 rounded-lg border bg-card">
                           <div>
                             <Label htmlFor="notify_preparing" className="font-medium cursor-pointer">
-                              تحضير الطلبية
+                              {tr("تحضير الطلبية")}
                             </Label>
-                            <p className="text-xs text-muted-foreground">عند البدء في تحضير الطلبية</p>
+                            <p className="text-xs text-muted-foreground">{tr("عند البدء في تحضير الطلبية")}</p>
                           </div>
                           <Switch
                             id="notify_preparing"
@@ -1907,9 +2129,9 @@ export default function Customers({ isSupplier }: CustomersProps) {
                         <div className="flex items-center justify-between p-3 rounded-lg border bg-card">
                           <div>
                             <Label htmlFor="notify_quality" className="font-medium cursor-pointer">
-                              التدقيق والمراجعة
+                              {tr("التدقيق والمراجعة")}
                             </Label>
-                            <p className="text-xs text-muted-foreground">عند مراجعة وتدقيق الطلبية</p>
+                            <p className="text-xs text-muted-foreground">{tr("عند مراجعة وتدقيق الطلبية")}</p>
                           </div>
                           <Switch
                             id="notify_quality"
@@ -1923,9 +2145,9 @@ export default function Customers({ isSupplier }: CustomersProps) {
                         <div className="flex items-center justify-between p-3 rounded-lg border bg-card">
                           <div>
                             <Label htmlFor="notify_ready" className="font-medium cursor-pointer">
-                              جاهز للشحن
+                              {tr("جاهز للشحن")}
                             </Label>
-                            <p className="text-xs text-muted-foreground">عند جاهزية الطلبية للشحن</p>
+                            <p className="text-xs text-muted-foreground">{tr("عند جاهزية الطلبية للشحن")}</p>
                           </div>
                           <Switch
                             id="notify_ready"
@@ -1939,9 +2161,9 @@ export default function Customers({ isSupplier }: CustomersProps) {
                         <div className="flex items-center justify-between p-3 rounded-lg border bg-card">
                           <div>
                             <Label htmlFor="notify_shipped" className="font-medium cursor-pointer">
-                              تم الشحن
+                              {tr("تم الشحن")}
                             </Label>
-                            <p className="text-xs text-muted-foreground">عند شحن الطلبية</p>
+                            <p className="text-xs text-muted-foreground">{tr("عند شحن الطلبية")}</p>
                           </div>
                           <Switch
                             id="notify_shipped"
@@ -1955,9 +2177,9 @@ export default function Customers({ isSupplier }: CustomersProps) {
                         <div className="flex items-center justify-between p-3 rounded-lg border bg-card">
                           <div>
                             <Label htmlFor="notify_delivered" className="font-medium cursor-pointer">
-                              تم التسليم
+                              {tr("تم التسليم")}
                             </Label>
-                            <p className="text-xs text-muted-foreground">عند تسليم الطلبية للعميل</p>
+                            <p className="text-xs text-muted-foreground">{tr("عند تسليم الطلبية للعميل")}</p>
                           </div>
                           <Switch
                             id="notify_delivered"
@@ -1971,9 +2193,9 @@ export default function Customers({ isSupplier }: CustomersProps) {
                         <div className="flex items-center justify-between p-3 rounded-lg border bg-card border-red-200">
                           <div>
                             <Label htmlFor="notify_cancelled" className="font-medium cursor-pointer text-red-700">
-                              إلغاء الطلبية
+                              {tr("إلغاء الطلبية")}
                             </Label>
-                            <p className="text-xs text-muted-foreground">عند إلغاء الطلبية</p>
+                            <p className="text-xs text-muted-foreground">{tr("عند إلغاء الطلبية")}</p>
                           </div>
                           <Switch
                             id="notify_cancelled"
@@ -1987,9 +2209,9 @@ export default function Customers({ isSupplier }: CustomersProps) {
                         <div className="flex items-center justify-between p-3 rounded-lg border bg-card">
                           <div>
                             <Label htmlFor="daily_summary" className="font-medium cursor-pointer">
-                              ملخص يومي
+                              {tr("ملخص يومي")}
                             </Label>
-                            <p className="text-xs text-muted-foreground">إرسال ملخص يومي بجميع الطلبيات</p>
+                            <p className="text-xs text-muted-foreground">{tr("إرسال ملخص يومي بجميع الطلبيات")}</p>
                           </div>
                           <Switch
                             id="daily_summary"
@@ -2006,360 +2228,60 @@ export default function Customers({ isSupplier }: CustomersProps) {
                     <div className="flex justify-end pt-4 border-t">
                       <Button
                         onClick={handleSaveNotificationSettings}
-                        disabled={savingNotificationSettings}
+                        disabled={savingNotificationSettings || !canUpdate}
                         className="gap-2"
                       >
                         <Save className="h-4 w-4" />
-                        {savingNotificationSettings ? "جاري الحفظ..." : "حفظ إعدادات الإشعارات"}
+                        {savingNotificationSettings ? tr("جاري الحفظ...") : tr("حفظ إعدادات الإشعارات")}
                       </Button>
                     </div>
                   </>
                 ) : (
-                  <div className="text-center py-4 text-muted-foreground">لا توجد إعدادات</div>
+                  <div className="text-center py-4 text-muted-foreground">{tr("لا توجد إعدادات")}</div>
                 )}
               </CardContent>
             </Card>
 
-            {/* Header with Add User Button */}
-            <div className="flex items-center justify-between">
-              <div>
-                <h3 className="text-lg font-semibold">حسابات الدخول</h3>
-                <p className="text-sm text-muted-foreground">إدارة المستخدمين والصلاحيات</p>
-              </div>
-              <Button onClick={() => setShowAddUserDialog(true)} className="gap-2">
-                <UserPlus className="h-4 w-4" />
-                إضافة مستخدم
-              </Button>
-            </div>
-
-            {/* Users Table */}
-            {loadingPortalUsers ? (
-              <div className="text-center py-8 text-muted-foreground">جاري التحميل...</div>
-            ) : portalUsers.length === 0 ? (
-              <Card className="bg-blue-50 border-blue-200">
-                <CardContent className="p-6 text-center">
-                  <Globe className="h-12 w-12 text-blue-400 mx-auto mb-3" />
-                  <h3 className="font-semibold text-blue-900 mb-2">لا يوجد مستخدمون</h3>
-                  <p className="text-blue-700 text-sm mb-4">قم بإضافة أول مستخدم للعميل للوصول إلى البوابة</p>
-                  <Button onClick={() => setShowAddUserDialog(true)} className="gap-2">
-                    <UserPlus className="h-4 w-4" />
-                    إضافة أول مستخدم
-                  </Button>
-                </CardContent>
-              </Card>
-            ) : (
-              <div className="rounded-md border">
-                <Table>
-                  <TableHeader>
-                    <TableRow>
-                      <TableHead className="text-right">اسم المستخدم</TableHead>
-                      <TableHead className="text-right">البريد الإلكتروني</TableHead>
-                      <TableHead className="text-right">آخر تسجيل دخول</TableHead>
-                      <TableHead className="text-right">الحالة</TableHead>
-                      <TableHead className="text-right">الصلاحيات</TableHead>
-                      <TableHead className="text-right">الإجراءات</TableHead>
-                    </TableRow>
-                  </TableHeader>
-                  <TableBody>
-                    {portalUsers.map((user) => (
-                      <TableRow key={user.id}>
-                        <TableCell className="font-medium">{user.username}</TableCell>
-                        <TableCell className="text-sm">{user.email || "-"}</TableCell>
-                        <TableCell className="text-xs text-muted-foreground">{formatDate(user.last_login)}</TableCell>
-                        <TableCell>
-                          <Badge variant={user.is_active ? "default" : "secondary"}>
-                            {user.is_active ? "مفعل" : "معطل"}
-                          </Badge>
-                        </TableCell>
-                        <TableCell>
-                          <div className="flex flex-wrap gap-1">
-                            {user.can_view_orders && (
-                              <Badge variant="outline" className="text-xs">
-                                طلبيات
-                              </Badge>
-                            )}
-                            {user.can_create_orders && (
-                              <Badge variant="outline" className="text-xs">
-                                إنشاء
-                              </Badge>
-                            )}
-                            {user.can_view_balance && (
-                              <Badge variant="outline" className="text-xs">
-                                رصيد
-                              </Badge>
-                            )}
-                            {user.can_view_products && (
-                              <Badge variant="outline" className="text-xs">
-                                أصناف
-                              </Badge>
-                            )}
-                            {user.can_view_prices && (
-                              <Badge variant="outline" className="text-xs">
-                                أسعار
-                              </Badge>
-                            )}
-                            {user.can_view_stock && (
-                              <Badge variant="outline" className="text-xs">
-                                مخزون
-                              </Badge>
-                            )}
-                          </div>
-                        </TableCell>
-                        <TableCell>
-                          <div className="flex gap-1">
-                            <Button
-                              variant="ghost"
-                              size="icon"
-                              onClick={() => openEditPermissionsDialog(user)}
-                              title="تعديل الصلاحيات"
-                            >
-                              <Shield className="h-4 w-4" />
-                            </Button>
-                            <Button
-                              variant="ghost"
-                              size="icon"
-                              onClick={() => handleResetPassword(user.id)}
-                              title="تغيير كلمة المرور"
-                            >
-                              <Key className="h-4 w-4" />
-                            </Button>
-                            <Button
-                              variant="ghost"
-                              size="icon"
-                              onClick={() => handleToggleUserStatus(user.id)}
-                              title={user.is_active ? "تعطيل" : "تفعيل"}
-                            >
-                              {user.is_active ? (
-                                <X className="h-4 w-4 text-red-600" />
-                              ) : (
-                                <CheckCircle className="h-4 w-4 text-green-600" />
-                              )}
-                            </Button>
-                          </div>
-                        </TableCell>
-                      </TableRow>
-                    ))}
-                  </TableBody>
-                </Table>
-              </div>
-            )}
-
-            {/* Info Card */}
-            <Card className="bg-blue-50 border-blue-200">
-              <CardContent className="p-4">
-                <h4 className="font-semibold text-blue-900 mb-2">معلومات مهمة</h4>
-                <ul className="text-blue-800 text-sm space-y-1">
-                  <li>• يمكن للعميل تسجيل الدخول من خلال صفحة بوابة العملاء</li>
-                  <li>• كل مستخدم له صلاحيات مستقلة يمكن تخصيصها</li>
-                  <li>• يتم تسجيل جميع عمليات الدخول لأغراض الأمان</li>
-                  <li>• يمكن تعطيل المستخدم مؤقتاً دون حذف حسابه</li>
-                </ul>
+            <Card className="border-2 border-emerald-200">
+              <CardHeader className="pb-3">
+                <CardTitle className="flex items-center gap-2 text-lg">
+                  <Globe className="h-5 w-5 text-emerald-600" />
+                  {tr("رابط بوابة العميل")}
+                </CardTitle>
+                <p className="text-sm text-muted-foreground">
+                  {tr("رابط خاص يفتح فيه العميل كشف حسابه ويرسل إشعار التحويل عند السداد — بدون اسم مستخدم أو كلمة مرور. إنشاء رابط جديد يُلغي الرابط السابق. الدفعات تُراجع من شاشة \"بوابة العملاء\".")}
+                </p>
+              </CardHeader>
+              <CardContent className="space-y-3">
+                <Button onClick={() => void createPortalLink()} disabled={creatingPortalLink || !canUpdate} className="gap-2">
+                  <Globe className="h-4 w-4" />
+                  {creatingPortalLink ? tr("جاري الإنشاء...") : tr("إنشاء رابط جديد")}
+                </Button>
+                {portalLink && (
+                  <div className="space-y-2 rounded-lg border border-emerald-200 bg-emerald-50 p-3 text-sm">
+                    <p className="font-semibold text-emerald-800">{tr("تم إنشاء الرابط ونسخه:")}</p>
+                    <Input readOnly dir="ltr" value={portalLink} onFocus={(event) => event.currentTarget.select()} className="font-mono text-xs" />
+                    <div className="flex flex-wrap gap-2">
+                      <Button size="sm" variant="outline" onClick={() => void navigator.clipboard.writeText(portalLink)}>{tr("نسخ")}</Button>
+                      <Button size="sm" variant="outline" asChild>
+                        <a href={`https://wa.me/${String(selectedCustomerForPortal?.whatsapp1 || selectedCustomerForPortal?.mobile1 || "").replace(/\D/g, "")}?text=${encodeURIComponent(`مرحباً ${selectedCustomerForPortal?.name || ""}،\nهذا رابط كشف حسابك لدينا، ويمكنك من خلاله إرسال إشعار التحويل عند السداد:\n${portalLink}`)}`} target="_blank" rel="noreferrer">{tr("واتساب")}</a>
+                      </Button>
+                      <Button size="sm" variant="outline" asChild>
+                        <a href={portalLink} target="_blank" rel="noreferrer">{tr("فتح")}</a>
+                      </Button>
+                    </div>
+                  </div>
+                )}
               </CardContent>
             </Card>
           </div>
         </DialogContent>
       </Dialog>
 
-      <Dialog open={showAddUserDialog} onOpenChange={setShowAddUserDialog}>
-        <DialogContent className="max-w-2xl" dir="rtl">
-          <DialogHeader>
-            <DialogTitle className="flex items-center gap-2">
-              <UserPlus className="h-5 w-5" />
-              إضافة مستخدم جديد
-            </DialogTitle>
-          </DialogHeader>
-
-          <div className="space-y-6 p-4">
-            {/* User Info */}
-            <div className="space-y-4">
-              <div>
-                <Label htmlFor="new_username">اسم المستخدم *</Label>
-                <Input
-                  id="new_username"
-                  value={newUserData.username}
-                  onChange={(e) => setNewUserData({ ...newUserData, username: e.target.value })}
-                  placeholder="أدخل اسم المستخدم"
-                  className="text-right"
-                />
-              </div>
-
-              <div>
-                <Label htmlFor="new_password">كلمة المرور *</Label>
-                <Input
-                  id="new_password"
-                  type="password"
-                  value={newUserData.password}
-                  onChange={(e) => setNewUserData({ ...newUserData, password: e.target.value })}
-                  placeholder="أدخل كلمة المرور"
-                  className="text-right"
-                />
-              </div>
-
-              <div>
-                <Label htmlFor="new_email">البريد الإلكتروني</Label>
-                <Input
-                  id="new_email"
-                  type="email"
-                  value={newUserData.email}
-                  onChange={(e) => setNewUserData({ ...newUserData, email: e.target.value })}
-                  placeholder="أدخل البريد الإلكتروني (اختياري)"
-                  className="text-right"
-                />
-              </div>
-            </div>
-
-            {/* Permissions */}
-            <div className="space-y-4">
-              <h3 className="font-semibold">الصلاحيات</h3>
-
-              <div className="space-y-3">
-                <div className="flex items-center justify-between">
-                  <Label htmlFor="perm_view_orders">عرض الطلبيات</Label>
-                  <Switch
-                    id="perm_view_orders"
-                    checked={userPermissions.can_view_orders}
-                    onCheckedChange={(checked) => setUserPermissions({ ...userPermissions, can_view_orders: checked })}
-                  />
-                </div>
-
-                <div className="flex items-center justify-between">
-                  <Label htmlFor="perm_create_orders">إنشاء طلبيات</Label>
-                  <Switch
-                    id="perm_create_orders"
-                    checked={userPermissions.can_create_orders}
-                    onCheckedChange={(checked) =>
-                      setUserPermissions({ ...userPermissions, can_create_orders: checked })
-                    }
-                  />
-                </div>
-
-                <div className="flex items-center justify-between">
-                  <Label htmlFor="perm_view_balance">عرض الرصيد</Label>
-                  <Switch
-                    id="perm_view_balance"
-                    checked={userPermissions.can_view_balance}
-                    onCheckedChange={(checked) => setUserPermissions({ ...userPermissions, can_view_balance: checked })}
-                  />
-                </div>
-
-                <div className="flex items-center justify-between">
-                  <Label htmlFor="perm_view_products">عرض الأصناف</Label>
-                  <Switch
-                    id="perm_view_products"
-                    checked={userPermissions.can_view_products}
-                    onCheckedChange={(checked) =>
-                      setUserPermissions({ ...userPermissions, can_view_products: checked })
-                    }
-                  />
-                </div>
-
-                <div className="flex items-center justify-between">
-                  <Label htmlFor="perm_view_prices">عرض الأسعار</Label>
-                  <Switch
-                    id="perm_view_prices"
-                    checked={userPermissions.can_view_prices}
-                    onCheckedChange={(checked) => setUserPermissions({ ...userPermissions, can_view_prices: checked })}
-                  />
-                </div>
-
-                <div className="flex items-center justify-between">
-                  <Label htmlFor="perm_view_stock">عرض المخزون</Label>
-                  <Switch
-                    id="perm_view_stock"
-                    checked={userPermissions.can_view_stock}
-                    onCheckedChange={(checked) => setUserPermissions({ ...userPermissions, can_view_stock: checked })}
-                  />
-                </div>
-              </div>
-            </div>
-
-            <div className="flex gap-3 justify-end pt-4 border-t">
-              <Button variant="outline" onClick={() => setShowAddUserDialog(false)}>
-                إلغاء
-              </Button>
-              <Button onClick={handleAddPortalUser}>إضافة المستخدم</Button>
-            </div>
-          </div>
-        </DialogContent>
-      </Dialog>
-
-      <Dialog open={showEditPermissionsDialog} onOpenChange={setShowEditPermissionsDialog}>
-        <DialogContent className="max-w-md" dir="rtl">
-          <DialogHeader>
-            <DialogTitle className="flex items-center gap-2">
-              <Shield className="h-5 w-5" />
-              تعديل الصلاحيات - {selectedUser?.username}
-            </DialogTitle>
-          </DialogHeader>
-
-          <div className="space-y-4 p-4">
-            <div className="flex items-center justify-between">
-              <Label htmlFor="edit_view_orders">عرض الطلبيات</Label>
-              <Switch
-                id="edit_view_orders"
-                checked={userPermissions.can_view_orders}
-                onCheckedChange={(checked) => setUserPermissions({ ...userPermissions, can_view_orders: checked })}
-              />
-            </div>
-
-            <div className="flex items-center justify-between">
-              <Label htmlFor="edit_create_orders">إنشاء طلبيات</Label>
-              <Switch
-                id="edit_create_orders"
-                checked={userPermissions.can_create_orders}
-                onCheckedChange={(checked) => setUserPermissions({ ...userPermissions, can_create_orders: checked })}
-              />
-            </div>
-
-            <div className="flex items-center justify-between">
-              <Label htmlFor="edit_view_balance">عرض الرصيد</Label>
-              <Switch
-                id="edit_view_balance"
-                checked={userPermissions.can_view_balance}
-                onCheckedChange={(checked) => setUserPermissions({ ...userPermissions, can_view_balance: checked })}
-              />
-            </div>
-
-            <div className="flex items-center justify-between">
-              <Label htmlFor="edit_view_products">عرض الأصناف</Label>
-              <Switch
-                id="edit_view_products"
-                checked={userPermissions.can_view_products}
-                onCheckedChange={(checked) => setUserPermissions({ ...userPermissions, can_view_products: checked })}
-              />
-            </div>
-
-            <div className="flex items-center justify-between">
-              <Label htmlFor="edit_view_prices">عرض الأسعار</Label>
-              <Switch
-                id="edit_view_prices"
-                checked={userPermissions.can_view_prices}
-                onCheckedChange={(checked) => setUserPermissions({ ...userPermissions, can_view_prices: checked })}
-              />
-            </div>
-
-            <div className="flex items-center justify-between">
-              <Label htmlFor="edit_view_stock">عرض المخزون</Label>
-              <Switch
-                id="edit_view_stock"
-                checked={userPermissions.can_view_stock}
-                onCheckedChange={(checked) => setUserPermissions({ ...userPermissions, can_view_stock: checked })}
-              />
-            </div>
-
-            <div className="flex gap-3 justify-end pt-4 border-t">
-              <Button variant="outline" onClick={() => setShowEditPermissionsDialog(false)}>
-                إلغاء
-              </Button>
-              <Button onClick={handleUpdatePermissions}>حفظ التغييرات</Button>
-            </div>
-          </div>
-        </DialogContent>
-      </Dialog>
 
       <ExcelImport
-        entityType={isSupplier ? "suppliers" : "customers"}
-        isOpen={showImportDialog}
+        entityType={isSupplier ? "suppliers" : isSubscriber ? "subscribers" : "customers"}
+        isOpen={showImportDialog && canCreate}
         onClose={() => setShowImportDialog(false)}
         onImportComplete={() => {
           fetchCustomers()

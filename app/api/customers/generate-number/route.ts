@@ -1,47 +1,7 @@
+import { authorizeCustomerType } from "@/app/api/customers/_permissions"
 import { type NextRequest, NextResponse } from "next/server"
 import { generateCustomerNumber } from "@/lib/number-generator";
-import { neon } from "@neondatabase/serverless"
-
-import { Pool } from "pg"
-
-let sql: any = null
-
-try {
-  if (!process.env.DATABASE_URL) {
-    console.error("[v0] DATABASE_URL environment variable is not set")
-  } else {
-    const dbUrl = process.env.DATABASE_URL
-
-    if (dbUrl.includes("localhost") || dbUrl.includes("127.0.0.1")) {
-      const pool = new Pool({ connectionString: dbUrl })
-      sql = async (strings: TemplateStringsArray, ...values: any[]) => {
-        const client = await pool.connect()
-        try {
-          const query =
-            strings.reduce(
-              (prev, curr, i) =>
-                prev + curr + (i < values.length ? `$${i + 1}` : ""),
-              ""
-            )
-          const result = await client.query(query, values)
-          return result.rows
-        } finally {
-          client.release()
-        }
-      }
-    } else {
-      console.log("[v0] Using Neon serverless client")
-      sql = neon(dbUrl)
-    }
-
-    console.log("[v0] Database client initialized successfully")
-  }
-} catch (error) {
-  console.error("[v0] Failed to initialize DB client:", error)
-  sql = null
-}
-
-export default sql
+import sql from "@/lib/database"
 
 
 export async function GET(req: NextRequest) {
@@ -56,11 +16,13 @@ export async function GET(req: NextRequest) {
       );
     }
 
-    // Read isSupplier from query params (default: false)
     const isSupplier = req.nextUrl.searchParams.get("isSupplier") === "true";
+    const isSalesman = req.nextUrl.searchParams.get("isSalesman") === "true";
+    const isSubscriber = req.nextUrl.searchParams.get("isSubscriber") === "true";
+    const permission = await authorizeCustomerType(req, isSupplier ? 2 : isSalesman ? 3 : isSubscriber ? 4 : 1, "create")
+    if (!permission.ok) return permission.response
 
-
-    const customerNumber = await generateCustomerNumber(isSupplier);
+    const customerNumber = await generateCustomerNumber(isSupplier, isSalesman, isSubscriber);
     console.log("[v0] API: Generated number:", customerNumber);
 
     return NextResponse.json({ customerNumber });

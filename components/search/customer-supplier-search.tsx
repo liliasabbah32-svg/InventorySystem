@@ -1,5 +1,7 @@
 "use client"
 
+import { normalizeArabicSearch } from "@/lib/arabic-search"
+import { tr } from "@/lib/i18n"
 import { useState, useEffect, useMemo } from "react"
 import { Search, Filter, X, Users, MapPin, Phone, Mail, User } from "lucide-react"
 import { Button } from "@/components/ui/button"
@@ -112,7 +114,7 @@ function CustomerSupplierSearch({
     let filtered = customers
 
     if (debouncedSearchTerm) {
-      const searchLower = debouncedSearchTerm.toLowerCase()
+      const searchLower = normalizeArabicSearch(debouncedSearchTerm)
       filtered = filtered.filter((customer) => {
         const searchableFields = [
           customer.customer_name,
@@ -128,8 +130,8 @@ function CustomerSupplierSearch({
           .toLowerCase()
 
         return (
-          searchableFields.includes(searchLower) ||
-          searchLower.split(" ").some((word) => word.length > 1 && searchableFields.includes(word))
+          normalizeArabicSearch(searchableFields).includes(searchLower) ||
+          searchLower.split(" ").some((word) => word.length > 1 && normalizeArabicSearch(searchableFields).includes(word))
         )
       })
     }
@@ -156,7 +158,7 @@ function CustomerSupplierSearch({
     let filtered = suppliers
 
     if (debouncedSearchTerm) {
-      const searchLower = debouncedSearchTerm.toLowerCase()
+      const searchLower = normalizeArabicSearch(debouncedSearchTerm)
       filtered = filtered.filter((supplier) => {
         const searchableFields = [
           supplier.supplier_name,
@@ -172,8 +174,8 @@ function CustomerSupplierSearch({
           .toLowerCase()
 
         return (
-          searchableFields.includes(searchLower) ||
-          searchLower.split(" ").some((word) => word.length > 1 && searchableFields.includes(word))
+          normalizeArabicSearch(searchableFields).includes(searchLower) ||
+          searchLower.split(" ").some((word) => word.length > 1 && normalizeArabicSearch(searchableFields).includes(word))
         )
       })
     }
@@ -252,27 +254,27 @@ function CustomerSupplierSearch({
           <div className="grid grid-cols-2 gap-4 text-sm">
             <div className="flex items-center gap-2">
               <User className="h-3 w-3 text-muted-foreground" />
-              <span className="search-result-subtitle">رقم الزبون: {customer.customer_code}</span>
+              <span className="search-result-subtitle">{tr("رقم العميل: ")}{customer.customer_code}</span>
             </div>
 
             {customer.city && (
               <div className="flex items-center gap-2">
                 <MapPin className="h-3 w-3 text-muted-foreground" />
-                <span className="search-result-subtitle">المدينة: {customer.city}</span>
+                <span className="search-result-subtitle">{tr("المدينة: ")}{customer.city}</span>
               </div>
             )}
 
             {customer.mobile1 && (
               <div className="flex items-center gap-2">
                 <Phone className="h-3 w-3 text-muted-foreground" />
-                <span className="search-result-subtitle">الجوال: {customer.mobile1}</span>
+                <span className="search-result-subtitle">{tr("الجوال: ")}{customer.mobile1}</span>
               </div>
             )}
 
             {customer.email && (
               <div className="flex items-center gap-2">
                 <Mail className="h-3 w-3 text-muted-foreground" />
-                <span className="search-result-subtitle">البريد: {customer.email}</span>
+                <span className="search-result-subtitle">{tr("البريد: ")}{customer.email}</span>
               </div>
             )}
           </div>
@@ -302,27 +304,27 @@ function CustomerSupplierSearch({
           <div className="grid grid-cols-2 gap-4 text-sm">
             <div className="flex items-center gap-2">
               <User className="h-3 w-3 text-muted-foreground" />
-              <span className="search-result-subtitle">رقم المورد: {supplier.supplier_code}</span>
+              <span className="search-result-subtitle">{tr("رقم المورد: ")}{supplier.supplier_code}</span>
             </div>
 
             {supplier.city && (
               <div className="flex items-center gap-2">
                 <MapPin className="h-3 w-3 text-muted-foreground" />
-                <span className="search-result-subtitle">المدينة: {supplier.city}</span>
+                <span className="search-result-subtitle">{tr("المدينة: ")}{supplier.city}</span>
               </div>
             )}
 
             {supplier.mobile1 && (
               <div className="flex items-center gap-2">
                 <Phone className="h-3 w-3 text-muted-foreground" />
-                <span className="search-result-subtitle">الجوال: {supplier.mobile1}</span>
+                <span className="search-result-subtitle">{tr("الجوال: ")}{supplier.mobile1}</span>
               </div>
             )}
 
             {supplier.email && (
               <div className="flex items-center gap-2">
                 <Mail className="h-3 w-3 text-muted-foreground" />
-                <span className="search-result-subtitle">البريد: {supplier.email}</span>
+                <span className="search-result-subtitle">{tr("البريد: ")}{supplier.email}</span>
               </div>
             )}
           </div>
@@ -343,7 +345,7 @@ function CustomerSupplierSearch({
       <div className="search-header">
         <div className="flex items-center gap-2">
           <Users className="h-5 w-5 text-primary" />
-          <h2 className="search-title">البحث عن الزبائن والموردين</h2>
+          <h2 className="search-title">{tr("البحث عن العملاء والموردين")}</h2>
         </div>
         <div className="flex items-center gap-2">
           <Button
@@ -353,7 +355,7 @@ function CustomerSupplierSearch({
             className="flex items-center gap-2"
           >
             <Filter className="h-4 w-4" />
-            فلاتر
+            {tr("فلاتر")}
           </Button>
           {isModal && onClose && (
             <Button variant="ghost" size="sm" onClick={onClose}>
@@ -365,13 +367,13 @@ function CustomerSupplierSearch({
 
       {/* Search Input */}
       <div className="relative">
-        <Search className="absolute right-3 top-1/2 transform -translate-y-1/2 h-4 w-4 text-muted-foreground" />
+        <Search className="absolute start-3 top-1/2 transform -translate-y-1/2 h-4 w-4 text-muted-foreground" />
         <Input
           type="text"
-          placeholder="ابحث بالاسم، الرقم، المدينة، أو العنوان..."
+          placeholder={tr("ابحث بالاسم، الرقم، المدينة، أو العنوان...")}
           value={searchTerm}
           onChange={(e) => setSearchTerm(e.target.value)}
-          className="search-input pr-10"
+          className="search-input ps-10"
         />
       </div>
 
@@ -379,39 +381,39 @@ function CustomerSupplierSearch({
       {showFilters && (
         <Card>
           <CardHeader>
-            <CardTitle className="text-sm">فلاتر البحث المتقدم</CardTitle>
+            <CardTitle className="text-sm">{tr("فلاتر البحث المتقدم")}</CardTitle>
           </CardHeader>
           <CardContent>
             <div className="search-filters">
               <div className="space-y-2">
-                <Label>التصنيف</Label>
+                <Label>{tr("التصنيف")}</Label>
                 <Select
                   value={filters.classification}
                   onValueChange={(value) => setFilters((prev) => ({ ...prev, classification: value }))}
                 >
                   <SelectTrigger>
-                    <SelectValue placeholder="اختر التصنيف" />
+                    <SelectValue placeholder={tr("اختر التصنيف")} />
                   </SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="all">جميع التصنيفات</SelectItem>
-                    <SelectItem value="vip">عميل مميز</SelectItem>
-                    <SelectItem value="regular">عميل عادي</SelectItem>
-                    <SelectItem value="wholesale">جملة</SelectItem>
+                    <SelectItem value="all">{tr("جميع التصنيفات")}</SelectItem>
+                    <SelectItem value="vip">{tr("عميل مميز")}</SelectItem>
+                    <SelectItem value="regular">{tr("عميل عادي")}</SelectItem>
+                    <SelectItem value="wholesale">{tr("جملة")}</SelectItem>
                   </SelectContent>
                 </Select>
               </div>
 
               <div className="space-y-2">
-                <Label>المندوب</Label>
+                <Label>{tr("المندوب")}</Label>
                 <Select
                   value={filters.representative}
                   onValueChange={(value) => setFilters((prev) => ({ ...prev, representative: value }))}
                 >
                   <SelectTrigger>
-                    <SelectValue placeholder="اختر المندوب" />
+                    <SelectValue placeholder={tr("اختر المندوب")} />
                   </SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="all">جميع المندوبين</SelectItem>
+                    <SelectItem value="all">{tr("جميع المندوبين")}</SelectItem>
                     {representatives.map((rep) => (
                       <SelectItem key={rep} value={rep}>
                         {rep}
@@ -422,16 +424,16 @@ function CustomerSupplierSearch({
               </div>
 
               <div className="space-y-2">
-                <Label>المدينة</Label>
+                <Label>{tr("المدينة")}</Label>
                 <Select
                   value={filters.city}
                   onValueChange={(value) => setFilters((prev) => ({ ...prev, city: value }))}
                 >
                   <SelectTrigger>
-                    <SelectValue placeholder="اختر المدينة" />
+                    <SelectValue placeholder={tr("اختر المدينة")} />
                   </SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="all">جميع المدن</SelectItem>
+                    <SelectItem value="all">{tr("جميع المدن")}</SelectItem>
                     {cities.map((city) => (
                       <SelectItem key={city} value={city}>
                         {city}
@@ -442,16 +444,16 @@ function CustomerSupplierSearch({
               </div>
 
               <div className="space-y-2">
-                <Label>الحالة</Label>
+                <Label>{tr("الحالة")}</Label>
                 <Select
                   value={filters.status}
                   onValueChange={(value) => setFilters((prev) => ({ ...prev, status: value }))}
                 >
                   <SelectTrigger>
-                    <SelectValue placeholder="اختر الحالة" />
+                    <SelectValue placeholder={tr("اختر الحالة")} />
                   </SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="all">جميع الحالات</SelectItem>
+                    <SelectItem value="all">{tr("جميع الحالات")}</SelectItem>
                     {statuses.map((status) => (
                       <SelectItem key={status} value={status}>
                         {status}
@@ -463,7 +465,7 @@ function CustomerSupplierSearch({
             </div>
             <div className="mt-4">
               <Button variant="outline" onClick={clearFilters} className="w-full bg-transparent">
-                مسح الفلاتر
+                {tr("مسح الفلاتر")}
               </Button>
             </div>
           </CardContent>
@@ -473,14 +475,14 @@ function CustomerSupplierSearch({
       {/* Tabs for Customers and Suppliers */}
       <Tabs value={activeTab} onValueChange={setActiveTab} className="w-full">
         <TabsList className="grid w-full grid-cols-2">
-          <TabsTrigger value="customers">الزبائن</TabsTrigger>
-          <TabsTrigger value="suppliers">الموردين</TabsTrigger>
+          <TabsTrigger value="customers">{tr("العملاء")}</TabsTrigger>
+          <TabsTrigger value="suppliers">{tr("الموردين")}</TabsTrigger>
         </TabsList>
 
         <TabsContent value="customers" className="space-y-4">
           <div className="flex items-center justify-between">
             <p className="text-sm text-muted-foreground">
-              {loading ? "جاري البحث..." : `تم العثور على ${filteredCustomers.length} زبون`}
+              {loading ? tr("جاري البحث...") : tr("تم العثور على {0} عميل", filteredCustomers.length)}
             </p>
             {debouncedSearchTerm && (
               <Badge variant="secondary" className="flex items-center gap-1">
@@ -498,7 +500,7 @@ function CustomerSupplierSearch({
             ) : filteredCustomers.length === 0 ? (
               <div className="text-center py-8 text-muted-foreground">
                 <Users className="h-12 w-12 mx-auto mb-4 opacity-50" />
-                <p>لم يتم العثور على زبائن مطابقين</p>
+                <p>{tr("لم يتم العثور على العملاء مطابقين")}</p>
               </div>
             ) : (
               filteredCustomers.map(renderCustomerCard)
@@ -509,7 +511,7 @@ function CustomerSupplierSearch({
         <TabsContent value="suppliers" className="space-y-4">
           <div className="flex items-center justify-between">
             <p className="text-sm text-muted-foreground">
-              {loading ? "جاري البحث..." : `تم العثور على ${filteredSuppliers.length} مورد`}
+              {loading ? tr("جاري البحث...") : tr("تم العثور على {0} مورد", filteredSuppliers.length)}
             </p>
             {debouncedSearchTerm && (
               <Badge variant="secondary" className="flex items-center gap-1">
@@ -527,7 +529,7 @@ function CustomerSupplierSearch({
             ) : filteredSuppliers.length === 0 ? (
               <div className="text-center py-8 text-muted-foreground">
                 <Users className="h-12 w-12 mx-auto mb-4 opacity-50" />
-                <p>لم يتم العثور على موردين مطابقين</p>
+                <p>{tr("لم يتم العثور على موردين مطابقين")}</p>
               </div>
             ) : (
               filteredSuppliers.map(renderSupplierCard)
@@ -553,3 +555,6 @@ function CustomerSupplierSearch({
 
 export { CustomerSupplierSearch }
 export default CustomerSupplierSearch
+
+
+

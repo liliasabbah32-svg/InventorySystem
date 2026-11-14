@@ -30,16 +30,8 @@ export default class MultiSelect extends React.Component {
     this.state = {
       floatLabel: false,
       isAllSelected: false,
-      filteredItems: this.props.options,
-      appendToContainer: null
+      filteredItems: this.props.options
     };
-  }
-
-  componentDidMount() {
-    const container = this.wrapperRef.current;
-    if (container && !this.props.appendTo) {
-      this.setState({ appendToContainer: container });
-    }
   }
   truncatedLabel = (option) => {
 
@@ -63,10 +55,34 @@ export default class MultiSelect extends React.Component {
   }
 
   render() {
-    const panelClassName = `${styles.panelClassRight} ${this.props.panelClassName ?? 'invoice-currency-dropdown-panel'}`.trim();
+    const panelClassName = `${styles.panelClassRight} ${this.props.panelClassName ?? ''}`.trim();
+    const options = Array.isArray(this.props.options) ? this.props.options : [];
+    const selectedValues = Array.isArray(this.props.value) ? this.props.value : [];
+    const optionValue = (option) => this.props.optionValue && option !== null && typeof option === 'object' ? option[this.props.optionValue] : option;
+    const valuesEqual = (left, right) => String(optionValue(left)) === String(optionValue(right));
+    const allSelected = options.length > 0 && options.every((option) => selectedValues.some((value) => valuesEqual(value, option)));
+    // PrimeReact reports `checked` as the current state, while consumers expect the
+    // state after clicking. Normalize it here and include the complete next value.
+    const selectAllHandler = this.props.onSelectAll
+      ? (event) => this.props.onSelectAll({
+          ...event,
+          checked: !event.checked,
+          value: event.checked ? [] : options.map(optionValue),
+        })
+      : this.props.handleSelectAll
+        ? this.props.handleSelectAll
+        : this.props.parent
+          ? this.handleSelectAll
+          : undefined;
+    // Avoid forwarding internal-only props to underlying DOM elements
+    const passProps = { ...this.props };
+    if (Object.prototype.hasOwnProperty.call(passProps, 'showFilter')) delete passProps.showFilter;
+    if (Object.prototype.hasOwnProperty.call(passProps, 'showCheck')) delete passProps.showCheck;
+    if (Object.prototype.hasOwnProperty.call(passProps, 'showMultiSelect')) delete passProps.showMultiSelect;
+    if (Object.prototype.hasOwnProperty.call(passProps, 'virtualScroll')) delete passProps.virtualScroll;
     // const SELECTALLMAXLIMIT = 5000;
     let divlabelStyle = {};
-    if (this.props.isReportFilter) divlabelStyle = { display: 'flex', width: '100%', overflow: 'hidden' };
+    if (this.props.isReportFilter) divlabelStyle = { display: 'flex', flexDirection: 'column', width: '100%', overflow: 'hidden' };
     let labelStyle = { width: !this.props.ignoreWidth ? 'auto' : '', minWidth: this.props.minLabelWidth ? this.props.minLabelWidth : '100px' };
     if (this.props.isReportFilter)
       labelStyle = {
@@ -76,7 +92,7 @@ export default class MultiSelect extends React.Component {
 
     const wrapperStyle = { ...divlabelStyle, position: 'relative' }
     return (
-      <div style={wrapperStyle} ref={this.wrapperRef}>
+      <div style={wrapperStyle} className={styles.multiselectRoot} ref={this.wrapperRef}>
         {this.props.caption && (
           <Label
             htmlFor={this.props.htmlFor}
@@ -103,17 +119,26 @@ export default class MultiSelect extends React.Component {
               }}
               ref={this.props.innerRef}
               virtualScroll={true}
-              virtualScrollerOptions={{ itemSize: 35 }}
+              virtualScrollerOptions={{ itemSize: 55 }}
               title={this.props.tooltip}
-              className={`${styles.multiselect} invoice-currency-dropdown w-full ${this.props.className || this.props.innerClass || ''}`.trim()}
-              {...this.props}
-              appendTo={this.props.appendTo ?? this.state.appendToContainer}
+              {...passProps}
+              // Keep the component's local style after the prop spread so a caller's className
+              // augments the control instead of replacing the shared multiselect appearance.
+              className={`${styles.multiselect} w-full ${this.props.className || this.props.innerClass || ''}`.trim()}
+              appendTo={this.props.appendTo ?? 'self'}
+              filter={this.props.showFilter ?? this.props.filter}
+              showSelectAll={this.props.showCheck ?? this.props.showSelectAll}
+              selectAll={allSelected}
               // showSelectAll={this.props.options&&this.props.options.length>SELECTALLMAXLIMIT && !this.props.showSelectAllAlways ?false:true}
               tooltipOptions={{ position: 'bottom', style: { direction: 'rtl' } }}
               panelClassName={panelClassName}
-              itemTemplate={this.itemsTemplate}
+              itemTemplate={this.props.itemTemplate ?? this.itemsTemplate}
+              panelHeaderTemplate={this.props.panelHeaderTemplate ?? this.panelHeaderTemplate}
+              filterPlaceholder={this.props.filterPlaceholder ?? 'ابحث في الخيارات...'}
+              emptyMessage={this.props.emptyMessage ?? 'لا توجد خيارات متاحة'}
+              emptyFilterMessage={this.props.emptyFilterMessage ?? 'لا توجد نتائج مطابقة'}
               resetFilterOnHide={true}
-              onSelectAll={this.props.handleSelectAll ? this.props.handleSelectAll : this.props.parent ? this.handleSelectAll : undefined}
+              onSelectAll={selectAllHandler}
               //options={this.state.filteredItems ?? this.props.options}
               //onFilter={this.onFilter}
 
@@ -153,21 +178,26 @@ export default class MultiSelect extends React.Component {
               this.checkAllIsSelected();
             }}
             ref={this.props.innerRef}
-            virtualScroll={true}
-            virtualScrollerOptions={{ itemSize: 35 }}
+            virtualScrollerOptions={{ itemSize: 55 }}
             title={this.props.tooltip}
-            className={`${styles.multiselect} invoice-currency-dropdown w-full ${this.props.className || this.props.innerClass || ''}`.trim()}
-            {...this.props}
-            appendTo={this.props.appendTo ?? this.state.appendToContainer}
+            {...passProps}
+            // See the withgroup branch above; local styles must survive the prop spread.
+            className={`${styles.multiselect} w-full ${this.props.className || this.props.innerClass || ''}`.trim()}
+            appendTo={this.props.appendTo ?? 'self'}
             filter={this.props.showFilter ?? this.props.filter}
             showSelectAll={this.props.showCheck ?? this.props.showSelectAll}
+            selectAll={allSelected}
             display={this.props.showMultiSelect ? 'chip' : this.props.display}
             tooltipOptions={{ position: 'bottom', style: { direction: 'rtl' } }}
             panelClassName={panelClassName}
-            itemTemplate={this.itemsTemplate}
-            selectedItemsLabel={this.props.value ? '$.strings.items.selectedItemsLabel' + ' ' + this.props.value.length : ''}
+            itemTemplate={this.props.itemTemplate ?? this.itemsTemplate}
+            panelHeaderTemplate={this.props.panelHeaderTemplate ?? this.panelHeaderTemplate}
+            filterPlaceholder={this.props.filterPlaceholder ?? 'ابحث في الخيارات...'}
+            emptyMessage={this.props.emptyMessage ?? 'لا توجد خيارات متاحة'}
+            emptyFilterMessage={this.props.emptyFilterMessage ?? 'لا توجد نتائج مطابقة'}
+            selectedItemsLabel={this.props.selectedItemsLabel ?? (this.props.value ? `تم تحديد ${this.props.value.length} عناصر` : '')}
             resetFilterOnHide={true}
-            onSelectAll={this.props.handleSelectAll ? this.props.handleSelectAll : this.props.parent ? this.handleSelectAll : undefined}
+            onSelectAll={selectAllHandler}
           >
             {this.props.children}
           </PrimeMultiSelect>
@@ -180,6 +210,23 @@ export default class MultiSelect extends React.Component {
       </div>
     );
   }
+
+  panelHeaderTemplate = (options) => {
+    const showFilter = options.props.filter;
+    const showSelectAll = options.props.showSelectAll !== false;
+
+    return (
+      <div className={`${options.className} ${styles.panelHeader}`}>
+        {showFilter && <div className={styles.searchRow}>{options.filterElement}</div>}
+        {showSelectAll && (
+          <div className={styles.selectAllRow}>
+            {options.checkboxElement}
+          </div>
+        )}
+      </div>
+    );
+  };
+
   searchWordsMatch = (option, searchQuery, filterFields) => {
     const words = searchQuery.trim().toLowerCase().split(/\s+/);
 

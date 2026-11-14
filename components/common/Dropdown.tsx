@@ -1,5 +1,6 @@
 "use client"
 
+import { appDir } from "@/lib/i18n"
 import React from "react"
 import { Dropdown as PrimeDropdown, type DropdownChangeEvent } from "primereact/dropdown"
 import {
@@ -96,7 +97,7 @@ export default class Dropdown extends React.Component<DropdownProps, DropdownSta
     }
 
     if ("current" in innerRef) {
-      innerRef.current = el
+      ;(innerRef as React.MutableRefObject<any>).current = el
     }
   }
 
@@ -144,18 +145,19 @@ export default class Dropdown extends React.Component<DropdownProps, DropdownSta
     const statusColor = option?.status && option.status !== 1 ? "red" : ""
 
     return (
-      <div style={{ color: statusColor }} dir="rtl">
+      <div style={{ color: statusColor }} dir={appDir()}>
         {optionText}
       </div>
     )
   }
 
   private selectedOptionTemplate = (option: DropdownOption | null, props: any) => {
-    if (!option) {
+    const selectedOption = option ?? this.findOptionByValue(this.props.value)
+    if (!selectedOption) {
       return <span>{props.placeholder}</span>
     }
 
-    const optionText = this.truncatedLabel(option)
+    const optionText = this.truncatedLabel(selectedOption)
     return (
       <div>
         <div
@@ -171,6 +173,14 @@ export default class Dropdown extends React.Component<DropdownProps, DropdownSta
         </div>
       </div>
     )
+  }
+
+  private findOptionByValue = (value: any): DropdownOption | null => {
+    const { options, optionValue } = this.props
+    if (value == null) return null
+    if (!optionValue) return typeof value === 'object' ? value : null
+
+    return options?.find((option) => `${option?.[optionValue]}` === `${value}`) ?? null
   }
 
   private handleOptions = () => {
@@ -264,16 +274,21 @@ export default class Dropdown extends React.Component<DropdownProps, DropdownSta
         ref={this.setDropdownRef}
         id={id || "float-input"}
         title={tooltip}
-        style={{ width: "100%", overflow: "hidden", ...(withgroup ? { flex: "1" } : {}) }}
+        // overflow: hidden فقط حين تُعرض القائمة خارج العنصر: مع appendTo="self" تُدرَج قائمة الخيارات داخل هذا
+        // العنصر نفسه فكان overflow: hidden يقصّها فلا تظهر الخيارات (كل القوائم في طلبية المبيعات). النص الطويل
+        // للقيمة المختارة مقصوص أصلاً بعلامة "…" عبر .p-dropdown-label في Dropdown.module.scss.
+        style={{ width: "100%", ...(restProps.appendTo === "self" ? {} : { overflow: "hidden" }), ...(withgroup ? { flex: "1" } : {}) }}
         className={`${styles.dropDown} ${innerClass || ""}`}
         onChange={this.handleChange}
-        tooltipOptions={{ position: "top", style: { direction: "rtl" } }}
+        tooltipOptions={{ position: "top", style: { direction: appDir() } }}
         placeholder={placeholder}
-        optionLabelLang2={optionLabelLang2 || optionLabel}
+        optionLabel={optionLabel}
         itemTemplate={this.optionsTemplate}
         valueTemplate={this.selectedOptionTemplate}
         resetFilterOnHide
         options={this.handleOptions()}
+        panelClassName={`${styles.dropDownPanel} ${restProps.panelClassName || ""}`.trim()}
+        appendTo={restProps.appendTo}
       >
         {children}
       </PrimeDropdown>

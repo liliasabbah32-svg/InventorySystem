@@ -131,13 +131,14 @@ export function useExchangeRates() {
       )
 
       try {
-        const response = await fetch(`/api/exchange-rates/${id}`, {
+        const response = await fetch("/api/exchange-rates", {
           method: "PUT",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(rateData),
+          body: JSON.stringify({ id, ...rateData }),
         })
 
-        if (!response.ok) throw new Error("Failed to update exchange rate")
+        // رسالة الخادم (مثل «لا يوجد لديك صلاحية تعديل سعر صرف») تصل للشاشة كما هي
+        if (!response.ok) throw new Error((await response.json().catch(() => null))?.error || "Failed to update exchange rate")
 
         mutate()
         return await response.json()
@@ -151,7 +152,7 @@ export function useExchangeRates() {
 
 
   return {
-    rates: data?.rates || data || [],
+    rates: Array.isArray(data?.rates) ? data.rates : Array.isArray(data) ? data : [],
     isLoading,
     isError: error,
     refresh: mutate,

@@ -3,22 +3,45 @@
 import type React from "react"
 import { useWindowManager } from "@/contexts/window-manager-context"
 import { ModalWindow } from "./modal-window"
+import { useBranchReloadKey } from "@/components/auth/use-branch-reload-key"
 import dynamic from "next/dynamic"
 const Dashboard = dynamic(() => import("@/components/dashboard").then((mod) => mod.Dashboard), { ssr: false })
 
 // Dynamically import heavy client-only components to prevent server-side
 // evaluation of browser-only libs (e.g. @grapecity/wijmo).
-import {SalesOrders} from "@/components/orders/sales-orders"
+const SalesOrders = dynamic(() => import("@/components/orders/sales-orders").then((m) => m.SalesOrders), { ssr: false })
 const PurchaseOrders = dynamic(() => import("@/components/orders/purchase-orders").then((m) => m.PurchaseOrders), { ssr: false })
 const Products = dynamic(() => import("@/components/products/products").then((m) => m.Products), { ssr: false })
 const Customers = dynamic(() => import("@/components/products/customers").then((m) => m.default), { ssr: false })
 const UnifiedCustomers = dynamic(() => import("@/components/products/unified-customers").then((m) => m.default), { ssr: false })
-import { OrderReports } from "@/components/reports/order-reports"
-import { ProductReports } from "@/components/reports/product-reports"
-import DocumentSettings from "@/components/settings/document-settings"
-import GeneralSettings from "@/components/settings/general-settings"
-import PervasiveSettings from "@/app/settings/pervasive/page"
-import UnifiedAccounts from "@/components/customer/unified-accounts-refactored"
+const OrderReports = dynamic(() => import("@/components/reports/order-reports").then((m) => m.OrderReports), { ssr: false })
+const ProductReports = dynamic(() => import("@/components/reports/product-reports").then((m) => m.ProductReports), { ssr: false })
+const ItemBalancesReport = dynamic(() => import("@/components/reports/item-balances-report").then((m) => m.ItemBalancesReport), { ssr: false })
+const ItemValuationReport = dynamic(() => import("@/components/reports/item-valuation-report").then((m) => m.ItemValuationReport), { ssr: false })
+const ItemCardReport = dynamic(() => import("@/components/reports/item-card-report").then((m) => m.ItemCardReport), { ssr: false })
+const ReceivablesStatementReport = dynamic(() => import("@/components/reports/account-statement-report").then((m) => m.ReceivablesStatementReport), { ssr: false })
+const AccountingStatementReport = dynamic(() => import("@/components/reports/account-statement-report").then((m) => m.AccountingStatementReport), { ssr: false })
+const VouchersReport = dynamic(() => import("@/components/reports/financial-report").then((m) => m.VouchersReport), { ssr: false })
+const TransactionsReport = dynamic(() => import("@/components/reports/financial-report").then((m) => m.TransactionsReport), { ssr: false })
+const TrialBalanceReport = dynamic(() => import("@/components/reports/financial-report").then((m) => m.TrialBalanceReport), { ssr: false })
+const BalanceSheetReport = dynamic(() => import("@/components/reports/financial-report").then((m) => m.BalanceSheetReport), { ssr: false })
+const IncomeStatementReport = dynamic(() => import("@/components/reports/financial-report").then((m) => m.IncomeStatementReport), { ssr: false })
+const ChequesPage = dynamic(() => import("@/components/accounting/cheques-management").then((m) => m.ChequesPage), { ssr: false })
+const ChequeOperationsPage = dynamic(() => import("@/components/accounting/cheques-management").then((m) => m.ChequeOperationsPage), { ssr: false })
+const ChequeDepositBulkPage = dynamic(() => import("@/components/accounting/bulk-cheque-operations").then((m) => m.ChequeDepositBulkPage), { ssr: false })
+const VisaCommissionJournalsPage = dynamic(() => import("@/components/accounting/auto-journals").then((m) => m.VisaCommissionJournalsPage), { ssr: false })
+const CurrencyTransferJournalPage = dynamic(() => import("@/components/accounting/auto-journals").then((m) => m.CurrencyTransferJournalPage), { ssr: false })
+const AccountCurrencyTransferJournalsPage = dynamic(() => import("@/components/accounting/auto-journals").then((m) => m.AccountCurrencyTransferJournalsPage), { ssr: false })
+const CurrencyDifferenceJournalsPage = dynamic(() => import("@/components/accounting/auto-journals").then((m) => m.CurrencyDifferenceJournalsPage), { ssr: false })
+const ChequeEndorseBulkPage = dynamic(() => import("@/components/accounting/bulk-cheque-operations").then((m) => m.ChequeEndorseBulkPage), { ssr: false })
+const OutgoingChequeClearBulkPage = dynamic(() => import("@/components/accounting/bulk-cheque-operations").then((m) => m.OutgoingChequeClearBulkPage), { ssr: false })
+const ChequePaymentVouchers = dynamic(() => import("@/components/accounting/unified-cheque-payment-voucher"), { ssr: false })
+const PosCashier = dynamic(() => import("@/components/pos/pos-cashier"), { ssr: false })
+const PosPointsSettings = dynamic(() => import("@/components/pos/pos-points-settings"), { ssr: false })
+const DocumentSettings = dynamic(() => import("@/components/settings/document-settings"), { ssr: false })
+const GeneralSettings = dynamic(() => import("@/components/settings/general-settings"), { ssr: false })
+const PervasiveSettings = dynamic(() => import("@/app/settings/pervasive/page"), { ssr: false })
+const UnifiedAccounts = dynamic(() => import("@/components/customer/unified-accounts-refactored"), { ssr: false })
 
 const componentMap: Record<string, React.ComponentType<any>> = {
   dashboard: Dashboard,
@@ -29,6 +52,28 @@ const componentMap: Record<string, React.ComponentType<any>> = {
   "unified-customers": UnifiedCustomers,
   "order-reports": OrderReports,
   "product-reports": ProductReports,
+  "item-balances-report": ItemBalancesReport,
+  "item-valuation-report": ItemValuationReport,
+  "item-card-report": ItemCardReport,
+  "receivables-statement-report": ReceivablesStatementReport,
+  "accounting-statement-report": AccountingStatementReport,
+  "vouchers-report": VouchersReport,
+  "transactions-report": TransactionsReport,
+  "trial-balance-report": TrialBalanceReport,
+  "balance-sheet-report": BalanceSheetReport,
+  "income-statement-report": IncomeStatementReport,
+  cheques: ChequesPage,
+  "cheque-operations": ChequeOperationsPage,
+  "cheque-deposit-bulk": ChequeDepositBulkPage,
+  "visa-commission-journals": VisaCommissionJournalsPage,
+  "currency-transfer-journal": CurrencyTransferJournalPage,
+  "account-currency-transfer-journals": AccountCurrencyTransferJournalsPage,
+  "currency-difference-journals": CurrencyDifferenceJournalsPage,
+  "cheque-endorse-bulk": ChequeEndorseBulkPage,
+  "outgoing-cheque-clear-bulk": OutgoingChequeClearBulkPage,
+  "cheque-payment-vouchers": ChequePaymentVouchers,
+  "pos-cashier": PosCashier,
+  "pos-points-settings": PosPointsSettings,
   "document-settings": DocumentSettings,
   "general-settings": GeneralSettings,
   "pervasive-settings": PervasiveSettings,
@@ -37,6 +82,7 @@ const componentMap: Record<string, React.ComponentType<any>> = {
 
 export function WindowRenderer() {
   const { windows, closeWindow } = useWindowManager()
+  const branchReloadKey = useBranchReloadKey()
 
 
   return (
@@ -55,7 +101,7 @@ export function WindowRenderer() {
 
         if (window.type === "modal") {
           return (
-            <ModalWindow key={window.id} window={window}>
+            <ModalWindow key={`${window.id}-branch-${branchReloadKey}`} window={window}>
               <Component {...(window.data || {})} inWindowManager closeWindow={() => closeWindow(window.id)} />
             </ModalWindow>
           )

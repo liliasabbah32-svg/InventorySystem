@@ -1,3 +1,4 @@
+import { authorizeUserAdmin } from "@/lib/user-admin-access"
 import { type NextRequest, NextResponse } from "next/server"
 
 function generateComprehensiveReport() {
@@ -19,19 +20,19 @@ function generateComprehensiveReport() {
             type: "error",
             message: "toLocaleString() called without null check",
             line: 103,
-            fix: "Use (value || 0).toLocaleString()",
+            fix: "Use (value || 0).toLocaleString('en-US')",
           },
           {
             type: "error",
             message: "toLocaleString() called without null check",
             line: 111,
-            fix: "Use (value || 0).toLocaleString()",
+            fix: "Use (value || 0).toLocaleString('en-US')",
           },
           {
             type: "error",
             message: "toLocaleString() called without null check",
             line: 175,
-            fix: "Use (value || 0).toLocaleString()",
+            fix: "Use (value || 0).toLocaleString('en-US')",
           },
         ],
         status: "error",
@@ -204,6 +205,9 @@ function generateComprehensiveReport() {
 }
 
 export async function POST(request: NextRequest) {
+  // أداة إدارية/تطوير: للمسؤول فقط
+  const admin = await authorizeUserAdmin(request)
+  if (!admin.ok) return admin.response
   try {
     console.log("[v0] Starting QA scan...")
 

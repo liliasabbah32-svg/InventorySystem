@@ -1,0 +1,77 @@
+import { type NextRequest, NextResponse } from "next/server"
+import { withVoucherAudit } from "@/lib/voucher-audit"
+import sql from "@/lib/database"
+import { ensureTables, fetchDetails, archiveAndDeleteVoucher, markVoucherPrinted } from "../_lib"
+import { authorizeStoredVoucher } from "@/lib/transaction-permissions"
+
+export async function GET(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
+  try {
+    await ensureTables()
+    const id = Number((await params).id)
+    if (!id) {
+      return NextResponse.json({ error: "معرف السند غير صالح" }, { status: 400 })
+    }
+    const authorization = await authorizeStoredVoucher(request, id, "view")
+    if (!authorization.ok) return authorization.response
+
+    const rows = await sql`SELECT * FROM voucher_header_tbl WHERE id = ${id}`
+    if (rows.length === 0) {
+      return NextResponse.json({ error: "السند غير موجود" }, { status: 404 })
+    }
+
+    const details = await fetchDetails(id)
+    return NextResponse.json({ ...rows[0], ...details })
+  } catch (error) {
+    console.error("Error fetching voucher:", error)
+    return NextResponse.json({ error: "Failed to fetch voucher" }, { status: 500 })
+  }
+}
+
+// حذف فعلي (مع أرشفة إلى جداول log) — متاح فقط لسند بحالة "فعال" (status=1). سند مُرحَّل
+// يُلغى منطقياً عبر PUT بـ status=3 بدل هذا المسار (انظر archiveAndDeleteVoucher في _lib.ts).
+async function deleteHandler(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
+  try {
+    const id = Number((await params).id)
+    if (!id) {
+      return NextResponse.json({ error: "معرف السند غير صالح" }, { status: 400 })
+    }
+    const authorization = await authorizeStoredVoucher(request, id, "delete")
+    if (!authorization.ok) return authorization.response
+
+    const result = await archiveAndDeleteVoucher(id)
+    if (result.error) {
+      return NextResponse.json({ error: result.error }, { status: 400 })
+    }
+
+    return NextResponse.json({ success: true })
+  } catch (error) {
+    console.error("Error deleting voucher:", error)
+    return NextResponse.json({ error: "Failed to delete voucher" }, { status: 500 })
+  }
+}
+
+// يُستدعى عند ضغط زر الطباعة على سند مُرحَّل بالفعل — يسجّل printed=1 دون المرور بمسار PUT
+// الرئيسي الذي يرفض أي تعديل على سند مُرحَّل (انظر markVoucherPrinted في _lib.ts).
+export async function PATCH(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
+  try {
+    const id = Number((await params).id)
+    if (!id) {
+      return NextResponse.json({ error: "معرف السند غير صالح" }, { status: 400 })
+    }
+    const authorization = await authorizeStoredVoucher(request, id, "view")
+    if (!authorization.ok) return authorization.response
+
+    const result = await markVoucherPrinted(id)
+    if (result.error) {
+      return NextResponse.json({ error: result.error }, { status: 400 })
+    }
+
+    return NextResponse.json({ success: true })
+  } catch (error) {
+    console.error("Error marking voucher as printed:", error)
+    return NextResponse.json({ error: "Failed to mark voucher as printed" }, { status: 500 })
+  }
+}
+
+// أرشفة السندات (تقرير ارشفة السندات): نسخة قبل/بعد + نوع العملية والمستخدم
+export const DELETE = withVoucherAudit(deleteHandler, { source: "voucher", kind: "delete" })

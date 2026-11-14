@@ -1,149 +1,144 @@
 import { NextRequest, NextResponse } from "next/server"
 import sql from "@/lib/database"
+import { filterAccessibleAccounts } from "@/lib/account-access"
+import { authorizeFile, authorizeFileRead, projectFileLookup } from "@/lib/file-permissions"
+import { runSchemaOnce } from "@/lib/schema-once"
+import {
+  statusLabelToCode,
+  toBool,
+  toNullableInt,
+  toNullableFloat,
+  ensureAccountsTable,
+  ensureAccountRelatedTables,
+  mapAccountRow,
+  accountFileFamilyForType,
+  validateAccountParentForChild,
+} from "./_lib"
 
-const statusLabelToCode = (status: string): number => {
-  if (status === "موقوف") return 2
-  if (status === "محذوف") return 3
-  return 1
-}
-
-const statusCodeToLabel = (status: number | null | undefined): string => {
-  if (status === 2) return "موقوف"
-  if (status === 3) return "محذوف"
-  return "نشط"
-}
-
-const toBool = (value: unknown, defaultValue = false): boolean => {
-  if (typeof value === "boolean") return value
-  if (typeof value === "number") return value === 1
-  if (typeof value === "string") {
-    const lowered = value.trim().toLowerCase()
-    return ["1", "true", "yes", "y", "نعم"].includes(lowered)
-  }
-  return defaultValue
-}
-
-const toNullableInt = (value: unknown): number | null => {
-  if (value === null || value === undefined || value === "") return null
-  const parsed = Number(value)
-  return Number.isFinite(parsed) ? parsed : null
-}
-
-const toNullableFloat = (value: unknown): number | null => {
-  if (value === null || value === undefined || value === "") return null
-  const parsed = Number(value)
-  return Number.isFinite(parsed) ? parsed : null
-}
-
-const ensureAccountsTable = async () => {
+const ensureAccountLookupTables = () => runSchemaOnce("app/api/accounts/route.ts#ensureAccountLookupTables", async () => {
   await sql`
-    CREATE TABLE IF NOT EXISTS account_tbl (
+    CREATE TABLE IF NOT EXISTS branches (
       id SERIAL PRIMARY KEY,
-      company_id INTEGER NOT NULL,
-      code VARCHAR(50) NOT NULL,
-      type INTEGER,
-      name VARCHAR(150) NOT NULL,
-      name_lang2 VARCHAR(150),
-      father_id INTEGER REFERENCES account_tbl(id) ON DELETE CASCADE,
-      level_no INTEGER NOT NULL,
-      finanical_list_id INTEGER NOT NULL,
-      finanical_list_assests_id INTEGER,
-      finanical_list_liabilities_id INTEGER,
-      finanical_list_income_id INTEGER,
-      currency_id INTEGER,
-      allow_trans_with_diff_curr INTEGER NOT NULL,
-      iscalc_curr_diff_rates BOOLEAN NOT NULL,
-      transaction_type INTEGER NOT NULL,
-      transaction_type_action INTEGER NOT NULL,
-      max_transaction_amount DOUBLE PRECISION NOT NULL,
-      max_transaction_amount_action INTEGER NOT NULL,
-      max_balance_amount DOUBLE PRECISION NOT NULL,
-      max_balance_action INTEGER,
-      budget_exceeding_perc DOUBLE PRECISION,
-      budget_exceeding_action INTEGER,
-      unified_report_account_no VARCHAR(50),
-      unified_report_group_code VARCHAR(50),
-      notes VARCHAR(70),
-      show_notes_in_transactions_soa BOOLEAN,
-      status INTEGER,
-      insert_date DATE,
-      last_update_date TIMESTAMPTZ,
-      UNIQUE (code)
+      branch_code VARCHAR(20) UNIQUE NOT NULL,
+      branch_name VARCHAR(100) NOT NULL,
+      bank_id INTEGER,
+      address TEXT,
+      manager VARCHAR(100),
+      phone VARCHAR(20),
+      status INTEGER DEFAULT 1,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
   `
-
-  await sql`CREATE INDEX IF NOT EXISTS idx_account_tbl_code ON account_tbl(code)`
-  await sql`CREATE INDEX IF NOT EXISTS idx_account_tbl_type ON account_tbl(type)`
-  await sql`CREATE INDEX IF NOT EXISTS idx_account_tbl_father ON account_tbl(father_id)`
-  await sql`CREATE INDEX IF NOT EXISTS idx_account_tbl_status ON account_tbl(status)`
-
   await sql`
-    DO $$
-    BEGIN
-      IF EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_name = 'account_tbl'
-          AND column_name = 'allow_trans_with_diff_curr'
-          AND data_type = 'boolean'
-      ) THEN
-        ALTER TABLE account_tbl
-        ALTER COLUMN allow_trans_with_diff_curr TYPE INTEGER
-        USING CASE WHEN allow_trans_with_diff_curr THEN 1 ELSE 0 END;
-      END IF;
-    END$$;
-  `
-}
-
-const ensureAccountRelatedTables = async () => {
-  await sql`
-    CREATE TABLE IF NOT EXISTS account_stop_transactions_tbl (
+    CREATE TABLE IF NOT EXISTS account_classification_types (
       id SERIAL PRIMARY KEY,
+      name VARCHAR(100) NOT NULL UNIQUE,
+      status INTEGER NOT NULL DEFAULT 1 CHECK (status IN (1, 2, 3)),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `
+  await sql`
+    CREATE TABLE IF NOT EXISTS account_branches (
       account_id INTEGER NOT NULL REFERENCES account_tbl(id) ON DELETE CASCADE,
-      voucher_types_id INTEGER,
-      stop_date TIMESTAMPTZ
+      branch_id INTEGER NOT NULL REFERENCES branches(id) ON DELETE CASCADE,
+      PRIMARY KEY (account_id, branch_id)
     )
   `
-
-  await sql`
-    CREATE TABLE IF NOT EXISTS account_costcenters_tbl (
-      id SERIAL PRIMARY KEY,
-      account_id INTEGER NOT NULL REFERENCES account_tbl(id) ON DELETE CASCADE,
-      cost_center_type_id INTEGER,
-      required_in_transactions INTEGER,
-      default_cost_center_id INTEGER
-    )
-  `
-
-  await sql`
-    CREATE TABLE IF NOT EXISTS account_classifications_tbl (
-      id SERIAL PRIMARY KEY,
-      account_id INTEGER NOT NULL REFERENCES account_tbl(id) ON DELETE CASCADE,
-      classification_id INTEGER NOT NULL
-    )
-  `
-
-  await sql`CREATE INDEX IF NOT EXISTS idx_acc_stop_account_id ON account_stop_transactions_tbl(account_id)`
-  await sql`CREATE INDEX IF NOT EXISTS idx_acc_cost_account_id ON account_costcenters_tbl(account_id)`
-  await sql`CREATE INDEX IF NOT EXISTS idx_acc_class_account_id ON account_classifications_tbl(account_id)`
-}
-
-const mapAccountRow = (row: any) => ({
-  ...row,
-  status: statusCodeToLabel(Number(row.status ?? 1)),
-  allow_trans_with_diff_curr: row.allow_trans_with_diff_curr != null ? Number(row.allow_trans_with_diff_curr) : 0,
-  iscalc_curr_diff_rates: toBool(row.iscalc_curr_diff_rates),
-  show_notes_in_transactions_soa: toBool(row.show_notes_in_transactions_soa),
 })
 
 export async function GET(request: NextRequest) {
   try {
+    const requestedType = new URL(request.url).searchParams.get("type")
+    const primaryFamily = accountFileFamilyForType(requestedType || 1)
+    const authorization = await authorizeFileRead(request, [primaryFamily, "accounts", "customers", "suppliers", "subscribers", "employees", "items", "services", "bank-accounts", "credit-cards"])
+    if (!authorization.ok) return authorization.response
     await ensureAccountsTable()
     await ensureAccountRelatedTables()
+    await ensureAccountLookupTables()
+
+    // تصفية حسب الفرع النشط (هيدر x-branch-id) — حساب بلا أي صف بـaccount_branches يبقى ظاهراً
+    // للجميع، وحساب مقيَّد بفرع/فروع معيّنة لا يظهر إلا لمستخدم فرعه أحدها. activeBranchId مُتحقَّق
+    // كعدد صحيح صراحة قبل تضمينه حرفياً بنص الاستعلام (نفس سبب app/api/customers/route.ts: fragment
+    // sql.unsafe المُضمَّن لا يُعيد ترقيم معاملاته الداخلية بالنسبة لمعاملات الاستعلام المحيط).
+    const requestedBranchId = Number(new URL(request.url).searchParams.get('branch_id'))
+    const activeBranchIdHeader = Number(request.headers.get('x-branch-id'))
+    const activeBranchId = Number.isInteger(requestedBranchId) && requestedBranchId > 0
+      ? requestedBranchId
+      : Number.isInteger(activeBranchIdHeader) && activeBranchIdHeader > 0 ? activeBranchIdHeader : null
+    // الفروع لا تُستخدم في التعريفات (الحسابات/العملاء/الأصناف) — في الحركات فقط: لا تصفية حسب الفرع هنا.
+    // صفوف *_branches القديمة تبقى في القاعدة دون أثر.
+    void activeBranchId
+    const branchFilterSql = ""
 
     // Get query parameters
     const { searchParams } = new URL(request.url)
     const typeParam = searchParams.get('type')
     const typeFilter = typeParam ? parseInt(typeParam, 10) : null
+    const deliveryVchTypesParam = searchParams.get('delivery_vch_types') || ""
+    const deliveryVchTypes = deliveryVchTypesParam
+      .split(",")
+      .map((value) => Number(value))
+      .filter((value) => Number.isFinite(value) && value > 0)
+
+    const orderTypeParam = searchParams.get('order_type')
+    const orderType = orderTypeParam ? Number(orderTypeParam) : null
+    const ORDER_SOURCE_VOUCHER_TYPE = 3
+    const sourceInvoiceType = orderType === 2 ? 17 : 12
+
+    const hasDeliveriesCondition = deliveryVchTypes.length > 0
+      ? sql`
+          EXISTS (
+            SELECT 1
+            FROM voucher_header_tbl vch
+            INNER JOIN voucher_items_tbl ivch ON ivch.voucher_id = vch.id
+            WHERE vch.account_id = a.id
+              AND vch.vch_type = ANY(${deliveryVchTypes}::int[])
+              AND vch.status = 2
+              AND (${activeBranchId ?? 0} = 0 OR vch.branch_id = ${activeBranchId ?? 0})
+              AND (
+                (
+                  ivch.qnty - (
+                    SELECT COALESCE(SUM(qnty), 0) FROM voucher_items_tbl WHERE delivery_item_id = ivch.id
+                  )
+                )
+                +
+                (
+                  ivch.bonus - (
+                    SELECT COALESCE(SUM(bonus), 0) FROM voucher_items_tbl WHERE delivery_item_id = ivch.id
+                  )
+                )
+              ) > 0
+          )`
+      : sql`FALSE`
+
+    const hasOrdersCondition = [1, 2].includes(Number(orderType))
+      ? sql`
+          EXISTS (
+            SELECT 1
+            FROM orders oh
+            INNER JOIN order_items oi ON oi.order_id = oh.id
+            LEFT JOIN LATERAL (
+              SELECT COALESCE(SUM(vi.qnty), 0) AS sent_quantity,
+                     COALESCE(SUM(vi.bonus), 0) AS sent_bonus
+              FROM voucher_items_tbl vi
+              INNER JOIN voucher_header_tbl vh ON vh.id=vi.voucher_id
+              WHERE vi.order_item_id=oi.id
+                AND vh.vch_type=${sourceInvoiceType}
+                AND vh.status<>3
+                AND vi.delivery_item_id IS NULL
+            ) sent ON TRUE
+            WHERE oh.customer_id=a.id AND oh.order_type=${orderType} AND oi.item_status IN(2,3,4)
+              AND (${activeBranchId ?? 0} = 0 OR oh.branch_id = ${activeBranchId ?? 0})
+              AND COALESCE(oh.deleted,FALSE)=FALSE
+              AND oh.order_status IN (2,3,4)
+              AND (
+                COALESCE(oi.quantity,0)>COALESCE(sent.sent_quantity,0)
+                OR COALESCE(oi.bonus,0)>COALESCE(sent.sent_bonus,0)
+              )
+          )`
+      : sql`FALSE`
 
     let rows
     if (typeFilter !== null) {
@@ -157,6 +152,7 @@ export async function GET(request: NextRequest) {
           a.name AS account_name,
           a.name_lang2,
           a.father_id AS parent_account_id,
+          EXISTS (SELECT 1 FROM account_tbl ch WHERE ch.father_id = a.id AND COALESCE(ch.status, 1) <> 3) AS has_children,
           pa.code AS parent_account_code,
           pa.name AS parent_account_name,
           a.level_no,
@@ -178,6 +174,8 @@ export async function GET(request: NextRequest) {
           a.unified_report_account_no,
           a.unified_report_group_code,
           a.notes AS description,
+          ${hasDeliveriesCondition} AS has_deliveries,
+          ${hasOrdersCondition} AS has_orders,
           a.show_notes_in_transactions_soa,
           a.status,
           a.insert_date AS created_at,
@@ -190,6 +188,7 @@ export async function GET(request: NextRequest) {
         LEFT JOIN account_classification_types t ON t.id = a.type
         LEFT JOIN account_tbl pa ON pa.id = a.father_id
         WHERE COALESCE(a.status, 1) IN (1, 2) AND a.type = ${typeFilter}
+        ${sql.unsafe(branchFilterSql)}
         ORDER BY a.code ASC
       `
     } else {
@@ -203,6 +202,7 @@ export async function GET(request: NextRequest) {
           a.name AS account_name,
           a.name_lang2,
           a.father_id AS parent_account_id,
+          EXISTS (SELECT 1 FROM account_tbl ch WHERE ch.father_id = a.id AND COALESCE(ch.status, 1) <> 3) AS has_children,
           pa.code AS parent_account_code,
           pa.name AS parent_account_name,
           a.level_no,
@@ -224,6 +224,8 @@ export async function GET(request: NextRequest) {
           a.unified_report_account_no,
           a.unified_report_group_code,
           a.notes AS description,
+          ${hasDeliveriesCondition} AS has_deliveries,
+          ${hasOrdersCondition} AS has_orders,
           a.show_notes_in_transactions_soa,
           a.status,
           a.insert_date AS created_at,
@@ -236,27 +238,22 @@ export async function GET(request: NextRequest) {
         LEFT JOIN account_classification_types t ON t.id = a.type
         LEFT JOIN account_tbl pa ON pa.id = a.father_id
         WHERE COALESCE(a.status, 1) IN (1, 2)
+        ${sql.unsafe(branchFilterSql)}
         ORDER BY a.code ASC
       `
     }
+    // صلاحيات المستخدمين على الحسابات: الحسابات الممنوعة عن المستخدم (بالفرع النشط) لا تظهر في البحث والاختيار
+    rows = await filterAccessibleAccounts(request, rows as any[], "id", activeBranchId)
 
-    const stopRows = await sql`
-      SELECT id, account_id, voucher_types_id, stop_date
-      FROM account_stop_transactions_tbl
-      ORDER BY id ASC
-    `
-
-    const costCenterRows = await sql`
-      SELECT id, account_id, cost_center_type_id, required_in_transactions, default_cost_center_id
-      FROM account_costcenters_tbl
-      ORDER BY id ASC
-    `
-
-    const classificationRows = await sql`
-      SELECT id, account_id, classification_id
-      FROM account_classifications_tbl
-      ORDER BY id ASC
-    `
+    const accountIds = [...new Set((rows as any[]).map((row) => Number(row.id)).filter((id) => Number.isInteger(id) && id > 0))]
+    const [stopRows, costCenterRows, classificationRows, branchRows] = accountIds.length
+      ? await Promise.all([
+          sql`SELECT id, account_id, voucher_types_id, stop_date FROM account_stop_transactions_tbl WHERE account_id = ANY(${accountIds}::int[]) ORDER BY account_id, id`,
+          sql`SELECT id, account_id, cost_center_type_id, required_in_transactions, default_cost_center_id FROM account_costcenters_tbl WHERE account_id = ANY(${accountIds}::int[]) ORDER BY account_id, id`,
+          sql`SELECT id, account_id, classification_id FROM account_classifications_tbl WHERE account_id = ANY(${accountIds}::int[]) ORDER BY account_id, id`,
+          sql`SELECT account_id, branch_id FROM account_branches WHERE account_id = ANY(${accountIds}::int[]) ORDER BY account_id`,
+        ])
+      : [[], [], [], []]
 
     const stopByAccount = new Map<number, any[]>()
     for (const row of stopRows) {
@@ -282,30 +279,64 @@ export async function GET(request: NextRequest) {
       classByAccount.set(accountId, list)
     }
 
+    const branchesByAccount = new Map<number, number[]>()
+    for (const row of branchRows) {
+      const accountId = Number(row.account_id)
+      const list = branchesByAccount.get(accountId) ?? []
+      list.push(Number(row.branch_id))
+      branchesByAccount.set(accountId, list)
+    }
+
     const items = rows.map((row: any) =>
       mapAccountRow({
         ...row,
         stop_transactions: stopByAccount.get(Number(row.id)) ?? [],
         cost_centers: costByAccount.get(Number(row.id)) ?? [],
         account_classifications: classByAccount.get(Number(row.id)) ?? [],
+        branch_ids: branchesByAccount.get(Number(row.id)) ?? [],
       }),
     )
 
-    return NextResponse.json(items)
+    const visibleItems = items.map((item: any) => {
+      const family = accountFileFamilyForType(item.classification_type_id ?? item.type)
+      return authorization.lookupOnly || family !== primaryFamily ? projectFileLookup("accounts", [item])[0] : item
+    })
+    return NextResponse.json(visibleItems)
   } catch (error) {
     console.error("Error fetching accounts:", error)
     return NextResponse.json({ error: "Failed to fetch accounts" }, { status: 500 })
   }
 }
 
+const normalizeAccountCode = (rawValue: unknown) => {
+  const cleaned = String(rawValue ?? "")
+    .trim()
+    .replace(/\s+/g, "")
+    .replace(/[^A-Za-z0-9]/g, "")
+    .toUpperCase()
+
+  if (!cleaned) return ""
+  return cleaned.length >= 10 ? cleaned.slice(0, 10) : cleaned.padEnd(10, "0")
+}
+
 export async function POST(request: NextRequest) {
   try {
+    const authorization = await authorizeFile(request, "accounts", "create")
+    if (!authorization.ok) return authorization.response
     await ensureAccountsTable()
     await ensureAccountRelatedTables()
+    await ensureAccountLookupTables()
+    await sql`
+      CREATE TABLE IF NOT EXISTS account_branches (
+        account_id INTEGER NOT NULL REFERENCES account_tbl(id) ON DELETE CASCADE,
+        branch_id INTEGER NOT NULL REFERENCES branches(id) ON DELETE CASCADE,
+        PRIMARY KEY (account_id, branch_id)
+      )
+    `
 
     const data = await request.json()
     // Support both naming conventions: account_code/account_name (API) and code/name (frontend)
-    const accountCode = String(data.account_code ?? data.code ?? "").trim()
+    const accountCode = normalizeAccountCode(data.account_code ?? data.code ?? "")
     const accountName = String(data.account_name ?? data.name ?? "").trim()
     const TypeId = 1 // Default to 1 if not provided, since it's required
     const parentCode = String(data.parent_code ?? data.father_code ?? "").trim()
@@ -347,6 +378,12 @@ export async function POST(request: NextRequest) {
 
     if (!accountName) {
       return NextResponse.json({ error: "اسم الحساب مطلوب" }, { status: 400 })
+    }
+    if (accountName.length > 100) {
+      return NextResponse.json({ error: "اسم الحساب يجب ألا يتجاوز 100 حرف" }, { status: 400 })
+    }
+    if (![1, 2, 3].includes(financialListId)) {
+      return NextResponse.json({ error: "القائمة المالية غير صحيحة" }, { status: 400 })
     }
 
     if (parentAccountId === null && parentCode) {
@@ -410,10 +447,8 @@ export async function POST(request: NextRequest) {
     }*/
 
     if (parentAccountId !== null) {
-      const parentExists = await sql`SELECT id FROM account_tbl WHERE id = ${parentAccountId}`
-      if (parentExists.length === 0) {
-        return NextResponse.json({ error: "الحساب الرئيسي غير موجود" }, { status: 400 })
-      }
+      const parentError = await validateAccountParentForChild(parentAccountId)
+      if (parentError) return NextResponse.json({ error: parentError }, { status: 400 })
     }
 
     const inserted = await sql`
@@ -511,6 +546,18 @@ export async function POST(request: NextRequest) {
       await sql`
         INSERT INTO account_classifications_tbl (account_id, classification_id)
         VALUES (${accountId}, ${classificationId})
+      `
+    }
+
+    // فروع تقييد ظهور الحساب بالبحث (اختياري) — بلا أي فرع هنا يبقى الحساب ظاهراً لكل الفروع.
+    const branchIds = Array.isArray(data.branch_ids) ? data.branch_ids : []
+    for (const branchId of branchIds) {
+      const numericBranchId = toNullableInt(branchId)
+      if (!numericBranchId) continue
+      await sql`
+        INSERT INTO account_branches (account_id, branch_id)
+        VALUES (${accountId}, ${numericBranchId})
+        ON CONFLICT DO NOTHING
       `
     }
 

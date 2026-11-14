@@ -1,0 +1,863 @@
+"use client"
+
+import { tr, appDir } from "@/lib/i18n"
+import { useVoucherDeepLink } from "@/hooks/use-voucher-deep-link"
+import { VoucherListHero, VoucherStats } from "@/components/common/voucher-list-shell"
+import { PackageOpen } from "lucide-react"
+
+import { useEffect, useMemo, useRef, useState } from "react"
+import { Button } from "@/components/ui/button"
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
+import { Input } from "@/components/ui/input"
+import { Label } from "@/components/ui/label"
+import { Edit, Plus, Search } from "lucide-react"
+import { useAuth } from "@/components/auth/auth-context"
+import UnifiedStockVoucher, {
+  type VoucherRecord,
+  type VoucherItemRow,
+  type StockVoucherType,
+  STOCK_IN_VCH_TYPE,
+  STOCK_OUT_VCH_TYPE,
+  INTERNAL_DELIVERY_VCH_TYPE,
+  USE_VOUCHER_VCH_TYPE,
+  toGridDateString,
+  validateItemMeasurement,
+} from "./unified-stock-voucher"
+import type { PostVoucherAction } from "@/components/common/post-voucher-dialog"
+import StockVoucherPrintLayout, { type StockVoucherPrintData } from "@/components/common/stock-voucher-print-layout"
+import { serialsSummary } from "@/components/inventory/item-serials-dialog"
+import { VoucherListTable, VoucherSearchButton, searchOnEnter, useVoucherListSearch } from "@/components/common/voucher-list-table"
+import { logVoucherAudit } from "@/lib/audit-client"
+import { useAnnounceTransactionSaved } from "@/lib/transaction-success"
+
+interface StockVouchersProps {
+  voucherType: StockVoucherType
+}
+
+interface LookupOption {
+  id: number
+  name: string
+}
+interface CurrencyRate {
+  currency_id?: number
+  id?: number
+  currency_name?: string
+  currency_code?: string
+}
+interface WarehouseOption {
+  id: number
+  warehouse_name: string
+  code: string
+}
+
+const TYPE_LABELS: Record<StockVoucherType, { title: string; listTitle: string; addLabel: string }> = {
+  8: { title: tr("سند ادخال بضاعة"), listTitle: tr("سندات ادخال البضاعة"), addLabel: tr("إضافة سند ادخال بضاعة") },
+  9: { title: tr("سند اخراج بضاعة"), listTitle: tr("سندات اخراج البضاعة"), addLabel: tr("إضافة سند اخراج بضاعة") },
+  10: { title: tr("ارسالية داخلية"), listTitle: tr("الارساليات الداخلية"), addLabel: tr("إضافة ارسالية داخلية") },
+  11: { title: tr("سند استعمال"), listTitle: tr("سندات الاستعمال"), addLabel: tr("إضافة سند استعمال") },
+}
+
+const emptyItemRow: VoucherItemRow = {
+  product_id: null,
+  product_code: "",
+  product_name: "",
+  barcode: "",
+  warehouse_id: null,
+  warehouse_name: "",
+  unit: "",
+  quantity: null,
+  unit_price: null,
+  total_price: null,
+  batch_number: "",
+  expiry_date: "",
+  length: null,
+  width: null,
+  height: null,
+  count: null,
+  note: "",
+  expense_account_id: null,
+  purchase_account_id: null,
+  expense_cost_centers: [],
+  purchase_cost_centers: [],
+}
+
+const buildInitialForm = (voucherType: StockVoucherType): VoucherRecord => ({
+  id: 0,
+  vch_type: voucherType,
+  vch_code: "",
+  vch_date: new Date().toISOString().slice(0, 10),
+  vch_book_id: null,
+  branch_id: null,
+  currency_id: null,
+  rate: 1,
+  account_id: null,
+  customer_name: "",
+  to_store_id: null,
+  from_store_id: null,
+  amount: 0,
+  manual_voucher: "",
+  manual_date: new Date().toISOString().slice(0, 10),
+  note: "",
+  status: 1,
+  is_printed: 0,
+  items: [{ ...emptyItemRow }],
+})
+
+const normalizeVoucher = (record: Partial<VoucherRecord>, voucherType: StockVoucherType): VoucherRecord => ({
+  ...buildInitialForm(voucherType),
+  ...record,
+  manual_date: record.manual_date || record.vch_date || buildInitialForm(voucherType).manual_date,
+  // toGridDateString هنا لنفس سبب استخدامها داخل unified-stock-voucher.tsx: تاريخ الصلاحية القادم
+  // من الخادم "YYYY-MM-DD" (بلا وقت) يُعرَض بشبكة Wijmo بتاريخ أقل بيوم في المناطق الزمنية المتقدّمة
+  // على UTC ما لم يُضَف وقت محلي صريح قبل ربطه بالعمود.
+  items: record.items?.length
+    ? (record.items as any[]).map((item) => ({
+        ...emptyItemRow,
+        ...item,
+        product_id: item.product_id ?? item.item_id ?? null,
+        product_code: String(item.product_code || item.current_product_code || "").trim(),
+        product_name: String(item.product_name || item.current_product_name || item.item_name || "").trim(),
+        warehouse_id: item.warehouse_id ?? item.store_id ?? null,
+        warehouse_name: item.warehouse_name || "",
+        unit: String(item.unit ?? item.unit_name ?? ""),
+        batch_number: String(item.batch_number || item.batch_no || ""),
+        expiry_date: toGridDateString(item.expiry_date),
+        quantity: item.quantity ?? item.qnty ?? null,
+        unit_price: item.unit_price ?? item.price ?? null,
+        total_price: item.total_price ?? (item.quantity ?? item.qnty ?? 0) * (item.unit_price ?? item.price ?? 0),
+        length: item.length ?? null,
+        width: item.width ?? null,
+        height: item.height ?? null,
+        count: item.count ?? null,
+        expense_account_id: item.expense_account_id ?? null,
+        purchase_account_id: item.purchase_account_id ?? null,
+        expense_account_code: String(item.expense_account_code || ""),
+        expense_account_name: String(item.expense_account_name || ""),
+        purchase_account_code: String(item.purchase_account_code || ""),
+        purchase_account_name: String(item.purchase_account_name || ""),
+        has_serial: Boolean(item.has_serial),
+        serials: Array.isArray(item.serials) ? item.serials : [],
+        serials_text: serialsSummary({ ...item, quantity: item.quantity ?? item.qnty }),
+      }))
+    : [{ ...emptyItemRow }],
+})
+
+export default function StockVouchers({ voucherType }: StockVouchersProps) {
+  const labels = TYPE_LABELS[voucherType]
+  const { user, activeBranchId } = useAuth()
+
+  const [vouchers, setVouchers] = useState<VoucherRecord[]>([])
+  const [currencies, setCurrencies] = useState<CurrencyRate[]>([])
+  const [voucherBooks, setVoucherBooks] = useState<LookupOption[]>([])
+  const [defaultBookId, setDefaultBookId] = useState<number | null>(null)
+  const [warehouses, setWarehouses] = useState<WarehouseOption[]>([])
+  const [defaultItemWarehouseId, setDefaultItemWarehouseId] = useState<number | null>(null)
+  const [priceCategories, setPriceCategories] = useState<LookupOption[]>([])
+  const [defaultCostPriceCategoryId, setDefaultCostPriceCategoryId] = useState<number | null>(null)
+
+  const [dialogOpen, setDialogOpen] = useState(false)
+  const [form, setForm] = useState<VoucherRecord>(buildInitialForm(voucherType))
+  const [isSaving, setIsSaving] = useState(false)
+  // تحميل عند "جديد"/التنقل/عرض سجل (مختلف عن isSaving الخاص بالحفظ فعلياً) — يعطّل الواجهة ريثما
+  // تُجلَب بيانات السند (تفاصيل + أرقام تسلسلية) من الخادم.
+  const [isLoading, setIsLoading] = useState(false)
+  const [currentIndex, setCurrentIndex] = useState(0)
+  const [errorMessages, setErrorMessages] = useState<string[]>([])
+  const [printData, setPrintData] = useState<StockVoucherPrintData | null>(null)
+  // "تمت العملية بنجاح" في نافذة السند بعد نجاح الحفظ (lib/transaction-success.ts)
+  const announceSaved = useAnnounceTransactionSaved()
+
+  const listSearch = useVoucherListSearch({ code: "", dateFrom: "", dateTo: "" })
+  const { draft: searchDraft, setDraft: setSearchDraft, filters: searchFilters } = listSearch
+  const runSearch = () => void listSearch.load(fetchVouchers, searchDraft)
+
+  const totalVouchers = vouchers.length
+  const totalAmount = useMemo(() => vouchers.reduce((sum, v) => sum + Number(v.amount || 0), 0), [vouchers])
+
+  const currencyOptions = useMemo(
+    () => currencies.map((c) => ({ value: Number(c.currency_id ?? c.id), label: c.currency_name || c.currency_code || "" })),
+    [currencies],
+  )
+  const baseCurrencyId = useMemo(
+    () => currencies.reduce<number | null>((min, c) => {
+      const id = Number(c.currency_id ?? c.id)
+      if (!Number.isFinite(id)) return min
+      return min === null || id < min ? id : min
+    }, null),
+    [currencies],
+  )
+
+  const filteredVouchers = useMemo(() => {
+    const codeQuery = searchFilters.code.trim().toLowerCase()
+    return vouchers.filter((voucher) => {
+      if (codeQuery && !voucher.vch_code.toLowerCase().includes(codeQuery)) return false
+      if (searchFilters.dateFrom && voucher.vch_date?.slice(0, 10) < searchFilters.dateFrom) return false
+      if (searchFilters.dateTo && voucher.vch_date?.slice(0, 10) > searchFilters.dateTo) return false
+      return true
+    })
+  }, [vouchers, searchFilters])
+
+  useEffect(() => {
+    void listSearch.load(fetchVouchers)
+    fetchLookups()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [voucherType, user?.id])
+
+
+  const fetchVouchers = async () => {
+    try {
+      const response = await fetch(`/api/stock-vouchers?vch_type=${voucherType}`)
+      const data = await response.json()
+      setVouchers(Array.isArray(data) ? data : [])
+    } catch (error) {
+      console.error("Failed to fetch stock vouchers", error)
+      setVouchers([])
+    }
+  }
+
+  const fetchLookups = async () => {
+    try {
+      const booksUrl = `/api/receipts/voucher-books?vch_type=${voucherType}${
+        user?.id ? `&user_id=${encodeURIComponent(user.id)}` : ""
+      }`
+      const warehouseDefaultsUrl = user?.id ? `/api/settings/user-warehouse-defaults?user_id=${encodeURIComponent(user.id)}` : null
+      const [currenciesRes, booksRes, warehousesRes, warehouseDefaultsRes, priceCategoriesRes, systemSettingsRes] = await Promise.all([
+        fetch("/api/exchange-rates").catch(() => null),
+        fetch(booksUrl).catch(() => null),
+        fetch("/api/warehouses").catch(() => null),
+        warehouseDefaultsUrl ? fetch(warehouseDefaultsUrl).catch(() => null) : Promise.resolve(null),
+        fetch("/api/pricecategory").catch(() => null),
+        fetch("/api/settings/system").catch(() => null),
+      ])
+      if (currenciesRes?.ok) {
+        const data = await currenciesRes.json()
+        setCurrencies(Array.isArray(data?.rates) ? data.rates : [])
+      }
+      if (booksRes?.ok) {
+        const data = await booksRes.json()
+        setVoucherBooks(Array.isArray(data?.books) ? data.books : [])
+        setDefaultBookId(data?.default_book_id ?? null)
+      }
+      if (warehousesRes?.ok) {
+        const data = await warehousesRes.json()
+        setWarehouses(Array.isArray(data) ? data : [])
+      }
+      if (warehouseDefaultsRes?.ok) {
+        const data = await warehouseDefaultsRes.json()
+        setDefaultItemWarehouseId(data?.default_item_warehouse_id ?? null)
+      } else {
+        setDefaultItemWarehouseId(null)
+      }
+      if (priceCategoriesRes?.ok) {
+        const data = await priceCategoriesRes.json()
+        setPriceCategories(Array.isArray(data) ? data.map((c: any) => ({ id: c.id, name: c.name })) : [])
+      }
+      if (systemSettingsRes?.ok) {
+        const data = await systemSettingsRes.json()
+        const payload = data?.settings ?? data
+        const raw = payload?.stock_voucher_item_cost_method
+        setDefaultCostPriceCategoryId(raw !== undefined && raw !== null && raw !== "" ? Number(raw) : null)
+      }
+    } catch (error) {
+      console.error("Failed to fetch lookups", error)
+    }
+  }
+
+  // يجلب دفتر السندات الافتراضي وأول عملة مباشرة من الخادم بدل الاعتماد على state قد لا يكون
+  // اكتمل تحميله بعد (مثلاً إن ضغط المستخدم "جديد" قبل أن يكتمل fetchLookups عند فتح الصفحة).
+  const fetchDefaults = async (): Promise<{ bookId: number | null; currencyId: number | null }> => {
+    try {
+      const booksUrl = `/api/receipts/voucher-books?vch_type=${voucherType}${
+        user?.id ? `&user_id=${encodeURIComponent(user.id)}` : ""
+      }`
+      const [booksRes, currenciesRes] = await Promise.all([
+        fetch(booksUrl).catch(() => null),
+        fetch("/api/exchange-rates").catch(() => null),
+      ])
+
+      let bookId: number | null = null
+      if (booksRes?.ok) {
+        const data = await booksRes.json()
+        setVoucherBooks(Array.isArray(data?.books) ? data.books : [])
+        bookId = data?.default_book_id ?? null
+        setDefaultBookId(bookId)
+      }
+
+      let currencyId: number | null = null
+      if (currenciesRes?.ok) {
+        const data = await currenciesRes.json()
+        const rates = Array.isArray(data?.rates) ? data.rates : []
+        setCurrencies(rates)
+        currencyId = rates.reduce((min: number | null, c: CurrencyRate) => {
+          const id = Number(c.currency_id ?? c.id)
+          if (!Number.isFinite(id)) return min
+          return min === null || id < min ? id : min
+        }, null)
+      }
+
+      return { bookId, currencyId }
+    } catch (error) {
+      console.error("Failed to fetch voucher defaults", error)
+      return { bookId: defaultBookId, currencyId: firstCurrencyId() }
+    }
+  }
+
+  const generateCode = async (bookId: number | null, fallbackCode = "", branchId: number | null = null) => {
+    if (!bookId) return fallbackCode
+    try {
+      const response = await fetch(`/api/stock-vouchers/generate-number?vch_type=${voucherType}&vch_book_id=${bookId}${branchId ? `&branch_id=${branchId}` : ""}`, { cache: "no-store" })
+      if (!response.ok) return fallbackCode
+      const data = await response.json()
+      return data.code || fallbackCode
+    } catch (error) {
+      console.error("Failed to generate stock voucher number", error)
+      return fallbackCode
+    }
+  }
+
+  useEffect(() => {
+    if (!dialogOpen || form.id > 0 || !form.vch_book_id) return
+    let cancelled = false
+    const bookId = form.vch_book_id
+    const branchId = form.branch_id
+    const previousCode = form.vch_code
+    const refreshNumber = async () => {
+      const code = await generateCode(bookId, previousCode, branchId)
+      if (cancelled || code === previousCode) return
+      setForm(current => current.id === 0 && current.vch_book_id === bookId && current.vch_code === previousCode
+        ? { ...current, vch_code: code }
+        : current)
+    }
+    window.addEventListener("system-settings-updated", refreshNumber)
+    return () => {
+      cancelled = true
+      window.removeEventListener("system-settings-updated", refreshNumber)
+    }
+  }, [dialogOpen, form.id, form.vch_book_id, form.branch_id, form.vch_code, voucherType])
+
+  // تغيير دفتر السندات (لسند جديد لم يُحفَظ بعد فقط) يعيد توليد رقم السند وفق الدفتر الجديد —
+  // بنفس نمط handleBookChange في credit-note.tsx/journal.tsx/receipts.tsx (لم تكن هذه الشاشة
+  // تطبّقه إطلاقاً).
+  const handleBookChange = async (bookId: number | null) => {
+    const previousCode = form.vch_code || ""
+    setForm((f) => ({ ...f, vch_book_id: bookId }))
+    if (form.id > 0 || !bookId) return
+    const generated = await generateCode(bookId, previousCode, form.branch_id)
+    setForm((f) => ({ ...f, vch_code: generated || previousCode }))
+  }
+
+  // تغيير الفرع لسند جديد لم يُحفظ بعد يعيد توليد رقم السند (رمز الفرع جزء من الرقم: بادئة السند + رمز الفرع
+  // + رمز الدفتر + التسلسل) — لا يُغيَّر رقم سند محفوظ مسبقاً.
+  const handleBranchChange = async (branchId: number | null) => {
+    const previousCode = form.vch_code || ""
+    const bookId = form.vch_book_id
+    setForm((f) => ({ ...f, branch_id: branchId }))
+    if (!(form.id <= 0) || !bookId || !branchId) return
+    const generated = await generateCode(bookId, previousCode, branchId)
+    setForm((f) => (f.branch_id === branchId && f.vch_book_id === bookId ? { ...f, vch_code: generated || previousCode } : f))
+  }
+
+  const fetchVoucherDetails = async (id: number): Promise<VoucherRecord | null> => {
+    try {
+      const response = await fetch(`/api/stock-vouchers/${id}`)
+      if (!response.ok) return null
+      return await response.json()
+    } catch (error) {
+      console.error("Failed to fetch stock voucher details", error)
+      return null
+    }
+  }
+
+  const firstCurrencyId = () => baseCurrencyId
+
+  const openNewDialog = async () => {
+    setIsLoading(true)
+    try {
+      const defaults = await fetchDefaults()
+      const code = await generateCode(defaults.bookId)
+      setForm({ ...buildInitialForm(voucherType), vch_code: code, vch_book_id: defaults.bookId, currency_id: defaults.currencyId })
+      setErrorMessages([])
+      setDialogOpen(true)
+    } finally {
+      setIsLoading(false)
+    }
+  }
+
+  const openRow = async (record: VoucherRecord, index: number) => {
+    setIsLoading(true)
+    try {
+      const details = await fetchVoucherDetails(record.id)
+      setForm(normalizeVoucher(details || record, voucherType))
+      setCurrentIndex(index)
+      setErrorMessages([])
+      setDialogOpen(true)
+    } finally {
+      setIsLoading(false)
+    }
+  }
+
+  // رقم سند غير مرتبط بأي سجل معروض حالياً (كُتب يدوياً في الحقل) — يُبحث عنه مباشرة بمعرّفه.
+  const handleCodeResolved = async (id: number) => {
+    setIsLoading(true)
+    try {
+      const details = await fetchVoucherDetails(id)
+      if (!details) return
+      const index = filteredVouchers.findIndex((v) => v.id === id)
+      setForm(normalizeVoucher(details, voucherType))
+      setCurrentIndex(index >= 0 ? index : 0)
+      setErrorMessages([])
+      setDialogOpen(true)
+      return true
+    } finally {
+      setIsLoading(false)
+    }
+  }
+
+  // رقم لا يخص أي سند محفوظ -> تصفير كل الحقول والشبكات لسند جديد بهذا الرقم، مع إبقاء دفتر
+  // السندات والعملة الحاليين لأنهما جزء من السياق الذي أُنشئ منه الرقم نفسه.
+  useVoucherDeepLink(async id => {
+    if (await handleCodeResolved(id)) setDialogOpen(true)
+  }, Boolean(user?.id), voucherType)
+
+  const handleCodeNotFound = (code: string) => {
+    setForm((f) => ({
+      ...buildInitialForm(voucherType),
+      vch_code: code,
+      vch_book_id: f.vch_book_id,
+      currency_id: f.currency_id,
+    }))
+    setErrorMessages([])
+  }
+
+  // نسخ السند الحالي إلى سند جديد غير محفوظ: نفس البيانات (المستودعات/العميل/الأصناف) برقم وتاريخ
+  // جديد بدل مسحها، ليحفظها المستخدم كسند مستقل دون إعادة إدخالها — مطابق لِـ cloneVoucher في receipts.tsx.
+  const cloneVoucher = async () => {
+    if (!form.id) return
+    logVoucherAudit({ action: "clone", voucher_id: Number(form.id) })
+    // دفتر غير متاح للمستخدم/سند قديم بلا عملة (تسوية جرد سابقة) ⇐ النسخة تأخذ الدفتر/العملة الافتراضية
+    // وإلا يرفض الحفظ "يجب تحديد دفتر السندات" / "العملة مطلوبة"
+    const bookAllowed = voucherBooks.some((book) => Number(book.id) === Number(form.vch_book_id))
+    const defaults = bookAllowed && form.currency_id ? null : await fetchDefaults()
+    const bookId = bookAllowed ? form.vch_book_id : defaults?.bookId ?? form.vch_book_id
+    const currencyId = form.currency_id || defaults?.currencyId || null
+    const code = await generateCode(bookId, "", form.branch_id)
+    const today = new Date().toISOString().slice(0, 10)
+    setForm((f) => ({
+      ...f,
+      vch_book_id: bookId,
+      currency_id: currencyId,
+      id: 0,
+      vch_code: code,
+      vch_date: today,
+      manual_date: today,
+      status: 1,
+      is_printed: 0,
+      // الأرقام التسلسلية فريدة لكل قطعة ⇐ لا تُنسَخ (وإلا يرفض الحفظ "الرقم التسلسلي موجود مسبقاً")
+      items: (f.items || []).map((item: any) => (item.serials?.length || item.serials_text ? { ...item, serials: [], serials_text: "" } : item)),
+    }))
+    setErrorMessages([])
+  }
+
+  // سند فعال (status=1) لم يُرحَّل بعد يُطبع كـ"نسخة للتدقيق" فقط دون أي تسجيل. سند مُرحَّل
+  // (status=2) يُسجَّل عليه is_printed=1 عند أول طباعة فتظهر "نسخة اصلية"، وأي طباعة لاحقة له
+  // تظهر "نسخة" فقط دون إعادة التسجيل — مطابق لِـ handlePrint في receipts.tsx.
+  const handlePrintVoucher = async () => {
+    if (!(form.id > 0) || form.status === 3) return
+
+    let isPrinted = form.is_printed || 0
+    const copyLabel = form.status !== 2 ? tr("نسخة للتدقيق") : isPrinted === 1 ? tr("نسخة") : tr("نسخة اصلية")
+
+    if (form.status === 2 && isPrinted !== 1) {
+      try {
+        const response = await fetch(`/api/stock-vouchers/${form.id}`, { method: "PATCH" })
+        if (response.ok) {
+          isPrinted = 1
+          setForm((f) => ({ ...f, is_printed: 1 }))
+        }
+      } catch (error) {
+        console.error("Failed to mark stock voucher as printed", error)
+      }
+    }
+
+    const rows = (form.items || []).filter((i) => i.product_id)
+    setPrintData({
+      title: labels.title,
+      copyLabel,
+      vch_code: form.vch_code,
+      vch_date: form.vch_date,
+      manual_voucher: form.manual_voucher,
+      note: form.note,
+      rows: rows.map((row) => ({
+        product_code: row.product_code,
+        product_name: row.product_name,
+        warehouse_name: row.warehouse_name,
+        unit: row.unit,
+        quantity: row.quantity,
+        unit_price: row.unit_price,
+        total_price: row.total_price,
+      })),
+    })
+  }
+
+  const validateVoucher = (data: VoucherRecord): string | null => {
+    if (!data.vch_code.trim()) return tr("رقم السند مطلوب")
+    if (!data.vch_book_id || !voucherBooks.some(book => Number(book.id) === Number(data.vch_book_id))) return tr("يجب تحديد دفتر السندات")
+    if (!data.currency_id) return tr("العملة مطلوبة")
+    if (!(Number(data.rate) > 0)) return tr("سعر الصرف يجب أن يكون أكبر من صفر")
+    const items = (data.items || []).filter((i) => i.product_id)
+    if (items.length === 0) return tr("يجب إدخال صنف واحد على الأقل")
+    // فحص مستودع رأس السند الآن للإرسالية الداخلية فقط (لها فحص from/to منفصل أدناه) — بقية الأنواع
+    // الثلاثة (ادخال/اخراج بضاعة، استعمال) لها جميعاً عمود "المستودع" الخاص بها بالسطر (أصنافها قد
+    // تدخل/تُصرف من مستودعات مختلفة)، فيكفيها الفحص العام "يجب اختيار المستودع لكل صنف" أدناه.
+    if (voucherType !== INTERNAL_DELIVERY_VCH_TYPE && voucherType !== USE_VOUCHER_VCH_TYPE && voucherType !== STOCK_IN_VCH_TYPE && voucherType !== STOCK_OUT_VCH_TYPE && !data.to_store_id) {
+      return tr("يجب اختيار المستودع")
+    }
+    if (items.some((i) => !i.warehouse_id)) return tr("يجب اختيار المستودع لكل صنف")
+    if (items.some((i) => !(Number(i.quantity || 0) > 0))) return tr("يجب إدخال الكمية لكل صنف")
+    const itemWithMissingAttributes = items.find((item) => {
+      const attributes = Array.isArray((item as any).attributes) ? (item as any).attributes : []
+      const selected = (item as any).selected_attributes && typeof (item as any).selected_attributes === "object"
+        ? (item as any).selected_attributes
+        : {}
+      return attributes.length > 0 && attributes.some((attribute: any) => !String(selected[attribute.name] || "").trim())
+    })
+    if (itemWithMissingAttributes) {
+      return tr("الصنف - {0} له ميزات وخصائص يجب تحديدها لا يمكن حفظ السند", itemWithMissingAttributes.product_name || itemWithMissingAttributes.product_code)
+    }
+    // أبعاد/عدد الصنف (نوع قياس غير عادي) — يُفحَص لكل أنواع السندات (لا سند ادخال بضاعة فقط)، إذ
+    // الأبعاد خاصية بمستوى السطر مستقلة عن اتجاه الحركة. الخادم يعيد نفس الفحص مستقلاً (_lib.ts).
+    for (const item of items) {
+      const measurementError = validateItemMeasurement(item)
+      if (measurementError) return measurementError
+    }
+    if (voucherType === STOCK_IN_VCH_TYPE) {
+      const missingExpiry = items.find((i) => i.has_expiry && !String(i.expiry_date || "").trim())
+      if (missingExpiry) return tr("يجب إدخال تاريخ الصلاحية للصنف: {0}", missingExpiry.product_name || missingExpiry.product_code)
+      const missingBatch = items.find((i) => i.has_batch && !String(i.batch_number || "").trim())
+      if (missingBatch) return tr("يجب إدخال الرقم التشغيلي للصنف: {0}", missingBatch.product_name || missingBatch.product_code)
+      // تاريخ الصلاحية الافتراضي عند اختيار صنف له تتبع صلاحية هو 1990-01-01 (قيمة اصطلاحية يُعدّلها
+      // المستخدم لاحقاً عبر التقويم) — أي تاريخ أقدم من 2020-01-01 عملياً يعني نسيان تعديل هذه القيمة
+      // الافتراضية قبل الحفظ، فيُرفَض الحفظ بدل قبول تاريخ غير منطقي لبضاعة داخلة حديثاً.
+      const implausibleExpiry = items.find(
+        (i) => i.has_expiry && i.expiry_date && new Date(i.expiry_date).getTime() < new Date("2020-01-01").getTime(),
+      )
+      if (implausibleExpiry) {
+        return tr("يرجى التأكد من تاريخ الصلاحية للصنف - {0}", implausibleExpiry.product_name || implausibleExpiry.product_code)
+      }
+    }
+    if (voucherType === INTERNAL_DELIVERY_VCH_TYPE && (!data.from_store_id || !data.to_store_id)) return tr("يجب اختيار المستودع المرسل والمستودع المستلم")
+    if (voucherType === INTERNAL_DELIVERY_VCH_TYPE && data.from_store_id && data.to_store_id && Number(data.from_store_id) === Number(data.to_store_id)) {
+      return tr("لا يمكن عمل ارسالية لنفس المستودع")
+    }
+    if (voucherType === USE_VOUCHER_VCH_TYPE && items.some((i) => !i.expense_account_id || !i.purchase_account_id)) {
+      return tr("يجب اختيار حساب المصروف وحساب المشتريات لكل صنف")
+    }
+    return null
+  }
+
+  const saveVoucher = async (action: PostVoucherAction = "save", keepCurrent = false): Promise<boolean> => {
+    // حفظ عادي / حفظ وطباعة: تبقى الحالة كما هي (لا ترحيل). حفظ وترحيل / ترحيل وطباعة: تصبح
+    // status=2 (مرحل) ويُقفل السند بعدها ويُطبَّق أثر المخزون — نفس منطق receipts.tsx.
+    const status = action === "save" || action === "save_print" ? form.status || 1 : 2
+    const isPrinted = action === "post_print" ? 1 : form.is_printed || 0
+    let dataToSave: VoucherRecord = { ...form, status, is_printed: isPrinted }
+    // اشتقاق مستودع كل صنف من قيمة رأس السند الآن للإرسالية الداخلية فقط (مستودع واحد لكامل السند من
+    // رأسه) — بقية الأنواع الثلاثة (ادخال/اخراج بضاعة، استعمال) لها عمود "المستودع" الخاص بها بالسطر
+    // (أصنافها قد تدخل/تُصرف من مستودعات مختلفة)، فتُترَك قيم warehouse_id الخاصة بكل سطر كما هي.
+    // "من مستودع" (from_store_id) لا "الى مستودع" — voucher_items_tbl.warehouse_id يمثّل مستودع
+    // الاستهلاك/المصدر في كل حسابات "المتاح" (resolveConsumptionWarehouseId هنا، وvalidateAvailableQuantity
+    // من جهة الخادم)؛ استخدام to_store_id هنا سابقاً كان يُسجِّل استهلاك الإرسالية الداخلية على
+    // المستودع الوجهة الخاطئ، فيُفسِد حساب "المتاح" لكلا المستودعين معاً.
+    if (voucherType !== USE_VOUCHER_VCH_TYPE && voucherType !== STOCK_IN_VCH_TYPE && voucherType !== STOCK_OUT_VCH_TYPE && dataToSave.from_store_id) {
+      const fromStore = warehouses.find((w) => w.id === dataToSave.from_store_id)
+      dataToSave = {
+        ...dataToSave,
+        items: (dataToSave.items || []).map((item) =>
+          item.product_id
+            ? { ...item, warehouse_id: dataToSave.from_store_id, warehouse_name: fromStore?.warehouse_name || item.warehouse_name }
+            : item,
+        ),
+      }
+    }
+    const validationError = validateVoucher(dataToSave)
+    if (validationError) {
+      setErrorMessages([validationError])
+      return false
+    }
+    setIsSaving(true)
+    setErrorMessages([])
+    try {
+      const method = form.id > 0 ? "PUT" : "POST"
+      const response = await fetch("/api/stock-vouchers", {
+        method,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(dataToSave),
+      })
+      if (!response.ok) {
+        const error = await response.json()
+        setErrorMessages([error.error || tr("فشل في حفظ السند")])
+        return false
+      }
+      const saved = await response.json()
+      announceSaved()
+
+      if (action === "post_print" || action === "save_print") {
+        const rows = (dataToSave.items || []).filter((i) => i.product_id)
+        setPrintData({
+          title: labels.title,
+          copyLabel: action === "post_print" ? tr("نسخة اصلية") : tr("نسخة للتدقيق"),
+          vch_code: saved.vch_code,
+          vch_date: saved.vch_date,
+          manual_voucher: saved.manual_voucher,
+          note: saved.note,
+          rows: rows.map((row) => ({
+            product_code: row.product_code,
+            product_name: row.product_name,
+            warehouse_name: row.warehouse_name,
+            unit: row.unit,
+            quantity: row.quantity,
+            unit_price: row.unit_price,
+            total_price: row.total_price,
+          })),
+        })
+      }
+
+      await fetchVouchers()
+      if (keepCurrent) {
+        setForm(normalizeVoucher({ ...dataToSave, ...saved, items: dataToSave.items }, voucherType))
+        return true
+      }
+      const defaults = await fetchDefaults()
+      // يبقى دفتر السندات كما هو (نفس الدفتر المستخدم للسند الذي حُفظ للتو) بدل الرجوع للدفتر
+      // الافتراضي — أكثر ملاءمة عند إدخال عدة سندات متتالية على نفس الدفتر.
+      const bookId = form.vch_book_id ?? defaults.bookId
+      const code = await generateCode(bookId)
+      setForm({ ...buildInitialForm(voucherType), vch_code: code, vch_book_id: bookId, currency_id: defaults.currencyId })
+      setDialogOpen(true)
+      return true
+    } catch (error) {
+      console.error(error)
+      setErrorMessages([tr("فشل في حفظ السند")])
+      return false
+    } finally {
+      setIsSaving(false)
+    }
+  }
+
+  const advanceAfterDelete = async () => {
+    setIsLoading(true)
+    try {
+      await fetchVouchers()
+      const nextList = vouchers.filter((v) => v.id !== form.id)
+      if (nextList.length > 0) {
+        const targetIndex = Math.min(Math.max(0, currentIndex), nextList.length - 1)
+        const next = nextList[targetIndex]
+        if (next) {
+          const details = await fetchVoucherDetails(next.id)
+          setForm(normalizeVoucher(details || next, voucherType))
+          setCurrentIndex(targetIndex)
+          setDialogOpen(true)
+          return
+        }
+      }
+      const defaults = await fetchDefaults()
+      const code = await generateCode(defaults.bookId)
+      setForm({ ...buildInitialForm(voucherType), vch_code: code, vch_book_id: defaults.bookId, currency_id: defaults.currencyId })
+      setCurrentIndex(0)
+      setDialogOpen(true)
+    } finally {
+      setIsLoading(false)
+    }
+  }
+
+  const handleDelete = async () => {
+    if (!form.id) return
+    setIsSaving(true)
+    setErrorMessages([])
+    try {
+      if (form.status === 2) {
+        const response = await fetch("/api/stock-vouchers", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ ...form, status: 3 }),
+        })
+        if (!response.ok) {
+          const error = await response.json().catch(() => null)
+          setErrorMessages([error?.error || tr("فشل في إلغاء السند")])
+          return
+        }
+        const saved = await response.json()
+        await fetchVouchers()
+        setForm(normalizeVoucher(saved, voucherType))
+        setDialogOpen(true)
+      } else {
+        const response = await fetch(`/api/stock-vouchers/${form.id}`, { method: "DELETE" })
+        if (!response.ok) {
+          const error = await response.json().catch(() => null)
+          setErrorMessages([error?.error || tr("فشل في حذف السند")])
+          return
+        }
+        await advanceAfterDelete()
+      }
+    } catch (error) {
+      console.error(error)
+      setErrorMessages([tr("فشل في حذف/إلغاء السند")])
+    } finally {
+      setIsSaving(false)
+    }
+  }
+
+  const navigationPending = useRef(false)
+  const handleNavigate = async (direction: "first" | "previous" | "next" | "last") => {
+    if (navigationPending.current || isLoading || isSaving) return
+    navigationPending.current = true
+    setIsLoading(true)
+    try {
+      const query = new URLSearchParams({ direction, currentId: String(Math.max(0, form.id)), vch_type: String(voucherType) })
+      const response = await fetch(`/api/transaction-navigation?${query}`, { cache: "no-store" })
+      const record = await response.json()
+      if (!response.ok) throw new Error(record?.error || tr("تعذر التنقل بين السندات"))
+      if (!record?.id) return
+      const details = await fetchVoucherDetails(record.id)
+      if (!details) throw new Error(tr("تعذر تحميل تفاصيل السند"))
+      setForm(normalizeVoucher(details, voucherType))
+      setCurrentIndex(filteredVouchers.findIndex(row => row.id === record.id))
+      setErrorMessages([])
+      setDialogOpen(true)
+    } catch (error) {
+      setErrorMessages([error instanceof Error ? error.message : tr("تعذر التنقل بين السندات")])
+    } finally {
+      navigationPending.current = false
+      setIsLoading(false)
+    }
+  }
+
+  const onFormChange = <K extends keyof VoucherRecord>(field: K, value: VoucherRecord[K]) => {
+    if (field === "branch_id") { void handleBranchChange(value as number | null); return }
+    setForm((f) => ({ ...f, [field]: value }))
+  }
+
+
+  // عرض سند بالمعرّف من نافذة بحث السندات (زر البحث بجانب رقم السند) — نفس مسار التنقل
+  const openVoucherById = async (voucherId: number) => {
+    setIsLoading(true)
+    try {
+      const details = await fetchVoucherDetails(voucherId)
+      if (!details) throw new Error(tr("تعذر تحميل تفاصيل السند"))
+      setForm(normalizeVoucher(details, voucherType))
+      setCurrentIndex(filteredVouchers.findIndex(row => row.id === voucherId))
+      setErrorMessages([])
+      setDialogOpen(true)
+    } catch (error) {
+      setErrorMessages([error instanceof Error ? error.message : tr("تعذر عرض السند")])
+    } finally {
+      setIsLoading(false)
+    }
+  }
+
+  return (
+    <div className="voucher-list-page w-full max-w-full space-y-5" dir={appDir()}>
+      <VoucherListHero icon={PackageOpen} title={<>{labels.listTitle}</>} addLabel={<>{labels.addLabel}</>} onNew={openNewDialog} />
+
+      <VoucherStats stats={[{ label: <>{tr("إجمالي {0}", labels.listTitle)}</>, value: <>{totalVouchers}</> }, { label: <>{tr("إجمالي المبالغ")}</>, value: <>{totalAmount.toLocaleString("en-US")}</> }]} />
+
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <Search className="h-5 w-5" />
+            {tr("البحث")}
+          </CardTitle>
+        </CardHeader>
+        <CardContent>
+          <div className="grid grid-cols-1 items-end gap-4 md:grid-cols-[1fr_1fr_1fr_auto]" onKeyDown={searchOnEnter(runSearch)}>
+            <div>
+              <Label htmlFor="search-code">{tr("رقم السند")}</Label>
+              <Input
+                id="search-code"
+                value={searchDraft.code}
+                onChange={(e) => setSearchDraft((prev) => ({ ...prev, code: e.target.value }))}
+                className="text-start"
+                placeholder={tr("ابحث برقم السند...")}
+              />
+            </div>
+            <div>
+              <Label htmlFor="search-date-from">{tr("من تاريخ")}</Label>
+              <Input
+                id="search-date-from"
+                type="date"
+                value={searchDraft.dateFrom}
+                onChange={(e) => setSearchDraft((prev) => ({ ...prev, dateFrom: e.target.value }))}
+              />
+            </div>
+            <div>
+              <Label htmlFor="search-date-to">{tr("إلى تاريخ")}</Label>
+              <Input
+                id="search-date-to"
+                type="date"
+                value={searchDraft.dateTo}
+                onChange={(e) => setSearchDraft((prev) => ({ ...prev, dateTo: e.target.value }))}
+              />
+            </div>
+            <VoucherSearchButton onClick={runSearch} loading={listSearch.loading} />
+          </div>
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>{`${labels.listTitle} (${filteredVouchers.length})`}</CardTitle>
+        </CardHeader>
+        <CardContent>
+          <div className="min-h-0">
+            <VoucherListTable
+              loading={listSearch.loading}
+              rows={filteredVouchers.map((voucher) => ({ ...voucher, display_date: voucher.vch_date?.slice(0, 10), display_amount: Number(voucher.amount || 0).toLocaleString("en-US") }))}
+              columns={[
+                { header: tr("رقم السند"), name: "vch_code", width: "*", minWidth: 150, isReadOnly: true },
+                { header: tr("التاريخ"), name: "display_date", width: 130, isReadOnly: true },
+                { header: tr("المبلغ"), name: "display_amount", width: 140, isReadOnly: true },
+                { header: tr("حالة السند"), name: "voucher_status", width: 140, isReadOnly: true },
+              ]}
+              onOpen={(row: any) => { const voucher = row.item || row; openRow(voucher, filteredVouchers.findIndex((item) => item.id === voucher.id)) }}
+            />
+          </div>
+        </CardContent>
+      </Card>
+
+      <UnifiedStockVoucher
+        onOpenVoucherById={(voucherId) => void openVoucherById(voucherId)}
+        voucherType={voucherType}
+        dialogOpen={dialogOpen}
+        onOpenChange={setDialogOpen}
+        form={form}
+        onFormChange={onFormChange}
+        onBookChange={handleBookChange}
+        onItemsChange={(items) => setForm((f) => ({ ...f, items }))}
+        voucherBooks={voucherBooks}
+        currencyOptions={currencyOptions}
+        baseCurrencyId={baseCurrencyId}
+        warehouses={warehouses}
+        defaultItemWarehouseId={defaultItemWarehouseId}
+        priceCategories={priceCategories}
+        defaultCostPriceCategoryId={defaultCostPriceCategoryId}
+        isSaving={isSaving || isLoading}
+        currentIndex={[...vouchers].sort((a,b)=>a.id-b.id).findIndex(row=>row.id===form.id)}
+        totalRecords={vouchers.length}
+        isFirstRecord={form.id > 0 && !vouchers.some(row=>row.id<form.id)}
+        isLoading={isLoading}
+        isLastRecord={form.id > 0 && !vouchers.some(row=>row.id>form.id)}
+        onNew={openNewDialog}
+        onSave={saveVoucher}
+        onValidateSave={() => validateVoucher(form)}
+        onDelete={handleDelete}
+        onNavigate={handleNavigate}
+        onPrint={handlePrintVoucher}
+        onClone={cloneVoucher}
+        onCodeResolved={handleCodeResolved}
+        onCodeNotFound={handleCodeNotFound}
+        errorMessages={errorMessages}
+      />
+      <StockVoucherPrintLayout data={printData} voucherTypeId={voucherType} />
+    </div>
+  )
+}

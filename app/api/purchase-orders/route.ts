@@ -1,9 +1,21 @@
 import { type NextRequest, NextResponse } from "next/server"
-import { sql } from "@/lib/database"
+import { withVoucherAudit } from "@/lib/voucher-audit"
+import sql from "@/lib/database"
 import { generatePurchaseOrderNumber } from "@/lib/number-generator"
+import { createPurchaseOrder } from "@/lib/orders"
+import { authorizeTransaction } from "@/lib/transaction-permissions"
+import { runSchemaOnce } from "@/lib/schema-once"
+import { validateAccountStops } from "@/lib/account-stops"
 
-export async function GET() {
+async function ensureBranchColumn() { return runSchemaOnce("app/api/purchase-orders/route.ts#ensureBranchColumn", async () => {
+  await sql`ALTER TABLE purchase_orders ADD COLUMN IF NOT EXISTS branch_id INTEGER`
+}) }
+
+export async function GET(request: NextRequest) {
   try {
+    await ensureBranchColumn()
+    const authorization = await authorizeTransaction(request, "purchase_order", "view")
+    if (!authorization.ok) return authorization.response
     const orders = await sql`
       SELECT 
         po.*,
@@ -12,6 +24,7 @@ export async function GET() {
         po.currency_name,
         po.currency_code
       FROM purchase_orders po
+      WHERE po.branch_id = ANY(${authorization.branchIds}::int[])
       ORDER BY po.created_at DESC
     `
 
@@ -22,9 +35,22 @@ export async function GET() {
   }
 }
 
-export async function POST(request: NextRequest) {
+async function postHandler(request: NextRequest) {
   try {
-    const data = await request.json()
+    await ensureBranchColumn()
+    const payload = await request.json()
+    const data = payload.orderData || payload
+    const items = payload.items || []
+    const authorization = await authorizeTransaction(request, "purchase_order", "create", data.branch_id)
+    if (!authorization.ok) return authorization.response
+    data.branch_id = authorization.branchId
+    // إيقاف الحركات على حساب المورد لنوع "طلبية مشتريات" (2)
+    const stopError = await validateAccountStops([data.supplier_id, data.customer_id, data.account_id], 2, data.order_date)
+    if (stopError) return NextResponse.json({ error: stopError }, { status: 400 })
+    if (payload.orderData) {
+      const order = await createPurchaseOrder(data, items)
+      return NextResponse.json(order, { status: 201 })
+    }
     console.log("[v0] Starting purchase order creation...")
 
     let orderNumber = data.order_number
@@ -35,7 +61,7 @@ export async function POST(request: NextRequest) {
       try {
         // Generate a new order number if not provided or if this is a retry
         if (!orderNumber || attempts > 0) {
-          orderNumber = await generatePurchaseOrderNumber()
+          orderNumber = await generatePurchaseOrderNumber("", Number(data.branch_id) || null)
           console.log(`[v0] Generated order number (attempt ${attempts + 1}): ${orderNumber}`)
         }
 
@@ -46,12 +72,12 @@ export async function POST(request: NextRequest) {
           INSERT INTO purchase_orders (
             order_number, order_date, supplier_id, supplier_name, manual_document,
             currency_code, currency_name, exchange_rate, salesman, expected_delivery_date,
-            notes, total_amount, attachments
+            notes, total_amount, attachments, branch_id
           ) VALUES (
             ${orderNumber}, ${orderDate}, ${data.supplier_id}, ${data.supplier_name},
             ${data.manual_document}, ${data.currency_code}, ${data.currency_name}, ${data.exchange_rate},
             ${data.salesman}, ${data.expected_delivery_date}, ${data.notes},
-            ${data.total_amount}, ${data.attachments}
+            ${data.total_amount}, ${data.attachments}, ${data.branch_id}
           ) RETURNING *
         `
 
@@ -79,10 +105,18 @@ export async function POST(request: NextRequest) {
   }
 }
 
-export async function PUT(request: NextRequest) {
+async function putHandler(request: NextRequest) {
   try {
-    const data = await request.json()
+    await ensureBranchColumn()
+    const payload = await request.json()
+    const data = payload.orderData || payload
     const { id, ...updateData } = data
+    const existing = (await sql`SELECT branch_id FROM purchase_orders WHERE id = ${id} LIMIT 1`)[0]
+    if (!existing) return NextResponse.json({ error: "Purchase order not found" }, { status: 404 })
+    const authorization = await authorizeTransaction(request, "purchase_order", "update", updateData.branch_id ?? existing.branch_id)
+    if (!authorization.ok) return authorization.response
+    const stopError = await validateAccountStops([updateData.supplier_id, updateData.customer_id, updateData.account_id], 2, updateData.order_date)
+    if (stopError) return NextResponse.json({ error: stopError }, { status: 400 })
 
     const result = await sql`
       UPDATE purchase_orders SET
@@ -98,6 +132,7 @@ export async function PUT(request: NextRequest) {
         notes = ${updateData.notes},
         total_amount = ${updateData.total_amount},
         attachments = ${updateData.attachments},
+        branch_id = ${authorization.branchId},
         updated_at = NOW()
       WHERE id = ${id}
       RETURNING *
@@ -110,7 +145,7 @@ export async function PUT(request: NextRequest) {
   }
 }
 
-export async function DELETE(request: NextRequest) {
+async function deleteHandler(request: NextRequest) {
   try {
     const { searchParams } = new URL(request.url)
     const id = searchParams.get("id")
@@ -118,6 +153,12 @@ export async function DELETE(request: NextRequest) {
     if (!id) {
       return NextResponse.json({ error: "Purchase order ID is required" }, { status: 400 })
     }
+
+    await ensureBranchColumn()
+    const existing = (await sql`SELECT branch_id FROM purchase_orders WHERE id = ${id} LIMIT 1`)[0]
+    if (!existing) return NextResponse.json({ error: "Purchase order not found" }, { status: 404 })
+    const authorization = await authorizeTransaction(request, "purchase_order", "delete", existing.branch_id)
+    if (!authorization.ok) return authorization.response
 
     await sql`DELETE FROM purchase_orders WHERE id = ${id}`
 
@@ -127,3 +168,8 @@ export async function DELETE(request: NextRequest) {
     return NextResponse.json({ error: "Failed to delete purchase order" }, { status: 500 })
   }
 }
+
+// أرشفة السندات (تقرير ارشفة السندات): نسخة قبل/بعد + نوع العملية والمستخدم
+export const POST = withVoucherAudit(postHandler, { source: "purchase_order", kind: "save" })
+export const PUT = withVoucherAudit(putHandler, { source: "purchase_order", kind: "save" })
+export const DELETE = withVoucherAudit(deleteHandler, { source: "purchase_order", kind: "delete" })

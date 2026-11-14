@@ -1,8 +1,11 @@
 "use client"
 
+import { tr } from "@/lib/i18n"
 import type React from "react"
 import { useState, useEffect } from "react"
 import { ProtectedRoute } from "@/components/auth/protected-route"
+import { FileAccessGate } from "@/components/auth/file-access-gate"
+import { TransactionAccessGate } from "@/components/auth/transaction-access-gate"
 import { ERPLayout } from "@/components/erp-layout"
 import { useWindowManager } from "@/contexts/window-manager-context"
 import { TabBar } from "@/components/window-manager/tab-bar"
@@ -29,6 +32,7 @@ import { BatchReports } from "@/components/reports/batch-reports"
 import { BatchLogReport } from "@/components/reports/batch-log-report"
 import { InventoryAnalytics } from "@/components/inventory/inventory-analytics"
 import { AutomatedReorderSystem } from "@/components/inventory/automated-reorder-system"
+import { PurchasePlanning } from "@/components/inventory/purchase-planning"
 import { BarcodeManagement } from "@/components/barcode/barcode-management"
 import { OrderTrackingDashboard } from "@/components/workflow/order-tracking-dashboard"
 import { LotOpener } from "@/components/inventory/lot-opener"
@@ -58,7 +62,7 @@ export default function DashboardLayoutPage() {
     if (activeWindows && activeWindows.length === 0) {
       openWindow({
         id: "dashboard",
-        title: "لوحة التحكم",
+        title: tr("لوحة التحكم"),
         component: Dashboard,
         icon: "dashboard",
         isMinimized: false,
@@ -154,6 +158,11 @@ export default function DashboardLayoutPage() {
                   component = AutomatedReorderSystem
                   title = "نظام إعادة الطلب التلقائي"
                   icon = "reorder"
+                  break
+                case "purchase-planning":
+                  component = () => <TransactionAccessGate section="purchase-planning"><FileAccessGate section="purchase-planning"><PurchasePlanning /></FileAccessGate></TransactionAccessGate>
+                  title = "تخطيط المشتريات الذكي"
+                  icon = "analytics"
                   break
                 case "barcode-management":
                   component = BarcodeManagement

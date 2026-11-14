@@ -1,48 +1,7 @@
+import { authorizeFile, authorizeFileRead, projectFileLookup } from "@/lib/file-permissions"
 import { type NextRequest, NextResponse } from "next/server"
-import { neon } from "@neondatabase/serverless"
-
-
-import { Pool } from "pg"
-
-let sql: any = null
-
-try {
-  if (!process.env.DATABASE_URL) {
-    console.error("[v0] DATABASE_URL environment variable is not set")
-  } else {
-    const dbUrl = process.env.DATABASE_URL
-
-    if (dbUrl.includes("localhost") || dbUrl.includes("127.0.0.1")) {
-      console.log("[v0] Using local PostgreSQL with pg Pool")
-      const pool = new Pool({ connectionString: dbUrl })
-      sql = async (strings: TemplateStringsArray, ...values: any[]) => {
-        const client = await pool.connect()
-        try {
-          const query =
-            strings.reduce(
-              (prev, curr, i) =>
-                prev + curr + (i < values.length ? `$${i + 1}` : ""),
-              ""
-            )
-          const result = await client.query(query, values)
-          return result.rows
-        } finally {
-          client.release()
-        }
-      }
-    } else {
-      console.log("[v0] Using Neon serverless client")
-      sql = neon(dbUrl)
-    }
-
-    console.log("[v0] Database client initialized successfully")
-  }
-} catch (error) {
-  console.error("[v0] Failed to initialize DB client:", error)
-  sql = null
-}
-
-export default sql
+import sql from "@/lib/database"
+import { financialListFromFather } from "@/app/api/customers/_lib"
 
 const toNullableInt = (value: unknown): number | null => {
   if (value === null || value === undefined || value === "") return null
@@ -120,6 +79,7 @@ const ensureSupplierAccount = async ({
   const finalIsCalcCurrDiffRates = toBool(isCalcCurrDiffRates, false)
   const finalFatherId = fatherId ? Number(fatherId) : null
   const finalLevelNo = Number(levelNo || 1) || 1
+  const financial = await financialListFromFather(finalFatherId)
 
   if (accountId) {
     await sql`
@@ -128,10 +88,10 @@ const ensureSupplierAccount = async ({
         code = ${normalizedCode},
         name = ${normalizedName},
         type = ${accountType},
-        finanical_list_id = 1,
-        finanical_list_assests_id = 2,
-        finanical_list_liabilities_id = NULL,
-        finanical_list_income_id = NULL,
+        finanical_list_id = ${financial.listId},
+        finanical_list_assests_id = ${financial.assetsId},
+        finanical_list_liabilities_id = ${financial.liabilitiesId},
+        finanical_list_income_id = ${financial.incomeId},
         father_id = ${finalFatherId},
         level_no = ${finalLevelNo},
         currency_id = ${finalCurrencyId},
@@ -171,10 +131,10 @@ const ensureSupplierAccount = async ({
       SET
         name = ${normalizedName},
         type = ${accountType},
-        finanical_list_id = 1,
-        finanical_list_assests_id = 2,
-        finanical_list_liabilities_id = NULL,
-        finanical_list_income_id = NULL,
+        finanical_list_id = ${financial.listId},
+        finanical_list_assests_id = ${financial.assetsId},
+        finanical_list_liabilities_id = ${financial.liabilitiesId},
+        finanical_list_income_id = ${financial.incomeId},
         father_id = ${finalFatherId},
         level_no = ${finalLevelNo},
         currency_id = ${finalCurrencyId},
@@ -221,15 +181,15 @@ const ensureSupplierAccount = async ({
     ) VALUES (
       3,
       ${normalizedCode},
-      1,
+      ${accountType},
       ${normalizedName},
       NULL,
       ${finalFatherId},
       ${finalLevelNo},
-      1,
-      2,
-      NULL,
-      NULL,
+      ${financial.listId},
+      ${financial.assetsId},
+      ${financial.liabilitiesId},
+      ${financial.incomeId},
       ${finalCurrencyId},
       ${finalAllowTransWithDiffCurr},
       ${finalIsCalcCurrDiffRates},
@@ -254,15 +214,28 @@ const ensureSupplierAccount = async ({
   return Number(created[0].id)
 }
 
-export async function GET() {
+const normalizeEntityCode = (rawValue: unknown, prefix = "S") => {
+  const cleaned = String(rawValue ?? "").trim().toUpperCase().replace(/[^A-Z0-9]/g, "")
+  if (!cleaned) return ""
+
+  const prefixValue = String(prefix).trim().toUpperCase()
+  const numericPart = cleaned.replace(/[^0-9]/g, "")
+  const maxDigits = Math.max(0, 10 - prefixValue.length)
+  const digits = numericPart.slice(0, maxDigits).padEnd(maxDigits, "0")
+  return `${prefixValue}${digits}`.slice(0, 10)
+}
+
+export async function GET(request: NextRequest) {
   try {
+    const permission = await authorizeFileRead(request, ["suppliers"])
+    if (!permission.ok) return permission.response
     const suppliers = await sql`
       SELECT *
       FROM suppliers
-      ORDER BY created_at DESC
+      ORDER BY supplier_code ASC NULLS LAST, id ASC
     `
 
-    return NextResponse.json(suppliers)
+    return NextResponse.json(permission.lookupOnly ? projectFileLookup("suppliers", suppliers) : suppliers)
   } catch (error) {
     console.error("Error fetching suppliers:", error)
     return NextResponse.json({ error: "Failed to fetch suppliers" }, { status: 500 })
@@ -271,9 +244,13 @@ export async function GET() {
 
 export async function POST(request: NextRequest) {
   try {
+    const permission = await authorizeFile(request, "suppliers", "create")
+    if (!permission.ok) return permission.response
     const data = await request.json()
 
     console.log("[v0] Received supplier data:", data)
+
+    data.supplier_code = normalizeEntityCode(data.supplier_code, "S")
 
     // Check if supplier code already exists
     if (data.supplier_code) {
@@ -379,6 +356,8 @@ export async function POST(request: NextRequest) {
 
 export async function PUT(request: NextRequest) {
   try {
+    const permission = await authorizeFile(request, "suppliers", "update")
+    if (!permission.ok) return permission.response
     const data = await request.json()
     const { id, ...updateData } = data
 
@@ -427,6 +406,8 @@ export async function PUT(request: NextRequest) {
 
 export async function DELETE(request: NextRequest) {
   try {
+    const permission = await authorizeFile(request, "suppliers", "delete")
+    if (!permission.ok) return permission.response
     const { searchParams } = new URL(request.url)
     const id = searchParams.get("id")
 

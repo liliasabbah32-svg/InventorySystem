@@ -1,34 +1,63 @@
 "use client";
 
+import { tr, appDir } from "@/lib/i18n"
 import { Dialog } from "primereact/dialog";
 import { Button } from "@/components/ui/button";
-import { ShieldAlert, SaveAll } from "lucide-react";
-import React, { useEffect } from "react";
+import { ShieldAlert, SaveAll, Sparkles } from "lucide-react";
+import React, { useEffect, useRef } from "react";
+import { Dialog as AppDialog, DialogContent, DialogTitle, DialogDescription } from "@/components/ui/dialog";
+import { useWorkspaceTabActive } from "@/contexts/workspace-tab-context"
 
 interface ConfirmDialogProps {
   visible: boolean;
+  title?: string;
   message?: string;
   onConfirm: () => void;
   onCancel: () => void;
   onBack?: () => void; // handler for "إلغاء"
   showBack?: boolean;  // true = show third button (unsaved changes mode)
   isCompact?: boolean; // true = smaller fonts and icons for compact mode
+  useAppDialog?: boolean;
+  busy?: boolean;
+  confirmLabel?: string;
+  cancelLabel?: string;
+  backLabel?: string;
+  onDismiss?: () => void;
+  /** وضع التنبيه (بديل alert): زر واحد فقط (confirmLabel، افتراضياً "حسناً") بلا زر إلغاء */
+  hideCancel?: boolean;
 }
 
 const ConfirmDialogYesNo: React.FC<ConfirmDialogProps> = ({
   visible,
+  title = "تأكيد حذف سند القيد",
   message = "هل أنت متأكد من الحذف؟",
   onConfirm,
   onCancel,
   onBack,
   showBack = false,
   isCompact = false,
+  useAppDialog = false,
+  busy = false,
+  confirmLabel,
+  cancelLabel,
+  backLabel,
+  onDismiss,
+  hideCancel = false,
 }) => {
+  const workspaceTabActive = useWorkspaceTabActive()
+
+  // أول Escape لا يُغلق النافذة — فقط "يُسلّحها"، ويُغلقها الضغط الثاني المتتالي. هذا يمنع
+  // إغلاقها فوراً وبشكل غير مقصود بنفس ضغطة الـ Escape التي فتحتها (مثلاً عند تعليق حفظ التغييرات).
+  const escapeArmedRef = useRef(false);
 
   useEffect(() => {
-    if (!visible) return;
+    escapeArmedRef.current = false;
+  }, [visible]);
 
-    const handleKeyDown = (e: KeyboardEvent) => {
+  useEffect(() => {
+    if (!visible || busy) return;
+
+    const handleKeyDown = (e: KeyboardEvent) => { if (!workspaceTabActive.current) return;
       if (e.key === "F3") {
         e.preventDefault();
         e.stopPropagation();
@@ -36,6 +65,11 @@ const ConfirmDialogYesNo: React.FC<ConfirmDialogProps> = ({
       } else if (e.key === "Escape") {
         e.preventDefault();
         e.stopPropagation();
+        if (!escapeArmedRef.current) {
+          escapeArmedRef.current = true;
+          return;
+        }
+        escapeArmedRef.current = false;
         if (showBack && onBack) {
           onBack();
         } else {
@@ -46,76 +80,89 @@ const ConfirmDialogYesNo: React.FC<ConfirmDialogProps> = ({
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [visible, onConfirm, onCancel, onBack, showBack]);
+  }, [visible, busy, onConfirm, onCancel, onBack, showBack]);
 
   const footer = (
-    <div className={`flex justify-center gap-2 mt-4 ${isCompact ? "mt-3" : "mt-5"}`}>
+    <div className={`flex justify-center gap-3 ${isCompact ? "mt-3" : "mt-5"}`}>
       <Button
+        type="button"
+        disabled={busy}
         onClick={() => {
           onConfirm();
         }}
-        className={`${isCompact ? "px-5 py-2 text-base" : "px-7 py-3 text-lg"} rounded-xl shadow-lg ${showBack
-            ? "bg-blue-600 hover:bg-blue-700 text-white"
-            : "bg-red-600 hover:bg-red-700 text-white"
-          }`}
+        className={`${isCompact ? "px-5 py-2 text-sm" : "px-7 py-3 text-base"} rounded-2xl border border-transparent bg-gradient-to-r from-rose-500 to-rose-600 text-white shadow-[0_10px_25px_-12px_rgba(244,63,94,0.9)] transition-all hover:-translate-y-0.5 hover:shadow-[0_14px_30px_-12px_rgba(244,63,94,0.9)]`}
       >
-        {showBack ? "نعم" : isCompact ? "حذف" : "نعم (F3)"}
+        {confirmLabel ?? (hideCancel ? tr("حسناً") : showBack ? tr("نعم") : tr("تأكيد"))}
       </Button>
 
-      <Button
+      {!hideCancel && <Button
+        type="button"
+        disabled={busy}
         onClick={onCancel}
         variant="outline"
-        className={`${isCompact ? "px-5 py-2 text-base" : "px-7 py-3 text-lg"} rounded-xl border-gray-400`}
+        className={`${isCompact ? "px-5 py-2 text-sm" : "px-7 py-3 text-base"} rounded-2xl border-slate-200 bg-white text-slate-700 shadow-sm transition-all hover:-translate-y-0.5 hover:bg-slate-50`}
       >
-        {showBack ? "لا" : isCompact ? "إلغاء" : "لا (ESC)"}
-      </Button>
+        {cancelLabel ?? (showBack ? tr("لا") : tr("إلغاء"))}
+      </Button>}
 
       {showBack && onBack && (
         <Button
           onClick={onBack}
-          className={`${isCompact ? "px-3 py-1 text-xs" : "px-4 py-1.5 text-sm"} rounded-xl bg-gray-300 hover:bg-gray-400 text-black`}
+          className={`${isCompact ? "px-3 py-2 text-xs" : "px-4 py-2 text-sm"} rounded-2xl border border-slate-200 bg-slate-100 text-slate-700 transition-all hover:bg-slate-200`}
         >
-          إلغاء
+          {backLabel ?? tr("رجوع")}
         </Button>
       )}
     </div>
   );
 
+  if (useAppDialog) return (
+    <AppDialog modal open={visible} onOpenChange={open => { if (!open && !busy) (onDismiss ?? onCancel)() }}>
+      {/* داخل مساحة الشاشة يضع DialogContent maxWidth كـ style فيُلغي max-w-md وتمتد النافذة بعرض الشاشة كلها أعلى الصفحة؛ نحدّها ونوسّطها هنا */}
+      <DialogContent dir={appDir()} hideCloseButton className="top-1/2 z-[1100] max-w-md -translate-y-1/2 rounded-2xl p-6 text-center" style={{ maxWidth: "min(28rem, calc(100% - 1.5rem))" }} onPointerDownOutside={event => event.preventDefault()} onEscapeKeyDown={event => event.preventDefault()}>
+        <ShieldAlert className="mx-auto h-10 w-10 text-rose-600" aria-hidden="true" />
+        <DialogTitle>{title}</DialogTitle>
+        <DialogDescription className="text-center leading-7">{message}</DialogDescription>
+        {footer}
+      </DialogContent>
+    </AppDialog>
+  );
+
   return (
     <Dialog
       visible={visible}
-      onHide={onCancel}
+      onHide={onDismiss ?? onCancel}
       footer={footer}
       modal
       closable={false}
-      className={`rounded-3xl shadow-2xl border-2 ${showBack ? "border-blue-400" : "border-red-400"
-        } backdrop-blur-xl`}
+      closeOnEscape={false}
+      className="overflow-hidden rounded-[24px] border border-slate-200/80 shadow-[0_20px_60px_-20px_rgba(15,23,42,0.35)]"
       style={{
         width: isCompact ? "420px" : "520px",
-        direction: "rtl",
+        maxWidth: "calc(100vw - 2rem)",
+        direction: appDir(),
         textAlign: "center",
-        background: "rgba(255, 255, 255, 0.95)",
+        background: "linear-gradient(135deg, rgba(255,255,255,0.98), rgba(248,250,252,0.97))",
       }}
     >
-      <div className={`flex flex-col items-center ${isCompact ? "py-2" : "py-4"}`}>
-        <div
-          className={`bg-white border-2 ${isCompact ? "p-2 rounded-full" : "p-4 rounded-full"} shadow-md ${showBack ? "border-blue-400" : "border-red-400"
-            }`}
-        >
-          {showBack ? (
-            <SaveAll className="text-blue-600" size={isCompact ? 20 : 30} />
-          ) : (
-            <ShieldAlert className="text-red-600" size={isCompact ? 20 : 30} />
-          )}
+      <div className={`flex flex-col items-center ${isCompact ? "px-2 py-3" : "px-3 py-5"}`}>
+        <div className={`relative mb-3 flex items-center justify-center ${isCompact ? "h-12 w-12" : "h-16 w-16"}`}>
+          <div className={`absolute inset-0 rounded-full bg-gradient-to-br ${showBack ? "from-blue-500/20 to-cyan-500/20" : "from-rose-500/20 to-orange-500/20"}`} />
+          <div className={`relative flex items-center justify-center rounded-full border ${showBack ? "border-blue-200 bg-blue-50" : "border-rose-200 bg-rose-50"} ${isCompact ? "h-10 w-10" : "h-14 w-14"}`}>
+            {showBack ? (
+              <SaveAll className={showBack ? "text-blue-600" : "text-rose-600"} size={isCompact ? 20 : 26} />
+            ) : (
+              <ShieldAlert className={showBack ? "text-blue-600" : "text-rose-600"} size={isCompact ? 20 : 26} />
+            )}
+          </div>
+          <div className="absolute -top-1 -start-1 rounded-full bg-white p-1 shadow-sm">
+            <Sparkles className="h-3.5 w-3.5 text-amber-500" />
+          </div>
         </div>
 
-        <h2
-          className={`font-bold ${isCompact ? "text-base mt-2" : "text-2xl mt-4"} ${showBack ? "text-blue-700" : "text-gray-800"
-            }`}
-        >
-        </h2>
-
-        <p className={`${isCompact ? "text-sm mt-2 px-3" : "text-gray-600 mt-3 px-4 text-lg"} text-gray-600`}>{message}</p>
+        <div className={`rounded-2xl border border-slate-200/70 bg-white/80 px-4 py-3 shadow-sm ${isCompact ? "max-w-[340px]" : "max-w-[420px]"}`}>
+          <p className={`${isCompact ? "text-sm" : "text-base"} leading-7 text-slate-700`}>{message}</p>
+        </div>
       </div>
     </Dialog>
   );

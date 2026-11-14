@@ -1,152 +1,80 @@
 import { type NextRequest, NextResponse } from "next/server"
-import sql, { updateSalesOrder, deleteSalesOrder,updatePrintSalesOrder } from "@/lib/orders"
+import { withVoucherAudit } from "@/lib/voucher-audit"
+import { getTenantPool } from "@/lib/database"
+import { deleteSalesOrder, updatePrintSalesOrder } from "@/lib/orders"
+import { authorizeTransaction } from "@/lib/transaction-permissions"
 
-export async function PUT_old(request: NextRequest, { params }: { params: { id: string } }) {
+async function getOrderType(id: number): Promise<number | null> {
+  const result = await (await getTenantPool()).query(`SELECT order_type FROM orders WHERE id = $1`, [id])
+  return result.rows[0]?.order_type ?? null
+}
+
+async function getOrderBranch(id: number): Promise<number | null> {
+  const result = await (await getTenantPool()).query(`SELECT branch_id FROM orders WHERE id = $1`, [id])
+  return result.rows[0]?.branch_id ?? null
+}
+
+async function getOrderStatus(id: number): Promise<number | null> {
+  const result = await (await getTenantPool()).query(`SELECT order_status FROM orders WHERE id = $1`, [id])
+  return result.rows[0]?.order_status == null ? null : Number(result.rows[0].order_status)
+}
+
+async function putHandler(request: NextRequest, { params }: { params: { id: string } }) {
   try {
-    console.log("[v0] PUT /api/orders/sales/[id] - Starting request processing")
+    const id = Number(params.id)
+    const userId = request.headers.get("x-user-id")
+    const data = await request.json()
 
-    const orderId = Number.parseInt(params.id)
-    if (Number.isNaN(orderId)) {
-      console.error("[v0] Invalid order ID:", params.id)
-      return NextResponse.json({ error: "رقم الطلبية غير صحيح" }, { status: 400 })
+    const orderType = await getOrderType(id)
+    if (orderType === null) {
+      return NextResponse.json({ error: "الطلبية غير موجودة" }, { status: 404 })
     }
 
-    const requestData = await request.json()
-    console.log("[v0] Update request data received for order:", orderId)
-
-    let orderData, items
-
-    if (requestData.orderData && requestData.items) {
-      // New structure: { orderData, items }
-      orderData = requestData.orderData
-      items = requestData.items
-    } else {
-      // Legacy structure: direct order data with items array
-      const { items: itemsArray, ...orderFields } = requestData
-      orderData = orderFields
-      items = itemsArray || []
+    if (data.printed) {
+      const authorization = await authorizeTransaction(request, "sales_order", "update", await getOrderBranch(id))
+      if (!authorization.ok) return authorization.response
+      await updatePrintSalesOrder(id, orderType, userId)
     }
 
-    if (!orderData) {
-      console.error("[v0] Validation failed: No order data")
-      return NextResponse.json({ error: "بيانات الطلبية مطلوبة" }, { status: 400 })
-    }
-
-    if (!items || items.length === 0) {
-      console.error("[v0] Validation failed: No items")
-      return NextResponse.json({ error: "عناصر الطلبية مطلوبة" }, { status: 400 })
-    }
-
-    console.log("[v0] Validation passed, updating order...")
-    const order = await updateSalesOrder(orderId, orderData, items)
-    console.log("[v0] Order updated successfully:", order.id)
-
-    return NextResponse.json(order)
+    return NextResponse.json({ success: true })
   } catch (error: any) {
-    console.error("[v0] Update sales order API error:", error)
-    console.error("[v0] Error stack:", error.stack)
-
-    const errorMessage = error.message || "حدث خطأ في تحديث طلبية المبيعات"
-    return NextResponse.json(
-      {
-        error: errorMessage,
-        details: process.env.NODE_ENV === "development" ? error.stack : undefined,
-      },
-      { status: 500 },
-    )
+    console.error("Update sales order API error:", error)
+    return NextResponse.json({ error: error?.message || "حدث خطأ أثناء تحديث الطلبية" }, { status: 500 })
   }
 }
 
-export async function DELETE(
-  request: NextRequest,
-  { params }: { params: { id: string } }
-) {
+async function deleteHandler(request: NextRequest, { params }: { params: { id: string } }) {
   try {
-    console.log("[v0] DELETE /api/orders/sales/[id] - Starting request processing");
+    const id = Number(params.id)
+    const userId = request.headers.get("x-user-id")
 
-    const orderId = Number.parseInt(params.id);
-    if (Number.isNaN(orderId)) {
-      return NextResponse.json(
-        { error: "رقم الطلبية غير صحيح" },
-        { status: 400 }
-      );
+    const orderType = await getOrderType(id)
+    if (orderType === null) {
+      return NextResponse.json({ error: "الطلبية غير موجودة" }, { status: 404 })
     }
 
-    // احصل على userId من الجلسة أو request headers (مثال)
-    const userId = request.headers.get("x-user-id") || "";
-
-    // احصل على order_type إذا تريد استخدامه كـ voucherType
-    const orderData = await sql`SELECT order_type FROM orders WHERE id = ${orderId}`;
-    if (!orderData || orderData.length === 0) {
+    const orderStatus = await getOrderStatus(id)
+    if (orderStatus === null) {
+      return NextResponse.json({ error: "الطلبية غير موجودة" }, { status: 404 })
+    }
+    if (![1, 2].includes(orderStatus)) {
       return NextResponse.json(
-        { error: "الطلبية غير موجودة" },
-        { status: 404 }
-      );
+        { error: "لا يمكن حذف الطلبية، تم إصدار فاتورة/فواتير من الطلبية" },
+        { status: 400 },
+      )
     }
 
-    const voucherType = orderData[0].order_type;
-    await deleteSalesOrder(orderId, voucherType, userId);
+    const authorization = await authorizeTransaction(request, "sales_order", "delete", await getOrderBranch(id))
+    if (!authorization.ok) return authorization.response
+    await deleteSalesOrder(id, orderType, userId)
 
-    return NextResponse.json({ message: "تم حذف الطلبية بنجاح" });
+    return NextResponse.json({ success: true })
   } catch (error: any) {
-    console.error("[v0] Delete sales order API error:", error);
-    console.error("[v0] Error stack:", error.stack);
-
-    const errorMessage = error.message || "حدث خطأ في حذف طلبية المبيعات";
-    return NextResponse.json(
-      {
-        error: errorMessage,
-        details: process.env.NODE_ENV === "development" ? error.stack : undefined,
-      },
-      { status: 500 }
-    );
+    console.error("Delete sales order API error:", error)
+    return NextResponse.json({ error: error?.message || "حدث خطأ أثناء حذف الطلبية" }, { status: 400 })
   }
 }
 
-
-export async function PUT(
-  request: NextRequest,
-  { params }: { params: { id: string } }
-) {
-  try {
-    console.log("[v0] Print /api/orders/sales/[id] - Starting request processing");
-
-    const orderId = Number.parseInt(params.id);
-    if (Number.isNaN(orderId)) {
-      return NextResponse.json(
-        { error: "رقم الطلبية غير صحيح" },
-        { status: 400 }
-      );
-    }
-
-    // احصل على userId من الجلسة أو request headers (مثال)
-    const userId = request.headers.get("x-user-id") || "";
-
-    // احصل على order_type إذا تريد استخدامه كـ voucherType
-    const orderData = await sql`SELECT order_type FROM orders WHERE id = ${orderId}`;
-    if (!orderData || orderData.length === 0) {
-      return NextResponse.json(
-        { error: "الطلبية غير موجودة" },
-        { status: 404 }
-      );
-    }
-
-    const voucherType = orderData[0].order_type;
-    await updatePrintSalesOrder(orderId, voucherType, userId);
-
-    return NextResponse.json({ message: "" });
-  } catch (error: any) {
-    console.error("[v0] Delete sales order API error:", error);
-    console.error("[v0] Error stack:", error.stack);
-
-    const errorMessage = error.message || "حدث خطأ في طباعة الطلبية ";
-    return NextResponse.json(
-      {
-        error: errorMessage,
-        details: process.env.NODE_ENV === "development" ? error.stack : undefined,
-      },
-      { status: 500 }
-    );
-  }
-}
-
+// أرشفة السندات (تقرير ارشفة السندات): نسخة قبل/بعد + نوع العملية والمستخدم
+export const PUT = withVoucherAudit(putHandler, { source: "order", kind: "save" })
+export const DELETE = withVoucherAudit(deleteHandler, { source: "order", kind: "delete" })

@@ -1,11 +1,24 @@
 "use client"
 
+import { tr, appDir } from "@/lib/i18n"
+import { showAlert } from "@/components/ui/confirm-host"
 import { useState, useEffect, useMemo, useRef } from "react"
+import { useCustomerDefaultSalesman } from "@/lib/use-customer-default-salesman"
+import { computeVoucherTax } from "@/lib/item-vat"
+import { useItemVatRates } from "@/lib/use-item-vat-rates"
+import {
+  applyItemAmountAction,
+  finiteItemNumber,
+  guardItemAmountInput,
+  handleItemAmountKeyDown,
+  parseItemAmount,
+  type AppliedItemAmountAction,
+} from "@/lib/item-amount"
 import { Button } from "@/components/ui/button"
+import AccountBalanceField from "@/components/common/account-balance-field"
 import { Dialog, DialogContent } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Textarea } from "@/components/ui/textarea"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
@@ -14,9 +27,11 @@ import { Accordion, AccordionContent, AccordionItem, AccordionTrigger } from "@/
 import { UniversalToolbar } from "@/components/ui/universal-toolbar"
 import { ReportGenerator } from "@/components/ui/report-generator"
 import { useRecordNavigation } from "@/hooks/use-record-navigation"
+import TransactionBranchField from "@/components/common/transaction-branch-field"
+import { useWorkspace } from "@/contexts/workspace-context"
 import * as wjcCore from '@grapecity/wijmo';
 import { Toast } from 'primereact/toast';
-import * as XLSX from "xlsx";
+import { VoucherLinesImportDialog } from "@/components/import/voucher-lines-import";
 import { FlexGrid } from '@grapecity/wijmo.react.grid';
 import {
   Plus,
@@ -30,26 +45,54 @@ import {
   MessageSquare,
   TrendingUp,
   Currency,
+  Printer,
+  CheckCircle2,
 } from "lucide-react"
+import { loadVoucherPrintSettings, printVoucher, printVoucherWithSettings } from "@/lib/voucher-print/print"
+import { armVoucherWhatsApp } from "@/lib/voucher-print/whatsapp-share"
+import type { PrintDocument } from "@/lib/voucher-print/document"
+import { settingEnabled } from "@/lib/item-vat"
 import { useDocumentSettings } from "@/hooks/use-document-settings"
+import { requestProductVariant } from "@/components/products/product-variant-service"
+import { useAuth } from "@/components/auth/auth-context"
 import { LotSelector } from "@/components/inventory/lot-selector"
 import ProductSearchPopup from "../products/ProductSearchPopup"
 import * as wjGrid from "@grapecity/wijmo.grid";
 import DataGridView from "../common/DataGridView"
 import Messages from "../common/Messages"
+import { useVoucherPricingPermission, voucherPricingPermissionLabel } from "@/components/auth/transaction-access-gate"
+import type { VoucherPricingAction } from "@/lib/transaction-permission-definitions"
 import Util from "../common/Util"
 import UnitsSearchPopup from "../products/UnitsSearchPopup"
 import StoresSearchPopup from "../products/StoresSearchPopup"
 import { adjustStock } from "@/lib/inventory"
 import { maxLength } from "zod/v4"
 import Dropdown from "../common/Dropdown"
-import CustomerSearchPopup from "../products/CustomerSearchPopup"
+import AccountSearchDialog, { type AccountItem } from "@/components/customer/account-search-dialog"
 import ProgressSpinner from "../ProgressSpinner/ProgressSpinner"
 import OrderSearchPopup from "./OrderSearchPopup"
 import ConfirmDialogYesNo from "../ui/ConfirmDialogYesNo"
+import MeasurementInputDialog from "@/components/common/MeasurementInputDialog"
 import { stat } from "fs"
 import { set } from "date-fns"
 import React from "react"
+import { useWorkspaceTabActive } from "@/contexts/workspace-tab-context"
+import { screenHotkeysAllowed } from "@/lib/hotkeys"
+import { useNavigationGuard } from "@/lib/navigation-guard"
+import { keepDialogOpenOnEscape } from "@/lib/dialog-escape"
+import { logVoucherAudit } from "@/lib/audit-client"
+import { SmsSendDialog } from "@/components/sms/sms-send-dialog"
+
+const ORDER_ITEM_STATUS_OPTIONS = [
+  { value: 1, label: tr("غير جاهز") },
+  { value: 2, label: tr("جاهز") },
+  { value: 3, label: tr("أرسلت جزئياً"), disabled: true },
+  { value: 4, label: tr("أرسلت كلياً"), disabled: true },
+  { value: 6, label: tr("مغلق") },
+]
+// "ملغي" (5) أُزيل من الحالات — يُعرض فقط لطلبية/سطر محفوظ سابقاً بهذه الحالة، ولا يمكن اختياره
+const LEGACY_CANCELLED_STATUS = { value: 5, label: tr("ملغي"), disabled: true }
+const ORDER_ITEM_STATUS_DISPLAY = [...ORDER_ITEM_STATUS_OPTIONS, LEGACY_CANCELLED_STATUS]
 const InlineProductSearch = ({ onSelect, onClose, products }: any) => {
   const [searchTerm, setSearchTerm] = useState("")
 
@@ -64,34 +107,34 @@ const InlineProductSearch = ({ onSelect, onClose, products }: any) => {
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-50">
       <div className="bg-white p-4 rounded-lg shadow-lg max-w-md w-full">
-        <h3 className="text-lg font-semibold mb-4">بحث المنتجات</h3>
+        <h3 className="text-lg font-semibold mb-4">{tr("بحث المنتجات")}</h3>
         <input
           type="text"
-          placeholder="ابحث عن منتج..."
-          className="mb-4 p-2 border rounded w-full text-right"
+          placeholder={tr("ابحث عن منتج...")}
+          className="mb-4 p-2 border rounded w-full text-start"
           value={searchTerm}
           onChange={(e) => setSearchTerm(e.target.value)}
-          dir="rtl"
+          dir={appDir()}
         />
         <div className="space-y-2 max-h-60 overflow-y-auto">
           {filteredProducts.map((product: any) => (
             <button
               key={product.id}
               onClick={() => onSelect(product)}
-              className="block w-full text-right p-2 hover:bg-gray-100 rounded"
+              className="block w-full text-start p-2 hover:bg-gray-100 rounded"
             >
               <div className="font-medium">{product.product_name}</div>
               <div className="text-sm text-gray-500">
                 {product.product_code} - {product.main_unit} - {product.selling_price || product.last_purchase_price}
-                ر.س
+                {tr("ر.س")}
               </div>
             </button>
           ))}
-          {filteredProducts.length === 0 && <div className="text-center text-gray-500 py-4">لا توجد نتائج</div>}
+          {filteredProducts.length === 0 && <div className="text-center text-gray-500 py-4">{tr("لا توجد نتائج")}</div>}
         </div>
         <div className="flex justify-end mt-4">
           <Button variant="outline" onClick={onClose}>
-            إغلاق
+            {tr("إغلاق")}
           </Button>
         </div>
       </div>
@@ -156,6 +199,7 @@ interface Product {
   id: number
   product_code: string
   name: string
+  transaction_notes?: string
   main_unit: string
   last_purchase_price: number
   selling_price?: number
@@ -184,6 +228,9 @@ interface OrderItem {
   expiry_date: string
   batch_number: string
   notes: string
+  attributes?: Array<{ name: string; values: string[]; value_images?: Record<string, string | null> }>
+  selected_attributes?: Record<string, string>
+  attribute_summary?: string
   // New fields for lot selection
   lot_id?: number | null
   lotAllocations?: any[] // To store detailed lot allocations
@@ -191,6 +238,7 @@ interface OrderItem {
 
 interface OrderFormData {
   id?: number
+  branch_id?: number | null
   order_number: string | null
   order_date: string | null
   invoice_number: string | null
@@ -240,6 +288,7 @@ interface OrderFormData {
 
 const initialFormData: OrderFormData = {
   id: 0,
+  branch_id: null,
   order_number: "",
   order_date: new Date().toISOString().split("T")[0],
   invoice_number: "",
@@ -279,7 +328,7 @@ const initialFormData: OrderFormData = {
   customer_number: "",
   customer_phone: "",
   order_source: "manual",
-  vch_book: "R",
+  vch_book: "",
   received_by: "",
   customer_order_no: "",
   printed: 0,
@@ -298,6 +347,9 @@ function UnifiedSalesOrder({
   vch_type,
   fromSearch = false,
 }: UnifiedSalesOrderProps) {
+  const workspaceTabActive = useWorkspaceTabActive()
+  const { activeBranchId, user } = useAuth()
+  const { fullscreenEnabled } = useWorkspace()
   const {
     settings,
     loading: settingsLoading,
@@ -334,11 +386,26 @@ function UnifiedSalesOrder({
   const isHandlingSave = useRef(false)
   const isDeleting = useRef(false)
   const lastVchBook = useRef<string | null>(null)
+  const [defaultItemWarehouseId, setDefaultItemWarehouseId] = useState<number | null>(null)
+  const defaultItemWarehouseIdRef = useRef<number | null>(null)
+  defaultItemWarehouseIdRef.current = defaultItemWarehouseId
+  const defaultVatPercentRef = useRef<number>(0)
   const doHotKeys = useRef(true)
+  const amountEditSnapshotRef = useRef<{ grid: any; row: number; value: any } | null>(null)
+  const amountVatAdjustmentRef = useRef(new Map<number, AppliedItemAmountAction>())
+  useEffect(() => {
+    amountVatAdjustmentRef.current.clear()
+  }, [state.formData.id, state.formData.vch_code])
   const toast = useRef<Toast | null>(null);
   const message = useRef(Messages);
+  // صلاحيات تسعير الطلبية (VOUCHER_PRICING_ACTIONS): تعديل السعر/المبلغ، خصم الصنف، الخصم العام، نسبة الضريبة
+  const canPricing = useVoucherPricingPermission(Number(vch_type) || 1)
+  const denyPricing = (action: VoucherPricingAction) => Util.showErrorMessage(message, tr("لا توجد لديك صلاحية {0}", voucherPricingPermissionLabel(Number(vch_type) || 1, action)))
+  // رسالة SMS للعميل (lib/sms.ts)
+  const [smsOpen, setSmsOpen] = useState(false)
   const [loading, setLoading] = useState(false);
   const setFromExcelRef = useRef(false);
+  const appendItemsRef = useRef(false);
   const priceCategoryIdRef = useRef(1)
   const [definitions, setDefinitions] = useState({
     categories: [] as Array<{ id: number; group_name: string }>,
@@ -376,6 +443,7 @@ function UnifiedSalesOrder({
   const [selectedIndex, setSelectedIndex] = useState(0)
   const [orderStatusList, setOrderStatusList] = useState<OrderStatus[]>([]);
   const [orderStatus, setOrderStatus] = useState<OrderStatus | null>(null);
+  const [voucherBooks, setVoucherBooks] = useState<{ id: number; name: string }[]>([]);
   const [selectedProductForUnits, setSelectedProductForUnits] = useState<Product | null>(null);
   const [showStoresSearch, setStoresSearch] = useState(false)
   const [showCustomerSearch, setShowCustomerSearch] = useState(false);
@@ -393,16 +461,58 @@ function UnifiedSalesOrder({
   const [alertMessage, setAlertMessage] = useState("");
   const [nextFunction, setNextFunction] = useState<(() => void) | null>(null);
   const [showPrintRefConfirm, setShowPrintRefConfirm] = useState(false);
+  // طباعة حسب المستودع (إعداد عام): زر يوزّع الأصناف على مستودعاتها ويطبع كل مجموعة على طابعة مستودعها
+  const [printByWarehouseEnabled, setPrintByWarehouseEnabled] = useState(false)
+  const [warehousesPrinted, setWarehousesPrinted] = useState(false)
+  const [warehousePrinting, setWarehousePrinting] = useState(false)
+  const [showWarehouseReprintConfirm, setShowWarehouseReprintConfirm] = useState(false)
   const [showDuplicateRefConfirm, setShowDuplicateRefConfirm] = useState(false);
+  const [measurementDialogOpen, setMeasurementDialogOpen] = useState(false)
+  const [measurementDialogRow, setMeasurementDialogRow] = useState<number | null>(null)
+  const measurementConfirmedRef = useRef(false)
   const [isDuplicateRefConfirmed, setIsDuplicateRefConfirmed] = useState(false);
   const duplicateRefDismissedValueRef = useRef<string>("");
   const skipNextEnterRef = useRef(false)
   const suppressEnterUntilRef = useRef(0)
-  const [data, setData] = useState([{
-    ser: 1, unit_id: 0, unit_name: '', units: [], name: '', discount: 0, batch: '', expiry_date: '1900-01-01', item_status: 1,
-    barcode: '', id: 0, code: '', price: 0, qnty: 0, bonus: 0, amount: 0, to_main_unit_qty: 0, store_id: 0, store_name: ''
+  const [data, setData] = useState<any[]>([{
+    ser: 1,
+    unit_id: 0,
+    unit_name: '',
+    units: [],
+    name: '',
+    discount: 0,
+    batch: '',
+    expiry_date: '1900-01-01',
+    item_status: 1,
+    barcode: '',
+    id: 0,
+    code: '',
+    price: 0,
+    price_incl_tax: 0,
+    qnty: 0,
+    bonus: 0,
+    amount: 0,
+    to_main_unit_qty: 0,
+    store_id: 0,
+    store_name: '',
+    measurment_id: 1,
+    product_length: null,
+    product_width: null,
+    product_density: null,
+    length: null,
+    width: null,
+    height: null,
+    count: null,
   }]);
-  const [CollectionView] = useState(() => new wjcCore.CollectionView(data));
+  const [CollectionView] = useState(() => {
+    const view = new wjcCore.CollectionView(data)
+    try {
+      view.refreshOnEdit = false
+    } catch {
+      // Ignore older Wijmo builds that do not expose refreshOnEdit.
+    }
+    return view
+  })
   const CollectionViewBackupRef = useRef(null as any);
   const createNewOrder = (): SalesOrder => ({
     id: 0,
@@ -495,15 +605,54 @@ function UnifiedSalesOrder({
 
 
   useEffect(() => {
-    const { vch_book } = state.formData;
+    const { vch_book, id: formId } = state.formData;
 
     // Optional: only generate if vch_book has a value
-    console.log("vch_book changed999999:", vch_book, "fromBlurRef:", fromBlurRef.current, "fromSearch:", fromSearch)
-    if (vch_book != null && !fromBlurRef.current && !fromSearch) {
+    console.log("vch_book changed:", vch_book, "fromBlurRef:", fromBlurRef.current, "fromSearch:", fromSearch, "formId:", formId);
+    
+    // Check if voucher book changed on NEW order (id = 0)
+    if (formId === 0 && vch_book != null && lastVchBook.current !== null && lastVchBook.current !== vch_book) {
+      console.log("Voucher book changed from", lastVchBook.current, "to", vch_book, "for new order");
+      
+      // Reset order number to force regeneration with new voucher book
+      setState((prev) => ({
+        ...prev,
+        formData: {
+          ...prev.formData,
+          order_number: "", // Reset order number
+        }
+      }));
+      
+      // Generate new order number with new voucher book
+      fromBlurRef.current = false;
+      generateOrderNumber(vch_book);
+      
+      // Set focus on date field
+      setTimeout(() => {
+        orderdateRef.current?.focus();
+      }, 50);
+    } else if (formId === 0 && vch_book != null && !fromBlurRef.current && !fromSearch) {
+      // طلبية جديدة فقط: طلبية محفوظة تحتفظ برقمها (سابقاً كان تحميلها يستبدل رقمها بالرقم التالي فيُحفظ فوقها/يُنسخ خطأً)
       generateOrderNumber();
     }
+    
+    // Store current vch_book as last for future change detection
+    if (vch_book != null) {
+      lastVchBook.current = vch_book;
+    }
+    
     fromSearch = false
-  }, [state.formData.vch_book]);
+  }, [state.formData.vch_book, state.formData.id]);
+  // تغيير الفرع لطلبية جديدة يعيد توليد رقمها (بادئة الطلبية + رمز الفرع + رمز الدفتر + التسلسل)
+  const lastBranchRef = useRef(state.formData.branch_id)
+  useEffect(() => {
+    const { id: formId, branch_id: branchId, vch_book } = state.formData
+    if (lastBranchRef.current === branchId) return
+    lastBranchRef.current = branchId
+    if (formId !== 0 || !branchId || vch_book == null) return
+    void generateOrderNumber(vch_book)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state.formData.branch_id])
   const currencies = [
     { code: "SAR", name: "ريال سعودي" },
     { code: "USD", name: "دولار أمريكي" },
@@ -528,24 +677,38 @@ function UnifiedSalesOrder({
       try {
         setLoading(true);
 
-        // Wait for definitions to load
-        await fetchDefinitions();
-
+        // Wait for definitions to load (includes default voucher book)
+        const definitions = await fetchDefinitions();
+        const defaultBookName = definitions?.defaultVoucherBook ?? null;
+        
         // Set order statuses
         setOrderStatusList([
           { id: 1, name: 'غير جاهز' },
           { id: 2, name: 'جاهز' },
           { id: 3, name: 'مرسلة جزئيا' },
           { id: 4, name: 'مرسلة كليا' },
-          { id: 5, name: 'ملغي' }
+          { id: 6, name: 'مغلق' }
         ]);
 
         // Initialize new record
-        if (order) {
+        if (order?.id) {
+          // طلبية موجودة: دفتر السندات يأتي من الطلبية نفسها (loadOrderData) — لا يُستبدَل بالافتراضي.
           loadOrderData("Byid", order.id)
           //fromSearch = false
         }
-        else reset_order();
+        else {
+          // طلبية جديدة: يُضبَط دفتر السندات على الافتراضي الفعلي لصلاحيات المستخدم أولاً (يُمرَّر
+          // صراحة لـreset_order بدل الاعتماد على "R" الثابتة القديمة أو قراءة state بعد setState
+          // غير متزامن)، ثم يُولَّد رقم الطلبية بناءً عليه مباشرة بنفس اللفة — لا توليد أول بدفتر
+          // خاطئ يليه توليد ثانٍ مصحَّح.
+          reset_order(defaultBookName ?? undefined);
+          if (Array.isArray(order?.items) && order.items.length) {
+            const prefilledItems = order.items.map((item: any, index: number) => ({ ser: index + 1, id: Number(item.product_id), product_id: Number(item.product_id), code: item.product_code || "", name: item.product_name || "", product_name: item.product_name || "", barcode: item.barcode || "", qnty: Number(item.qnty ?? item.quantity ?? 0), bonus: 0, price: Number(item.unit_price || 0), price_incl_tax: Number(item.unit_price || 0), amount: Number(item.qnty ?? item.quantity ?? 0) * Number(item.unit_price || 0), unit_id: item.unit_id || 0, unit_name: item.unit_name || item.unit || "", units: [], store_id: Number(item.store_id || 0), store_name: item.store_name || "", item_status: 1, measurment_id: Number(item.measurment_id || 1), length: item.length == null ? null : Number(item.length), width: item.width == null ? null : Number(item.width), height: item.height == null ? null : Number(item.height), count: item.count == null ? null : Number(item.count), selected_attributes: item.selected_attributes || item.features || {}, attribute_summary: Object.values(item.selected_attributes || item.features || {}).join("، "), specifications: item.specifications || { product: item.features || {}, reviewed: true } }))
+            CollectionView.sourceCollection.splice(0, CollectionView.sourceCollection.length, ...prefilledItems)
+            CollectionView.refresh()
+            setState((prev) => ({ ...prev, formData: { ...prev.formData, customer_id: Number(order.customer_id) || prev.formData.customer_id, customer_name: order.customer_name || prev.formData.customer_name, general_notes: order.general_notes || prev.formData.general_notes }, activeTab: "items" }))
+          }
+        }
       } catch (error) {
         console.error("Failed to fetch definitions:", error);
       } finally {
@@ -575,6 +738,30 @@ function UnifiedSalesOrder({
       setDefinitions((prev) => ({ ...prev, currencies: currenciesData.rates }))
     }
 
+    // Load default system settings for tax rate
+    const systemResponse = await fetch("/api/settings/system")
+    if (systemResponse.ok) {
+      const systemData = await systemResponse.json()
+      defaultVatPercentRef.current = Number(systemData?.tax_rate) || 0
+      setPrintByWarehouseEnabled(settingEnabled(systemData?.print_order_by_warehouse ?? systemData?.settings?.print_order_by_warehouse))
+    }
+
+    if (user?.id) {
+      try {
+        const warehouseDefaultsUrl = `/api/settings/user-warehouse-defaults?user_id=${encodeURIComponent(user.id)}`
+        const defaultsResponse = await fetch(warehouseDefaultsUrl)
+        if (defaultsResponse.ok) {
+          const defaultsData = await defaultsResponse.json()
+          setDefaultItemWarehouseId(defaultsData?.default_item_warehouse_id ?? null)
+        } else {
+          setDefaultItemWarehouseId(null)
+        }
+      } catch (error) {
+        console.error("Failed to load user default warehouse:", error)
+        setDefaultItemWarehouseId(null)
+      }
+    }
+
     // Price categories
     const pricesResponse = await fetch("/api/pricecategory")
     if (pricesResponse.ok) {
@@ -589,26 +776,35 @@ function UnifiedSalesOrder({
       setSalesmen(Array.isArray(json.data) ? json.data : []);
     }
 
-    return definitionsObj
+    // Fetch default voucher book
+    // دفتر السندات: يُجلَب فعلياً من voucher_book_user_permissions_tbl،
+    // مقيّداً بنوع السند (1=طلبية مبيعات، 2=طلبية مشتريات — voucher_types_tbl).
+    let defaultBookName: string | null = null;
+    try {
+      const booksRes = await fetch(
+        `/api/receipts/voucher-books?vch_type=${vch_type ?? 1}${user?.id ? `&user_id=${encodeURIComponent(user.id)}` : ""}`,
+      );
+      if (booksRes.ok) {
+        const booksData = await booksRes.json();
+        const books = Array.isArray(booksData?.books) ? booksData.books : [];
+        setVoucherBooks(books);
+        definitionsObj.defaultVoucherBook = books.find((b: any) => b.id === booksData?.default_book_id)?.name ?? books[0]?.name ?? null;
+        defaultBookName = definitionsObj.defaultVoucherBook;
+      }
+    } catch (error) {
+      console.error("Failed to fetch voucher books:", error);
+    }
+
+    return { ...definitionsObj, defaultVoucherBook: defaultBookName }
   }
   useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
+    const handleKeyDown = (e: KeyboardEvent) => { if (!workspaceTabActive.current) return;
       // F2 for customer search
-      if (e.key === "F2" && !e.ctrlKey && !e.altKey) {
+      if (e.key === "F2" && !e.ctrlKey && !e.altKey && screenHotkeysAllowed()) {
         e.preventDefault()
         setState((prev) => ({ ...prev, showCustomerSearch: true }))
       }
-      // F3 for product search in focused row
-      if (e.key === "F3" && !e.ctrlKey && !e.altKey) {
-        e.preventDefault()
-        const activeElement = document.activeElement as HTMLElement
-        if (activeElement?.closest("[data-product-row]")) {
-          const rowId = activeElement.closest("[data-product-row]")?.getAttribute("data-product-row")
-          if (rowId) {
-            setState((prev) => ({ ...prev, showProductSearch: true, activeItemId: rowId }))
-          }
-        }
-      }
+      // F3/Ctrl+S حفظ، F9 حذف، F4 نسخ، F5 جديد، Ctrl+P طباعة: UniversalToolbar (lib/hotkeys.ts)
       // Escape to close search
       if (e.key === "Escape") {
         setState((prev) => ({
@@ -618,11 +814,6 @@ function UnifiedSalesOrder({
           activeItemId: null,
           showLotSelector: false,
         }))
-      }
-      // Ctrl+S for save
-      if (e.key === "s" && e.ctrlKey) {
-        e.preventDefault()
-        handleSave()
       }
     }
 
@@ -667,11 +858,14 @@ function UnifiedSalesOrder({
     }
   }
 
-  const generateOrderNumber = async () => {
+  // vchBookOverride: يُستخدَم عندما يُستدعى التوليد مباشرة بعد ضبط دفتر السندات ببرمجية (setState)
+  // بنفس اللفة التزامنية — state.formData.vch_book بالذاكرة المحلية لا يعكس تحديث setState الأخير
+  // بعد (تحديثات React غير متزامنة)، فتُمرَّر القيمة الفعلية صراحة بدل قراءتها من state القديم.
+  const generateOrderNumber = async (vchBookOverride?: string) => {
     try {
-      const vchBook = state.formData.vch_book ?? "0";
+      const vchBook = vchBookOverride ?? state.formData.vch_book ?? "0";
       const response = await fetch(
-        `/api/orders/generate-number?vch_book=${encodeURIComponent(vchBook)}&vch_type=${encodeURIComponent(vch_type ?? 1)}`
+        `/api/orders/generate-number?vch_book=${encodeURIComponent(vchBook)}&vch_type=${encodeURIComponent(vch_type ?? 1)}${state.formData.branch_id ? `&branch_id=${state.formData.branch_id}` : ""}`
       );
 
       if (!response.ok) {
@@ -711,7 +905,7 @@ function UnifiedSalesOrder({
   };
 
 
-  const adjustCode = (code: string, codeLen: number = 8): string => {
+  const adjustCode = (code: string, codeLen: number = 10): string => {
     if (!code || !code.trim()) return '';
 
     code = code.trim().toUpperCase();
@@ -763,56 +957,15 @@ function UnifiedSalesOrder({
   };
 
   const handleOrderCodeBlur = async () => {
-    const { order_number } = state.formData;
+    const raw = (state.formData.order_number || "").trim();
+    if (!raw) return;
 
-    // Remove all non-alphanumeric characters
-    let cleaned = (order_number || "").replace(/[^a-zA-Z0-9]/g, "");
-
-    // Force first letter based on vch_type
-    const firstLetter = vch_type === 1 ? "O" : "T";
-
-    // Ensure first character is replaced
-
-    // Adjust length using your adjustCode function
-    cleaned = adjustCode(cleaned, 8);
-
-    let order_num = firstLetter + (cleaned.slice(1) || "");
-
-
-    console.log("order_num ", order_num);
-    fromBlurRef.current = true
-    // Update state
-    setState((prev) => ({
-      ...prev,
-      formData: {
-        ...prev.formData,
-        order_number: order_num,
-        vch_book: order_num[1] ?? "R", // second character
-      },
-    }));
-
-    const params = new URLSearchParams({
-      order_number: order_num,
-    });
-
-    const res = await fetch(`/api/orders/getorderbycode?${params.toString()}`);
-    const data = await res.json();
-    if (!res.ok) {
-      reset_order()
+    try {
+      await loadOrderData('ByCode', undefined, raw, false);
+    } catch (error) {
+      console.error("Error resolving order code:", error);
+      Util.showErrorMessage(message, tr("حدث خطأ أثناء التحقق من رقم الطلبية"));
     }
-    else {
-      if (!data) reset_order()
-      else {
-        if (data.deleted === true) {
-          Util.showErrorMessage(message, 'الطلبية محذوفة لا يمكن عرضها')
-          reset_order();
-          return
-        }
-
-        loadOrderData('Byid', data.id)
-      }
-    }
-    //fromBlurRef.current = false
   };
 
 
@@ -852,6 +1005,20 @@ function UnifiedSalesOrder({
 
     const grid = gridRef.current?.flex;
     const selectedIndex = grid?.selection?.row;
+    const selectedItem = CollectionView.sourceCollection[selectedIndex] as any;
+
+    // بند مرتبط بمخطط سير عمل تتبع طلبيات (workflow_id يُضبط تلقائياً عند حفظ الطلبية) لا يجوز
+    // حذفه من السطر — حذفه يترك مهمة/مراحل "لوحة تتبع الطلبيات" يتيمة بلا بند طلبية أصلي تتبعه.
+    if (selectedItem?.workflow_id) {
+      toast.current?.show({
+        severity: 'error',
+        summary: tr("تعذر الحذف"),
+        detail: tr("الصنف - {0} مرتبط بمخطط سير عمل - {1} لا يمكن حذف الصنف", selectedItem.name || selectedItem.product_name || '', selectedItem.workflow_name || ''),
+        life: 4000
+      });
+      return;
+    }
+
     CollectionView.sourceCollection.splice(selectedIndex, 1);
     CollectionView.refresh();
 
@@ -862,7 +1029,11 @@ function UnifiedSalesOrder({
     CollectionView.sourceCollection.forEach((item, index) => {
       item.ser = index + 1;
     });
-    grid.refresh();
+    try {
+      grid?.refresh?.();
+    } catch {
+      // Ignore stale grid refreshes after the app resumes or the control is recreated.
+    }
 
     setTimeout(async () => {
       const lastRowIndex = CollectionView.items.length - 1;
@@ -881,24 +1052,45 @@ function UnifiedSalesOrder({
     const grid = gridRef.current?.flex;
     if (!grid) return;
 
+    const selectedItems = Array.isArray(items) ? items.filter(Boolean) : items ? [items] : [];
+    if (selectedItems.length === 0) return;
+
+    try {
+      await FillItemInner(selectedItems, grid);
+    } catch (error: any) {
+      // استثناء غير معالَج هنا سابقاً (كخطأ شبكة عند جلب وحدات الصنف) كان يهرب كـ unhandled promise
+      // rejection بعد إغلاق نافذة البحث أصلاً — يظهر للمستخدم كأن التطبيق "تعطّل" رغم أن الإضافة قد
+      // تكون جزئية. الآن يُلتَقط ويُعرَض كتنبيه بدل ذلك.
+      console.error("Error adding product to order:", error);
+      toast.current?.show({
+        severity: "error",
+        summary: tr("تعذّرت إضافة الصنف"),
+        detail: error?.message || tr("حدث خطأ غير متوقع أثناء إضافة الصنف"),
+        life: 4000,
+      });
+    }
+  };
+
+  const FillItemInner = async (items: any[], grid: wjGrid.FlexGrid) => {
     const resolveProductStore = (product: any) => {
-      const defaultStoreId = Number(product.default_store ?? product.store_id ?? 0) || 0;
-      const defaultStoreName =
-        product.default_store_name ||
+      const productStoreId = product?.default_store ? Number(product.default_store) : product?.store_id ? Number(product.store_id) : 0;
+      const userWarehouseId = Number(defaultItemWarehouseIdRef.current ?? 0) || 0;
+      const resolvedStoreId = productStoreId > 0 ? productStoreId : userWarehouseId > 0 ? userWarehouseId : definitionsRef.current?.warehouses?.[0]?.id ?? 0;
+      const resolvedStoreName =
+        (productStoreId > 0
+          ? product.default_store_name || product.store_name
+          : userWarehouseId > 0
+          ? definitionsRef.current?.warehouses?.find((warehouse: any) => warehouse.id === userWarehouseId)?.warehouse_name
+          : undefined) ||
         product.store_name ||
-        definitionsRef.current?.warehouses?.find((warehouse: any) => warehouse.id === defaultStoreId)?.warehouse_name ||
+        product.default_store_name ||
+        definitionsRef.current?.warehouses?.find((warehouse: any) => warehouse.id === resolvedStoreId)?.warehouse_name ||
+        definitionsRef.current?.warehouses?.[0]?.warehouse_name ||
         "";
 
-      if (defaultStoreId > 0) {
-        return {
-          store_id: defaultStoreId,
-          store_name: defaultStoreName || definitionsRef.current?.warehouses?.[0]?.warehouse_name || "",
-        };
-      }
-
       return {
-        store_id: definitionsRef.current?.warehouses?.[0]?.id ?? 0,
-        store_name: definitionsRef.current?.warehouses?.[0]?.warehouse_name ?? "",
+        store_id: resolvedStoreId,
+        store_name: resolvedStoreName,
       };
     };
 
@@ -907,8 +1099,17 @@ function UnifiedSalesOrder({
     if (setFromExcelRef.current) {
       selectedIndexL = lastRowIndex;
     }
+    // إضافة تلقائية (أصناف نموذج العميل): تبدأ من أول سطر فارغ في النهاية — لا تستبدل أي سطر قائم
+    if (appendItemsRef.current) {
+      let firstEmpty = CollectionView.items.length;
+      for (let k = CollectionView.items.length - 1; k >= 0 && !CollectionView.items[k]?.id; k--) firstEmpty = k;
+      selectedIndexL = firstEmpty;
+    }
     for (let i = 0; i < items.length; i++) {
-      const ii = items[i];
+      let ii = items[i];
+      if (ii.transaction_notes?.trim()) {
+        toast.current?.show({ severity: "info", summary: tr("ملاحظات الصنف"), detail: ii.transaction_notes, life: 5000 });
+      }
       console.log("ii ", ii)
       const index = selectedIndexL + i; // new row index
       let item = CollectionView.items[index];
@@ -916,9 +1117,20 @@ function UnifiedSalesOrder({
       const response = await fetch(`/api/products/${ii.id}/units`);
       if (!response.ok) throw new Error("Failed to fetch units");
       const units: Unit[] = await response.json();
+      // طلبية المشتريات: الوحدة المختارة في نافذة البحث (افتراضياً وحدة الشراء في تعريف الصنف) بدل الوحدة الأولى
+      if (vch_type === 2 && !setFromExcelRef.current && ii.selected_unit?.unit_id) {
+        const unit = ii.selected_unit;
+        ii = { ...ii, unit_id: unit.unit_id, unit_name: unit.unit_name, first_unit: unit.unit_name, main_unit: unit.unit_name, to_main_unit_qty: Number(unit.to_main_qnty) || 1, price: Number(unit.price) > 0 ? Number(unit.price) : ii.price };
+      }
 
       // Validate price
       const resolvedStore = resolveProductStore(ii);
+      const initialPrice = (() => {
+        const p = ii.price ? ii.price / state.formData.exchange_rate : NaN;
+        const fallback = ii.first_price ? ii.first_price / state.formData.exchange_rate : NaN;
+        return isNaN(p) ? (isNaN(fallback) ? 0 : fallback) : p;
+      })();
+      const initialPriceInclTax = calculateInclusivePrice(initialPrice, state.formData.vat_percent ?? 0)
 
       if (!item) {
         // Add new item
@@ -928,11 +1140,8 @@ function UnifiedSalesOrder({
           code: ii.product_code,
           name: ii.product_name,
           barcode: ii.barcode || ii.first_barcode,
-          price: (() => {
-            const p = ii.price ? ii.price / state.formData.exchange_rate : NaN;
-            const fallback = ii.first_price ? ii.first_price / state.formData.exchange_rate : NaN;
-            return isNaN(p) ? (isNaN(fallback) ? 0 : fallback) : p;
-          })(),
+          price: initialPrice,
+          price_incl_tax: initialPriceInclTax,
           unit_id: ii.unit_id,
           unit_name: ii.first_unit || ii.unit_name || ii.main_unit,
           store_id: resolvedStore.store_id,
@@ -941,20 +1150,25 @@ function UnifiedSalesOrder({
           units: units,
           has_batch_number: ii.has_batch_number,
           batch: '',
-          qnty: items.length > 1 ? 1 : '',
+          qnty: 1,
           bonus: '',
-          amount: items.length > 1 ? (() => {
-            const p = ii.price ? ii.price / state.formData.exchange_rate : NaN;
-            const fallback = ii.first_price ? ii.first_price / state.formData.exchange_rate : NaN;
-            return isNaN(p) ? (isNaN(fallback) ? 0 : fallback) : p;
-          })() : ''
-
+          amount: initialPrice,
+          item_status: state.formData.order_status || 1,
+          measurment_id: ii.measurment_id != null ? Number(ii.measurment_id) : 1,
+          product_length: ii.length != null ? Number(ii.length) : null,
+          product_width: ii.width != null ? Number(ii.width) : null,
+          product_density: ii.density != null ? Number(ii.density) : null,
+          length: null,
+          width: null,
+          height: null,
+          count: 1,
         };
         if (setFromExcelRef.current) {
           item.qnty = ii.qnty;
           item.bonus = ii.bonus;
           item.batch = ii.batch + '';
           item.price = ii.price;
+          item.price_incl_tax = calculateInclusivePrice(ii.price, state.formData.vat_percent ?? 0);
           item.amount = ii.price * ii.qnty;
         }
         CollectionView.sourceCollection.push(item);
@@ -967,13 +1181,13 @@ function UnifiedSalesOrder({
         item.name = ii.product_name;
         item.unit_id = ii.unit_id;
         item.unit_name = ii.first_unit || ii.unit_name || ii.main_unit;
-        item.price = setFromExcelRef.current ? ii.price : (() => {
+        const updatedPrice = setFromExcelRef.current ? ii.price : (() => {
           const p = ii.price ? ii.price / state.formData.exchange_rate : NaN;
           const fallback = ii.first_price ? ii.first_price / state.formData.exchange_rate : NaN;
           return isNaN(p) ? (isNaN(fallback) ? 0 : fallback) : p;
         })();
-        item.qnty = setFromExcelRef.current ? ii.qnty : '';
-        item.bonus = setFromExcelRef.current ? ii.bonus : '';
+        item.price = updatedPrice;
+        item.price_incl_tax = calculateInclusivePrice(updatedPrice, state.formData.vat_percent ?? 0);
         item.store_id = resolvedStore.store_id;
         item.store_name = resolvedStore.store_name;
         item.barcode = ii.barcode || ii.first_barcode;
@@ -981,13 +1195,21 @@ function UnifiedSalesOrder({
         item.units = units;
         item.has_batch_number = ii.has_batch_number;
         item.batch = setFromExcelRef.current ? ii.batch + '' : '';
-        item.qnty = setFromExcelRef.current ? ii.qnty : items.length > 1 ? 1 : '';
-        item.amount = setFromExcelRef.current ? ii.qnty * ii.price : items.length > 1 ? (() => {
-          const p = ii.price ? ii.price / state.formData.exchange_rate : NaN;
-          const fallback = ii.first_price ? ii.first_price / state.formData.exchange_rate : NaN;
-          return isNaN(p) ? (isNaN(fallback) ? 0 : fallback) : p;
-        })() : ''
-          , CollectionView.commitEdit();
+        item.qnty = setFromExcelRef.current ? ii.qnty : 1;
+        item.amount = setFromExcelRef.current ? ii.qnty * ii.price : updatedPrice;
+        item.measurment_id = ii.measurment_id != null ? Number(ii.measurment_id) : 1;
+        item.product_length = ii.length != null ? Number(ii.length) : null;
+        item.product_width = ii.width != null ? Number(ii.width) : null;
+        item.product_density = ii.density != null ? Number(ii.density) : null;
+        item.length = null;
+        item.width = null;
+        item.height = null;
+        item.count = 1;
+        // Ensure item_status is set to order status
+        if (!item.item_status) {
+          item.item_status = state.formData.order_status || 1;
+        }
+        CollectionView.commitEdit();
       }
     }
 
@@ -1035,7 +1257,7 @@ function UnifiedSalesOrder({
       const itemValid = item?.id;
       console.log("itemValid itemValid ", itemValid)
       if (!itemValid || (itemValid + '').trim() === '' || (itemValid + '').trim() === '0') {
-        Util.showErrorToast(toast.current, 'يجب ادخال رقم الصنف');
+        Util.showErrorToast(toast.current, tr("يجب ادخال رقم الصنف"));
         grid.focus();
         grid.select(currentRow, 'code');
         return false;
@@ -1068,12 +1290,12 @@ function UnifiedSalesOrder({
     try {
       console.log("priceCategoryId priceCategoryId ", priceCategoryIdRef.current)
       const res = await fetch(
-        `/api/inventory/products/search?query=${encodeURIComponent(value)}&priceCategoryId=${priceCategoryIdRef.current}`
+        `/api/inventory/products/search?query=${encodeURIComponent(value)}&priceCategoryId=${priceCategoryIdRef.current}${vch_type === 2 ? "&unitRole=purchase" : ""}${Util.getVoucherBarcodeMode(vch_type) === "barcode" ? "" : `&numberType=${Util.getVoucherBarcodeMode(vch_type)}`}`
       );
       console.log("res res res res res ", res)
       if (!res.ok) throw new Error('Failed to fetch product');
       const product: Product | null = await res.json();
-      return product;
+      return product ? await requestProductVariant(product as any) as Product | null : null;
     } catch (err) {
       console.error('Error fetching product:', err);
       return null;
@@ -1086,26 +1308,54 @@ function UnifiedSalesOrder({
     const colName = grid.columns[col].binding;
     const editedValue = grid.getCellData(row, col, false);
     const oldValue = e.data;
-    const price = grid.getCellData(row, 'price', false) ?? 0;
-    const discount = grid.getCellData(row, 'discount', false) ?? 0;
-    const qnty = grid.getCellData(row, 'qnty', false) ?? 0;
-    const amount = grid.getCellData(row, 'amount', false) ?? 0;
+    if (colName === "item_status" && [3, 4].includes(Number(oldValue))) {
+      grid.setCellData(row, col, Number(oldValue), false)
+      grid.refresh(true)
+      Util.showErrorMessage(message, tr("لا يمكن تغيير حالة صنف مرسل جزئياً أو مرسل كلياً"))
+      return
+    }
+    // "أرسلت جزئياً/كلياً" تتحدد من فواتير المبيعات فقط (قائمة الشبكة لا تحترم disabled في الخيارات)
+    if (colName === "item_status" && [3, 4, 5].includes(Number(editedValue)) && Number(editedValue) !== Number(oldValue)) {
+      grid.setCellData(row, col, Number(oldValue) || 1, false)
+      grid.refresh(true)
+      Util.showErrorMessage(message, Number(editedValue) === 5
+        ? tr("حالة \"ملغي\" لم تعد مستخدمة — استخدم \"مغلق\"")
+        : tr("حالة \"أرسلت جزئياً/كلياً\" تتحدد تلقائياً من فواتير المبيعات فقط"))
+      return
+    }
+    const price = finiteItemNumber(grid.getCellData(row, 'price', false)) ?? 0;
+    const discount = finiteItemNumber(grid.getCellData(row, 'discount', false)) ?? 0;
+    const qnty = finiteItemNumber(grid.getCellData(row, 'qnty', false)) ?? 0;
+    const amount = finiteItemNumber(grid.getCellData(row, 'amount', false)) ?? 0;
+    const taxPercentage = finiteItemNumber(state.formData.vat_percent) ?? 0;
     console.log(" row  row ", row)
     setSelectedIndex(row)
+    if (colName === "item_status") {
+      const statuses = CollectionView.items
+        .filter((item: any) => item?.id || item?.product_id)
+        .map((item: any) => Number(item.item_status || 1))
+      const nextOrderStatus = statuses.length > 0 && statuses.every((status: number) => status === 4)
+        ? 4
+        : statuses.some((status: number) => status === 3 || status === 4)
+          ? 3
+          : statuses.length > 0 && statuses.every((status: number) => status === 2) ? 2 : 1
+      setState((prev) => ({ ...prev, formData: { ...prev.formData, order_status: nextOrderStatus } }))
+      return
+    }
     if (colName === 'code' || colName === 'barcode') {
       console.log("value value ", editedValue)
       let code = editedValue;
 
       if (colName === "code") {
         code = String(editedValue);
-        code = Util.adjustCode(code, 8).toUpperCase();
+        code = Util.adjustCode(code, 10).toUpperCase();
       }
       const product = await fetchProductByCodeOrBarcode(code);
 
       if (product) {
         FillItem([product])
       } else {
-        Util.showErrorToast(toast.current, `لا يوجد صنف بهذا الرقم أو الباركود: ${editedValue}`);
+        Util.showErrorToast(toast.current, tr("لا يوجد صنف بهذا الرقم أو الباركود: {0}", editedValue));
         if (grid.activeEditor) grid.activeEditor.value = '';
         const ColIndex = grid.columns.findIndex((coll: { binding: string }) => coll.binding === 'code');
         grid.setCellData(row, ColIndex, oldValue, false);
@@ -1116,12 +1366,12 @@ function UnifiedSalesOrder({
     }
     if (colName === 'qnty' || colName === 'bonus') {
       if (isNaN(editedValue)) {
-        Util.showErrorToast(toast.current, `يجب ادخال ارقام فقط `);
+        Util.showErrorToast(toast.current, tr("يجب ادخال ارقام فقط "));
         if (grid.activeEditor) grid.activeEditor.value = '';
         return;
       }
       if (parseFloat(editedValue) <= 0.0001) {
-        Util.showErrorToast(toast.current, `يجب ادخال ارقام فقط `);
+        Util.showErrorToast(toast.current, tr("يجب ادخال ارقام فقط "));
         if (grid.activeEditor) grid.activeEditor.value = '';
         return;
       }
@@ -1135,48 +1385,103 @@ function UnifiedSalesOrder({
         return;
       }*/
       //await recalculate_invoice(false/*, discountAmountRef.current*/);
-      const amount = parseFloat(editedValue) * parseFloat(price) - parseFloat(discount)
+      const amount = Number(editedValue) * price - discount
       const ColIndex = grid.columns.findIndex((coll: { binding: string }) => coll.binding === 'amount');
-      grid.setCellData(row, ColIndex, amount);
+      grid.setCellData(row, ColIndex, Number.isFinite(amount) ? amount : 0);
       grid.refresh(true);
     }
     if (colName === 'price') {
       if (isNaN(editedValue)) {
-        Util.showErrorToast(toast.current, `يجب ادخال ارقام فقط `);
+        Util.showErrorToast(toast.current, tr("يجب ادخال ارقام فقط "));
         if (grid.activeEditor) grid.activeEditor.value = '';
         return;
       }
-      const amount = parseFloat(editedValue) * parseFloat(qnty) - parseFloat(discount)
-      const ColIndex = grid.columns.findIndex((coll: { binding: string }) => coll.binding === 'amount');
-      grid.setCellData(row, ColIndex, amount);
+      const amount = Number(editedValue) * qnty - discount
+      const currentItem = grid.rows?.[row]?.dataItem ?? CollectionView.items[row]
+      const productId = Number(currentItem?.product_id ?? currentItem?.id) || null
+      const rowTaxPercentage = itemVat.enabled ? (itemVat.rateOf(productId) ?? 0) : taxPercentage
+      const priceInclTax = calculateInclusivePrice(Number(editedValue), rowTaxPercentage)
+      const amountIndex = grid.columns.findIndex((coll: { binding: string }) => coll.binding === 'amount');
+      const priceInclIndex = grid.columns.findIndex((coll: { binding: string }) => coll.binding === 'price_incl_tax');
+      grid.setCellData(row, amountIndex, Number.isFinite(amount) ? amount : 0);
+      if (priceInclIndex >= 0) {
+        grid.setCellData(row, priceInclIndex, priceInclTax);
+      }
       grid.refresh(true);
     }
     if (colName === 'discount') {
       if (isNaN(editedValue)) {
-        Util.showErrorToast(toast.current, `يجب ادخال ارقام فقط `);
+        Util.showErrorToast(toast.current, tr("يجب ادخال ارقام فقط "));
         if (grid.activeEditor) grid.activeEditor.value = '';
         return;
       }
-      if (parseFloat(editedValue) > parseFloat(amount)) {
-        Util.showErrorToast(toast.current, `لا يمكن ادخال خصم اكبر من المبلغ `);
+      if (Number(editedValue) > amount) {
+        Util.showErrorToast(toast.current, tr("لا يمكن ادخال خصم اكبر من المبلغ "));
         if (grid.activeEditor) grid.activeEditor.value = '';
         const ColIndex = grid.columns.findIndex((coll: { binding: string }) => coll.binding === 'discount');
         grid.setCellData(row, ColIndex, oldValue, false);
         return;
       }
-      const amountVal = parseFloat(price) * parseFloat(qnty) - parseFloat(editedValue)
+      const amountVal = price * qnty - Number(editedValue)
       const ColIndex = grid.columns.findIndex((coll: { binding: string }) => coll.binding === 'amount');
-      grid.setCellData(row, ColIndex, amountVal, false);
+      grid.setCellData(row, ColIndex, Number.isFinite(amountVal) ? amountVal : amount, false);
       //grid.refresh(true);
     }
     if (colName === 'amount') {
+      const parsedAmount = parseItemAmount(editedValue)
+      const snapshot = amountEditSnapshotRef.current
+      const oldAmount = snapshot && snapshot.grid === grid && snapshot.row === row
+        ? snapshot.value
+        : grid.rows?.[row]?.dataItem?.amount ?? grid.getCellData(row, col, false)
+      const amountIndex = grid.columns.findIndex((column: { binding: string }) => column.binding === 'amount')
+      const restoreAmount = () => {
+        const safeOldAmount = oldAmount == null ? oldAmount : finiteItemNumber(oldAmount) ?? 0
+        if (amountIndex >= 0) grid.setCellData(row, amountIndex, safeOldAmount, false)
+        grid.refresh(true)
+      }
+      const quantity = finiteItemNumber(grid.getCellData(row, 'qnty', false))
+      const lineDiscount = finiteItemNumber(grid.getCellData(row, 'discount', false)) ?? 0
+      if (!parsedAmount) {
+        Util.showErrorToast(toast.current, tr("ظٹط¬ط¨ ط§ط¯ط®ط§ظ„ ط§ط±ظ‚ط§ظ… ظپظ‚ط· "))
+        restoreAmount()
+        return
+      }
+      if (quantity === null || quantity <= 0) {
+        restoreAmount()
+        return
+      }
+      const item = grid.rows?.[row]?.dataItem ?? CollectionView.items[row]
+      const productId = Number(item?.product_id ?? item?.id) || null
+      const vatRate = itemVat.enabled
+        ? (itemVat.rateOf(productId) ?? 0)
+        : (finiteItemNumber(state.formData.vat_percent) ?? 0)
+      const previousAdjustment = amountVatAdjustmentRef.current.get(row)
+      const amountAction = applyItemAmountAction(parsedAmount.amount, parsedAmount.vatAction, vatRate, productId, previousAdjustment)
+      const { netAmount, displayAmount } = amountAction
+      if (amountAction.adjustment) amountVatAdjustmentRef.current.set(row, amountAction.adjustment)
+      else amountVatAdjustmentRef.current.delete(row)
+      const nextPrice = (netAmount + lineDiscount) / quantity
+      if (!Number.isFinite(nextPrice)) {
+        restoreAmount()
+        return
+      }
+      const priceIndex = grid.columns.findIndex((column: { binding: string }) => column.binding === 'price')
+      const priceInclIndex = grid.columns.findIndex((column: { binding: string }) => column.binding === 'price_incl_tax')
+      if (priceIndex >= 0) grid.setCellData(row, priceIndex, nextPrice, false)
+      if (priceInclIndex >= 0) grid.setCellData(row, priceInclIndex, calculateInclusivePrice(nextPrice, vatRate), false)
+      if (amountIndex >= 0) grid.setCellData(row, amountIndex, displayAmount, false)
+      grid.refresh(true)
+      return
+    }
+
+    if (colName === 'amount') {
       if (isNaN(editedValue)) {
-        Util.showErrorToast(toast.current, `يجب ادخال ارقام فقط `);
+        Util.showErrorToast(toast.current, tr("يجب ادخال ارقام فقط "));
         if (grid.activeEditor) grid.activeEditor.value = '';
         return;
       }
-      if (parseFloat(qnty) > 0) {
-        const price = parseFloat(editedValue) / parseFloat(qnty) - parseFloat(discount)
+      if (qnty > 0) {
+        const price = Number(editedValue) / qnty - discount
         const ColIndex = grid.columns.findIndex((coll: { binding: string }) => coll.binding === 'price');
         grid.setCellData(row, ColIndex, price);
         grid.refresh(true);
@@ -1185,9 +1490,46 @@ function UnifiedSalesOrder({
 
   }
 
+  const onBeginningEdit = (grid: any, e: any) => {
+    const colName = grid?.columns?.[e.col]?.binding
+    // صلاحيات التسعير: السعر/المبلغ ⇐ تعديل السعر، الخصم ⇐ خصم صنف
+    const pricingAction: VoucherPricingAction | null = colName === "discount" ? "item_discount" : colName === "price" || colName === "amount" ? "price" : null
+    if (pricingAction && !canPricing(pricingAction)) {
+      e.cancel = true
+      denyPricing(pricingAction)
+      return
+    }
+    if (colName === "amount") {
+      amountEditSnapshotRef.current = { grid, row: e.row, value: grid.getCellData(e.row, e.col, false) }
+      guardItemAmountInput(grid, e.row, e.col, true)
+    }
+    const item = grid?.rows?.[e.row]?.dataItem ?? CollectionView.items[e.row]
+    if (colName === "item_status" && ([3, 4].includes(Number(item?.item_status)) || [4, 6].includes(Number(state.formData.order_status)))) {
+      e.cancel = true
+      Util.showErrorMessage(message, tr("لا يمكن تغيير حالة صنف مرسل جزئياً أو مرسل كلياً"))
+      return
+    }
+    if (!item || Number(item.measurment_id || 1) === 1) return
+
+    if (colName === "qnty") {
+      e.cancel = true
+      if (item.id) {
+        measurementConfirmedRef.current = false
+        setMeasurementDialogRow(e.row)
+        setMeasurementDialogOpen(true)
+        popupHasCalled()
+      }
+    } else if (colName === "bonus") {
+      e.cancel = true
+    }
+  }
+
   const onKeyDownGrid = (grid: any, e: KeyboardEvent) => {
     // Make sure grid and selection exist
-    if (!grid || !grid.selection) return;
+    // يُستدعى مرتين لكل ضغطة مفتاح فعلياً: مرة بمعطيات Wijmo الصحيحة، ومرة أخرى بمعطيات غير مكتملة
+    // (onKeyDown ليس حدثاً مُوثَّقاً بـFlexGridInputs) — بلا هذا الحارس، قراءة e.keyCode على undefined
+    // بالاستدعاء الثاني تُطلِق استثناءً غير مُلتقَط يمنع Wijmo من بدء تحرير الخلية بعد أول ضغطة مفتاح.
+    if (!grid || !grid.selection || !e || typeof e.keyCode === "undefined") return;
     if (doHotKeys.current === false) return;
     if (e.keyCode === 113) {
       e.preventDefault(); // Prevent FlexGrid from opening the editor
@@ -1199,9 +1541,17 @@ function UnifiedSalesOrder({
     // Make sure row and col are valid
     if (row < 0 || col < 0) return;
 
+    if (e.keyCode === Util.keyboardKeys.F7) {
+      e.preventDefault();
+      deleteCurrentRow();
+      return;
+    }
+
     const colName = grid.columns[col]?.binding;
     const activeEditor = grid.activeEditor;
     const value = activeEditor ? activeEditor.value : '';
+
+    if (handleItemAmountKeyDown(grid, e, true)) return
 
     const item = grid.collectionView?.items?.[row];
     const item_id = item?.id;
@@ -1225,22 +1575,19 @@ function UnifiedSalesOrder({
       if (!item_id || item_id + '' === '0') {
         toast.current?.show({
           severity: 'error',
-          summary: 'خطأ',
-          detail: 'يجب ادخال رقم الصنف',
+          summary: tr("خطأ"),
+          detail: tr("يجب ادخال رقم الصنف"),
           life: 1500
         });
         grid.focus();
         e.preventDefault();
       }
     }
-    if (['qnty', 'bonus', 'amount', 'price', 'discount'].includes(colName)) {
+    if (['qnty', 'bonus', 'price', 'discount'].includes(colName)) {
       if (e.key.length === 1 && !/[0-9.]/.test(e.key)) {
         e.preventDefault();
         return;
       }
-    }
-    if (colName === 'amount' && parseFloat(item?.qnty) === 0) {
-      e.preventDefault();
     }
     switch (e.keyCode) {
       case 121: // F10
@@ -1271,7 +1618,7 @@ function UnifiedSalesOrder({
           if (validateAddNewRow(row, grid)/* && this.state.dataObject.vch_status_id + '' !== '2' && this.state.dataObject.status !== 3*/) {
             grid.collectionView.addNew({});
             grid.collectionView.commitNew();
-            grid.finishEditing(true);
+            grid?.finishEditing?.(true);
             CollectionView.items[grid.rows.length - 1].ser = grid.rows.length;
             //setData(newData);
 
@@ -1345,6 +1692,34 @@ function UnifiedSalesOrder({
     }
   };
 
+  const openAttributeEditor = async (item: OrderItem) => {
+    if (!item?.product_id) return
+    let product: any = item
+    if (!Array.isArray(product.attributes) || product.attributes.length === 0) {
+      try {
+        const response = await fetch(`/api/inventory/products?productId=${item.product_id}`)
+        const products = response.ok ? await response.json() : []
+        const fetchedProduct = Array.isArray(products) ? products[0] : null
+        if (fetchedProduct) product = { ...fetchedProduct, ...item, attributes: fetchedProduct.attributes }
+      } catch (error) {
+        console.error("Failed to load product attributes", error)
+      }
+    }
+    if (!Array.isArray(product.attributes) || product.attributes.length === 0) return
+    const selected = await requestProductVariant({
+      ...product,
+      id: Number(item.product_id),
+      product_name: item.product_name || item.name,
+      selected_attributes: item.selected_attributes || product.selected_attributes,
+    }, true)
+    if (!selected) return
+    updateOrderItem(item.id, "product_name", selected.product_name || item.product_name || item.name)
+    updateOrderItem(item.id, "name", selected.product_name || item.name)
+    updateOrderItem(item.id, "attributes", selected.attributes)
+    updateOrderItem(item.id, "selected_attributes", selected.selected_attributes)
+    updateOrderItem(item.id, "attribute_summary", selected.attribute_summary)
+  }
+
   const getScheme = () => {
     let scheme = {
       name: 'UnitsScheme_Table',
@@ -1359,13 +1734,18 @@ function UnifiedSalesOrder({
         },
 
         {
-          header: "الحالة", name: "item_status", width: 100, visible: false,
+          header: tr("حالة الصنف"),
+          name: "item_status",
+          width: 145,
+          visible: true,
+          dataType: wjcCore.DataType.Number,
+          dataMap: new wjGrid.DataMap(ORDER_ITEM_STATUS_DISPLAY, "value", "label"),
         },
         {
-          header: "الباركود", name: "barcode", width: 120, visible: Util.getVoucherSettingScreenData(vch_type, 'barcode')
+          header: Util.getVoucherBarcodeHeader(vch_type), name: "barcode", width: 120, visible: Util.getVoucherSettingScreenData(vch_type, 'barcode')
         },
         {
-          header: "رقم الصنف", name: "code", width: 120, maxLength: 8, visible: Util.getVoucherSettingScreenData(vch_type, 'code')
+          header: tr("رقم الصنف"), name: "code", width: 120, maxLength: 8, visible: Util.getVoucherSettingScreenData(vch_type, 'code')
         },
 
         { header: "id", name: "id", width: 150, visible: false },
@@ -1389,10 +1769,16 @@ function UnifiedSalesOrder({
         },
 
         {
-          header: "اسم الصنف", name: "name", width: "*", minWidth: 150, maxLength: 100
+          header: tr("اسم الصنف"), name: "name", width: "*", minWidth: 150, maxLength: 100
         },
-        { header: "رقم المستودع", name: "store_id", width: 150, visible: false },
-        { header: "المستودع", name: "store_name", width: 100, visible: Util.getVoucherSettingScreenData(vch_type, 'store') },
+        {
+          header: tr("المتغيرات والخصائص"), name: "btnAttributes", width: 75,
+          buttonBody: 'button', align: 'center', title: tr("عرض وتعديل المتغيرات والخصائص"),
+          iconType: 'edit', isReadOnly: true, visible: true, visibleInColumnChooser: true,
+          onClick: (e: any, ctx: any) => { void openAttributeEditor(ctx.item as OrderItem) },
+        },
+        { header: tr("رقم المستودع"), name: "store_id", width: 150, visible: false },
+        { header: tr("المستودع"), name: "store_name", width: 100, visible: Util.getVoucherSettingScreenData(vch_type, 'store') },
         {
           name: 'btnSearchStores',
           header: ' ',
@@ -1413,13 +1799,13 @@ function UnifiedSalesOrder({
           visible: Util.getVoucherSettingScreenData(vch_type, 'store'),
           visibleInColumnChooser: true
         },
-        { header: "الكمية", name: "qnty", width: 80, visible: true, maxLength: 10 },
-        { header: "البونص", name: "bonus", width: 80, maxLength: 10, visible: Util.getVoucherSettingScreenData(vch_type, 'bonus') },
-        { header: "الرقم التشغيلي", name: "batch", width: 150, maxLength: 30, visible: Util.getVoucherSettingScreenData(vch_type, 'batch') },
-        { header: "رقم الوحدة", name: "unit_id", width: 150, visible: false },
-        { header: "الوحدة", name: "unit_name", width: 80, visible: Util.getVoucherSettingScreenData(vch_type, 'unit') },
-        { header: "وحدات الصنف", name: "units", width: 150, visible: false },
-        { header: "العلاقة", name: "to_main_unit_qty", width: 150, visible: false },
+        { header: tr("الكمية"), name: "qnty", width: 80, visible: true, maxLength: 10 },
+        { header: tr("البونص"), name: "bonus", width: 80, maxLength: 10, visible: Util.getVoucherSettingScreenData(vch_type, 'bonus') },
+        { header: tr("الرقم التشغيلي"), name: "batch", width: 150, maxLength: 30, visible: Util.getVoucherSettingScreenData(vch_type, 'batch') },
+        { header: tr("رقم الوحدة"), name: "unit_id", width: 150, visible: false },
+        { header: tr("الوحدة"), name: "unit_name", width: 80, visible: Util.getVoucherSettingScreenData(vch_type, 'unit') },
+        { header: tr("وحدات الصنف"), name: "units", width: 150, visible: false },
+        { header: tr("العلاقة"), name: "to_main_unit_qty", width: 150, visible: false },
 
         {
           name: 'btnSearchUnits',
@@ -1443,10 +1829,17 @@ function UnifiedSalesOrder({
           visible: true,
           visibleInColumnChooser: true
         },
-        { header: "السعر", name: "price", width: 80, maxLength: 10, visible: Util.getVoucherSettingScreenData(vch_type, 'price') },
-        { header: "الخصم", name: "discount", width: 80, maxLength: 10, visible: Util.getVoucherSettingScreenData(vch_type, 'discount') },
-        { header: "المبلغ", name: "amount", width: 80, visible: true, maxLength: 15 },
-        { header: "تاريخ الصلاحية", name: "expiry_date", width: 120, visible: false },
+        { header: tr("السعر"), name: "price", width: 80, maxLength: 10, visible: Util.getVoucherSettingScreenData(vch_type, 'price') },
+        {
+          header: tr("السعر شامل"),
+          name: "price_incl_tax",
+          width: 100,
+          visible: Util.getVoucherSettingScreenData(vch_type, 'price_excl_tax'),
+          isReadOnly: true,
+        },
+        { header: tr("الخصم"), name: "discount", width: 80, maxLength: 10, visible: Util.getVoucherSettingScreenData(vch_type, 'discount') },
+        { header: tr("المبلغ"), name: "amount", width: 80, dataType: wjcCore.DataType.String, visible: true, maxLength: 15 },
+        { header: tr("تاريخ الصلاحية"), name: "expiry_date", width: 120, visible: false },
         { header: "has_batch_number", name: "has_batch_number", width: 150, visible: false },
         {
           name: 'btnDelete',
@@ -1506,7 +1899,7 @@ function UnifiedSalesOrder({
       ...prev,
       formData: {
         ...prev.formData,
-        customer_id: customer.id,
+        customer_id: Number(customer.account_id ?? customer.id),
         customer_name: customer.customer_name || customer.name,
         customer_code: customer.customer_code,
         customer_address: customer.address || "",
@@ -1520,7 +1913,9 @@ function UnifiedSalesOrder({
     }))
   }
 
-  const handleProductSelect = (product: any, itemId: string) => {
+  const handleProductSelect = async (product: any, itemId: string) => {
+    product = await requestProductVariant(product)
+    if (!product) return
     updateOrderItem(itemId, "product_id", product.id)
     updateOrderItem(itemId, "product_code", product.product_code)
     updateOrderItem(itemId, "product_name", product.product_name)
@@ -1529,6 +1924,13 @@ function UnifiedSalesOrder({
     updateOrderItem(itemId, "unit_price", product.selling_price || product.last_purchase_price)
     setState((prev) => ({ ...prev, showProductSearch: false, activeItemId: null }))
   }
+
+  // مندوب العميل يُعبّأ تلقائياً عند اختيار العميل (إن كان له مندوب، وإلا يبقى كما هو)
+  useCustomerDefaultSalesman({
+    recordId: state.formData.id,
+    accountId: state.formData.customer_id,
+    onSalesman: (salesmanId) => setState((prev) => ({ ...prev, formData: { ...prev.formData, salesman: String(salesmanId) } })),
+  })
 
   const selectCustomer = (customer: Customer) => {
     const allowedVoucherBooks = ["L", "P", "M", "R"]
@@ -1541,7 +1943,7 @@ function UnifiedSalesOrder({
       ...prev,
       formData: {
         ...prev.formData,
-        customer_id: customer.id,
+        customer_id: Number((customer as any).account_id ?? customer.id),
         customer_name: customer.customer_name,
         customer_code: customer.customer_code,
         customer_address: customer.address || "",
@@ -1588,33 +1990,47 @@ function UnifiedSalesOrder({
     const taxAmount = (afterDiscount * item.vat_percent) / 100
     return afterDiscount + taxAmount
   }
+
+  const calculateInclusivePrice = (price: number, vatPercent: number) => {
+    const numericPrice = Number(price ?? 0)
+    const numericVat = Number(vatPercent ?? 0)
+    if (!Number.isFinite(numericPrice)) return 0
+    return Math.round(numericPrice * (1 + numericVat / 100) * 100) / 100
+  }
   type OrderItemType = {
     qnty: number;
     price: number;
     discount: number;
     [key: string]: any; // allow other props
   };
+  // الضريبة على مستوى الصنف (الإعدادات العامة): نسبة كل سطر من الصنف — نفس معادلة الإرساليات/الفواتير
+  const productIdOf = (item: any) => Number(item?.product_id ?? item?.id) || null
+  const itemVat = useItemVatRates(((CollectionView?.items as OrderItemType[]) ?? []).map(productIdOf))
+  // على مستوى الصنف: نسبة التصنيف الضريبي للصنف (بلا تصنيف ⇐ 0)؛ وإلا نسبة الطلبية
+  const lineVatRate = (item: any) => itemVat.enabled ? (itemVat.rateOf(productIdOf(item)) ?? 0) : Number(state.formData.vat_percent ?? 0)
   const totals = useMemo(() => {
     // Safely get items from CollectionView
     const items: OrderItemType[] = (CollectionView?.items as OrderItemType[]) ?? [];
 
-    // Calculate subtotal
-    const subtotal = items.reduce((sum: number, item: OrderItemType) => {
-      const quantity = Number(item.qnty ?? 0);
-      const price = Number(item.price ?? 0);
-      const discount = Number(item.discount ?? 0);
-      return sum + quantity * price - discount;
-    }, 0);
+    // Update inclusive price column values for all rows when totals calculation runs
+    items.forEach((item) => {
+      item.price_incl_tax = calculateInclusivePrice(Number(item.price ?? 0), lineVatRate(item))
+    })
+
     if (!state.formData.discount_amount) state.formData.discount_amount = 0.0;
-    // Calculate discount
-    const discountValue = parseFloat(state.formData.discount_amount ?? 0);
-    const discount =
-      state.formData.discount_type === "percentage"
-        ? (subtotal * discountValue) / 100
-        : discountValue;
-    // Calculate tax
-    const taxPercentage = parseFloat(state.formData.vat_percent ?? 0);
-    const tax = ((subtotal - discount) * taxPercentage) / 100;
+    // المجموع، خصم الطلبية، والضريبة (نسبة الطلبية أو نسبة كل صنف) — lib/item-vat.ts
+    const result = computeVoucherTax(
+      items.map((item) => ({
+        quantity: Number(item.qnty ?? 0),
+        unitPrice: Number(item.price ?? 0),
+        discountAmount: Number(item.discount ?? 0),
+        vatRate: itemVat.rateOf(productIdOf(item)) ?? null,
+      })),
+      { discountType: state.formData.discount_type === "percentage" ? "percentage" : "amount", discountValue: parseFloat(state.formData.discount_amount ?? 0), vatPercent: parseFloat(state.formData.vat_percent ?? 0), itemLevel: itemVat.enabled },
+    )
+    const subtotal = result.subtotal
+    const discount = result.discount
+    const tax = result.tax;
     // Shipping and other charges
     const shippingCost = parseFloat(state.formData.shipping_cost ?? 0);
     const otherCharges = parseFloat(state.formData.other_charges ?? 0);
@@ -1635,39 +2051,67 @@ function UnifiedSalesOrder({
     state.formData.shipping_cost,
     state.formData.other_charges,
     CollectionView?.items,
+    itemVat.enabled,
+    itemVat.version,
   ]);
+
+  // الضريبة على مستوى الصنف: حقل "نسبة الضريبة" يعرض النسبة الفعلية للطلبية (ضريبة الأسطر ÷ الصافي)
+  useEffect(() => {
+    if (!itemVat.enabled) return
+    const netBase = totals.subtotal - totals.discount
+    const effective = netBase > 0 ? Math.round((totals.tax / netBase) * 10000) / 100 : 0
+    if (Math.abs(effective - Number(state.formData.vat_percent ?? 0)) > 0.001) {
+      setState((prev) => ({ ...prev, formData: { ...prev.formData, vat_percent: effective } }))
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [itemVat.enabled, totals.subtotal, totals.discount, totals.tax])
+
+  useEffect(() => {
+    if (!CollectionView) return
+    const items: any[] = CollectionView.items ?? []
+    items.forEach((item) => {
+      item.price_incl_tax = calculateInclusivePrice(Number(item.price ?? 0), lineVatRate(item))
+    })
+    CollectionView.refresh()
+    gridRef.current?.refresh()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state.formData.vat_percent, CollectionView, itemVat.enabled, itemVat.version])
 
 
   const validateOrder = () => {
     message.current?.clear()
     console.log("state.formData ", state.formData)
     if (!state.formData.order_number) {
-      Util.showErrorMessage(message, 'رقم الطلبية فارغ لا يمكن الاستمرار')
+      Util.showErrorMessage(message, tr("رقم الطلبية فارغ لا يمكن الاستمرار"))
+      return false
+    }
+    if (!String(state.formData.vch_book || "").trim() || !voucherBooks.some(book => String(book.name).trim() === String(state.formData.vch_book).trim())) {
+      Util.showErrorMessage(message, tr("يجب تحديد دفتر السندات"))
       return false
     }
     if (state.formData.currency_id === 0) {
-      Util.showErrorMessage(message, 'يجب تحديد العملة')
+      Util.showErrorMessage(message, tr("يجب تحديد العملة"))
       return false
     }
     if (state.formData.exchange_rate <= 0) {
-      Util.showErrorMessage(message, 'يجب ادخال سعر الصرف')
+      Util.showErrorMessage(message, tr("يجب ادخال سعر الصرف"))
       return false
     }
 
     if (state.formData.customer_id === 0) {
-      Util.showErrorMessage(message, 'يجب ادخال الزبون')
+      Util.showErrorMessage(message, tr("يجب ادخال العميل"))
       return false
     }
     if (!state.formData.customer_name.trim()) {
-      Util.showErrorMessage(message, 'يجب ادخال اسم الزبون')
+      Util.showErrorMessage(message, tr("يجب ادخال اسم العميل"))
       return false
     }
     if (CollectionView.items.length === 0 || !CollectionView?.items[0]?.id) {
-      Util.showErrorMessage(message, 'يجب ادخال صنف واحد على الأقل')
+      Util.showErrorMessage(message, tr("يجب ادخال صنف واحد على الأقل"))
       return false
     }
     if (Number(totals.total) < 0) {
-      Util.showErrorMessage(message, 'مجموع الطلبية غير منطقي يرجى التأكد من المدخلات')
+      Util.showErrorMessage(message, tr("مجموع الطلبية غير منطقي يرجى التأكد من المدخلات"))
       return false
     }
     // Assuming collectionView is your CollectionView instance
@@ -1684,7 +2128,7 @@ function UnifiedSalesOrder({
       const qty = Number(item.qnty) || 0;
       const bonus = Number(item.bonus) || 0;
       if (qty <= 0 && bonus <= 0) {
-        Util.showErrorMessage(message, 'يوجد اصناف لم يتم ادخال الكمية او البونص لها')
+        Util.showErrorMessage(message, tr("يوجد اصناف لم يتم ادخال الكمية او البونص لها"))
         return false
       }
 
@@ -1692,11 +2136,11 @@ function UnifiedSalesOrder({
       const amount = Number(item.amount) || 0;
       const discount = Number(item.discount) || 0;
       if (discount > amount) {
-        Util.showErrorMessage(message, 'مبلغ الخصم اكبر من مبلغ الصنف ' + item.name)
+        Util.showErrorMessage(message, tr("مبلغ الخصم اكبر من مبلغ الصنف ") + item.name)
         return false
       }
       if (item.has_batch_number && (!item.batch || item.batch === '') && vch_type === 2) {
-        Util.showErrorMessage(message, 'يجب ادخال الرقم التشغيلي للصنف ' + item.name)
+        Util.showErrorMessage(message, tr("يجب ادخال الرقم التشغيلي للصنف ") + item.name)
         return false
       }
 
@@ -1706,7 +2150,7 @@ function UnifiedSalesOrder({
         if (usedBatches.has(batchNo)) {
           Util.showErrorMessage(
             message,
-            'يوجد رقم تشغيلي مكرر مع اكثر من صنف : ' + batchNo
+            tr("يوجد رقم تشغيلي مكرر مع اكثر من صنف : ") + batchNo
           );
           return false;
         }
@@ -1747,184 +2191,96 @@ function UnifiedSalesOrder({
 
     }
 
+    // الطباعة عبر المحرك الموحّد (lib/voucher-print): إعدادات طباعة "طلبية مبيعات" (نوع 1)، نسخة أصلية/نسخة
+    // (النسخة تطابق الأصلية — لقطة الإعدادات)، أرشفة الطباعة، وزر واتساب في شريط الأدوات.
     setLoading(true)
-    const { pageType = "custom", width = "120mm", height = "100mm" } = settings;
-
-    const html = `
-    <html>
-      <head>
-        <title>Order ${order.order_number}</title>
-        <style>
-          @media print {
-            @page {
-              margin: 0; /* remove browser header/footer */
-            }
-            body {
-              margin: 0;
-              padding: 0;
-              font-family: Arial, sans-serif;
-              -webkit-print-color-adjust: exact;
-            }
-            .order-page {
-              page-break-after: always;
-            }
-          }
-
-          .order-page {
-            width: ${pageType === "custom" ? width : "120mm"};
-            min-height: ${pageType === "custom" ? height : "100mm"};
-            padding: 20px;
-            box-sizing: border-box;
-          }
-
-          .header {
-            display: flex;
-            flex-wrap: wrap;
-            justify-content: space-between;
-            margin-bottom: 10px;
-            font-size: 16px;
-            font-weight: bold;
-          }
-
-          table {
-            width: 100%;
-            border-collapse: collapse;
-            margin-top: 10px;
-            border: 3px solid black;
-          }
-
-          th, td {
-            border: 2px solid black;
-            padding: 6px 8px;
-            font-size: 20px;
-          }
-
-          th {
-            text-align: left;
-          }
-
-          /* column widths */
-          .col-index { width: 10%; }
-          .col-item { width: 70%; }
-          .col-quantity { width: 20%; text-align: center; }
-
-          .notes {
-            margin-top: 20px;
-            font-size: 16px;
-            font-weight: bold;
-          }
-        </style>
-      </head>
-      <body>
-        <div class="order-page">
-          <div class="header">
-            <div>Reference: ${order.reference_number}</div>
-            <div></div>
-          </div>
-          <div class="header">
-          <div>Date: ${order.order_date}</div>
-            <div>Order No: ${order.customer_order_no}</div>
-            
-          </div>
-          <div class="header">
-            <div>Name: ${order.customer_name}</div>
-            <div>Received By: ${order.received_by || ""}</div>
-          </div>
-
-          <table>
-            <thead>
-              <tr>
-                <th class="col-index">#</th>
-                <th class="col-item">Item & No.</th>
-                <th class="col-quantity">Quantity</th>
-              </tr>
-            </thead>
-            <tbody>
-              ${items.map((item, idx) => `
-                <tr>
-                  <td class="col-index">${idx + 1}</td>
-                  <td class="col-item">${item.name}</td>
-                  <td class="col-quantity">${item.quantity + (item.bonus || 0)}</td>
-                </tr>
-              `).join("")}
-            </tbody>
-          </table>
-
-          <div class="notes">
-            Notes: ${order.general_notes || ""}
-          </div>
-        </div>
-      </body>
-    </html>
-  `;
-
-    // Get saved user
-    const savedUser = localStorage.getItem("erp_user") || sessionStorage.getItem("erp_user");
-    if (!savedUser) return;
-    const user = JSON.parse(savedUser);
-    if (!user?.id) return;
-
-    // Update printed status in backend
-    console.log("order order ", order)
-    await fetch(`/api/orders/sales/${order.id}`, {
-      method: "PUT",
-      headers: {
-        "Content-Type": "application/json",
-        "x-user-id": user.id,
-      },
-      body: JSON.stringify({ printed: 1 }),
-    });
-
-    // Use iframe to print without opening about:blank
-    const iframe = document.createElement("iframe");
-    iframe.style.position = "absolute";
-    iframe.style.width = "0";
-    iframe.style.height = "0";
-    iframe.style.border = "0";
-    document.body.appendChild(iframe);
-    const doc = iframe.contentDocument || iframe.contentWindow?.document;
-    if (!doc) return;
-    doc.open();
-    doc.write(html);
-    doc.close();
-    iframe.contentWindow?.focus();
-    iframe.contentWindow?.print();
-    document.body.removeChild(iframe);
-    setState((prev) => ({
-      ...prev,
-      formData: { ...prev.formData, printed: 1 },
-    }))
-    setLoading(false)
-    setTimeout(() => {
-      referenceNumberRef.current?.focus();
-    }, 1000)
+    try {
+      const alreadyPrinted = Number(order?.printed) === 1
+      const lines = (items || []).filter((item: any) => (Number(item?.product_id ?? item?.id) || 0) > 0 || String(item?.name || item?.product_name || "").trim())
+      const document: PrintDocument = {
+        voucherTypeId: 1,
+        title: tr("طلبية مبيعات"),
+        code: String(order?.order_number || ""),
+        date: String(order?.order_date || "").slice(0, 10),
+        copyLabel: alreadyPrinted ? tr("نسخة") : tr("نسخة اصلية"),
+        auditSource: "order",
+        auditVoucherId: Number(order?.id) || null,
+        fields: [
+          { label: tr("العميل"), value: order?.customer_name || "" },
+          { label: tr("المرجع"), value: order?.reference_number || "" },
+          { label: tr("رقم طلبية العميل"), value: order?.customer_order_no || "" },
+          { label: tr("استلمت بواسطة"), value: order?.received_by || "" },
+          { label: tr("هاتف العميل"), value: order?.customer_phone || "" },
+          { label: tr("المندوب"), value: order?.salesman_name || (salesmen as any[]).find((salesman) => String(salesman.id) === String(order?.salesman ?? order?.salesman_id ?? ""))?.name || "" },
+        ],
+        columns: [
+          { key: "ser", label: "#", align: "center", weight: 0.5 },
+          { key: "code", label: tr("رقم الصنف"), weight: 1.3 },
+          { key: "name", label: tr("اسم الصنف"), weight: 3 },
+          { key: "unit", label: tr("الوحدة"), weight: 1 },
+          { key: "qnty", label: tr("الكمية"), align: "end", weight: 1, numeric: true },
+          { key: "bonus", label: tr("البونص"), align: "end", weight: 0.9, numeric: true },
+        ],
+        rows: lines.map((line: any, index: number) => ({
+          ser: index + 1,
+          code: line.code || line.product_code || "",
+          name: [line.name || line.product_name || "", line.attribute_summary ? `(${line.attribute_summary})` : ""].filter(Boolean).join(" "),
+          unit: line.unit_name || line.unit || "",
+          qnty: Number(line.qnty ?? line.quantity ?? 0),
+          bonus: Number(line.bonus || 0) || null,
+        })),
+        totals: [{ label: tr("إجمالي الكمية"), value: lines.reduce((sum: number, line: any) => sum + Number(line.qnty ?? line.quantity ?? 0) + Number(line.bonus || 0), 0), strong: true }],
+        notes: String(order?.general_notes || order?.notes || ""),
+      }
+      const result = await printVoucher(document)
+      // إرسال واتساب ليس طباعة: لا تُعلَّم الطلبية "مطبوعة"
+      if (result.method !== "whatsapp" && Number(order?.id) > 0) {
+        const savedUser = sessionStorage.getItem("erp_user") || localStorage.getItem("erp_user")
+        const user = savedUser ? JSON.parse(savedUser) : null
+        await fetch(`/api/orders/sales/${order.id}`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json", ...(user?.id ? { "x-user-id": String(user.id) } : {}) },
+          body: JSON.stringify({ printed: 1 }),
+        })
+        setState((prev) => ({ ...prev, formData: { ...prev.formData, printed: 1 } }))
+      }
+      if (result.method === "service") Util.showSuccessMessage(message, "تم إرسال الطلبية إلى الطابعة")
+      else if (result.warning) Util.showErrorMessage(message, tr("تمت الطباعة عبر المتصفح — خدمة الطباعة غير متاحة: {0}", result.warning))
+    } catch (error) {
+      Util.showErrorMessage(message, error instanceof Error ? error.message : tr("تعذرت الطباعة"))
+    } finally {
+      setLoading(false)
+      setTimeout(() => {
+        referenceNumberRef.current?.focus();
+      }, 1000)
+    }
   };
 
-  async function handleSaveOrder(orderToSave: any, isNewRecord: boolean): Promise<void> {
+  async function handleSaveOrder(orderToSave: any, isNewRecord: boolean, showPrintPrompt = true): Promise<boolean> {
 
     // ✅ HARD LOCK FIRST
-    if (isSaving.current) return;
+    if (isSaving.current) return false;
     isSaving.current = true;
 
     try {
       console.log("[v0] Starting save process...");
 
-      if (!validateOrder()) return;
+      if (!validateOrder()) return false;
 
       const savedUser =
-        localStorage.getItem("erp_user") ||
-        sessionStorage.getItem("erp_user");
+        sessionStorage.getItem("erp_user") ||
+        localStorage.getItem("erp_user");
 
       if (!savedUser) {
-        Util.showErrorMessage(message, "المستخدم غير معرف يرجى تسجيل الدخول من جديد");
-        return;
+        Util.showErrorMessage(message, tr("المستخدم غير معرف يرجى تسجيل الدخول من جديد"));
+        return false;
       }
 
       const user = JSON.parse(savedUser);
 
       if (!user?.id) {
-        Util.showErrorMessage(message, "المستخدم غير معرف يرجى تسجيل الدخول من جديد");
-        return;
+        Util.showErrorMessage(message, tr("المستخدم غير معرف يرجى تسجيل الدخول من جديد"));
+        return false;
       }
 
       const orderData = {
@@ -1959,6 +2315,7 @@ function UnifiedSalesOrder({
         received_by: state.formData.received_by || "",
         customer_order_no: state.formData.customer_order_no || "",
         user_id: user.id,
+        branch_id: state.formData.branch_id ?? activeBranchId ?? null,
       };
 
       const items = CollectionView.items.map((item) => ({
@@ -1975,7 +2332,10 @@ function UnifiedSalesOrder({
         expiry_date: item.expiry_date || null,
         batch_number: item.batch || null,
         item_status: item.item_status,
+        order_item_id: item.order_item_id ?? null,
         name: item.name,
+        selected_attributes: item.selected_attributes || {},
+        specifications: { ...(item.specifications || {}), product: item.specifications?.product || item.selected_attributes || {}, reviewed: true, measurement: { measurment_id: Number(item.measurment_id || 1), length: item.length ?? null, width: item.width ?? null, height: item.height ?? null, count: item.count ?? null } },
       }));
 
       const response = await fetch("/api/orders/sales", {
@@ -1999,12 +2359,16 @@ function UnifiedSalesOrder({
 
         Util.showErrorMessage(
           message,
-          errorData.error || "فشل في حفظ طلبية المبيعات"
+          errorData.error || tr("فشل في حفظ طلبية المبيعات")
         );
-        return;
+        return false;
       }
 
       const result = await response.json();
+
+      // Keep the parent list and toolbar navigation in sync immediately after a
+      // successful save instead of waiting for the order dialog to close.
+      await onOrderSaved?.(result);
 
       const id = result.id;
 
@@ -2017,18 +2381,17 @@ function UnifiedSalesOrder({
 
       Util.showSuccessMessage(message);
       lastVchBook.current = state.formData.vch_book;
-      popupHasCalled();
-      setAlertMessage("هل تريد طباعة الطلبية؟");
 
-      setState((prev) => ({
-        ...prev,
-        FormDataBackup: orderDataBackup,
-      }));
-
-      CollectionViewBackupRef.current = itemsBackup;
-      setShowAlert(true);
+      if (showPrintPrompt) {
+        popupHasCalled();
+        setAlertMessage(tr("هل تريد طباعة الطلبية؟"));
+        setState((prev) => ({ ...prev, FormDataBackup: orderDataBackup }));
+        CollectionViewBackupRef.current = itemsBackup;
+        setShowAlert(true);
+      }
 
       reset_order();
+      return true;
 
     } finally {
       // ✅ ALWAYS RELEASE LOCK
@@ -2038,12 +2401,14 @@ function UnifiedSalesOrder({
 
   const handleDeleteClick = (checkUnsaved: any) => {
     let newFormData = {
+      form: getFormChangeSnapshot(state.formData),
       order_date: state.formData.order_date,
       customer_id: state.formData.customer_id,
       customer_name: state.formData.customer_name,
 
       currency_id: state.formData.currency_id,
       exchange_rate: state.formData.exchange_rate,
+      items: getItemsChangeSnapshot(CollectionView.items),
       //total: totals.total,
     };
     const currentHash = getFormDataHash(newFormData);
@@ -2055,21 +2420,25 @@ function UnifiedSalesOrder({
     if (!state.formData.id) {
       toast.current?.show({
         severity: 'warn',
-        summary: 'تنبيه',
-        detail: 'لا يوجد طلبية لحذفها',
+        summary: tr("تنبيه"),
+        detail: tr("لا يوجد طلبية لحذفها"),
         life: 3000
       });
       return;
     }
+    if (![1, 2].includes(Number(state.formData.order_status))) {
+      Util.showErrorMessage(message, tr("لا يمكن حذف الطلبية إلا عندما تكون حالتها غير جاهز أو جاهز"))
+      return
+    }
     message.current?.clear();
     if (state.formData.is_exported) {
-      Util.showErrorMessage(message, "الطلبية مرحلة الى النظام المحاسبي لن تتم عملية الحذف");
+      Util.showErrorMessage(message, tr("الطلبية معتمدة الى النظام المحاسبي لن تتم عملية الحذف"));
 
       //Util.showInfoToast(toast.current, "الطلبية مرحلة الى النظام المحاسبي لن تتم عملية الحفظ");
       return;
     }
     if (state.formData.id > 0 && state.formData.order_decision >= 4) {
-      Util.showErrorMessage(message, "الطلبية معتمدة/مدققة لن تتم عملية الحذف");
+      Util.showErrorMessage(message, tr("الطلبية معتمدة/مدققة لن تتم عملية الحذف"));
 
       return;
     }
@@ -2095,16 +2464,16 @@ function UnifiedSalesOrder({
   }, [state.formData]);
   async function handleDeleteOrder(orderToDelete: SalesOrder): Promise<void> {
     if (!state.formData || !state.formData.id) {
-      throw new Error("لا توجد طلبية محددة للحذف")
+      throw new Error(tr("لا توجد طلبية محددة للحذف"))
     }
-    const savedUser = localStorage.getItem("erp_user") || sessionStorage.getItem("erp_user")
+    const savedUser = sessionStorage.getItem("erp_user") || localStorage.getItem("erp_user")
     if (!savedUser) {
-      Util.showErrorMessage(message, 'المستخدم غير معرف يرجى تسجيل الدخول من جديد')
+      Util.showErrorMessage(message, tr("المستخدم غير معرف يرجى تسجيل الدخول من جديد"))
       return
     }
     const user = JSON.parse(savedUser)
     if (!user || !user.id) {
-      Util.showErrorMessage(message, 'المستخدم غير معرف يرجى تسجيل الدخول من جديد')
+      Util.showErrorMessage(message, tr("المستخدم غير معرف يرجى تسجيل الدخول من جديد"))
       return
     }
     setLoading(true)
@@ -2118,7 +2487,10 @@ function UnifiedSalesOrder({
     });
     if (!response.ok) {
       setLoading(false)
-      throw new Error("فشل في حذف الطلبية")
+      const payload = await response.json().catch(() => null)
+      const detail = payload?.error || "فشل في حذف الطلبية"
+      Util.showErrorMessage(message, detail)
+      return
     }
     Util.showSuccessMessage(message, 'تم حذف الطلبية بنجاح ✅')
     reset_order()
@@ -2129,40 +2501,25 @@ function UnifiedSalesOrder({
 
   // Handle navigation for UniversalToolbar
   const handleNavigate = (direction: "first" | "previous" | "next" | "last") => {
-    switch (direction) {
-      case "first":
-        goToFirst()
-        break
-      case "previous":
-        goToPrevious()
-        break
-      case "next":
-        goToNext()
-        break
-      case "last":
-        goToLast()
-        break
-      default:
-        break
-    }
+    loadOrderData(direction, undefined, undefined, true)
   }
 
 
-  const handleSave = async () => {
-    if (isHandlingSave.current) return;
+  const handleSave = async (showPrintPrompt = true): Promise<boolean> => {
+    if (isHandlingSave.current) return false;
     isHandlingSave.current = true;
     message.current?.clear();
 
     if (state.formData.is_exported) {
-      Util.showErrorMessage(message, "الطلبية مرحلة الى النظام المحاسبي لن تتم عملية الحفظ");
+      Util.showErrorMessage(message, tr("الطلبية معتمدة الى النظام المحاسبي لن تتم عملية الحفظ"));
 
       //Util.showInfoToast(toast.current, "الطلبية مرحلة الى النظام المحاسبي لن تتم عملية الحفظ");
-      return;
+      return false;
     }
     if (state.formData.id > 0 && state.formData.order_decision >= 4) {
-      Util.showErrorMessage(message, "الطلبية معتمدة/مدققة لن تتم عملية التعديل");
+      Util.showErrorMessage(message, tr("الطلبية معتمدة/مدققة لن تتم عملية التعديل"));
 
-      return;
+      return false;
     }
     setState((prev) => ({ ...prev, isSaving: true }))
     try {
@@ -2190,7 +2547,7 @@ function UnifiedSalesOrder({
         // Add other relevant fields if needed by useRecordNavigation for its save logic
       }
 
-      await handleSaveOrder(currentOrderForNavigation, isNewRecord)
+      return await handleSaveOrder(currentOrderForNavigation, isNewRecord, showPrintPrompt)
       //alert("تم حفظ الطلبية بنجاح")
 
       // After successful save, update the state with the latest data if it was a new record
@@ -2211,7 +2568,8 @@ function UnifiedSalesOrder({
       }*/
     } catch (err: any) {
       console.error("Error saving sales order:", err)
-      alert(err.message || "حدث خطأ أثناء حفظ البيانات")
+      showAlert(err.message || tr("حدث خطأ أثناء حفظ البيانات"))
+      return false
     } finally {
       setState((prev) => ({ ...prev, isSaving: false }))
       isHandlingSave.current = false;
@@ -2222,13 +2580,13 @@ function UnifiedSalesOrder({
   const handleDelete = async () => {
     message.current?.clear();
     if (state.formData.is_exported) {
-      Util.showErrorMessage(message, "الطلبية مرحلة الى النظام المحاسبي لن تتم عملية الحذف");
+      Util.showErrorMessage(message, tr("الطلبية معتمدة الى النظام المحاسبي لن تتم عملية الحذف"));
 
       //Util.showInfoToast(toast.current, "الطلبية مرحلة الى النظام المحاسبي لن تتم عملية الحفظ");
       return;
     }
     if (state.formData.id > 0 && state.formData.order_decision >= 4) {
-      Util.showErrorMessage(message, "الطلبية معتمدة/مدققة لن تتم عملية الحذف");
+      Util.showErrorMessage(message, tr("الطلبية معتمدة/مدققة لن تتم عملية الحذف"));
 
       return;
     }
@@ -2237,7 +2595,7 @@ function UnifiedSalesOrder({
       // The deleteRecord from useRecordNavigation hook handles the deletion logic
       // It expects the currentRecord to be passed or it uses the internally tracked current record.
       await deleteRecord()
-      alert("تم حذف الطلبية بنجاح")
+      showAlert(tr("تم حذف الطلبية بنجاح"))
 
       // Close the dialog after deletion
       if (onOpenChange) {
@@ -2247,7 +2605,7 @@ function UnifiedSalesOrder({
       }
     } catch (err: any) {
       console.error("Error deleting sales order:", err)
-      alert(err.message || "حدث خطأ أثناء حذف البيانات")
+      showAlert(err.message || tr("حدث خطأ أثناء حذف البيانات"))
     } finally {
       setState((prev) => ({ ...prev, isDeleting: false }))
     }
@@ -2255,6 +2613,7 @@ function UnifiedSalesOrder({
 
   const handleClone = async () => {
     if (!state.formData) return;
+    if (Number(state.formData.id) > 0) logVoucherAudit({ action: "clone", source: "order", voucher_id: Number(state.formData.id) })
 
     setLoading(true);
     const order_num = await generateOrderNumber()
@@ -2266,6 +2625,8 @@ function UnifiedSalesOrder({
         order_number: order_num, // generate new number
         order_date: new Date().toISOString().split("T")[0], // today
         delivery_date: new Date().toISOString().split("T")[0], // today
+        order_status: 1,
+        order_status2: 1,
         printed: 0,
         is_exported: 0
       };
@@ -2279,8 +2640,15 @@ function UnifiedSalesOrder({
         formData: clonedFormData,
       }));
 
+      CollectionView.items.forEach((item: any) => {
+        item.item_status = 1
+        // أسطر الطلبية الجديدة لا ترتبط بأسطر الطلبية الأصلية (حالة الإرسال/الكميات المُرسَلة)
+        item.order_item_id = null
+      })
+      CollectionView.refresh()
+
       // 4️⃣ Focus on first input (order date)
-      setTimeout(() => referenceNumberRef.current?.focus(), 50)
+      setTimeout(() => orderdateRef.current?.focus(), 50)
     } catch (err) {
       console.error("Failed to clone order:", err);
     } finally {
@@ -2322,7 +2690,7 @@ function UnifiedSalesOrder({
   }
 
   useEffect(() => {
-    const handler = (e: KeyboardEvent) => {
+    const handler = (e: KeyboardEvent) => { if (!workspaceTabActive.current) return;
       if (!doHotKeys.current) return;
 
       if (e.key === "Enter" && skipNextEnterRef.current) {
@@ -2361,21 +2729,7 @@ function UnifiedSalesOrder({
         }
         return;
       }
-      if (e.key === "F3") {
-        e.preventDefault();
-
-        // Blur the active element to commit any input changes
-        (document.activeElement as HTMLElement)?.blur();
-
-        // Now state has the latest values from all inputs
-        handleSave();
-      }
-
-      if (e.key === "F4") {
-        e.preventDefault();
-        handleDelete();
-      }
-
+      // F3 حفظ / F9 حذف / F4 نسخ: UniversalToolbar (lib/hotkeys.ts)
       if (e.key === "ESC") {
         e.preventDefault();
         onCancel();
@@ -2397,12 +2751,14 @@ function UnifiedSalesOrder({
   const importOrderFromExcel = (checkUnsaved = true) => {
 
     let newFormData = {
+      form: getFormChangeSnapshot(state.formData),
       order_date: state.formData.order_date,
       customer_id: state.formData.customer_id,
       customer_name: state.formData.customer_name,
       delivery_date: state.formData.delivery_date,
       currency_id: state.formData.currency_id,
       exchange_rate: state.formData.exchange_rate,
+      items: getItemsChangeSnapshot(CollectionView.items),
       //total: totals.total,
     };
     const currentHash = getFormDataHash(newFormData);
@@ -2414,78 +2770,64 @@ function UnifiedSalesOrder({
       return;
     }
     reset_order();
-    const input = document.createElement("input");
-    input.type = "file";
-    input.accept = ".xlsx,.xls"; // Only Excel files
-    input.onchange = (event: Event) => {
-      const target = event.target as HTMLInputElement;
-      if (target.files && target.files.length > 0) {
-        const file = target.files[0];
-        handleImportExcel(file); // Your function to read Excel and populate collectionView
-      }
-    };
-    input.click();
+    setExcelLinesOpen(true);
   }
-  const handleImportExcel = async (file: File) => {
-    try {
-      setLoading(true);
-      setFromExcelRef.current = true
-      const data = await file.arrayBuffer();
-      const workbook = XLSX.read(data, { type: "array" });
-      const firstSheetName = workbook.SheetNames[0];
-      const sheet = workbook.Sheets[firstSheetName];
-      const rows: any[] = XLSX.utils.sheet_to_json(sheet, { defval: "" });
-
-      if (!rows || rows.length === 0) {
-        alert("الملف فارغ أو لا يحتوي على بيانات صالحة");
-        return;
-      }
-
-      const importedProducts = await Promise.all(
-        rows.map(async (row) => {
-          const codeOrBarcode = row["رقم الصنف"] || row["barcode"] || row["code"];
-          if (!codeOrBarcode) return null;
-
-          const product = await fetchProductByCodeOrBarcode(codeOrBarcode);
-          if (!product) {
-            console.warn(`المنتج غير موجود: ${codeOrBarcode}`);
-            return null;
-          }
-
-          // Update fields from Excel
-          product.price = row["السعر"] || row["price"] || row["Price"] || product.price;
-          product.qnty = row["الكمية"] || row["quantity"] || row["qnty"] || 1;
-          product.bonus = row["البونص"] || row["بونص"] || row["bonus"] || 0;
-          product.batch = row["الرقم التشغيلي"] || row["batch"] || '';
-          return product;
-        })
-      );
-
-      // Filter out nulls (products not found)
-      const validProducts = importedProducts.filter((p): p is Product => p !== null);
-      // Fill items into CollectionView
-      if (validProducts.length > 0) {
-        FillItem(validProducts);
-
-      }
-      // Update CollectionView
-      //collectionView.sourceCollection = products;
-
-    } catch (err) {
-      console.error("خطأ أثناء استيراد Excel:", err);
-      alert("حدث خطأ أثناء قراءة ملف Excel.");
-    }
-    finally {
-      setLoading(false);
-
-    }
+  // استيراد الأسطر من Excel بالمحرك الموحّد: مطابقة الأعمدة ومراجعة الأصناف غير الموجودة قبل إضافتها للشبكة
+  const [excelLinesOpen, setExcelLinesOpen] = useState(false);
+  const importExcelLines = async (products: Product[]) => {
+    setFromExcelRef.current = true
+    await FillItem(products);
   };
+
+  // نماذج العملاء والأصناف المعلَّمة "إضافة الأصناف تلقائياً في الحركات عند اختيار العميل": عند اختيار العميل في
+  // طلبية جديدة تُضاف أصناف نماذجه الفعّالة بتاريخ الطلبية — عبر FillItem نفسها، دون تكرار صنف موجود.
+  const fillItemRef = useRef(FillItem);
+  fillItemRef.current = FillItem;
+  const autoAddedForRef = useRef("");
+  useEffect(() => {
+    const accountId = Number(state.formData?.customer_id) || 0;
+    if (Number(state.formData?.id) > 0 || !accountId) {
+      if (!accountId) autoAddedForRef.current = "";
+      return;
+    }
+    const orderDate = String(state.formData?.order_date || "").slice(0, 10);
+    const key = `${accountId}:${orderDate}`;
+    if (autoAddedForRef.current === key) return;
+    autoAddedForRef.current = key;
+    let cancelled = false;
+    let finished = false;
+    void (async () => {
+      try {
+        const query = new URLSearchParams({ account_id: String(accountId), auto: "1", ...(orderDate ? { date: orderDate } : {}) });
+        const templateData = await fetch(`/api/customer-product-templates/customer-products?${query}`, { cache: "no-store" }).then((response) => response.ok ? response.json() : null);
+        const existing = new Set((CollectionView.items || []).map((row: any) => Number(row?.id)).filter(Boolean));
+        const ids: number[] = (Array.isArray(templateData?.product_ids) ? templateData.product_ids : []).map(Number).filter((id: number) => !existing.has(id));
+        if (cancelled || !ids.length) return;
+        const products = await fetch(`/api/inventory/products?priceCategoryId=${priceCategoryIdRef.current || 1}&activeOnly=true&ids=${ids.join(",")}`, { cache: "no-store" }).then((response) => response.ok ? response.json() : []);
+        if (cancelled || !Array.isArray(products) || !products.length) return;
+        const ordered = ids.map((id) => products.find((product: any) => Number(product.id) === id)).filter(Boolean);
+        appendItemsRef.current = true;
+        try { await fillItemRef.current(ordered); } finally { appendItemsRef.current = false; }
+        toast.current?.show({ severity: "info", summary: tr("أصناف نموذج العميل"), detail: tr("أُضيف {0} صنف{1}", ordered.length, templateData?.templates?.length ? ` من: ${templateData.templates.map((row: any) => row.name || row.code).join("، ")}` : ""), life: 4000 });
+      } catch (error) {
+        console.error("Failed to auto-add customer template items", error);
+      } finally {
+        finished = true;
+      }
+    })();
+    return () => {
+      cancelled = true;
+      if (!finished && autoAddedForRef.current === key) autoAddedForRef.current = "";
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state.formData?.customer_id, state.formData?.id, state.formData?.order_date]);
   const filteredCustomers = state.customers.filter(
     (customer) =>
       customer.customer_name.toLowerCase().includes(state.customerSearch.toLowerCase()) ||
       customer.customer_code.toLowerCase().includes(state.customerSearch.toLowerCase()),
   )
   const initialHash = useRef(0);
+  const initialFullHash = useRef(0);
   const hashCode = (str: string) => {
     let hash = 0;
     for (let i = 0; i < str.length; i++) {
@@ -2498,6 +2840,56 @@ function UnifiedSalesOrder({
   const getFormDataHash = (data: any) => {
     return hashCode(JSON.stringify(data));
   };
+  const getFormChangeSnapshot = (form: OrderFormData) => {
+    const editableKeys: Array<keyof OrderFormData> = [
+      "branch_id", "order_number", "order_date", "invoice_number", "reference_number",
+      "customer_id", "customer_name", "customer_code", "customer_address", "customer_tax_number",
+      "customer_number", "customer_phone", "salesman", "sales_representative", "currency_id",
+      "currency_name", "exchange_rate", "payment_terms", "delivery_date", "delivery_address",
+      "delivery_notes", "order_status", "order_status2", "financial_status", "order_decision",
+      "source", "order_source", "general_notes", "internal_notes", "discount_type",
+      "discount_amount", "vat_percent", "shipping_cost", "other_charges", "vch_book",
+      "received_by", "customer_order_no",
+    ]
+    return Object.fromEntries(editableKeys.map((key) => [key, form[key] ?? null]))
+  };
+  const getItemsChangeSnapshot = (items: any[] = []) => items.map((item: any) => ({
+    id: Number(item.id || item.product_id || 0),
+    code: String(item.code || item.product_code || ""),
+    qnty: Number(item.qnty ?? item.quantity ?? 0),
+    bonus: Number(item.bonus ?? item.bonus_quantity ?? 0),
+    price: Number(item.price ?? item.unit_price ?? 0),
+    discount: Number(item.discount ?? item.discount_percent ?? 0),
+    unit_id: Number(item.unit_id || 0),
+    store_id: Number(item.store_id || 0),
+    item_status: Number(item.item_status || 1),
+  }));
+
+  // لقطة "بلا تعديلات" كانت تُؤخذ فور فتح الطلبية، قبل أن يصل رقم الطلبية المُولَّد (طلب للخادم) والفرع الافتراضي
+  // والعملة وسعر الصرف — فتظهر نافذة "تم تعديل السجل" بمجرد فتح الطلبية وإغلاقها. قبل أول تفاعل فعلي من
+  // المستخدم (نقرة/مفتاح داخل الطلبية) يُعدّ كل تغيير تلقائياً وتُحدَّث اللقطتان (نفس صيغتي المقارنة أدناه).
+  const userTouchedRef = useRef(false)
+  const rebaselineChangeHashes = (formData: typeof state.formData) => {
+    const form = getFormChangeSnapshot(formData)
+    const items = getItemsChangeSnapshot(CollectionView.items)
+    initialHash.current = getFormDataHash({
+      form,
+      order_date: formData.order_date,
+      customer_id: formData.customer_id,
+      customer_name: formData.customer_name,
+      delivery_date: formData.delivery_date,
+      currency_id: formData.currency_id,
+      exchange_rate: formData.exchange_rate,
+      items,
+    })
+    initialFullHash.current = getFormDataHash({ form, items })
+  }
+  useEffect(() => {
+    if (!open || userTouchedRef.current || initialFullHash.current === 0) return
+    rebaselineChangeHashes(state.formData)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state.formData, open])
+
   const [currentOrderId, setCurrentOrderId] = useState<number>(0);
   const loadOrderData = async (
     navigationType: "first" | "previous" | "next" | "last" | "Byid" | "ByCode",
@@ -2505,19 +2897,22 @@ function UnifiedSalesOrder({
     orderCode?: string,
     checkUnsaved: boolean = true
   ) => {
-    setLoading(true)
     let newFormData = {
+      form: getFormChangeSnapshot(state.formData),
       order_date: state.formData.order_date,
       customer_id: state.formData.customer_id,
       customer_name: state.formData.customer_name,
       delivery_date: state.formData.delivery_date,
       currency_id: state.formData.currency_id,
       exchange_rate: state.formData.exchange_rate,
+      items: getItemsChangeSnapshot(CollectionView.items),
       //total: totals.total,
     };
-    const currentHash = getFormDataHash(newFormData);
-    console.log("loadOrderData currentHash ", currentHash, " initialHash ", initialHash.current)
-    if (checkUnsaved && currentHash !== initialHash.current && initialHash.current != 0) {
+    const currentFullHash = getFormDataHash({
+      form: newFormData.form,
+      items: newFormData.items,
+    })
+    if (checkUnsaved && initialFullHash.current !== 0 && currentFullHash !== initialFullHash.current) {
       setShowUnsaved(true);
       setNextFunction(() =>
         () => loadOrderData(navigationType, orderId, orderCode, false)
@@ -2525,6 +2920,7 @@ function UnifiedSalesOrder({
       return;
     }
 
+    setLoading(true)
     try {
       /*if (!hasPermission("orders-view")) {
         toast.current?.show({
@@ -2539,8 +2935,8 @@ function UnifiedSalesOrder({
         `/api/orders/navigation/${navigationType}`,
         location.origin
       );
-      url.searchParams.set("currentId", state.formData.order_number.toString());
-      url.searchParams.set("vch_book", state.formData.vch_book.toString());
+      url.searchParams.set("currentId", String(state.formData.id || 0));
+      url.searchParams.set("vch_book", state.formData.vch_book?.toString() ?? "");
       url.searchParams.set("order_type", vch_type?.toString() ?? "1");
       // ---- navigation params ----
       if (navigationType === "Byid" && orderId) {
@@ -2551,14 +2947,20 @@ function UnifiedSalesOrder({
         url.searchParams.set("order_number", orderCode);
       }
 
-
+      console.log("Fetching order data from URL:", url.toString());
+      console.log("Current Order ID:", state.formData.id);
       const res = await fetch(url.toString());
       const order = await res.json();
-      if (!order?.id || order.id === currentOrderId) {
+      console.log("Fetched order data:", order);
+      if (!order?.id) {
         Util.showErrorToast(toast.current, navigationType === "previous" || navigationType === "first"
-          ? "بداية السجلات"
-          : "نهاية السجلات");
+          ? tr("بداية السجلات")
+          : navigationType === "ByCode" ? tr("لم يتم العثور على الطلبية") : tr("نهاية السجلات"));
 
+        setLoading(false)
+        return;
+      }
+      if (order.id === currentOrderId && navigationType !== "ByCode") {
         setLoading(false)
         return;
       }
@@ -2588,7 +2990,7 @@ function UnifiedSalesOrder({
           ...order,
           order_date: onlyOrderDate, // only date part
           delivery_date: onlyDeliveryDate,
-          vch_book: mappedOrder.order_number[1],
+          vch_book: mappedOrder.vch_book || mappedOrder.order_number?.[1] || lastVchBook.current || initialFormData.vch_book,
           salesman: mappedOrder.salesman_id ? mappedOrder.salesman_id : "-1",
           discount_type: mappedOrder.discount_type === 1 ? "percentage" : "amount",
           discount_amount: mappedOrder.discount_type === 1 ? Number(mappedOrder.discount_amount) * 100 / (Number(mappedOrder.total_amount) + Number(mappedOrder.discount_amount) - Number(mappedOrder.vat_amount)) : mappedOrder.discount_amount
@@ -2599,42 +3001,81 @@ function UnifiedSalesOrder({
 
       if (mappedOrder.items?.length) {
         let ser = 1;
-        const updatedItems = mappedOrder.items.map((item: any) => ({
-          ...item,
-          id: item.product_id,
-          item_id: item.product_id,
-          name: item.product_name,
-          price: item.price,
-          discount: item.discount,
-          qnty: item.quantity,
-          bonus: item.bonus,
-          ser: ser++,
-          unit_name: item.unit_name, // you might want actual unit name instead of ID
-          amount: item.quantity * item.price - item.discount,
-          batch: item.batch_number,
-          unit_id: item.unit_id,
-          store_id: item.store_id,
-          store_name: item.store_name,
-          units: item.units
-        }));
-
-        CollectionView.sourceCollection = updatedItems;
+        const updatedItems = mappedOrder.items.map((item: any, index: number) => {
+          const quantity = Number(item.qnty ?? item.quantity ?? 0) || 0
+          const unitPrice = Number(item.price || 0)
+          return {
+            ...item,
+            ser: index + 1,
+            id: item.product_id,
+            item_id: item.product_id,
+            code: item.product_code,
+            name: item.product_name,
+            price: unitPrice,
+            price_incl_tax: calculateInclusivePrice(unitPrice, Number(mappedOrder.vat_percent ?? state.formData.vat_percent ?? 0)),
+            unit_id: item.unit_id,
+            store_id: item.store_id,
+            store_name: item.store_name,
+            units: item.units,
+            qnty: quantity,
+            bonus: Number(item.bonus_quantity ?? item.bonus ?? 0),
+            amount: item.amount ?? quantity * unitPrice,
+            batch: item.batch ?? "",
+            expiry_date: item.expiry_date ?? "",
+            discount: Number(item.discount ?? item.discount_percentage ?? 0),
+            // السجل المحفوظ يحتفظ بحالته من قاعدة البيانات؛ السجلات القديمة التي لا تحمل
+            // item_status ترث حالة الطلبية الحالية.
+            item_status: Number(item.item_status ?? mappedOrder.order_status ?? 1),
+            order_item_id: Number(item.id || 0) || null,
+          }
+        });
+        // Replace the CollectionView contents with the loaded items
+        try {
+          CollectionView.sourceCollection.splice(0, CollectionView.sourceCollection.length);
+          updatedItems.forEach((it: any) => CollectionView.sourceCollection.push(it));
+        } catch (e) {
+          // Fallback: assign directly if splice is not available
+          // @ts-ignore
+          CollectionView.sourceCollection = updatedItems;
+        }
+        CollectionView.refresh();
+      } else {
+        // Ensure grid has at least one empty row when no items
+        CollectionView.sourceCollection.splice(0, CollectionView.sourceCollection.length);
+        const newRow = { ser: 1 };
+        CollectionView.sourceCollection.push(newRow);
         CollectionView.refresh();
       }
 
 
       let newFormData = {
-        order_date: mappedOrder.order_date,
+        form: getFormChangeSnapshot({
+          ...state.formData,
+          ...order,
+          order_date: onlyOrderDate,
+          delivery_date: onlyDeliveryDate,
+          vch_book: mappedOrder.vch_book || mappedOrder.order_number?.[1] || lastVchBook.current || initialFormData.vch_book,
+          salesman: mappedOrder.salesman_id ? mappedOrder.salesman_id : "-1",
+          discount_type: mappedOrder.discount_type === 1 ? "percentage" : "amount",
+          discount_amount: mappedOrder.discount_type === 1 ? Number(mappedOrder.discount_amount) * 100 / (Number(mappedOrder.total_amount) + Number(mappedOrder.discount_amount) - Number(mappedOrder.vat_amount)) : mappedOrder.discount_amount,
+        }),
+        order_date: onlyOrderDate,
         customer_id: mappedOrder.customer_id,
         customer_name: mappedOrder.customer_name,
-        delivery_date: mappedOrder.delivery_date,
+        delivery_date: onlyDeliveryDate,
         currency_id: mappedOrder.currency_id,
         exchange_rate: mappedOrder.exchange_rate,
+        items: getItemsChangeSnapshot(CollectionView.items),
         //total: Number(mappedOrder.total_amount),
       };
       const newHash = getFormDataHash(newFormData);
       console.log("newFormData ", newFormData)
+      userTouchedRef.current = false
       initialHash.current = newHash;
+      initialFullHash.current = getFormDataHash({
+        form: newFormData.form,
+        items: newFormData.items,
+      });
 
       setCurrentOrderId(order.id);
     } catch (err) {
@@ -2643,7 +3084,7 @@ function UnifiedSalesOrder({
     finally {
       setLoading(false)
       setTimeout(() => {
-        referenceNumberRef.current?.focus();
+        orderdateRef.current?.focus();
       }, 50)
 
     }
@@ -2653,12 +3094,14 @@ function UnifiedSalesOrder({
   const handleNewRecord = (checkUnsaved: any) => {
 
     let newFormData = {
+      form: getFormChangeSnapshot(state.formData),
       order_date: state.formData.order_date,
       customer_id: state.formData.customer_id,
       customer_name: state.formData.customer_name,
       delivery_date: state.formData.delivery_date,
       currency_id: state.formData.currency_id,
       exchange_rate: state.formData.exchange_rate,
+      items: getItemsChangeSnapshot(CollectionView.items),
       //total: totals.total,
     };
     const currentHash = getFormDataHash(newFormData);
@@ -2672,11 +3115,13 @@ function UnifiedSalesOrder({
     reset_order()
   }
 
-  const reset_order = () => {
+  const reset_order = (vchBookOverride?: string) => {
     setLoading(true)
+    const resolvedVchBook = vchBookOverride || lastVchBook.current || initialFormData.vch_book;
+    console.log("reset_order resolvedVchBook ", resolvedVchBook, " lastVchBook.current ", lastVchBook.current, " initialFormData.vch_book ", initialFormData.vch_book)
     setState((prev) => ({
       ...prev, // Keep existing states like customers, products etc.
-      formData: { ...initialFormData, vch_book: lastVchBook.current || initialFormData.vch_book },
+      formData: { ...initialFormData, vat_percent: defaultVatPercentRef.current, vch_book: resolvedVchBook },
       customerSearch: "",
       activeTab: "basic", // Reset to basic tab
       showCustomerSearch: false,
@@ -2686,34 +3131,49 @@ function UnifiedSalesOrder({
       selectedProductForLots: null,
       selectedItemIdForLots: null,
     }))
-    CollectionView.sourceCollection.splice(0);
-    CollectionView.refresh();
+    try {
+      CollectionView.sourceCollection.splice(0);
+      CollectionView.refresh();
+    } catch {
+      // Ignore stale-grid refreshes when the grid has been recreated after returning from inactivity.
+    }
     const newRow = { ser: 1 };
-    CollectionView.sourceCollection.push(newRow);
-    CollectionView.refresh();
+    try {
+      CollectionView.sourceCollection.push(newRow);
+      CollectionView.refresh();
+    } catch {
+      // Ignore stale-grid refreshes when the grid has been recreated after returning from inactivity.
+    }
     setTimeout(() => {
       focusGrid()
     }, 10)
     console.log("initialFormData before reset ", initialFormData)
-    generateOrderNumber()
+    generateOrderNumber(resolvedVchBook)
     setLoading(false)
     const orderDate = new Date(initialFormData.order_date ?? new Date());
 
     console.log("initialFormData ", initialFormData)
     let newFormData = {
+      form: getFormChangeSnapshot({ ...initialFormData, vat_percent: defaultVatPercentRef.current, vch_book: resolvedVchBook }),
       order_date: initialFormData.order_date,
       customer_id: initialFormData.customer_id,
       customer_name: initialFormData.customer_name,
       delivery_date: initialFormData.delivery_date,
       currency_id: initialFormData.currency_id,
       exchange_rate: initialFormData.exchange_rate,
+      items: getItemsChangeSnapshot([{ ser: 1 }]),
       //total: 0
     };
     const currentHash = getFormDataHash(newFormData);
+    userTouchedRef.current = false
     initialHash.current = currentHash;
+    initialFullHash.current = getFormDataHash({
+      form: newFormData.form,
+      items: newFormData.items,
+    });
 
     setTimeout(() => {
-      referenceNumberRef.current?.focus();
+      orderdateRef.current?.focus();
     }, 50)
     setCurrentOrderId(0)
     priceCategoryIdRef.current = 1
@@ -2804,69 +3264,209 @@ function UnifiedSalesOrder({
     printOrder(state.formData, CollectionView.items, {}, showMsg)
   }
 
-  const reportColumns = [
-    { key: "order_number", label: "رقم الطلبية", width: "120px" },
-    { key: "order_date", label: "التاريخ", width: "100px" },
-    { key: "customer_name", label: "اسم الزبون", width: "200px" },
+  // حالة "تم طباعتها مستودعات" للطلبية المعروضة
+  useEffect(() => {
+    const orderId = Number(state.formData.id) || 0
+    if (!printByWarehouseEnabled || !orderId) { setWarehousesPrinted(false); return }
+    let cancelled = false
+    fetch(`/api/orders/warehouse-print?order_id=${orderId}`, { cache: "no-store" })
+      .then((response) => response.json())
+      .then((data) => { if (!cancelled) setWarehousesPrinted(Boolean(data?.printed)) })
+      .catch(() => undefined)
+    return () => { cancelled = true }
+  }, [printByWarehouseEnabled, state.formData.id])
 
-    { key: "total_amount", label: "المبلغ", width: "100px" },
-    { key: "salesman", label: "المندوب", width: "120px" },
-    { key: "delivery_date", label: "تاريخ التسليم", width: "120px" },
+  // توزيع أصناف الطلبية على مستودعاتها وطباعة كل مجموعة على الطابعة الافتراضية لمستودعها
+  const printByWarehouses = async (confirmed = false) => {
+    const orderId = Number(state.formData.id) || 0
+    if (!orderId) { Util.showErrorMessage(message, tr("يجب حفظ الطلبية أولاً")); return }
+    if (warehousesPrinted && !confirmed) { setShowWarehouseReprintConfirm(true); return }
+    const lines = ((CollectionView?.items as any[]) ?? []).filter((item) => (Number(item?.product_id ?? item?.id) || 0) > 0 && Number(item?.qnty || 0) > 0)
+    if (!lines.length) { Util.showErrorMessage(message, tr("لا توجد أصناف للطباعة")); return }
+    setWarehousePrinting(true)
+    try {
+      const response = await fetch(`/api/orders/warehouse-print?order_id=${orderId}`, { cache: "no-store" })
+      const data = await response.json()
+      if (!response.ok) throw new Error(data?.error || tr("تعذر تحميل بيانات المستودعات"))
+      const warehouseById = new Map<number, any>((data.warehouses || []).map((row: any) => [Number(row.id), row]))
+      const groups = new Map<number, any[]>()
+      for (const line of lines) {
+        const storeId = Number(line.store_id) || 0
+        groups.set(storeId, [...(groups.get(storeId) || []), line])
+      }
+      const { settings, company } = await loadVoucherPrintSettings(1)
+      const failures: string[] = []
+      for (const [storeId, groupLines] of groups) {
+        const warehouse = warehouseById.get(storeId)
+        const warehouseName = warehouse?.name || groupLines[0]?.store_name || (storeId ? `مستودع ${storeId}` : "بدون مستودع")
+        const document: PrintDocument = {
+          voucherTypeId: 1,
+          title: tr("طلبية مبيعات — {0}", warehouseName),
+          code: String(state.formData.order_number || ""),
+          date: String(state.formData.order_date || "").slice(0, 10),
+          fields: [
+            { label: tr("العميل"), value: state.formData.customer_name || "" },
+            { label: tr("المستودع"), value: warehouseName },
+            { label: tr("المندوب"), value: (state.formData as any).salesman || "" },
+          ],
+          columns: [
+            { key: "ser", label: "#", align: "center", weight: 0.5 },
+            { key: "code", label: tr("رقم الصنف"), weight: 1.3 },
+            { key: "name", label: tr("اسم الصنف"), weight: 3 },
+            { key: "unit", label: tr("الوحدة"), weight: 1 },
+            { key: "qnty", label: tr("الكمية"), align: "end", weight: 1, numeric: true },
+            { key: "bonus", label: tr("البونص"), align: "end", weight: 0.9, numeric: true },
+          ],
+          rows: groupLines.map((line, index) => ({
+            ser: index + 1,
+            code: line.code || line.product_code || "",
+            name: [line.name || line.product_name || "", line.attribute_summary ? `(${line.attribute_summary})` : ""].filter(Boolean).join(" "),
+            unit: line.unit_name || "",
+            qnty: Number(line.qnty || 0),
+            bonus: Number(line.bonus || 0) || null,
+          })),
+          totals: [{ label: tr("إجمالي الكمية"), value: groupLines.reduce((sum, line) => sum + Number(line.qnty || 0) + Number(line.bonus || 0), 0), strong: true }],
+          notes: String((state.formData as any).notes || (state.formData as any).note || ""),
+        }
+        try {
+          await printVoucherWithSettings(document, { ...settings, printer_name: String(warehouse?.default_printer || "").trim() || settings.printer_name }, company)
+        } catch (error) {
+          failures.push(`${warehouseName}: ${error instanceof Error ? error.message : "تعذر الطباعة"}`)
+        }
+      }
+      if (failures.length === groups.size) throw new Error(failures.join(" — "))
+      await fetch("/api/orders/warehouse-print", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ order_id: orderId }) })
+      setWarehousesPrinted(true)
+      if (failures.length) Util.showErrorMessage(message, tr("طُبعت بقية المستودعات، وتعذرت: {0}", failures.join(" — ")))
+      else Util.showSuccessMessage(message, `تمت طباعة الطلبية على ${groups.size} مستودع`)
+    } catch (error) {
+      Util.showErrorMessage(message, error instanceof Error ? error.message : tr("تعذرت الطباعة حسب المستودع"))
+    } finally {
+      setWarehousePrinting(false)
+    }
+  }
+
+  const guardToolbarAction = (action: () => void | Promise<void>) => {
+    const currentFullHash = getFormDataHash({
+      form: getFormChangeSnapshot(state.formData),
+      items: getItemsChangeSnapshot(CollectionView.items),
+    })
+    if (initialFullHash.current !== 0 && currentFullHash !== initialFullHash.current) {
+      setNextFunction(() => () => { void action() })
+      setShowUnsaved(true)
+      return
+    }
+    void action()
+  }
+  // تبديل الشاشة من القائمة/إغلاق التبويب/رجوع المتصفح/تحديث الصفحة مع تغييرات غير محفوظة ⇐ نفس نافذة
+  // التحقق من التغييرات — كما في كاشير نقطة البيع (lib/navigation-guard.ts)
+  useNavigationGuard(
+    () => Boolean(open && initialFullHash.current !== 0 && getFormDataHash({ form: getFormChangeSnapshot(state.formData), items: getItemsChangeSnapshot(CollectionView.items) }) !== initialFullHash.current),
+    (continueNavigation) => guardToolbarAction(continueNavigation),
+  )
+
+
+  const reportColumns = [
+    { key: "order_number", label: tr("رقم الطلبية"), width: "120px" },
+    { key: "order_date", label: tr("التاريخ"), width: "100px" },
+    { key: "customer_name", label: tr("اسم العميل"), width: "200px" },
+
+    { key: "total_amount", label: tr("المبلغ"), width: "100px" },
+    { key: "salesman", label: tr("المندوب"), width: "120px" },
+    { key: "delivery_date", label: tr("تاريخ التسليم"), width: "120px" },
   ]
 
 
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange || handleCancel}>
-      <DialogContent className="
-          w-full
-          max-w-[95vw]
-          sm:max-w-[90vw]
-          md:max-w-[80vw]
-          lg:max-w-[135vh]
-          h-[95vh]
-          max-h-[95vh]
+    // الإغلاق (ESC أو زر X) يمر بالتحقق من التغييرات
+    <Dialog open={open} onOpenChange={(next) => { if (next) return; guardToolbarAction(() => (onOpenChange ? onOpenChange(false) : handleCancel())) }}>
+      <DialogContent
+        inline={fullscreenEnabled && open}
+        className={`sales-order-form
+          h-[calc(100dvh-1rem)]
+          max-h-[92vh]
+          w-[calc(100vw-1rem)]
+          max-w-[1400px]
+          sm:h-[92vh]
+          sm:w-[96vw]
+          xl:w-[92vw]
           p-0
           gap-0
           flex
           flex-col
-        "
+          overflow-hidden
+          text-[13px]
+          [&_label]:text-xs
+          [&_input:not([type=checkbox])]:h-8
+          [&_input:not([type=checkbox])]:px-2.5
+          [&_.p-dropdown]:min-h-8
+          [&_.p-dropdown-label]:py-1.5
+          ${fullscreenEnabled && open ? "!end-0 !top-0 !h-full !max-h-full !w-full !max-w-none !translate-x-0 !translate-y-0 !rounded-none" : ""}
+        `}
+        dir={appDir()}
         onPointerDownOutside={(event) => event.preventDefault()}
-        onEscapeKeyDown={(event) => { if (!doHotKeys.current) event.preventDefault() }}
+        onEscapeKeyDown={(event) => { if (!doHotKeys.current || showUnsaved) event.preventDefault(); else keepDialogOpenOnEscape(event) }}
+        onPointerDownCapture={() => { userTouchedRef.current = true }}
+        onKeyDownCapture={() => { userTouchedRef.current = true }}
 
       >
 
+        {smsOpen && <SmsSendDialog open={smsOpen} onOpenChange={setSmsOpen} docKey={`order_${Number(vch_type) === 2 ? 2 : 1}`} documentId={Number(state.formData?.id)} />}
         <div className="flex-shrink-0">
           <UniversalToolbar
             currentRecord={currentIndex}
             totalRecords={navTotalRecords}
-            onFirst={async () => { await loadOrderData('first') }}
-            onPrevious={async () => { await loadOrderData('previous') }}
-            onNext={async () => { await loadOrderData('next') }}
-            onLast={async () => { await loadOrderData('last') }}
-            onNew={() => handleNewRecord(true)}
+            onFirst={() => guardToolbarAction(() => handleNavigate('first'))}
+            onPrevious={() => guardToolbarAction(() => handleNavigate('previous'))}
+            onNext={() => guardToolbarAction(() => handleNavigate('next'))}
+            onLast={() => guardToolbarAction(() => handleNavigate('last'))}
+            onNew={() => guardToolbarAction(() => handleNewRecord(false))}
             onSave={handleSave}
-            onDelete={() => { handleDeleteClick(false) }}
-            onReport={handleReport}
-            onExportExcel={handleExportExcel}
-            onPrint={handlePrint}
+            onDelete={() => guardToolbarAction(() => handleDeleteClick(false))}
+            onPrint={() => guardToolbarAction(() => handlePrint())}
+            onWhatsApp={() => guardToolbarAction(() => { armVoucherWhatsApp(state.formData?.customer_id); handlePrint() })}
+            onSms={Number(state.formData?.id) > 0 ? () => setSmsOpen(true) : undefined}
             isLoading={navLoading}
             isSaving={state.isSaving}
             canSave={canSave}
             canPrint={state.formData.id > 0 ? true : false}
-            canDelete={state.formData.id > 0 ? true : false}
+            canDelete={state.formData.id > 0 && [1, 2].includes(Number(state.formData.order_status))}
             canClone={state.formData.id > 0 ? true : false}
             isFirstRecord={isFirstRecord}
             isLastRecord={isLastRecord}
-            onClone={handleClone}
+            onClone={() => guardToolbarAction(handleClone)}
           />
+          {printByWarehouseEnabled && Number(state.formData.id) > 0 && (
+            <div className="flex flex-wrap items-center gap-2 px-3 pt-2" dir={appDir()}>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                disabled={warehousePrinting}
+                onClick={() => guardToolbarAction(() => printByWarehouses(false))}
+                className="h-8 gap-1.5 rounded-lg border-teal-200 bg-teal-50 font-bold text-teal-800 hover:bg-teal-100"
+                title={tr("توزيع أصناف الطلبية على مستودعاتها وطباعة كل مجموعة على الطابعة الافتراضية لمستودعها")}
+              >
+                <Printer className="h-4 w-4" />
+                {warehousePrinting ? tr("جاري الطباعة...") : tr("طباعة حسب المستودعات")}
+              </Button>
+              {warehousesPrinted && (
+                <span className="inline-flex items-center gap-1 rounded-full bg-emerald-100 px-3 py-1 text-xs font-bold text-emerald-800 ring-1 ring-emerald-200">
+                  <CheckCircle2 className="h-3.5 w-3.5" />
+                  {tr("تم طباعتها مستودعات")}
+                </span>
+              )}
+            </div>
+          )}
           <Messages innerRef={message} />
         </div>
 
-        <div className="flex-1 overflow-y-auto">
+        <div className="sales-order-form-body min-h-0 min-w-0 flex-1 overflow-y-auto">
 
-          <div className="p-6 space-y-6">
+          <div className="min-w-0 space-y-3 rounded-b-3xl bg-slate-50/60 px-3 py-2 sm:px-4 sm:py-3">
             <Toast ref={toast} position={'top-left'} className="erp-toast-host" style={{ top: 100, whiteSpace: 'pre-line' }} />
+            <VoucherLinesImportDialog<Product> open={excelLinesOpen} onOpenChange={setExcelLinesOpen} priceCategoryId={priceCategoryIdRef.current} resolveProduct={fetchProductByCodeOrBarcode} onLines={importExcelLines} />
             <ProgressSpinner loading={loading} />
 
             <ProductSearchPopup
@@ -2876,10 +3476,15 @@ function UnifiedSalesOrder({
               priceCategoryId={priceCategoryIdRef.current}
               ShowSelect={true}
               searchText={searchTextRef.current}
+              voucherNumberType={Util.getVoucherBarcodeMode(vch_type) as "barcode" | "factory" | "original"}
+              customerAccountId={Number(state.formData?.customer_id) || null}
+              transactionDate={state.formData?.order_date || null}
+              defaultUnitRole={vch_type === 2 ? "purchase" : undefined}
             />
             <UnitsSearchPopup
               visible={showUnitsSearch}
               product={selectedProductForUnits!}      // selected row from your main grid
+              priceCategoryId={priceCategoryIdRef.current}
               units={selectedProductForUnits?.units ?? []} // units from that row
               onClose={() => {
                 setUnitsSearch(false)
@@ -2911,42 +3516,51 @@ function UnifiedSalesOrder({
                 //FillItem([obj]);
               }}
             />
-            <CustomerSearchPopup
-              visible={showCustomerSearch}
-              type={-1}
-              vch_type={vch_type ?? 1}
-              onClose={() => {
-                popupHasClosed()
-                setShowCustomerSearch(false)
-                customerNameRef.current?.focus()
-              }
-              }
-              onSelect={(customer) => {   // customer: Customer
-                const allowedVoucherBooks = ["L", "P", "M", "R"]
-                const customerVoucherBook = customer.vch_book?.toString().trim().toUpperCase()
-                const book = allowedVoucherBooks.includes(customerVoucherBook)
-                  ? customerVoucherBook
-                  : state.formData.vch_book
-
+            <AccountSearchDialog
+              open={showCustomerSearch}
+              onOpenChange={(open) => {
+                setShowCustomerSearch(open)
+                if (!open) {
+                  popupHasClosed()
+                  customerNameRef.current?.focus()
+                }
+              }}
+              accounts={[]}
+              allowedTypeValues={[2, 3, 5]}
+              onSelect={(account: AccountItem) => {
+                const book = state.formData.vch_book
                 setState((prev) => ({
                   ...prev,
                   formData: {
                     ...prev.formData,
-                    customer_id: customer.id,
-                    customer_code: customer.customer_code,
-                    customer_name: customer.name,
-                    customer_phone: customer.mobile1,
+                    customer_id: account.id,
+                    customer_code: account.code,
+                    customer_name: account.name,
+                    customer_phone: (account as any).mobile1 || account.notes || "",
                     vch_book: book,
                   },
                 }))
-                priceCategoryIdRef.current = customer.pricecategory
+                // price category not available on AccountItem; keep existing
                 customerNameRef.current?.focus()
                 popupHasClosed()
+                setShowCustomerSearch(false)
               }}
             />
             <ConfirmDialogYesNo
               visible={showUnsaved}
-              onConfirm={() => { setShowUnsaved(false); handleSave() }}
+              useAppDialog
+              title={tr("حفظ تعديلات الطلبية")}
+              onDismiss={() => { setShowUnsaved(false); popupHasClosed(); setLoading(false) }}
+              onConfirm={async () => {
+                setShowUnsaved(false)
+                popupHasClosed()
+                const pendingAction = nextFunction
+                const saved = await handleSave(false)
+                if (saved && pendingAction) {
+                  setNextFunction(null)
+                  pendingAction()
+                }
+              }}
               onCancel={async () => {
                 setShowUnsaved(false); popupHasClosed();
                 if (nextFunction) {
@@ -2955,18 +3569,22 @@ function UnifiedSalesOrder({
 
                 }
               }}
-              message="تم تعديل السجل هل تريد الحفظ؟"
+              message={tr("تم تعديل السجل هل تريد الحفظ؟")}
               onBack={() => { setShowUnsaved(false); popupHasClosed(); setLoading(false) }}
               showBack={true}
             />
             <ConfirmDialogYesNo
               visible={showConfirm}
+              useAppDialog
+              title={tr("تأكيد حذف الطلبية")}
               onConfirm={confirmDelete}
               onCancel={() => { setShowConfirm(false); popupHasClosed() }}
-              message="هل أنت متأكد من حذف السجل؟"
+              message={tr("هل أنت متأكد من حذف السجل؟")}
             />
             <ConfirmDialogYesNo
               visible={showAlert}
+              useAppDialog
+              title={tr("تأكيد الطباعة")}
               onConfirm={async () => {
                 await printOrder(state.FormDataBackup, CollectionViewBackupRef.current, {}, true); setShowAlert(false); popupHasClosed();
                 setTimeout(() => referenceNumberRef.current?.focus(), 50)
@@ -2975,13 +3593,27 @@ function UnifiedSalesOrder({
               message={alertMessage}
             />
             <ConfirmDialogYesNo
+              visible={showWarehouseReprintConfirm}
+              useAppDialog
+              title={tr("طباعة حسب المستودعات")}
+              confirmLabel={tr("نعم")}
+              cancelLabel={tr("لا")}
+              onConfirm={() => { setShowWarehouseReprintConfirm(false); popupHasClosed(); void printByWarehouses(true) }}
+              onCancel={() => { setShowWarehouseReprintConfirm(false); popupHasClosed() }}
+              message={tr("تم طباعة الطلبية مستودعات مسبقا هل تريد طباعتها مرة أخرى؟")}
+            />
+            <ConfirmDialogYesNo
               visible={showPrintRefConfirm}
+              useAppDialog
+              title={tr("إعادة الطباعة")}
               onConfirm={() => { setShowPrintRefConfirm(false); popupHasClosed(); handlePrint(false); setTimeout(() => referenceNumberRef.current?.focus(), 50) }}
               onCancel={() => { setShowPrintRefConfirm(false); popupHasClosed(); setTimeout(() => referenceNumberRef.current?.focus(), 50) }}
-              message="تمت طباعة السند مسبقا هل تريد الطباعة مرة أخرى؟"
+              message={tr("تمت طباعة السند مسبقا هل تريد الطباعة مرة أخرى؟")}
             />
             <ConfirmDialogYesNo
               visible={showDuplicateRefConfirm}
+              useAppDialog
+              title={tr("رقم سند يدوي مكرر")}
               onConfirm={() => {
                 setIsDuplicateRefConfirmed(true)
                 duplicateRefDismissedValueRef.current = ""
@@ -3010,11 +3642,11 @@ function UnifiedSalesOrder({
                   popupHasClosed()
                 }, 220)
               }}
-              message="رقم السند اليدوي مستخدم مسبقا، هل تريد المتابعة؟"
+              message={tr("رقم السند اليدوي مستخدم مسبقا، هل تريد المتابعة؟")}
             />
             <OrderSearchPopup
               visible={showOrderSearch}
-              type={vch_type ?? 0}
+              type={vch_type ?? 1}
 
               onClose={() => { popupHasCalled(); setShowOrderSearch(false); setTimeout(() => referenceNumberRef.current?.focus(), 50) }}
               onSelect={(order) => {
@@ -3061,85 +3693,82 @@ function UnifiedSalesOrder({
                 gridRef.current?.select(selectedIndex, 'qnty');
               }}
             />
-            <Card className="bg-gradient-to-br from-primary/5 to-primary/10 border-primary/20 sticky top-0 z-40 shadow-md">
+            <Card className="sales-order-summary sticky top-0 z-40 gap-0 py-0 border-emerald-200 bg-gradient-to-br from-emerald-50 to-teal-50 shadow-md">
               <CardContent className="py-4">
                 <div className="flex flex-wrap items-center justify-between gap-4">
                   <div className="flex items-center gap-2">
-                    <TrendingUp className="h-5 w-5 text-primary" />
-                    <span className="text-sm font-medium">ملخص الطلبية</span>
+                    <TrendingUp className="h-5 w-5 text-emerald-700" />
+                    <span className="text-sm font-medium">{tr("ملخص الطلبية")}</span>
                   </div>
-                  <div className="flex flex-wrap items-center gap-6 text-sm">
+                  <div className="sales-order-summary-values flex flex-wrap items-center gap-6 text-sm">
                     <div className="flex flex-col items-end">
-                      <span className="text-xs text-muted-foreground">المجموع الفرعي</span>
-                      <span className="font-semibold">{totals.subtotal.toFixed(2)} </span>
+                      <span className="text-xs text-muted-foreground">{tr("المجموع الفرعي")}</span>
+                      <span className="font-semibold">{Util.formatNumber(totals.subtotal, Util.getSystemSetting(17))} </span>
                     </div>
                     <div className="flex flex-col items-end">
-                      <span className="text-xs text-muted-foreground">الخصم</span>
-                      <span className="font-semibold text-red-600">-{totals.discount.toFixed(2)} </span>
+                      <span className="text-xs text-muted-foreground">{tr("الخصم")}</span>
+                      <span className="font-semibold text-red-600">-{Util.formatNumber(totals.discount, Util.getSystemSetting(17))} </span>
                     </div>
                     <div className="flex flex-col items-end">
-                      <span className="text-xs text-muted-foreground">الضريبة</span>
-                      <span className="font-semibold">{totals.tax.toFixed(2)} </span>
+                      <span className="text-xs text-muted-foreground">{tr("الضريبة")}</span>
+                      <span className="font-semibold">{Util.formatNumber(totals.tax, Util.getSystemSetting(17))} </span>
                     </div>
                     <Separator orientation="vertical" className="h-10 hidden md:block" />
                     <div className="flex flex-col items-end">
-                      <span className="text-xs text-muted-foreground">الإجمالي</span>
-                      <span className="text-lg font-bold text-primary">{totals.total.toFixed(2)}</span>
+                      <span className="text-xs text-muted-foreground">{tr("الإجمالي")}</span>
+                      <span className="text-lg font-bold text-emerald-700">{Util.formatNumber(totals.total, Util.getSystemSetting(17))}</span>
                     </div>
                   </div>
                 </div>
               </CardContent>
             </Card>
-            <div className="grid grid-cols-1 xl:grid-cols-2 gap-6" dir="rtl">
+            <div className="sales-delivery-details-grid grid min-w-0 items-start gap-2" dir={appDir()}>
 
               {/* ===================== */}
               {/* معلومات الطلبية (يمين) */}
               {/* ===================== */}
-              <Card className="h-full">
-                <CardHeader className="pb-4">
-                  <CardTitle className="text-lg flex items-center gap-2">
-                    <FileText className="h-5 w-5 text-primary" />
-                    معلومات الطلبية الأساسية
+              <Card className="sales-order-details-panel min-w-0 gap-3 py-3 rounded-xl border-slate-200 shadow-sm">
+                <CardHeader className="px-3 pb-0 pt-0">
+                  <CardTitle className="flex items-center gap-2 text-sm font-bold text-emerald-700">
+                    <FileText className="h-4 w-4" />
+                    {tr("معلومات الطلبية الأساسية")}
                   </CardTitle>
                 </CardHeader>
 
-                <CardContent className="space-y-10">
+                <CardContent className="space-y-3 px-3 py-0">
 
                   {/* الصف الأول */}
-                  <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                  <div className="voucher-header-grid grid gap-3">
                     {/* دفتر السندات */}
-                    <div>
-                      <Label>دفتر السندات</Label>
-                      <Select
-                        value={String(state.formData.vch_book ?? "R")}
-                        onValueChange={(value) =>
+                    <div className="grid content-start gap-1.5 invoice-currency-dropdown-wrap">
+                      <Label>{tr("دفتر السندات")}</Label>
+                      <Dropdown
+                        value={state.formData.vch_book ?? null}
+                        options={voucherBooks}
+                        optionLabel="name"
+                        optionValue="name"
+                        placeholder={tr("اختر")}
+                        filter
+                        className="invoice-currency-dropdown w-full"
+                        panelClassName="invoice-currency-dropdown-panel"
+                        appendTo="self"
+                        panelStyle={{ zIndex: 10000 }}
+                        onChange={(e: any) =>
                           setState(prev => ({
                             ...prev,
-                            formData: { ...prev.formData, vch_book: value }
+                            formData: { ...prev.formData, vch_book: e.value ?? null }
                           }))
                         }
-                      >
-                        <SelectTrigger className="h-11">
-                          <SelectValue />
-                        </SelectTrigger>
-                        <SelectContent>
-                          {"LMPR".split("").map(l => (
-                            <SelectItem key={l} value={l}>{l}</SelectItem>
-                          ))}
-                        </SelectContent>
-                      </Select>
+                      />
                     </div>
 
                     {/* رقم الطلبية */}
-                    <div className="space-y-2">
+                    <div className="grid content-start gap-1.5">
                       <Label className="text-sm font-medium">
-                        {"رقم الطلبية"} <span className="text-red-500 mr-1">*</span>
+                        {tr("رقم الطلبية")} <span className="text-red-500 ms-1">*</span>
                       </Label>
 
-                      <div className="flex flex-row-reverse gap-2 items-center">
-                        <Button type="button" onClick={() => { popupHasCalled(); setShowOrderSearch(true) }}>
-                          🔍
-                        </Button>
+                      <div className="flex min-w-0 gap-1.5 items-center">
                         <Input
                           ref={orderNumberRef}
                           value={state.formData.order_number ?? ""}
@@ -3158,18 +3787,28 @@ function UnifiedSalesOrder({
                               formData: { ...prev.formData, order_number: e.target.value },
                             }))
                           }
-                          className="text-right font-medium h-11 flex-1"
-                          dir="rtl"
+                          className="min-w-0 text-start font-medium h-11 flex-1"
+                          dir={appDir()}
                           placeholder={""}
                           onBlur={handleOrderCodeBlur}
-                          maxLength={8}
+                          maxLength={10}
                         />
+                        {/* بعد رقم الطلبية وبنفس شكل زر بحث السندات في بقية السندات (VoucherSearchButton) */}
+                        <button
+                          type="button"
+                          title={tr("بحث عن طلبية")}
+                          aria-label={tr("بحث عن طلبية")}
+                          onClick={() => { popupHasCalled(); setShowOrderSearch(true) }}
+                          className="flex h-11 w-11 shrink-0 items-center justify-center rounded-md border border-emerald-200 bg-emerald-50 text-emerald-700 transition hover:bg-emerald-100 disabled:opacity-50"
+                        >
+                          <Search className="h-4 w-4" />
+                        </button>
                       </div>
                     </div>
 
                     {/* تاريخ الطلبية */}
-                    <div>
-                      <Label>تاريخ الطلبية</Label>
+                    <div className="grid content-start gap-1.5">
+                      <Label>{tr("تاريخ الطلبية")}</Label>
                       <Input
                         ref={orderdateRef}
                         type="date"
@@ -3192,18 +3831,38 @@ function UnifiedSalesOrder({
                         className="h-11"
                       />
                     </div>
+
+                    <div className="min-w-0">
+                      <TransactionBranchField
+                        family="sales_order"
+                        action={state.formData.id ? "update" : "create"}
+                        value={state.formData.branch_id}
+                        onChange={(branchId) => setState((prev) => ({
+                          ...prev,
+                          formData: { ...prev.formData, branch_id: branchId },
+                        }))}
+                      />
+                    </div>
                   </div>
 
                   {/* الصف الثاني */}
-                  <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+                  <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
                     {/* العملة */}
-                    <div>
-                      <Label>العملة</Label>
-                      <Select
-                        value={String(state.formData.currency_id ?? "-1")}
-                        onValueChange={async (value) => {
+                    <div className="grid gap-1.5 invoice-currency-dropdown-wrap">
+                      <Label>{tr("العملة")}</Label>
+                      <Dropdown
+                        value={state.formData.currency_id ?? null}
+                        options={definitionsRef.current.currencies}
+                        optionLabel="currency_name"
+                        optionValue="currency_id"
+                        placeholder={tr("اختر العملة")}
+                        className="invoice-currency-dropdown w-full"
+                        panelClassName="invoice-currency-dropdown-panel"
+                        appendTo="self"
+                        panelStyle={{ zIndex: 10000 }}
+                        onChange={async (e: any) => {
                           const selected = definitionsRef.current.currencies.find(
-                            (c) => String(c.currency_id) === value
+                            (c) => c.currency_id === e.value
                           );
 
                           if (!selected) return;
@@ -3218,30 +3877,18 @@ function UnifiedSalesOrder({
                             ...prev,
                             formData: {
                               ...prev.formData,
-                              currency_id: selected.currency_id,                 // ✅ API
-                              currency_name: selected.currency_name,    // ✅ UI
-                              exchange_rate: rate,                      // ✅ from DB
+                              currency_id: selected.currency_id,
+                              currency_name: selected.currency_name,
+                              exchange_rate: rate,
                             },
                           }));
                         }}
-
-                      >
-                        <SelectTrigger>
-                          <SelectValue placeholder="اختر العملة" />
-                        </SelectTrigger>
-                        <SelectContent>
-                          {definitionsRef.current.currencies.map(c => (
-                            <SelectItem key={c.currency_id} value={String(c.currency_id)}>
-                              {c.currency_name}
-                            </SelectItem>
-                          ))}
-                        </SelectContent>
-                      </Select>
+                      />
                     </div>
 
                     {/* سعر الصرف */}
                     <div>
-                      <Label>سعر الصرف</Label>
+                      <Label>{tr("سعر الصرف")}</Label>
                       <Input
                         value={state.formData.exchange_rate ?? 1}
                         disabled={state.formData.currency_id === 1}
@@ -3249,59 +3896,74 @@ function UnifiedSalesOrder({
                     </div>
 
                     {/* حالة الطلبية */}
-                    <div>
-                      <Label>حالة الطلبية</Label>
-                      <Select
-                        value={String(state.formData.order_status ?? "1")}
-                        onValueChange={(v) =>
+                    <div className="grid gap-1.5 invoice-currency-dropdown-wrap">
+                      <Label>{tr("حالة الطلبية")}</Label>
+                      <Dropdown
+                        value={state.formData.order_status ?? 1}
+                        options={Number(state.formData.order_status) === 5 ? ORDER_ITEM_STATUS_DISPLAY : ORDER_ITEM_STATUS_OPTIONS}
+                        optionLabel="label"
+                        optionValue="value"
+                        optionDisabled="disabled"
+                        placeholder={tr("اختر حالة الطلبية")}
+                        className="invoice-currency-dropdown w-full"
+                        panelClassName="invoice-currency-dropdown-panel"
+                        appendTo="self"
+                        panelStyle={{ zIndex: 10000 }}
+                        disabled={[3, 4].includes(Number(state.formData.order_status))}
+                        onChange={(e: any) => {
+                          const nextStatus = Number(e.value)
+                          CollectionView.sourceCollection.forEach((item: any) => {
+                            if (!item?.id && !item?.product_id) return
+                            const currentStatus = Number(item.item_status || 1)
+                            // Keep sent item statuses unchanged when changing the order status.
+                            if ([3, 4].includes(currentStatus)) return
+                            if (nextStatus === 6) {
+                              if ([1, 2].includes(currentStatus)) item.item_status = 6
+                            } else if ([1, 2].includes(nextStatus)) {
+                              item.item_status = nextStatus
+                            }
+                          })
+                          CollectionView.refresh()
                           setState(prev => ({
                             ...prev,
-                            formData: { ...prev.formData, order_status: v }
+                            formData: { ...prev.formData, order_status: nextStatus }
                           }))
-                        }
-                      >
-                        <SelectTrigger>
-                          <SelectValue />
-                        </SelectTrigger>
-                        <SelectContent>
-                          <SelectItem value="1">غير جاهزة</SelectItem>
-                          <SelectItem value="2">جاهزة</SelectItem>
-                          <SelectItem value="3">مرسلة جزئيا</SelectItem>
-                          <SelectItem value="4">مرسلة كليا</SelectItem>
-                          <SelectItem value="5">ملغاة</SelectItem>
-                        </SelectContent>
-                      </Select>
+                        }}
+                      />
                     </div>
 
                     {/*2 حالة الطلبية */}
-                    <div>
-                      <Label>حالة التسليم</Label>
-                      <Select
-                        value={String(state.formData.order_status2 ?? "1")}
-                        onValueChange={(v) =>
+                    <div className="grid gap-1.5 invoice-currency-dropdown-wrap">
+                      <Label>{tr("حالة التسليم")}</Label>
+                      <Dropdown
+                        value={state.formData.order_status2 ?? 1}
+                        options={[
+                          { value: 1, label: tr("غير مسلم") },
+                          { value: 2, label: tr("مسلم") },
+                          { value: 3, label: tr("ملغي") },
+                        ]}
+                        optionLabel="label"
+                        optionValue="value"
+                        placeholder={tr("اختر حالة التسليم")}
+                        className="invoice-currency-dropdown w-full"
+                        panelClassName="invoice-currency-dropdown-panel"
+                        appendTo="self"
+                        panelStyle={{ zIndex: 10000 }}
+                        onChange={(e: any) =>
                           setState(prev => ({
                             ...prev,
-                            formData: { ...prev.formData, order_status2: v }
+                            formData: { ...prev.formData, order_status2: e.value }
                           }))
                         }
-                      >
-                        <SelectTrigger>
-                          <SelectValue />
-                        </SelectTrigger>
-                        <SelectContent>
-                          <SelectItem value="1">غير مسلم</SelectItem>
-                          <SelectItem value="2">مسلم</SelectItem>
-                          <SelectItem value="3">ملغي</SelectItem>
-                        </SelectContent>
-                      </Select>
+                      />
                     </div>
 
                   </div>
 
-                  <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                  <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-3">
                     <div>
                       <Label className="text-sm font-medium">
-                        {"السند اليدوي"}
+                        {tr("السند اليدوي")}
                       </Label>
                       <Input
                         ref={referenceNumberRef}
@@ -3315,14 +3977,14 @@ function UnifiedSalesOrder({
                           }))
                         }}
                         onBlur={handleReferenceNumberBlur}
-                        className="text-right h-11"
-                        dir="rtl"
+                        className="text-start h-11"
+                        dir={appDir()}
                         maxLength={7}
                       />
                     </div>
                     <div>
                       <Label className="text-sm font-medium">
-                        {"تاريخ التسليم"}
+                        {tr("تاريخ التسليم")}
                       </Label>
                       <Input
                         type="date"
@@ -3333,35 +3995,38 @@ function UnifiedSalesOrder({
                             formData: { ...prev.formData, delivery_date: e.target.value },
                           }))
                         }
-                        className="text-right h-11"
-                        dir="rtl"
+                        className="text-start h-11"
+                        dir={appDir()}
                       />
                     </div>
-                    <div>
+                    <div className="grid gap-1.5 invoice-currency-dropdown-wrap">
                       <Label className="text-sm font-medium">
-                        {"قرار الإدارة"}
+                        {tr("قرار الإدارة")}
                       </Label>
-                      <Select
-                        value={String(state.formData.order_decision ?? "1")}
-                        onValueChange={(value) =>
+                      <Dropdown
+                        value={state.formData.order_decision ?? 1}
+                        options={[
+                          { value: 1, label: tr("مقبول") },
+                          { value: 2, label: tr("مرفوض") },
+                          { value: 3, label: tr("مؤجل") },
+                          { value: 4, label: tr("معتمدة") },
+                          { value: 5, label: tr("مدققة") },
+                        ]}
+                        optionLabel="label"
+                        optionValue="value"
+                        placeholder={tr("اختر قرار الإدارة")}
+                        disabled={state.formData.order_decision > 3}
+                        className="invoice-currency-dropdown w-full"
+                        panelClassName="invoice-currency-dropdown-panel"
+                        appendTo="self"
+                        panelStyle={{ zIndex: 10000 }}
+                        onChange={(e: any) =>
                           setState((prev) => ({
                             ...prev,
-                            formData: { ...prev.formData, order_decision: value },
+                            formData: { ...prev.formData, order_decision: e.value },
                           }))
                         }
-                        disabled={state.formData.order_decision > 3}
-                      >
-                        <SelectTrigger className="h-11">
-                          <SelectValue />
-                        </SelectTrigger>
-                        <SelectContent>
-                          <SelectItem value="1">مقبول</SelectItem>
-                          <SelectItem value="2">مرفوض</SelectItem>
-                          <SelectItem value="3">مؤجل</SelectItem>
-                          <SelectItem value="4">معتمدة</SelectItem>
-                          <SelectItem value="5">مدققة</SelectItem>
-                        </SelectContent>
-                      </Select>
+                      />
                     </div>
                   </div>
 
@@ -3369,24 +4034,24 @@ function UnifiedSalesOrder({
               </Card>
 
               {/* ===================== */}
-              {/* معلومات الزبون (يسار) */}
+              {/* معلومات العميل (يسار) */}
               {/* ===================== */}
-              <Card className="h-full">
-                <CardHeader className="pb-4">
-                  <CardTitle className="text-lg flex items-center gap-2">
-                    <User className="h-5 w-5 text-primary" />
-                    معلومات الزبون
+              <Card className="sales-order-details-panel min-w-0 gap-3 py-3 rounded-xl border-slate-200 shadow-sm">
+                <CardHeader className="px-3 pb-0 pt-0">
+                  <CardTitle className="flex items-center gap-2 text-sm font-bold text-emerald-700">
+                    <User className="h-4 w-4" />
+                    {tr("معلومات العميل")}
                   </CardTitle>
                 </CardHeader>
 
-                <CardContent className="space-y-6">
+                <CardContent className="space-y-3 px-3 py-0">
 
-                  <div className="grid grid-cols-12 gap-4">
+                  <div className="sales-order-customer-fields grid grid-cols-12 gap-3">
 
-                    {/* رقم الزبون */}
-                    <div className="col-span-12 md:col-span-4">
+                    {/* رقم العميل */}
+                    <div className="col-span-12 md:col-span-5">
                       <Label htmlFor="customer_code" className="text-sm font-medium">
-                        {'رقم الزبون *'}
+                        {tr("رقم العميل *")}
                       </Label>
                       <div className="flex gap-2">
                         <Input
@@ -3408,20 +4073,26 @@ function UnifiedSalesOrder({
                             }
                           }
                           }
-                          className="text-right"
-                          placeholder={'رقم الزبون '}
+                          className="min-w-0 flex-1 text-start"
+                          placeholder={tr("رقم العميل ")}
 
                         />
-                        <Button type="button" onClick={() => setShowCustomerSearch(true)}>
-                          🔍
-                        </Button>
+                        <button
+                          type="button"
+                          title={tr("بحث عن عميل")}
+                          aria-label={tr("بحث عن عميل")}
+                          onClick={() => setShowCustomerSearch(true)}
+                          className="flex h-11 w-11 shrink-0 items-center justify-center rounded-md border border-emerald-200 bg-emerald-50 text-emerald-700 transition hover:bg-emerald-100 disabled:opacity-50"
+                        >
+                          <Search className="h-4 w-4" />
+                        </button>
                       </div>
                     </div>
 
 
-                    {/* اسم الزبون */}
-                    <div className="col-span-8">
-                      <Label>اسم الزبون *</Label>
+                    {/* اسم العميل */}
+                    <div className="col-span-12 md:col-span-4">
+                      <Label>{tr("اسم العميل *")}</Label>
                       <Input
                         ref={customerNameRef}
                         value={state.formData.customer_name ?? ""}
@@ -3434,9 +4105,12 @@ function UnifiedSalesOrder({
                       />
                     </div>
 
+                    {/* رصيد العميل — حسب صلاحية "السماح بمشاهدة رصيد الحساب في الحركات" */}
+                    <AccountBalanceField accountId={state.formData.customer_id} refreshKey={`${state.formData.id}-${state.formData.order_status}`} className="col-span-12 md:col-span-3" />
+
                     {/* هاتف */}
                     <div className="col-span-4">
-                      <Label>هاتف الزبون</Label>
+                      <Label>{tr("هاتف العميل")}</Label>
                       <Input
                         value={state.formData.customer_phone ?? ""}
                         maxLength={15}
@@ -3450,7 +4124,7 @@ function UnifiedSalesOrder({
                     </div>
                     {/* استلمت بواسطة */}
                     <div className="col-span-4">
-                      <Label>استلمت بواسطة</Label>
+                      <Label>{tr("استلمت بواسطة")}</Label>
                       <Input
                         value={state.formData.received_by ?? ""}
                         maxLength={30}
@@ -3462,9 +4136,9 @@ function UnifiedSalesOrder({
                         }
                       />
                     </div>
-                    {/* رقم طلبية الزبون */}
+                    {/* رقم طلبية العميل */}
                     <div className="col-span-4">
-                      <Label>رقم طلبية الزبون</Label>
+                      <Label>{tr("رقم طلبية العميل")}</Label>
                       <Input
                         value={state.formData.customer_order_no ?? ""}
                         maxLength={15}
@@ -3478,7 +4152,7 @@ function UnifiedSalesOrder({
                     </div>
                     {/* عنوان التسليم */}
                     <div className="col-span-12">
-                      <Label>عنوان التسليم</Label>
+                      <Label>{tr("عنوان التسليم")}</Label>
                       <Input
                         value={state.formData.delivery_address ?? ""}
                         className="resize-none"
@@ -3496,7 +4170,7 @@ function UnifiedSalesOrder({
                     </div>
                     {/* ملاحظة عامة */}
                     <div className="col-span-12">
-                      <Label>ملاحظة عامة</Label>
+                      <Label>{tr("ملاحظة عامة")}</Label>
                       <Input
                         value={state.formData.general_notes ?? ""}
                         className="resize-none"
@@ -3520,13 +4194,13 @@ function UnifiedSalesOrder({
             </div>
             {state.formData?.id > 0 && state.formData?.printed === 1 && (
               <div className="px-6 py-2 bg-green-100 text-green-800 font-semibold rounded-b-lg text-center text-xl">
-                تمت الطباعة
+                {tr("تمت الطباعة")}
               </div>
 
             )}
             {state.formData?.is_exported === 1 && (
               <div className="px-6 py-2 bg-green-100 text-blue-800 font-semibold rounded-b-lg text-center text-xl">
-                مرحلة
+                {tr("معتمدة")}
               </div>
 
             )}
@@ -3535,20 +4209,22 @@ function UnifiedSalesOrder({
                 <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3">
                   <CardTitle className="text-lg flex items-center gap-2">
                     <Package className="h-5 w-5 text-primary" />
-                    أصناف الطلبية
+                    {tr("أصناف الطلبية")}
                   </CardTitle>
 
                 </div>
               </CardHeader>
-              <CardContent>
+              <CardContent className="min-w-0 px-3 pb-3 sm:px-4 sm:pb-4">
+                <div className="w-full max-w-full overflow-x-auto">
                 <DataGridView
-                  style={{ maxHeight: '280px' }}
+                  style={{ height: '300px' }}
                   ref={gridRef}
                   idProperty="ser"
                   scheme={getScheme()}
                   dataSource={CollectionView}
                   onKeyDown={(s: any, e: any) => onKeyDownGrid(s, e)}
                   cellEditEnded={(s: any, e: any) => onCellEditEnded(s, e)}
+                  beginningEdit={(s: any, e: any) => onBeginningEdit(s, e)}
                   showContextMenu={false}
                   copyItemStoreDown={true}
                   dontConvertToCards={true}
@@ -3557,6 +4233,7 @@ function UnifiedSalesOrder({
                   allowSorting={false}
                   keyActionEnter="None"
                 />
+                </div>
 
               </CardContent>
             </Card>
@@ -3567,14 +4244,14 @@ function UnifiedSalesOrder({
                   <AccordionTrigger className="px-6 py-4 hover:no-underline">
                     <CardTitle className="text-lg flex items-center gap-2">
                       <MessageSquare className="h-5 w-5 text-primary" />
-                      الملاحظات
+                      {tr("الملاحظات")}
                     </CardTitle>
                   </AccordionTrigger>
                   <AccordionContent>
                     <CardContent className="space-y-6 pt-0">
 
                       <div className="space-y-2">
-                        <Label className="text-sm font-medium">ملاحظات داخلية</Label>
+                        <Label className="text-sm font-medium">{tr("ملاحظات داخلية")}</Label>
                         <Textarea
                           value={state.formData.internal_notes ?? ""}
                           onChange={(e) =>
@@ -3583,14 +4260,14 @@ function UnifiedSalesOrder({
                               formData: { ...prev.formData, internal_notes: e.target.value },
                             }))
                           }
-                          className="text-right min-h-[100px] resize-none"
+                          className="text-start min-h-[100px] resize-none"
                           rows={4}
-                          placeholder="ملاحظات للاستخدام الداخلي فقط"
-                          dir="rtl"
+                          placeholder={tr("ملاحظات للاستخدام الداخلي فقط")}
+                          dir={appDir()}
                         />
                       </div>
                       <div className="space-y-2">
-                        <Label className="text-sm font-medium">ملاحظات التسليم</Label>
+                        <Label className="text-sm font-medium">{tr("ملاحظات التسليم")}</Label>
                         <Textarea
                           value={state.formData.delivery_notes ?? ""}
                           onChange={(e) =>
@@ -3599,10 +4276,10 @@ function UnifiedSalesOrder({
                               formData: { ...prev.formData, delivery_notes: e.target.value },
                             }))
                           }
-                          className="text-right min-h-[100px] resize-none"
+                          className="text-start min-h-[100px] resize-none"
                           rows={4}
-                          placeholder="ملاحظات خاصة بالتسليم"
-                          dir="rtl"
+                          placeholder={tr("ملاحظات خاصة بالتسليم")}
+                          dir={appDir()}
                         />
                       </div>
                     </CardContent>
@@ -3615,37 +4292,43 @@ function UnifiedSalesOrder({
                 <CardHeader className="pb-4">
                   <CardTitle className="text-lg flex items-center gap-2">
                     <Percent className="h-5 w-5 text-primary" />
-                    الخصومات والضرائب
+                    {tr("الخصومات والضرائب")}
                   </CardTitle>
                 </CardHeader>
                 <CardContent className="space-y-6">
                   <div className="grid grid-cols-2 gap-4">
                     <div className="space-y-2">
-                      <Label className="text-sm font-medium">نوع الخصم</Label>
-                      <Select
+                      <Label className="text-sm font-medium">{tr("نوع الخصم")}</Label>
+                      <Dropdown
                         value={state.formData.discount_type || "percentage"}
-                        onValueChange={(value) =>
+                        options={[
+                          { value: "percentage", label: tr("نسبة مئوية") },
+                          { value: "amount", label: tr("مبلغ ثابت") },
+                        ]}
+                        optionLabel="label"
+                        optionValue="value"
+                        placeholder={tr("اختر نوع الخصم")}
+                        disabled={!canPricing("general_discount")}
+                        className="invoice-currency-dropdown w-full"
+                        panelClassName="invoice-currency-dropdown-panel"
+                        appendTo="self"
+                        panelStyle={{ zIndex: 10000 }}
+                        onChange={(e: any) =>
                           setState((prev) => ({
                             ...prev,
-                            formData: { ...prev.formData, discount_type: value },
+                            formData: { ...prev.formData, discount_type: String(e.value) },
                           }))
                         }
-                      >
-                        <SelectTrigger className="h-11">
-                          <SelectValue />
-                        </SelectTrigger>
-                        <SelectContent>
-                          <SelectItem value="percentage">نسبة مئوية</SelectItem>
-                          <SelectItem value="amount">مبلغ ثابت</SelectItem>
-                        </SelectContent>
-                      </Select>
+                      />
                     </div>
                     <div className="space-y-2">
-                      <Label className="text-sm font-medium">قيمة الخصم</Label>
+                      <Label className="text-sm font-medium">{tr("قيمة الخصم")}</Label>
                       <Input
                         type="number"
                         step="0.01"
                         value={state.formData.discount_amount || 0}
+                        disabled={!canPricing("general_discount")}
+                        title={canPricing("general_discount") ? undefined : tr("لا توجد لديك صلاحية {0}", voucherPricingPermissionLabel(Number(vch_type) || 1, "general_discount"))}
                         onChange={(e) => {
                           let value = Number.parseFloat(e.target.value) || 0;
 
@@ -3665,32 +4348,39 @@ function UnifiedSalesOrder({
                             },
                           }));
                         }}
-                        className="text-right h-11"
-                        dir="rtl"
+                        className="text-start h-11"
+                        dir={appDir()}
                       />
                     </div>
                   </div>
 
                   <div className="space-y-2">
-                    <Label className="text-sm font-medium">نسبة الضريبة (%)</Label>
+                    <Label className="text-sm font-medium">{tr("نسبة الضريبة (%)")}</Label>
                     <Input
                       type="number"
                       step="0.01"
-                      value={state.formData.vat_percent || 0}
-                      onChange={(e) =>
+                      min={0}
+                      max={100}
+                      value={state.formData.vat_percent ?? 0}
+                      // الضريبة على مستوى الصنف: النسبة من التصنيف الضريبي لكل صنف — الحقل للعرض فقط (النسبة الفعلية)
+                      disabled={itemVat.enabled || !canPricing("vat_rate")}
+                      title={itemVat.enabled ? tr("الضريبة على مستوى الصنف مفعّلة: نسبة كل صنف من تصنيفه الضريبي، وهذه النسبة الفعلية للطلبية") : !canPricing("vat_rate") ? tr("لا توجد لديك صلاحية {0}", voucherPricingPermissionLabel(Number(vch_type) || 1, "vat_rate")) : undefined}
+                      onChange={(e) => {
+                        const entered = Number.parseFloat(e.target.value)
+                        const value = Number.isNaN(entered) ? 0 : Math.min(Math.max(entered, 0), 100)
                         setState((prev) => ({
                           ...prev,
-                          formData: { ...prev.formData, vat_percent: Number.parseFloat(e.target.value) || 0 },
+                          formData: { ...prev.formData, vat_percent: value },
                         }))
-                      }
-                      className="text-right h-11"
-                      dir="rtl"
+                      }}
+                      className="text-start h-11"
+                      dir={appDir()}
                     />
                   </div>
 
                   <div className="grid grid-cols-2 gap-4">
                     <div className="space-y-2">
-                      <Label className="text-sm font-medium">تكلفة الشحن</Label>
+                      <Label className="text-sm font-medium">{tr("تكلفة الشحن")}</Label>
                       <Input
                         type="number"
                         step="0.01"
@@ -3701,12 +4391,12 @@ function UnifiedSalesOrder({
                             formData: { ...prev.formData, shipping_cost: Number.parseFloat(e.target.value) || 0 },
                           }))
                         }
-                        className="text-right h-11"
-                        dir="rtl"
+                        className="text-start h-11"
+                        dir={appDir()}
                       />
                     </div>
                     <div className="space-y-2">
-                      <Label className="text-sm font-medium">رسوم أخرى</Label>
+                      <Label className="text-sm font-medium">{tr("رسوم أخرى")}</Label>
                       <Input
                         type="number"
                         step="0.01"
@@ -3717,8 +4407,8 @@ function UnifiedSalesOrder({
                             formData: { ...prev.formData, other_charges: Number.parseFloat(e.target.value) || 0 },
                           }))
                         }
-                        className="text-right h-11"
-                        dir="rtl"
+                        className="text-start h-11"
+                        dir={appDir()}
                       />
                     </div>
                   </div>
@@ -3729,35 +4419,35 @@ function UnifiedSalesOrder({
                 <CardHeader className="pb-4">
                   <CardTitle className="text-lg flex items-center gap-2">
                     <Calculator className="h-5 w-5 text-primary" />
-                    ملخص المبالغ
+                    {tr("ملخص المبالغ")}
                   </CardTitle>
                 </CardHeader>
                 <CardContent>
                   <div className="space-y-4">
                     <div className="flex justify-between items-center text-base py-2">
-                      <span className="text-muted-foreground">المجموع الفرعي:</span>
-                      <span className="font-semibold text-lg">{totals.subtotal.toFixed(2)} </span>
+                      <span className="text-muted-foreground">{tr("المجموع الفرعي:")}</span>
+                      <span className="font-semibold text-lg">{Util.formatNumber(totals.subtotal, Util.getSystemSetting(17))} </span>
                     </div>
                     <div className="flex justify-between items-center text-base py-2">
-                      <span className="text-muted-foreground">الخصم:</span>
-                      <span className="font-semibold text-lg text-red-600">-{totals.discount.toFixed(2)} </span>
+                      <span className="text-muted-foreground">{tr("الخصم:")}</span>
+                      <span className="font-semibold text-lg text-red-600">-{Util.formatNumber(totals.discount, Util.getSystemSetting(17))} </span>
                     </div>
                     <div className="flex justify-between items-center text-base py-2">
-                      <span className="text-muted-foreground">الضريبة:</span>
-                      <span className="font-semibold text-lg">{totals.tax.toFixed(2)} </span>
+                      <span className="text-muted-foreground">{tr("الضريبة:")}</span>
+                      <span className="font-semibold text-lg">{Util.formatNumber(totals.tax, Util.getSystemSetting(17))} </span>
                     </div>
                     <div className="flex justify-between items-center text-base py-2">
-                      <span className="text-muted-foreground">الشحن:</span>
-                      <span className="font-semibold text-lg">{(Number(state.formData.shipping_cost) || 0).toFixed(2)} </span>
+                      <span className="text-muted-foreground">{tr("الشحن:")}</span>
+                      <span className="font-semibold text-lg">{Util.formatNumber(Number(state.formData.shipping_cost) || 0, Util.getSystemSetting(17))} </span>
                     </div>
                     <div className="flex justify-between items-center text-base py-2">
-                      <span className="text-muted-foreground">رسوم أخرى:</span>
-                      <span className="font-semibold text-lg">{(Number(state.formData.other_charges) || 0).toFixed(2)} </span>
+                      <span className="text-muted-foreground">{tr("رسوم أخرى:")}</span>
+                      <span className="font-semibold text-lg">{Util.formatNumber(Number(state.formData.other_charges) || 0, Util.getSystemSetting(17))} </span>
                     </div>
                     <Separator className="my-4" />
                     <div className="flex justify-between items-center bg-primary/10 p-4 rounded-lg border border-primary/20">
-                      <span className="text-lg font-bold">المجموع الكلي:</span>
-                      <span className="text-2xl font-bold text-primary">{(Number(totals.total) || 0).toFixed(2)} </span>
+                      <span className="text-lg font-bold">{tr("المجموع الكلي:")}</span>
+                      <span className="text-2xl font-bold text-primary">{Util.formatNumber(Number(totals.total) || 0, Util.getSystemSetting(17))} </span>
                     </div>
                   </div>
                 </CardContent>
@@ -3790,8 +4480,45 @@ function UnifiedSalesOrder({
           />
         )}
 
+        <MeasurementInputDialog
+          open={measurementDialogOpen}
+          onOpenChange={(open) => {
+            setMeasurementDialogOpen(open)
+            if (!open) {
+              popupHasClosed()
+              const row = measurementDialogRow
+              setTimeout(() => {
+                gridRef.current?.focus()
+                if (row !== null) gridRef.current?.select(row, measurementConfirmedRef.current ? "price" : "qnty")
+              }, 0)
+            }
+          }}
+          measurmentId={measurementDialogRow !== null ? Number(CollectionView.items[measurementDialogRow]?.measurment_id || 1) : 1}
+          productName={measurementDialogRow !== null ? CollectionView.items[measurementDialogRow]?.name : undefined}
+          initialValues={measurementDialogRow !== null ? {
+            length: CollectionView.items[measurementDialogRow]?.length ?? null,
+            width: CollectionView.items[measurementDialogRow]?.width ?? null,
+            height: CollectionView.items[measurementDialogRow]?.height ?? null,
+            count: CollectionView.items[measurementDialogRow]?.count ?? null,
+          } : undefined}
+          productLength={measurementDialogRow !== null ? CollectionView.items[measurementDialogRow]?.product_length : null}
+          productWidth={measurementDialogRow !== null ? CollectionView.items[measurementDialogRow]?.product_width : null}
+          productDensity={measurementDialogRow !== null ? CollectionView.items[measurementDialogRow]?.product_density : null}
+          onConfirm={(values, quantity) => {
+            if (measurementDialogRow === null) return
+            const item = CollectionView.items[measurementDialogRow]
+            if (!item) return
+            Object.assign(item, values, {
+              qnty: quantity,
+              amount: quantity * (Number(item.price) || 0) - (Number(item.discount) || 0),
+            })
+            measurementConfirmedRef.current = true
+            CollectionView.refresh()
+          }}
+        />
+
         <ReportGenerator
-          title={vch_type === 1 ? "تقرير طلبيات المبيعات" : "تقرير طلبيات المشتريات"}
+          title={vch_type === 1 ? tr("تقرير طلبيات المبيعات") : tr("تقرير طلبيات المشتريات")}
           data={allOrders}
           columns={reportColumns}
           isOpen={showReport}

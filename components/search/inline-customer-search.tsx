@@ -1,5 +1,6 @@
 "use client"
 
+import { normalizeArabicSearch } from "@/lib/arabic-search"
 import type React from "react"
 
 import { useState, useEffect, useRef } from "react"
@@ -28,7 +29,7 @@ interface InlineCustomerSearchProps {
 export function InlineCustomerSearch({
   value,
   onSelect,
-  placeholder = "ابحث عن الزبون...",
+  placeholder = "ابحث عن العميل...",
   className,
 }: InlineCustomerSearchProps) {
   const [searchTerm, setSearchTerm] = useState(value)
@@ -74,7 +75,7 @@ export function InlineCustomerSearch({
     if (searchTerm.length >= 2) {
       const filtered = customers.filter(
         (customer) =>
-          customer.customer_name.toLowerCase().includes(searchTerm.toLowerCase()) ||
+          normalizeArabicSearch(customer.customer_name).includes(normalizeArabicSearch(searchTerm)) ||
           customer.customer_code.toLowerCase().includes(searchTerm.toLowerCase()) ||
           customer.customer_mobile.includes(searchTerm),
       )
@@ -129,27 +130,27 @@ export function InlineCustomerSearch({
           value={searchTerm}
           onChange={handleInputChange}
           placeholder={placeholder}
-          className="pr-10"
+          className="ps-10"
           onFocus={() => {
             if (searchTerm.length >= 2) setIsOpen(true)
           }}
         />
-        <Search className="absolute right-3 top-1/2 transform -translate-y-1/2 h-4 w-4 text-muted-foreground" />
+        <Search className="absolute start-3 top-1/2 transform -translate-y-1/2 h-4 w-4 text-muted-foreground" />
       </div>
 
       {isOpen && filteredCustomers.length > 0 && (
-        <Card className="absolute top-full left-0 right-0 z-50 mt-1 max-h-80 overflow-auto shadow-lg">
+        <Card className="absolute top-full end-0 start-0 z-50 mt-1 max-h-80 overflow-auto shadow-lg">
           <CardContent className="p-0">
             {filteredCustomers.map((customer) => (
               <Button
                 key={customer.id}
                 variant="ghost"
-                className="w-full justify-start p-4 h-auto text-right hover:bg-muted"
+                className="w-full justify-start p-4 h-auto text-start hover:bg-muted"
                 onClick={() => handleCustomerSelect(customer)}
               >
                 <div className="flex items-start gap-3 w-full">
                   <User className="h-5 w-5 text-primary mt-1 flex-shrink-0" />
-                  <div className="flex-1 text-right space-y-1">
+                  <div className="flex-1 text-start space-y-1">
                     <div className="flex justify-between items-start">
                       <span className="font-semibold text-foreground">{customer.customer_name}</span>
                       <span className="text-sm text-primary font-mono">{customer.customer_code}</span>

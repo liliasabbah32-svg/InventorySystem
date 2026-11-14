@@ -1,39 +1,9 @@
+import { ensureVoucherPrefixDefaults } from "@/lib/voucher-prefix-defaults"
 import { type NextRequest, NextResponse } from "next/server"
-import { neon } from "@neondatabase/serverless"
-import { Pool } from "pg"
-
-let sql: any = null
-
-try {
-  if (!process.env.DATABASE_URL) {
-    console.error("[v0] DATABASE_URL environment variable is not set")
-  } else {
-    const dbUrl = process.env.DATABASE_URL
-
-    if (dbUrl.includes("localhost") || dbUrl.includes("127.0.0.1")) {
-      const pool = new Pool({ connectionString: dbUrl })
-      sql = async (strings: TemplateStringsArray, ...values: any[]) => {
-        const client = await pool.connect()
-        try {
-          const query = strings.reduce(
-            (prev, curr, i) => prev + curr + (i < values.length ? `$${i + 1}` : ""),
-            "",
-          )
-          const result = await client.query(query, values)
-          return result.rows
-        } finally {
-          client.release()
-        }
-      }
-    } else {
-      sql = neon(dbUrl)
-    }
-  }
-} catch (error) {
-  console.error("[v0] Failed to initialize DB client:", error)
-  sql = null
-}
-
+import sql, { memoInTransaction, resolveCurrentDbName } from "@/lib/database"
+import { ensureWorkingPeriodGuard } from "@/lib/working-period"
+import { runSchemaOnce } from "@/lib/schema-once"
+import { validateLeafAccounts } from "@/lib/leaf-accounts"
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
 }
@@ -99,19 +69,32 @@ function normalizePayload(data: unknown): Record<string, unknown> {
     company_phone: ["company_phone", "companyPhone", "phone"],
     company_email: ["company_email", "companyEmail", "email"],
     company_website: ["company_website", "companyWebsite", "website"],
+    company_logo: ["company_logo", "companyLogo"],
     tax_number: ["tax_number", "taxNumber"],
     commercial_register: ["commercial_register", "commercialRegister"],
     default_currency: ["default_currency", "defaultCurrency"],
     invoice_prefix: ["invoice_prefix", "invoicePrefix"],
     order_prefix: ["order_prefix", "orderPrefix"],
     purchase_prefix: ["purchase_prefix", "purchasePrefix"],
+    receipt_prefix: ["receipt_prefix", "receiptPrefix"],
+    payment_prefix: ["payment_prefix", "paymentPrefix"],
+    credit_note_prefix: ["credit_note_prefix", "creditNotePrefix"],
+    debit_note_prefix: ["debit_note_prefix", "debitNotePrefix"],
     customer_prefix: ["customer_prefix", "customerPrefix"],
+    salesman_prefix: ["salesman_prefix", "salesmanPrefix"],
+    employee_prefix: ["employee_prefix", "employeePrefix"],
     supplier_prefix: ["supplier_prefix", "supplierPrefix"],
     item_group_prefix: ["item_group_prefix", "itemGroupPrefix"],
     invoice_start: ["invoice_start", "invoiceStart"],
     order_start: ["order_start", "orderStart"],
     purchase_start: ["purchase_start", "purchaseStart"],
+    receipt_start: ["receipt_start", "receiptStart"],
+    payment_start: ["payment_start", "paymentStart"],
+    credit_note_start: ["credit_note_start", "creditNoteStart"],
+    debit_note_start: ["debit_note_start", "debitNoteStart"],
     customer_start: ["customer_start", "customerStart"],
+    salesman_start: ["salesman_start", "salesmanStart"],
+    employee_start: ["employee_start", "employeeStart"],
     supplier_start: ["supplier_start", "supplierStart"],
     item_group_start: ["item_group_start", "itemGroupStart"],
     item_start: ["item_start", "itemStart"],
@@ -162,96 +145,156 @@ function normalizePayload(data: unknown): Record<string, unknown> {
   return normalized
 }
 
-async function ensureSettingsTable(): Promise<void> {
+async function ensureSettingsTable(): Promise<void> { return runSchemaOnce("app/api/settings/system/route.ts#ensureSettingsTable", async () => {
   if (!sql) return
 
-  await sql`
+  // Create a minimal key/value table if it doesn't exist. Many installations
+  // previously used a simple integer id PK with description/value columns.
+  // We avoid throwing on ALTER failures so older schemas remain usable.
+  const execSafe = async (q: any) => {
+    try {
+      await q
+    } catch (err) {
+      console.warn("[v0] Non-fatal schema change failed:", err instanceof Error ? err.message : String(err))
+    }
+  }
+
+  await execSafe(sql`
     CREATE TABLE IF NOT EXISTS system_settings (
       id VARCHAR(100) PRIMARY KEY,
       description TEXT,
       value TEXT
     )
-  `
+  `)
 
-  await sql`ALTER TABLE system_settings ALTER COLUMN id TYPE VARCHAR(100) USING id::TEXT`
-  await sql`ALTER TABLE system_settings ALTER COLUMN id DROP DEFAULT`
-  await sql`ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS description TEXT`
-  await sql`ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS value TEXT`
+  // Many databases contain id as integer; attempts to ALTER may fail with
+  // insufficient privileges — ignore those errors and proceed.
+  // PostgreSQL won't change an IDENTITY column to varchar. Remove its generation
+  // metadata/default first, then perform the legacy key/value schema conversion.
+  await execSafe(sql`ALTER TABLE system_settings ALTER COLUMN id DROP IDENTITY IF EXISTS`)
+  await execSafe(sql`ALTER TABLE system_settings ALTER COLUMN id DROP DEFAULT`)
+  await execSafe(sql`ALTER TABLE system_settings ALTER COLUMN id TYPE VARCHAR(100) USING id::TEXT`)
+  await execSafe(sql`ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS description TEXT`)
+  await execSafe(sql`ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS value TEXT`)
 
-  await sql`ALTER TABLE system_settings DROP COLUMN IF EXISTS organization_id`
-  await sql`ALTER TABLE system_settings DROP COLUMN IF EXISTS company_name`
-  await sql`ALTER TABLE system_settings DROP COLUMN IF EXISTS company_name_en`
-  await sql`ALTER TABLE system_settings DROP COLUMN IF EXISTS company_email`
-  await sql`ALTER TABLE system_settings DROP COLUMN IF EXISTS company_phone`
-  await sql`ALTER TABLE system_settings DROP COLUMN IF EXISTS company_address`
-  await sql`ALTER TABLE system_settings DROP COLUMN IF EXISTS company_website`
-  await sql`ALTER TABLE system_settings DROP COLUMN IF EXISTS tax_number`
-  await sql`ALTER TABLE system_settings DROP COLUMN IF EXISTS commercial_register`
-  await sql`ALTER TABLE system_settings DROP COLUMN IF EXISTS default_currency`
-  await sql`ALTER TABLE system_settings DROP COLUMN IF EXISTS language`
-  await sql`ALTER TABLE system_settings DROP COLUMN IF EXISTS timezone`
-  await sql`ALTER TABLE system_settings DROP COLUMN IF EXISTS date_format`
-  await sql`ALTER TABLE system_settings DROP COLUMN IF EXISTS time_format`
-  await sql`ALTER TABLE system_settings DROP COLUMN IF EXISTS fiscal_year_start`
-  await sql`ALTER TABLE system_settings DROP COLUMN IF EXISTS auto_numbering`
-  await sql`ALTER TABLE system_settings DROP COLUMN IF EXISTS numbering_system`
-  await sql`ALTER TABLE system_settings DROP COLUMN IF EXISTS invoice_prefix`
-  await sql`ALTER TABLE system_settings DROP COLUMN IF EXISTS invoice_start`
-  await sql`ALTER TABLE system_settings DROP COLUMN IF EXISTS order_prefix`
-  await sql`ALTER TABLE system_settings DROP COLUMN IF EXISTS order_start`
-  await sql`ALTER TABLE system_settings DROP COLUMN IF EXISTS purchase_prefix`
-  await sql`ALTER TABLE system_settings DROP COLUMN IF EXISTS purchase_start`
-  await sql`ALTER TABLE system_settings DROP COLUMN IF EXISTS customer_prefix`
-  await sql`ALTER TABLE system_settings DROP COLUMN IF EXISTS customer_start`
-  await sql`ALTER TABLE system_settings DROP COLUMN IF EXISTS supplier_prefix`
-  await sql`ALTER TABLE system_settings DROP COLUMN IF EXISTS supplier_start`
-  await sql`ALTER TABLE system_settings DROP COLUMN IF EXISTS item_prefix`
-  await sql`ALTER TABLE system_settings DROP COLUMN IF EXISTS item_start`
-  await sql`ALTER TABLE system_settings DROP COLUMN IF EXISTS item_group_prefix`
-  await sql`ALTER TABLE system_settings DROP COLUMN IF EXISTS item_group_start`
-  await sql`ALTER TABLE system_settings DROP COLUMN IF EXISTS default_customer_parent_account`
-  await sql`ALTER TABLE system_settings DROP COLUMN IF EXISTS default_customer_credit_account`
-  await sql`ALTER TABLE system_settings DROP COLUMN IF EXISTS default_sales_tax_account`
-  await sql`ALTER TABLE system_settings DROP COLUMN IF EXISTS default_currency_transfer_account`
-  await sql`ALTER TABLE system_settings DROP COLUMN IF EXISTS default_earned_discount_account`
-  await sql`ALTER TABLE system_settings DROP COLUMN IF EXISTS default_exchange_gain_loss_account`
-  await sql`ALTER TABLE system_settings DROP COLUMN IF EXISTS default_salesman_parent_account`
-  await sql`ALTER TABLE system_settings DROP COLUMN IF EXISTS default_supplier_parent_account`
-  await sql`ALTER TABLE system_settings DROP COLUMN IF EXISTS default_customer_subscription_account`
-  await sql`ALTER TABLE system_settings DROP COLUMN IF EXISTS default_purchase_tax_account`
-  await sql`ALTER TABLE system_settings DROP COLUMN IF EXISTS default_new_employee_account`
-  await sql`ALTER TABLE system_settings DROP COLUMN IF EXISTS default_allowed_discount_account`
-  await sql`ALTER TABLE system_settings DROP COLUMN IF EXISTS paper_size`
-  await sql`ALTER TABLE system_settings DROP COLUMN IF EXISTS print_logo`
-  await sql`ALTER TABLE system_settings DROP COLUMN IF EXISTS print_footer`
-  await sql`ALTER TABLE system_settings DROP COLUMN IF EXISTS default_printer`
-  await sql`ALTER TABLE system_settings DROP COLUMN IF EXISTS working_days`
-  await sql`ALTER TABLE system_settings DROP COLUMN IF EXISTS working_hours`
-  await sql`ALTER TABLE system_settings DROP COLUMN IF EXISTS session_timeout`
-  await sql`ALTER TABLE system_settings DROP COLUMN IF EXISTS two_factor_auth`
-  await sql`ALTER TABLE system_settings DROP COLUMN IF EXISTS password_policy`
-  await sql`ALTER TABLE system_settings DROP COLUMN IF EXISTS audit_log`
-  await sql`ALTER TABLE system_settings DROP COLUMN IF EXISTS account_prefix`
-  await sql`ALTER TABLE system_settings DROP COLUMN IF EXISTS account_start`
-  await sql`ALTER TABLE system_settings DROP COLUMN IF EXISTS created_at`
-  await sql`ALTER TABLE system_settings DROP COLUMN IF EXISTS updated_at`
+  const dropColumns = [
+    "organization_id",
+    "company_name",
+    "company_name_en",
+    "company_email",
+    "company_phone",
+    "company_address",
+    "company_website",
+    "tax_number",
+    "commercial_register",
+    "default_currency",
+    "language",
+    "timezone",
+    "date_format",
+    "time_format",
+    "fiscal_year_start",
+    "auto_numbering",
+    "numbering_system",
+    "invoice_prefix",
+    "invoice_start",
+    "order_prefix",
+    "order_start",
+    "purchase_prefix",
+    "purchase_start",
+    "customer_prefix",
+    "salesman_prefix",
+    "customer_start",
+    "salesman_start",
+    "employee_prefix",
+    "employee_start",
+    "supplier_prefix",
+    "supplier_start",
+    "item_prefix",
+    "item_start",
+    "item_group_prefix",
+    "item_group_start",
+    "default_customer_parent_account",
+    "default_customer_credit_account",
+    "default_sales_tax_account",
+    "default_currency_transfer_account",
+    "default_earned_discount_account",
+    "default_exchange_gain_loss_account",
+    "default_salesman_parent_account",
+    "default_supplier_parent_account",
+    "default_customer_subscription_account",
+    "default_purchase_tax_account",
+    "default_new_employee_account",
+    "default_allowed_discount_account",
+    "paper_size",
+    "print_logo",
+    "print_footer",
+    "default_printer",
+    "working_days",
+    "working_hours",
+    "session_timeout",
+    "two_factor_auth",
+    "password_policy",
+    "audit_log",
+    "account_prefix",
+    "account_start",
+    "created_at",
+    "updated_at",
+  ]
+
+  // كل الأعمدة القديمة بأمر واحد بدل ~60 أمراً متتالياً (القائمة ثابتة أعلاه فبناء النص مباشرة آمن —
+  // أسماء الأعمدة لا يمكن تمريرها كمعاملات)
+  await execSafe(sql([`ALTER TABLE system_settings ${dropColumns.map((col) => `DROP COLUMN IF EXISTS "${col}"`).join(", ")}`] as any))
+}) }
+
+// داخل معاملة (حفظ فاتورة الكاشير مثلاً) تُقرأ الإعدادات مرة واحدة (memoInTransaction في lib/database.ts)؛
+// نسخة منفصلة لكل مستدعٍ حتى لا يؤثر تعديل أحدهم على الآخر.
+export async function loadStoredSettings(): Promise<Record<string, unknown>> {
+  return { ...(await memoInTransaction("system-settings", loadStoredSettingsFromDb)) }
 }
 
-async function loadStoredSettings(): Promise<Record<string, unknown>> {
+// نوع عمود id (جداول قديمة برقم صحيح) — يُفحص مرة لكل قاعدة شركة بدل استعلام information_schema مع كل قراءة وحفظ
+const idTypeByDb = new Map<string, Promise<boolean>>()
+async function settingsIdIsInteger(): Promise<boolean> {
+  const dbName = await resolveCurrentDbName()
+  let pending = idTypeByDb.get(dbName)
+  if (!pending) {
+    pending = (async () => {
+      try {
+        const info = await sql`
+          SELECT data_type FROM information_schema.columns
+          WHERE table_name = 'system_settings' AND column_name = 'id' LIMIT 1
+        `
+        const dt = info?.[0]?.data_type
+        return typeof dt === "string" && /int/i.test(dt)
+      } catch {
+        return false
+      }
+    })()
+    idTypeByDb.set(dbName, pending)
+  }
+  return pending
+}
+
+async function loadStoredSettingsFromDb(): Promise<Record<string, unknown>> {
   if (!sql) return {}
 
   await ensureSettingsTable()
 
-  const rows = await sql`
+  // نفس مفتاح lib/system-settings.ts#getSystemSettings: داخل معاملة الحفظ يُقرأ الجدول مرة واحدة للمسارين
+  const rows = await memoInTransaction("system-settings-rows", () => sql`
     SELECT id, description, value
     FROM system_settings
     ORDER BY id ASC
-  `
+  ` as Promise<any[]>)
 
   const settings: Record<string, unknown> = {}
 
+  // Detect if the existing table uses an integer id PK (legacy). If so,
+  // prefer the `description` column as the settings key.
+  const idIsInteger = await settingsIdIsInteger()
+
   for (const row of rows) {
-    const key = row.id ?? row.description
+    const key = idIsInteger ? row.description ?? String(row.id) : row.id ?? row.description
     if (!key) continue
     settings[String(key)] = deserializeSettingValue(row.value)
   }
@@ -259,20 +302,48 @@ async function loadStoredSettings(): Promise<Record<string, unknown>> {
   return settings
 }
 
-async function saveSettingsPayload(payload: Record<string, unknown>): Promise<Record<string, unknown>> {
+async function saveSettingsPayload(payload: Record<string, unknown>, stored?: Record<string, unknown>): Promise<Record<string, unknown>> {
   if (!sql) return {}
 
   await ensureSettingsTable()
 
-  for (const [key, value] of Object.entries(payload)) {
-    const serializedValue = serializeSettingValue(value)
+  // If the table has an integer `id` PK (legacy), store settings by
+  // `description`/`value`. Otherwise use `id` as the key.
+  const idIsInteger = await settingsIdIsInteger()
+
+  // فقط المفاتيح التي تغيّرت عن المحفوظ (مقارنة بالقيمة المخزنة نصاً)، ثم إدراج/تحديث جماعي باستعلام واحد —
+  // كان كل مفتاح (مئات المفاتيح) يُحفظ باستعلام منفصل متتالٍ فيستغرق الحفظ ثوانٍ مع قاعدة بعيدة.
+  const changed = Object.entries(payload).filter(([key, value]) => !stored || !(key in stored)
+    || serializeSettingValue(value) !== serializeSettingValue(stored[key]))
+  if (!changed.length) return stored ? { ...stored } : loadStoredSettings()
+
+  if (!idIsInteger) {
+    const keys = changed.map(([key]) => key)
+    const values = changed.map(([, value]) => serializeSettingValue(value))
     await sql`
       INSERT INTO system_settings (id, description, value)
-      VALUES (${key}, ${key}, ${serializedValue})
+      SELECT k, k, v FROM unnest(${keys}::text[], ${values}::text[]) AS t(k, v)
       ON CONFLICT (id) DO UPDATE SET
         description = EXCLUDED.description,
         value = EXCLUDED.value
     `
+    return loadStoredSettings()
+  }
+
+  for (const [key, value] of changed) {
+    const serializedValue = serializeSettingValue(value)
+      const updated = await sql`
+        UPDATE system_settings
+        SET value = ${serializedValue}
+        WHERE description = ${key}
+        RETURNING id
+      `
+      if (updated.length === 0) {
+        await sql`
+          INSERT INTO system_settings (description, value)
+          VALUES (${key}, ${serializedValue})
+        `
+      }
   }
 
   return loadStoredSettings()
@@ -280,7 +351,11 @@ async function saveSettingsPayload(payload: Record<string, unknown>): Promise<Re
 
 export async function GET() {
   try {
+    await ensureVoucherPrefixDefaults()
     const settings = await loadStoredSettings()
+    // يُثبَّت فحص فترة العمل (سنة/أشهر العمل) على سندات هذه الشركة — مرة لكل قاعدة لكل تشغيل للخادم.
+    // لا يُفشِل قراءة الإعدادات إن تعذّر (صلاحيات قاعدة محدودة مثلاً).
+    await ensureWorkingPeriodGuard().catch((error) => console.error("Failed to install working period guard:", error))
     return NextResponse.json(settings)
   } catch (error) {
     console.error("Database query error:", error)
@@ -288,11 +363,31 @@ export async function GET() {
   }
 }
 
+const PARENT_ACCOUNT_SETTING_KEYS = new Set([
+  "default_customer_parent_account", "default_customer_credit_account", "default_salesman_parent_account",
+  "default_supplier_parent_account", "default_customer_subscription_account", "default_new_employee_account",
+])
+
 export async function PUT(request: NextRequest) {
   try {
     const data = await request.json()
     const payload = normalizePayload(data)
-    const saved = await saveSettingsPayload(payload)
+    // الحسابات الافتراضية يجب أن تكون فرعية — عدا حقول "حساب الأب" (عملاء/موردين/مندوبين/مشتركين/موظفين/اعتمادات).
+    // يُفحص فقط ما تغيّر عن المحفوظ: حساب محفوظ أصبح رئيسياً لاحقاً لا يمنع حفظ بقية الإعدادات.
+    const storedSettings = await loadStoredSettings().catch(() => ({} as Record<string, unknown>))
+    const leafAccountIds = Object.entries(payload)
+      .filter(([key, value]) => /^default_\w*account(_id)?$/.test(key) && !PARENT_ACCOUNT_SETTING_KEYS.has(key)
+        && (Number(value) || 0) !== (Number(storedSettings[key]) || 0))
+      .map(([, value]) => value)
+    const leafAccountsError = await validateLeafAccounts(leafAccountIds, "الحسابات الافتراضية")
+    if (leafAccountsError) return NextResponse.json({ error: leafAccountsError }, { status: 400 })
+    // ملاحظة السند الإجبارية: طول الملاحظة يجب أن يكون أكبر من صفر لكل نوع سند مفعّل
+    if (Array.isArray(payload.voucher_note_rules)) {
+      const invalid = (payload.voucher_note_rules as any[]).some((rule) => rule?.required && !(Number(rule?.min_length) > 0))
+      if (invalid) return NextResponse.json({ error: "طول ملاحظة السند يجب أن يكون أكبر من صفر لكل نوع سند جُعلت ملاحظته اجبارية" }, { status: 400 })
+    }
+    const saved = await saveSettingsPayload(payload, storedSettings)
+    await ensureWorkingPeriodGuard().catch((error) => console.error("Failed to install working period guard:", error))
     return NextResponse.json(saved)
   } catch (error) {
     console.error("Database update error:", error)

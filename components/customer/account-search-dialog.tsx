@@ -1,12 +1,46 @@
 "use client"
 
+import { tr, appDir } from "@/lib/i18n"
 import { useEffect, useMemo, useState, useRef } from "react"
+import { Search, Wallet, Plus, UserPlus } from "lucide-react"
+import { newRecordHref } from "@/lib/new-record-param"
 import { Button } from "@/components/ui/button"
 import { Dialog, DialogContent } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
-import { Label } from "@/components/ui/label"
-import { Dropdown as PrimeDropdown } from "primereact/dropdown"
-import DataGridView from "../common/DataGridView"
+import PrimeDropdown from "@/components/common/FocusDropdown"
+import {
+  SearchDialogHeader,
+  SearchFilterField,
+  SearchResultsTable,
+  searchInputClassName,
+  useEnterAsTabFilters,
+  type SearchColumn,
+  type SearchResultsTableHandle,
+} from "@/components/common/search-dialog-kit"
+import { useWorkspaceDialog } from "@/contexts/workspace-dialog-context"
+import { useToast } from "@/hooks/use-toast"
+import { getAccountList } from "@/components/customer/account-data"
+
+// كل كلمة في نص البحث يجب أن تكون موجودة في النص الهدف (بأي ترتيب) — وليس تطابق سلسلة متتالية
+// فقط، فيجد "احمد علي" نتيجة عند البحث "علي احمد" أيضاً.
+const normalizeSearchText = (value: string): string =>
+  String(value || "")
+    .normalize("NFKD")
+    .replace(/[\u064B-\u065F\u0670\u0640]/g, "")
+    .replace(/[أإآٱ]/g, "ا")
+    .replace(/ى/g, "ي")
+    .replace(/ؤ/g, "و")
+    .replace(/ئ/g, "ي")
+    .replace(/ة/g, "ه")
+    .toLocaleLowerCase("ar")
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .trim()
+
+const searchWordsMatch = (text: string, searchQuery: string): boolean => {
+  const words = normalizeSearchText(searchQuery).split(/\s+/).filter(Boolean)
+  const normalizedText = normalizeSearchText(text)
+  return words.every((word) => normalizedText.includes(word))
+}
 
 export interface AccountItem {
   id: number
@@ -40,6 +74,9 @@ export interface AccountItem {
   unified_report_group_code?: string | null
   notes?: string | null
   show_notes_in_transactions_soa: boolean
+  has_deliveries?: boolean
+  has_orders?: boolean
+  has_children?: boolean
   status: string
   cost_centers?: any[]
   created_at?: string
@@ -55,14 +92,43 @@ interface AccountSearchDialogProps {
   defaultTypeValue?: string
   showFinancialListFilter?: boolean
   showTypeFilter?: boolean
+  showDeliveryOnlyFilter?: boolean
+  lockDeliveryOnlyFilter?: boolean
+  deliveryVchTypes?: number[]
+  showOrderOnlyFilter?: boolean
+  lockOrderOnlyFilter?: boolean
+  orderType?: number | null
+  branchId?: number | null
+  /** الحسابات الرئيسية (التي لها حسابات فرعية) لا تُعرض ولا تُختار — افتراضياً في كل الحركات والتعريفات */
+  leafOnly?: boolean
+  emptyActionLabel?: string
+  emptyActionHref?: string
+  /** النص المكتوب في مربع الحساب قبل فتح النافذة (Enter على نص لا يطابق حساباً واحداً) — يُبحث به مباشرة */
+  initialSearch?: string
+}
+
+/** حساب رئيسي = له حساب فرعي واحد على الأقل (has_children من الخادم، أو father_id لحساب آخر في القائمة) */
+export const isParentAccount = (account: Pick<AccountItem, "id" | "has_children">, accounts: Pick<AccountItem, "father_id">[] = []) =>
+  account.has_children === true || accounts.some((candidate) => Number(candidate.father_id ?? 0) === Number(account.id))
+
+export const PARENT_ACCOUNT_MESSAGE = tr("لا يمكن اختيار حساب رئيسي (له حسابات فرعية) — اختر حساباً فرعياً")
+
+interface CurrencyOption {
+  currency_id: number
+  currency_name?: string
+  currency_code?: string
 }
 
 const API_URL = "/api/accounts"
+const codeCollator = new Intl.Collator("en", { numeric: true, sensitivity: "base" })
+const CURRENCIES_API_URL = "/api/exchange-rates"
 
 const ACCOUNT_TYPE_OPTIONS = [
-  { label: "حساب محاسبي", value: "1" },
-  { label: "زبون", value: "2" },
-  { label: "مورد", value: "3" },
+  { label: tr("حساب محاسبي"), value: "1" },
+  { label: tr("عميل"), value: "2" },
+  { label: tr("مورد"), value: "3" },
+  { label: tr("مندوب"), value: "4" },
+  { label: tr("مشترك"), value: "5" },
 ]
 
 const getAccountTypeId = (account: Pick<AccountItem, "type" | "classification_type_id">) =>
@@ -76,10 +142,12 @@ const getAccountTypeLabel = (
 ) => {
   const typeId = getAccountTypeId(account)
 
-  if (typeId === 1) return "حساب محاسبي"
-  if (typeId === 2) return "زبون"
-  if (typeId === 3) return "مورد"
-  return "أخرى"
+  if (typeId === 1) return tr("حساب محاسبي")
+  if (typeId === 2) return tr("عميل")
+  if (typeId === 3) return tr("مورد")
+  if (typeId === 4) return tr("مندوب")
+  if (typeId === 5) return tr("مشترك")
+  return tr("أخرى")
 }
 
 export default function AccountSearchDialog({
@@ -91,9 +159,34 @@ export default function AccountSearchDialog({
   defaultTypeValue = "__all__",
   showFinancialListFilter = true,
   showTypeFilter = true,
+  showDeliveryOnlyFilter = false,
+  lockDeliveryOnlyFilter = false,
+  deliveryVchTypes = [],
+  showOrderOnlyFilter = false,
+  lockOrderOnlyFilter = false,
+  orderType = null,
+  branchId = null,
+  leafOnly = true,
+  emptyActionLabel,
+  emptyActionHref = "/?section=customers",
+  initialSearch = "",
 }: AccountSearchDialogProps) {
+  const { confined: workspaceConfined } = useWorkspaceDialog()
+  // الجوال (والتطبيق APK): حجم "مساحة العمل" الثابت (~1000px) يُقصّ من اليسار ويُخفي زرَّي موافق/إلغاء —
+  // على الشاشات الصغيرة تُعرض النافذة دائماً بملء الشاشة
+  const [smallScreen, setSmallScreen] = useState(false)
+  useEffect(() => {
+    const query = window.matchMedia("(max-width: 639px)")
+    const update = () => setSmallScreen(query.matches)
+    update()
+    query.addEventListener("change", update)
+    return () => query.removeEventListener("change", update)
+  }, [])
+  const confined = workspaceConfined && !smallScreen
+  const { toast } = useToast()
   const [searchResults, setSearchResults] = useState<AccountItem[]>([])
   const [allAccounts, setAllAccounts] = useState<AccountItem[]>([])
+  const [currencies, setCurrencies] = useState<CurrencyOption[]>([])
   const [selectedAccount, setSelectedAccount] = useState<AccountItem | null>(null)
   const [loading, setLoading] = useState(false)
   const [searchFilters, setSearchFilters] = useState({
@@ -101,8 +194,15 @@ export default function AccountSearchDialog({
     accountName: "",
     financialList: "__all__",
     type: defaultTypeValue,
+    currency: "__all__",
+    deliveryOnly: Boolean(showDeliveryOnlyFilter),
+    orderOnly: Boolean(showOrderOnlyFilter),
   })
-  const gridRef = useRef<any>(null)
+  const resultsRef = useRef<SearchResultsTableHandle | null>(null)
+  const filterContainerRef = useRef<HTMLDivElement | null>(null)
+  const accountNameInputRef = useRef<HTMLInputElement | null>(null)
+  const forceRefreshRef = useRef(false)
+  const initialSearchAppliedRef = useRef(false)
 
   const visibleAccounts = useMemo(() => {
     if (!allowedTypeValues || allowedTypeValues.length === 0) {
@@ -117,31 +217,37 @@ export default function AccountSearchDialog({
       ? ACCOUNT_TYPE_OPTIONS.filter((option) => allowedTypeValues.includes(Number(option.value)))
       : ACCOUNT_TYPE_OPTIONS
 
-    return [{ label: "الكل", value: "__all__" }, ...filteredTypes]
+    return [{ label: tr("الكل"), value: "__all__" }, ...filteredTypes]
   }, [allowedTypeValues])
 
   const financialListOptions = useMemo(
     () => [
-      { label: "الكل", value: "__all__" },
-      { label: "الميزانية العمومية", value: "1" },
-      { label: "قائمة الدخل", value: "2" },
-      { label: "تقييم بضاعة", value: "3" },
+      { label: tr("الكل"), value: "__all__" },
+      { label: tr("الميزانية العمومية"), value: "1" },
+      { label: tr("قائمة الدخل"), value: "2" },
+      { label: tr("تقييم بضاعة"), value: "3" },
     ],
     [],
   )
 
-  const accountScheme = useMemo(
-    () => ({
-      name: "AccountSearchScheme",
-      columns: [
-        { header: "رقم الحساب", name: "code", width: 180, isReadOnly: true },
-        { header: "اسم الحساب", name: "name", width: "*", minWidth: 320, isReadOnly: true },
-        { header: "النوع", name: "type_name", width: 220, isReadOnly: true },
-        { header: "القائمة المالية", name: "finanical_list_id", width: 240, isReadOnly: true },
-      ],
-    }),
-    [],
+  const currencyOptions = useMemo(
+    () => [
+      { label: tr("الكل"), value: "__all__" },
+      ...currencies.map((c) => ({
+        label: c.currency_name || c.currency_code || tr("غير محدد"),
+        value: String(c.currency_id),
+      })),
+    ],
+    [currencies],
   )
+
+  const currencyLabelById = useMemo(() => {
+    const map = new Map<number, string>()
+    for (const c of currencies) {
+      map.set(Number(c.currency_id), c.currency_code || c.currency_name || "")
+    }
+    return map
+  }, [currencies])
 
   const gridDataSource = useMemo(
     () =>
@@ -157,41 +263,80 @@ export default function AccountSearchDialog({
               : getFinancialListId(account) === 3
                 ? "تقييم بضاعة"
                 : "",
+        currency_label: account.currency_id ? currencyLabelById.get(Number(account.currency_id)) || "" : "",
       })),
-    [searchResults],
+    [searchResults, currencyLabelById],
   )
 
   const allowedTypeValuesKey = allowedTypeValues ? allowedTypeValues.join(",") : ""
+  const [refreshVersion, setRefreshVersion] = useState(0)
+
+  useEffect(() => {
+    if (!open) return
+    const refreshAfterReturn = () => {
+      forceRefreshRef.current = true
+      setRefreshVersion((value) => value + 1)
+    }
+    window.addEventListener("focus", refreshAfterReturn)
+    return () => window.removeEventListener("focus", refreshAfterReturn)
+  }, [open])
 
   useEffect(() => {
     if (!open) {
+      initialSearchAppliedRef.current = false
       setSearchResults([])
       setAllAccounts([])
+      setCurrencies([])
       setSelectedAccount(null)
       setSearchFilters({
         accountNumber: "",
         accountName: "",
         financialList: "__all__",
         type: defaultTypeValue,
+        currency: "__all__",
+        deliveryOnly: Boolean(showDeliveryOnlyFilter),
+        orderOnly: Boolean(showOrderOnlyFilter),
       })
       return
     }
 
-    const nextFilters = {
-      accountNumber: "",
-      accountName: "",
-      financialList: "__all__",
-      type: defaultTypeValue,
+    let cancelled = false
+    const forceRefresh = forceRefreshRef.current
+    forceRefreshRef.current = false
+    // أول فتح: النص المكتوب في مربع الحساب يُوضع في فلتر الرقم (أرقام/حروف لاتينية) أو الاسم ويُبحث به فوراً
+    let effectFilters = searchFilters
+    const typed = initialSearch.trim()
+    if (typed && !initialSearchAppliedRef.current) {
+      initialSearchAppliedRef.current = true
+      effectFilters = /^[a-z\d]+$/i.test(typed) ? { ...searchFilters, accountNumber: typed.toUpperCase() } : { ...searchFilters, accountName: typed }
+      setSearchFilters(effectFilters)
+    }
+
+    // Show the autocomplete's already-loaded list immediately while a scoped refresh runs.
+    const canUseAutocompleteAccounts = deliveryVchTypes.length === 0 && orderType == null && !(Number(branchId) > 0)
+    if (canUseAutocompleteAccounts && accounts.length > 0) {
+      const seededAccounts = leafOnly ? accounts.filter((account) => !isParentAccount(account, accounts)) : accounts
+      setAllAccounts(seededAccounts)
+      applySearchFilters(effectFilters, seededAccounts)
     }
 
     const loadFreshAccounts = async () => {
       setLoading(true)
       try {
-        const response = await fetch(API_URL)
-        if (!response.ok) return
+        const url = new URL(API_URL, window.location.origin)
+        if (deliveryVchTypes.length > 0) {
+          url.searchParams.set("delivery_vch_types", deliveryVchTypes.join(","))
+        }
+        if (orderType != null) {
+          url.searchParams.set("order_type", String(orderType))
+        }
+        if (Number(branchId) > 0) {
+          url.searchParams.set("branch_id", String(branchId))
+        }
+        const data = await getAccountList(url.toString(), forceRefresh)
+        if (cancelled) return
 
-        const data = await response.json()
-        const nextAccounts = (Array.isArray(data) ? data : []).map((account: AccountItem) => ({
+        const nextAccounts = data.map((account: AccountItem) => ({
           ...account,
           id: Number(account.id),
           code: String((account as any).code || (account as any).account_code || ""),
@@ -202,6 +347,8 @@ export default function AccountSearchDialog({
               : (account as any).parent_account_id != null
                 ? Number((account as any).parent_account_id)
                 : null,
+          has_orders: Boolean((account as any).has_orders),
+          has_children: (account as any).has_children == null ? undefined : Boolean((account as any).has_children),
           type:
             account.type != null
               ? Number(account.type)
@@ -212,16 +359,58 @@ export default function AccountSearchDialog({
           finanical_list_id: Number(account.finanical_list_id ?? (account as any).financial_list_id ?? 1),
         }))
 
-        setAllAccounts(nextAccounts)
-        setSearchFilters(nextFilters)
-        applySearchFilters(nextFilters, nextAccounts)
+        const selectableAccounts = leafOnly ? nextAccounts.filter((account) => !isParentAccount(account, nextAccounts)) : nextAccounts
+        setAllAccounts(selectableAccounts)
+        // Closing the dialog already resets filters. While it remains open,
+        // refreshes (including window-focus refreshes) must preserve what the
+        // user checked or unchecked instead of restoring the default-only flag.
+        applySearchFilters(effectFilters, selectableAccounts)
+      } catch (error) {
+        if (!cancelled) console.error("Failed to load account search results:", error)
       } finally {
-        setLoading(false)
+        if (!cancelled) setLoading(false)
       }
     }
 
     void loadFreshAccounts()
-  }, [open, defaultTypeValue, allowedTypeValuesKey])
+    return () => {
+      cancelled = true
+    }
+  }, [open, defaultTypeValue, allowedTypeValuesKey, deliveryVchTypes.join(","), orderType, branchId, showOrderOnlyFilter, showDeliveryOnlyFilter, refreshVersion, leafOnly])
+
+  useEffect(() => {
+    if (!open) return
+    let cancelled = false
+
+    fetch(CURRENCIES_API_URL)
+      .then((response) => (response.ok ? response.json() : null))
+      .then((data) => {
+        if (cancelled) return
+        const rates = Array.isArray(data?.rates) ? data.rates : []
+        setCurrencies(
+          rates.map((currency: any) => ({
+            currency_id: Number(currency.currency_id ?? currency.id),
+            currency_name: currency.currency_name ?? currency.name,
+            currency_code: currency.currency_code ?? currency.code,
+          })),
+        )
+      })
+      .catch(() => {
+        if (!cancelled) setCurrencies([])
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [open])
+
+  useEffect(() => {
+    if (!open) return
+    const t = setTimeout(() => {
+      if (!window.matchMedia("(max-width: 639px)").matches) accountNameInputRef.current?.focus()
+    }, 120)
+    return () => clearTimeout(t)
+  }, [open])
 
   const matchesTypeFilter = (account: AccountItem, filterValue: string) => {
     if (filterValue === "__all__") {
@@ -235,12 +424,27 @@ export default function AccountSearchDialog({
     return getAccountTypeId(account) === typeFilter
   }
 
+  const matchesCurrencyFilter = (account: AccountItem, filterValue: string) => {
+    if (filterValue === "__all__") return true
+    return Number(account.currency_id ?? 0) === Number(filterValue)
+  }
+
+  const matchesDeliveryFilter = (account: AccountItem, deliveryOnly: boolean) => {
+    if (!deliveryOnly) return true
+    return Boolean(account.has_deliveries)
+  }
+
+  const matchesOrderFilter = (account: AccountItem, orderOnly: boolean) => {
+    if (!orderOnly) return true
+    return Boolean(account.has_orders)
+  }
+
   const handleSearchAccounts = () => {
     const results = visibleAccounts.filter((account) => {
       if (searchFilters.accountNumber && !account.code.includes(searchFilters.accountNumber)) {
         return false
       }
-      if (searchFilters.accountName && !account.name.toLowerCase().includes(searchFilters.accountName.toLowerCase())) {
+      if (searchFilters.accountName && !searchWordsMatch(`${account.name} ${account.name_lang2 || ""}`, searchFilters.accountName)) {
         return false
       }
       if (searchFilters.financialList !== "__all__" && String(getFinancialListId(account)) !== searchFilters.financialList) {
@@ -249,20 +453,34 @@ export default function AccountSearchDialog({
       if (!matchesTypeFilter(account, searchFilters.type)) {
         return false
       }
+      if (!matchesCurrencyFilter(account, searchFilters.currency)) {
+        return false
+      }
+      if (!matchesDeliveryFilter(account, searchFilters.deliveryOnly)) {
+        return false
+      }
+      if (!matchesOrderFilter(account, searchFilters.orderOnly)) {
+        return false
+      }
       return true
     })
-    setSearchResults(results)
+    // ترتيب النتائج حسب رقم الحساب تصاعدياً بترتيب رقمي طبيعي (2 قبل 10، C9 قبل C10) — ترتيب SQL النصي لا يضمنه
+    setSearchResults([...results].sort((a, b) => codeCollator.compare(String(a.code || ""), String(b.code || ""))))
     setSelectedAccount(null)
   }
 
+
   const applySearchFilters = (nextFilters?: typeof searchFilters, sourceAccounts?: AccountItem[]) => {
     const filters = nextFilters || searchFilters
-    const list = sourceAccounts || visibleAccounts
+    // Always start again from the complete API result. Re-filtering a derived
+    // list can leave the dialog empty after an "only" checkbox is cleared,
+    // because accounts excluded by the previous filter are no longer present.
+    const list = sourceAccounts || allAccounts
     const results = list.filter((account) => {
       if (filters.accountNumber && !account.code.includes(filters.accountNumber)) {
         return false
       }
-      if (filters.accountName && !account.name.toLowerCase().includes(filters.accountName.toLowerCase())) {
+      if (filters.accountName && !searchWordsMatch(`${account.name} ${account.name_lang2 || ""}`, filters.accountName)) {
         return false
       }
       if (filters.financialList !== "__all__" && String(getFinancialListId(account)) !== filters.financialList) {
@@ -271,24 +489,38 @@ export default function AccountSearchDialog({
       if (!matchesTypeFilter(account, filters.type)) {
         return false
       }
+      if (!matchesCurrencyFilter(account, filters.currency)) {
+        return false
+      }
+      if (!matchesDeliveryFilter(account, filters.deliveryOnly)) {
+        return false
+      }
+      if (!matchesOrderFilter(account, filters.orderOnly)) {
+        return false
+      }
       return true
     })
-    setSearchResults(results)
+    // ترتيب النتائج حسب رقم الحساب تصاعدياً بترتيب رقمي طبيعي (2 قبل 10، C9 قبل C10) — ترتيب SQL النصي لا يضمنه
+    setSearchResults([...results].sort((a, b) => codeCollator.compare(String(a.code || ""), String(b.code || ""))))
     setSelectedAccount(null)
-  }
-
-  const handleCodeOrNameKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
-    if (e.key === "Enter" || e.key === " ") {
-      e.preventDefault()
-      applySearchFilters()
-    }
   }
 
   const handleCodeOrNameBlur = () => {
     applySearchFilters()
   }
 
+  // آخر فلتر (Enter) أو السهم للأسفل من أي فلتر ⇐ أول سطر في جدول النتائج
+  const focusGridFirstRow = () => {
+    resultsRef.current?.focusFirstRow()
+  }
+
+  useEnterAsTabFilters(open, filterContainerRef, focusGridFirstRow)
+
   const handleRowDoubleClick = (account: AccountItem) => {
+    if (leafOnly && isParentAccount(account, allAccounts)) {
+      toast({ title: tr("تعذر اختيار الحساب"), description: `${PARENT_ACCOUNT_MESSAGE}: ${account.code} - ${account.name}`, variant: "destructive" })
+      return
+    }
     if (onSelect) {
       onSelect(account)
     }
@@ -301,135 +533,292 @@ export default function AccountSearchDialog({
     }
   }
 
-  const filterGridClassName = showFinancialListFilter
-    ? "grid gap-2 grid-cols-1 sm:grid-cols-2 xl:grid-cols-5 border-b border-slate-200 pb-3 sm:pb-4"
-    : "grid gap-2 grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 border-b border-slate-200 pb-3 sm:pb-4"
+  const dropdownStyle = { height: "36px", minHeight: "36px", borderRadius: "8px", backgroundColor: "#fff" }
+
+  const MAX_VISIBLE_RESULTS = 500
+  const visibleRows = useMemo(
+    () => (gridDataSource.length > MAX_VISIBLE_RESULTS ? gridDataSource.slice(0, MAX_VISIBLE_RESULTS) : gridDataSource),
+    [gridDataSource],
+  )
+
+  const resultColumns: SearchColumn<(typeof gridDataSource)[number]>[] = [
+    { key: "code", header: tr("رقم الحساب"), width: "140px", className: "font-mono text-xs text-slate-600" },
+    { key: "name", header: tr("اسم الحساب"), className: "max-w-[380px] truncate font-semibold text-slate-800" },
+    {
+      key: "type_name",
+      header: tr("النوع"),
+      width: "120px",
+      render: (account) => (
+        <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[11px] font-bold text-slate-600">{account.type_name}</span>
+      ),
+    },
+    { key: "finanical_list_id", header: tr("القائمة المالية"), width: "140px", className: "text-xs text-slate-500" },
+    { key: "currency_label", header: tr("العملة"), width: "80px", align: "center", className: "text-xs font-bold text-slate-600" },
+  ]
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent hideCloseButton className="w-[94vw] max-w-6xl h-auto max-h-[76vh] overflow-hidden rounded-2xl border border-slate-200 bg-white/95 p-3 shadow-2xl backdrop-blur sm:p-4" dir="rtl">
-        <div className="flex flex-col gap-3 sm:gap-4">
-          <div className="flex flex-col gap-2 rounded-xl bg-gradient-to-r from-slate-50 via-white to-blue-50/60 px-3 py-3 sm:flex-row sm:items-center sm:justify-between sm:px-4">
-            <div>
-              <h2 className="text-lg sm:text-xl font-extrabold tracking-tight text-slate-900 text-center sm:text-right">بحث الحسابات</h2>
-            </div>
-            <Button
-              variant="ghost"
-              onClick={() => onOpenChange(false)}
-              className="mx-auto h-8 w-8 rounded-full border border-slate-200 bg-white p-0 text-slate-500 shadow-sm hover:bg-slate-100 sm:mx-0"
-              aria-label="إغلاق"
-              title="إغلاق"
-            >
-              ✕
-            </Button>
-          </div>
+      <DialogContent
+        hideCloseButton
+        className={confined
+          ? "h-[min(720px,calc(100%-1.5rem))] max-h-[calc(100%-1.5rem)] w-[min(1000px,calc(100%-1.5rem))] max-w-[calc(100%-1.5rem)] gap-0 overflow-hidden rounded-2xl border-0 bg-slate-50 p-0 shadow-2xl ring-1 ring-slate-900/10"
+          : "!fixed !inset-0 !end-0 !top-0 !h-[100dvh] !max-h-[100dvh] !w-full !max-w-none !translate-x-0 !translate-y-0 gap-0 overflow-hidden rounded-none border-0 bg-slate-50 p-0 shadow-2xl sm:!end-1/2 sm:!top-1/2 sm:!h-[min(80dvh,720px)] sm:!max-h-[min(80dvh,720px)] sm:!w-[calc(100%-2rem)] sm:!max-w-[1000px] sm:!-translate-x-1/2 sm:!-translate-y-1/2 sm:rounded-2xl sm:ring-1 sm:ring-slate-900/10"}
+        dir={appDir()}
+        onCloseAutoFocus={(event) => event.preventDefault()}
+        onInteractOutside={(event) => event.preventDefault()}
+        // كان Radix يركّز أول زر بالنافذة (إضافة حساب) حتى ينتقل التركيز لمربع البحث بعد 120ms —
+        // فضغطة Enter سريعة بعد فتح النافذة كانت تضغط "إضافة حساب". التركيز الآن مباشرة على مربع البحث.
+        onOpenAutoFocus={(event) => {
+          event.preventDefault()
+          if (!window.matchMedia("(max-width: 639px)").matches) accountNameInputRef.current?.focus()
+          else (event.currentTarget as HTMLElement | null)?.focus?.()
+        }}
+      >
+        <div className="account-search-dialog-shell flex h-full min-h-0 flex-col">
+          <SearchDialogHeader
+            icon={<Wallet className="h-4 w-4" />}
+            title={tr("دليل الحسابات")}
+            subtitle={tr("Enter للتنقل بين الفلاتر ثم للنتائج • ↑↓ للتنقل • Enter للاختيار")}
+            count={searchResults.length}
+            onClose={() => onOpenChange(false)}
+            actions={
+              // تبويب جديد بالنظام كاملاً (القائمة والتنقل) على سجل جديد — بدل صفحة /admin/accounts المنفصلة بملء الشاشة
+              <>
+                <Button
+                  type="button"
+                  tabIndex={-1}
+                  onClick={() => window.open(newRecordHref("accounts"), "_blank", "noopener,noreferrer")}
+                  className="h-8 gap-1.5 rounded-lg bg-white px-2.5 text-xs font-bold text-emerald-700 hover:bg-emerald-50"
+                  title={tr("تعريف حساب")}
+                >
+                  <Plus className="h-3.5 w-3.5" />
+                  <span className="hidden sm:inline">{tr("تعريف حساب")}</span>
+                </Button>
+                <Button
+                  type="button"
+                  tabIndex={-1}
+                  onClick={() => window.open(newRecordHref("customers"), "_blank", "noopener,noreferrer")}
+                  className="h-8 gap-1.5 rounded-lg bg-white px-2.5 text-xs font-bold text-sky-700 hover:bg-sky-50"
+                  title={tr("تعريف عميل")}
+                >
+                  <UserPlus className="h-3.5 w-3.5" />
+                  <span className="hidden sm:inline">{tr("تعريف عميل")}</span>
+                </Button>
+              </>
+            }
+          />
 
-          <div className={filterGridClassName}>
-            <div>
-              <Label className="mb-2 block text-sm font-medium">رقم الحساب</Label>
-              <Input
-                value={searchFilters.accountNumber}
-                onChange={(e) => setSearchFilters({ ...searchFilters, accountNumber: e.target.value })}
-                placeholder="ابحث برقم الحساب"
-                className="h-10 rounded-xl border border-slate-200 bg-white text-right shadow-sm focus:border-blue-300 focus:bg-white"
-                onKeyDown={handleCodeOrNameKeyDown}
-                onBlur={handleCodeOrNameBlur}
-              />
-            </div>
-            <div>
-              <Label className="mb-2 block text-sm font-medium">الاسم</Label>
-              <Input
-                value={searchFilters.accountName}
-                onChange={(e) => setSearchFilters({ ...searchFilters, accountName: e.target.value })}
-                placeholder="ابحث باسم الحساب"
-                className="h-10 rounded-xl border border-slate-200 bg-white text-right shadow-sm focus:border-blue-300 focus:bg-white"
-                onKeyDown={handleCodeOrNameKeyDown}
-                onBlur={handleCodeOrNameBlur}
-              />
-            </div>
-            {showFinancialListFilter ? (
-              <div>
-                <Label className="mb-2 block text-sm font-medium">القائمة المالية</Label>
-                <PrimeDropdown
-                  value={searchFilters.financialList}
-                  options={financialListOptions}
-                  optionLabel="label"
-                  optionValue="value"
-                  placeholder="اختر القائمة المالية"
-                  className="invoice-currency-dropdown w-full"
-                  valueTemplate={(option) => (
-                    <div className="text-right w-full">{option?.label ?? "اختر القائمة المالية"}</div>
-                  )}
-                  style={{ minHeight: "40px", borderRadius: "14px", backgroundColor: "#fff" }}
-                  panelClassName="invoice-currency-dropdown-panel"
-                  appendTo="self"
-                  onChange={(e: any) => {
-                    const nextFilters = { ...searchFilters, financialList: e.value }
-                    setSearchFilters(nextFilters)
-                    applySearchFilters(nextFilters)
-                  }}
-                />
+          {/* الفلاتر */}
+          <div className="shrink-0 border-b border-slate-200 bg-white px-3 py-2 sm:px-4 sm:py-3">
+            <div className="flex min-w-0 flex-col gap-2">
+              <div ref={filterContainerRef} className="account-search-dialog-filters-grid grid min-w-0 gap-2">
+                <SearchFilterField label={tr("رقم الحساب")}>
+                  <Input
+                    value={searchFilters.accountNumber}
+                    onChange={(e) => {
+                      const nextFilters = { ...searchFilters, accountNumber: e.target.value }
+                      setSearchFilters(nextFilters)
+                      applySearchFilters(nextFilters)
+                    }}
+                    placeholder={tr("رقم الحساب")}
+                    className={searchInputClassName}
+                    onBlur={handleCodeOrNameBlur}
+                  />
+                </SearchFilterField>
+                <SearchFilterField label={tr("الاسم")} className="col-span-2 sm:col-span-1">
+                  <Input
+                    ref={accountNameInputRef}
+                    value={searchFilters.accountName}
+                    onChange={(e) => {
+                      const nextFilters = { ...searchFilters, accountName: e.target.value }
+                      setSearchFilters(nextFilters)
+                      applySearchFilters(nextFilters)
+                    }}
+                    placeholder={tr("يمكن كتابة أكثر من كلمة")}
+                    className={searchInputClassName}
+                    onBlur={handleCodeOrNameBlur}
+                  />
+                </SearchFilterField>
+                {showFinancialListFilter ? (
+                  <SearchFilterField label={tr("القائمة المالية")} className="invoice-currency-dropdown-wrap">
+                    <PrimeDropdown
+                      value={searchFilters.financialList}
+                      options={financialListOptions}
+                      optionLabel="label"
+                      optionValue="value"
+                      placeholder={tr("اختر القائمة المالية")}
+                      className="invoice-currency-dropdown w-full"
+                      valueTemplate={(option) => <div className="w-full text-start">{option?.label ?? tr("اختر القائمة المالية")}</div>}
+                      style={dropdownStyle}
+                      panelClassName="invoice-currency-dropdown-panel"
+                      appendTo="self"
+                      onChange={(e: any) => {
+                        const nextFilters = { ...searchFilters, financialList: e.value }
+                        setSearchFilters(nextFilters)
+                        applySearchFilters(nextFilters)
+                      }}
+                    />
+                  </SearchFilterField>
+                ) : null}
+                {showTypeFilter ? (
+                  <SearchFilterField label={tr("النوع")} className="invoice-currency-dropdown-wrap">
+                    <PrimeDropdown
+                      value={searchFilters.type}
+                      options={typeOptions}
+                      optionLabel="label"
+                      optionValue="value"
+                      placeholder={tr("اختر النوع")}
+                      className="invoice-currency-dropdown w-full"
+                      valueTemplate={(option) => <div className="w-full text-start">{option?.label ?? tr("اختر النوع")}</div>}
+                      style={dropdownStyle}
+                      panelClassName="invoice-currency-dropdown-panel"
+                      appendTo="self"
+                      onChange={(e: any) => {
+                        const nextFilters = { ...searchFilters, type: e.value }
+                        setSearchFilters(nextFilters)
+                        applySearchFilters(nextFilters)
+                      }}
+                    />
+                  </SearchFilterField>
+                ) : null}
+                <SearchFilterField label={tr("العملة")} className="invoice-currency-dropdown-wrap" data-filter-field="currency">
+                  <PrimeDropdown
+                    value={searchFilters.currency}
+                    options={currencyOptions}
+                    optionLabel="label"
+                    optionValue="value"
+                    placeholder={tr("اختر العملة")}
+                    className="invoice-currency-dropdown w-full"
+                    valueTemplate={(option) => <div className="w-full text-start">{option?.label ?? tr("اختر العملة")}</div>}
+                    style={dropdownStyle}
+                    panelClassName="invoice-currency-dropdown-panel"
+                    appendTo="self"
+                    onChange={(e: any) => {
+                      const nextFilters = { ...searchFilters, currency: e.value }
+                      setSearchFilters(nextFilters)
+                      applySearchFilters(nextFilters)
+                    }}
+                  />
+                </SearchFilterField>
               </div>
-            ) : null}
-            {showTypeFilter ? (
-              <div>
-                <Label className="mb-2 block text-sm font-medium">النوع</Label>
-                <PrimeDropdown
-                  value={searchFilters.type}
-                  options={typeOptions}
-                  optionLabel="label"
-                  optionValue="value"
-                  placeholder="اختر النوع"
-                  className="invoice-currency-dropdown w-full"
-                  valueTemplate={(option) => (
-                    <div className="text-right w-full">{option?.label ?? "اختر النوع"}</div>
-                  )}
-                  style={{ height: "40px", borderRadius: "14px", backgroundColor: "#fff" }}
-                  panelClassName="invoice-currency-dropdown-panel"
-                  appendTo="self"
-                  onChange={(e: any) => {
-                    const nextFilters = { ...searchFilters, type: e.value }
-                    setSearchFilters(nextFilters)
-                    applySearchFilters(nextFilters)
-                  }}
-                />
-              </div>
-            ) : null}
-            <div className="flex items-end">
-              <Button onClick={handleSearchAccounts} size="sm" className="w-full rounded-xl border-0 bg-emerald-600 px-4 text-white shadow-md hover:bg-emerald-700">
-                بحث
+              <Button
+                type="button"
+                onClick={() => {
+                  handleSearchAccounts()
+                  // بعد رسم النتائج الجديدة ⇐ أول سطر
+                  window.requestAnimationFrame(() => window.requestAnimationFrame(focusGridFirstRow))
+                }}
+                className="h-9 w-full shrink-0 gap-1.5 rounded-lg bg-emerald-600 px-4 text-xs font-bold text-white hover:bg-emerald-700"
+              >
+                <Search className="h-3.5 w-3.5" />
+                {tr("بحث")}
               </Button>
             </div>
-          </div>
-
-          <div className="rounded-xl border border-slate-200 overflow-hidden bg-white shadow-sm" style={{ height: '460px' }}>
-            {searchResults.length > 0 ? (
-              <DataGridView
-                innerRef={gridRef}
-                containerStyle={{ height: '100%', minHeight: 0, maxHeight: '100%' }}
-                style={{ height: '100%', minHeight: 0, maxHeight: '100%' }}
-                defaultRowHeight={42}
-                autoRowHeights={false}
-                wordWrap={false}
-                dataSource={gridDataSource}
-                scheme={accountScheme}
-                onRowClick={(account: AccountItem) => setSelectedAccount(account)}
-                onRowDoubleClick={handleRowDoubleClick}
-              />
-            ) : (
-              <div className="flex h-full min-h-[360px] items-center justify-center bg-gradient-to-b from-slate-50 to-white text-slate-500 text-sm">
-                {loading ? "جاري تحميل البيانات ..." : "لا توجد نتائج. قم بالبحث لعرض النتائج"}
+            {(showDeliveryOnlyFilter || showOrderOnlyFilter) && (
+              <div className="mt-2 flex flex-wrap items-center gap-x-5 gap-y-1.5">
+                {showDeliveryOnlyFilter ? (
+                  <label htmlFor="deliveryOnly" className="flex cursor-pointer items-center gap-2 text-xs font-semibold text-slate-600">
+                    <input
+                      id="deliveryOnly"
+                      type="checkbox"
+                      checked={searchFilters.deliveryOnly}
+                      disabled={lockDeliveryOnlyFilter}
+                      onChange={(e) => {
+                        const nextFilters = {
+                          ...searchFilters,
+                          deliveryOnly: e.target.checked,
+                          // الفلتران بديلان — اشتراطهما معاً قد يُخفي كل العملاء
+                          orderOnly: e.target.checked ? false : searchFilters.orderOnly,
+                        }
+                        setSearchFilters(nextFilters)
+                        applySearchFilters(nextFilters)
+                        setRefreshVersion((value) => value + 1)
+                      }}
+                      className="h-4 w-4 rounded border-slate-300 accent-emerald-600 disabled:cursor-not-allowed disabled:opacity-60"
+                    />
+                    {tr("إظهار العملاء الذين لديهم ارساليات فقط")}
+                  </label>
+                ) : null}
+                {showOrderOnlyFilter ? (
+                  <label htmlFor="orderOnly" className="flex cursor-pointer items-center gap-2 text-xs font-semibold text-slate-600">
+                    <input
+                      id="orderOnly"
+                      type="checkbox"
+                      checked={searchFilters.orderOnly}
+                      disabled={lockOrderOnlyFilter}
+                      onChange={(e) => {
+                        const nextFilters = {
+                          ...searchFilters,
+                          orderOnly: e.target.checked,
+                          deliveryOnly: e.target.checked ? false : searchFilters.deliveryOnly,
+                        }
+                        setSearchFilters(nextFilters)
+                        applySearchFilters(nextFilters)
+                        setRefreshVersion((value) => value + 1)
+                      }}
+                      className="h-4 w-4 rounded border-slate-300 accent-emerald-600 disabled:cursor-not-allowed disabled:opacity-60"
+                    />
+                    {tr("إظهار العملاء الذين لديهم طلبيات فقط")}
+                  </label>
+                ) : null}
               </div>
             )}
           </div>
 
-          <div className="flex justify-center gap-2 border-t border-slate-200 pt-4">
-            <Button onClick={handleConfirm} disabled={!selectedAccount} className="search-button shadow-sm">
-              موافق
-            </Button>
-            <Button variant="outline" onClick={() => onOpenChange(false)} className="search-button shadow-sm">
-              إغلاق
-            </Button>
+          {/* النتائج */}
+          <div className="flex min-h-0 flex-1 flex-col gap-1.5 p-3">
+            <div className="flex items-center justify-between px-1 text-[11px] font-bold text-slate-500">
+              <span>{tr("نتائج البحث")}</span>
+              <span>
+                {searchResults.length > MAX_VISIBLE_RESULTS
+                  ? tr("عرض أول {0} من {1} — ضيّق البحث", MAX_VISIBLE_RESULTS, searchResults.length.toLocaleString("en-US"))
+                  : tr("{0} حساب", searchResults.length.toLocaleString("en-US"))}
+              </span>
+            </div>
+            {emptyActionLabel && !loading && visibleRows.length === 0 ? (
+              <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-3 rounded-xl border border-dashed border-slate-300 bg-white px-4 py-10 text-center">
+                <Search className="h-8 w-8 text-slate-300" />
+                <p className="text-sm text-slate-500">{tr("لا توجد نتائج مطابقة")}</p>
+                <Button
+                  type="button"
+                  onClick={() => window.open(emptyActionHref, "_blank", "noopener,noreferrer")}
+                  className="h-9 gap-2 rounded-lg bg-emerald-600 px-4 font-bold text-white hover:bg-emerald-700"
+                >
+                  <Plus className="h-4 w-4" />
+                  {emptyActionLabel}
+                </Button>
+              </div>
+            ) : <SearchResultsTable<(typeof gridDataSource)[number]>
+              ref={resultsRef}
+              rows={visibleRows}
+              columns={resultColumns}
+              getRowKey={(account) => account.id}
+              // صف العرض يحمل نصوصاً للعرض (القائمة المالية/العملة) — يُعاد دوماً الحساب الأصلي للمستدعي
+              onPick={(row) => {
+                const account = searchResults.find((item) => item.id === row.id)
+                if (account) handleRowDoubleClick(account)
+              }}
+              onActiveChange={(row) => setSelectedAccount(row ? searchResults.find((item) => item.id === row.id) ?? null : null)}
+              emptyText={loading ? tr("جاري تحميل البيانات ...") : tr("لا توجد نتائج مطابقة")}
+            />}
+          </div>
+
+          <div className="flex shrink-0 items-center justify-between gap-2 border-t border-slate-200 bg-white px-3 pt-2 pb-[max(0.625rem,env(safe-area-inset-bottom))] sm:px-4 sm:pt-2.5">
+            <span className="hidden truncate text-[11px] text-slate-400 sm:block">
+              {selectedAccount ? `${selectedAccount.code} — ${selectedAccount.name}` : tr("نقر مزدوج أو Enter للاختيار")}
+            </span>
+            <div className="grid w-full flex-1 grid-cols-2 gap-2 sm:w-auto sm:flex-none sm:flex">
+              <Button
+                onClick={handleConfirm}
+                disabled={!selectedAccount}
+                className="h-9 w-full min-w-0 rounded-lg bg-emerald-600 px-3 font-bold text-white hover:bg-emerald-700 sm:w-auto sm:px-6"
+              >
+                {tr("موافق")}
+              </Button>
+              <Button variant="outline" onClick={() => onOpenChange(false)} className="h-9 w-full min-w-0 rounded-lg border-2 border-slate-300 bg-white px-3 font-bold text-slate-700 hover:bg-slate-50 sm:w-auto sm:px-6">
+                {tr("إلغاء")}
+              </Button>
+            </div>
           </div>
         </div>
       </DialogContent>

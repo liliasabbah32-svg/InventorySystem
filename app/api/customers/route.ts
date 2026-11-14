@@ -1,265 +1,35 @@
 import { type NextRequest, NextResponse } from "next/server"
-import { neon } from "@neondatabase/serverless"
 import { generateCustomerNumber } from "@/lib/number-generator";
-import { Pool } from "pg"
+import sql from "@/lib/database"
+import { projectFileLookup } from "@/lib/file-permissions"
+import { authorizeCustomerType, authorizeStoredCustomer, customerFileFamily } from "./_permissions"
+import {
+  toNullableInt,
+  toInt,
+  toBool,
+  ensureCustomerCompatibilityColumns,
+  validateCustomerContactFields,
+  normalizeCustomerIdNumber,
+  resolveCustomerCity,
+  resolveAccountType,
+  ensureCustomerAccount,
+  resolveRequiredParentAccount,
+  MissingParentAccountError,
+} from "./_lib"
+import { runSchemaOnce } from "@/lib/schema-once"
 
-let sql: any = null
-
-try {
-  if (!process.env.DATABASE_URL) {
-    console.error("[v0] DATABASE_URL environment variable is not set")
-  } else {
-    const dbUrl = process.env.DATABASE_URL
-
-    if (dbUrl.includes("localhost") || dbUrl.includes("127.0.0.1")) {
-      const pool = new Pool({ connectionString: dbUrl })
-      sql = async (strings: TemplateStringsArray, ...values: any[]) => {
-        const client = await pool.connect()
-        try {
-          const query =
-            strings.reduce(
-              (prev, curr, i) =>
-                prev + curr + (i < values.length ? `$${i + 1}` : ""),
-              ""
-            )
-          const result = await client.query(query, values)
-          return result.rows
-        } finally {
-          client.release()
-        }
-      }
-    } else {
-      console.log("[v0] Using Neon serverless client")
-      sql = neon(dbUrl)
-    }
-
-    console.log("[v0] Database client initialized successfully")
-  }
-} catch (error) {
-  console.error("[v0] Failed to initialize DB client:", error)
-  sql = null
-}
-
-export default sql
-
-const toNullableInt = (value: unknown): number | null => {
-  if (value === null || value === undefined || value === "") return null
-  const parsed = Number(value)
-  return Number.isFinite(parsed) ? parsed : null
-}
-
-const toInt = (value: unknown, fallback = 0): number => {
-  const parsed = Number(value)
-  return Number.isFinite(parsed) ? parsed : fallback
-}
-
-const toBool = (value: unknown, fallback = false): boolean => {
-  if (typeof value === "boolean") return value
-  if (typeof value === "number") return value !== 0
-  if (typeof value === "string") {
-    const normalized = value.trim().toLowerCase()
-    return ["1", "true", "yes", "y", "نعم"].includes(normalized)
-  }
-  return fallback
-}
-
-const ensureCustomerCompatibilityColumns = async () => {
+// تقييد ظهور العميل بفروع معيّنة (اختياري) — بلا أي صف هنا لهذا العميل يبقى ظاهراً لكل الفروع.
+// نفس نمط product_branches بـapp/api/inventory/products/route.ts، تُستدعى من GET/POST/PUT الثلاثة
+// إذ لا وسيلة migration منفصلة بهذا المشروع (كل مسار API يضمن جداوله بنفسه عند أول استدعاء).
+const ensureCustomerBranchesTable = async () => { return runSchemaOnce("app/api/customers/route.ts#ensureCustomerBranchesTable", async () => {
   await sql`
-    ALTER TABLE customers
-      ADD COLUMN IF NOT EXISTS type INTEGER DEFAULT 1,
-      ADD COLUMN IF NOT EXISTS isDeleted BOOLEAN DEFAULT false
-  `
-}
-
-const resolveAccountHierarchy = async (fatherIdInput: unknown, levelNoInput: unknown) => {
-  const fatherId = toNullableInt(fatherIdInput)
-
-  if (!fatherId) {
-    return { fatherId: null, levelNo: toInt(levelNoInput, 1) || 1 }
-  }
-
-  const parentRows = await sql`
-    SELECT level_no
-    FROM account_tbl
-    WHERE id = ${fatherId}
-    LIMIT 1
-  `
-
-  if (parentRows.length === 0) {
-    throw new Error("الحساب الرئيسي غير موجود")
-  }
-
-  const parentLevel = Number(parentRows[0]?.level_no ?? 0)
-  return { fatherId, levelNo: parentLevel + 1 }
-}
-
-const ensureCustomerAccount = async ({
-  accountId,
-  code,
-  name,
-  currencyId = 1,
-  allowTransWithDiffCurr = 0,
-  isCalcCurrDiffRates = false,
-  fatherId = null,
-  levelNo = 1,
-  accountType = 2,
-}: {
-  accountId?: number | null
-  code: string
-  name: string
-  currencyId?: number | null
-  allowTransWithDiffCurr?: unknown
-  isCalcCurrDiffRates?: unknown
-  fatherId?: number | null
-  levelNo?: number
-  accountType?: number
-}) => {
-  const normalizedCode = String(code || "").trim()
-  const normalizedName = String(name || "").trim()
-
-  if (!normalizedCode || !normalizedName) {
-    throw new Error("رقم واسم الحساب مطلوبان")
-  }
-
-  const finalCurrencyId = Number(currencyId || 1) || 1
-  const finalAllowTransWithDiffCurr = toInt(allowTransWithDiffCurr, 0)
-  const finalIsCalcCurrDiffRates = toBool(isCalcCurrDiffRates, false)
-  const finalFatherId = fatherId ? Number(fatherId) : null
-  const finalLevelNo = Number(levelNo || 1) || 1
-
-  if (accountId) {
-    await sql`
-      UPDATE account_tbl
-      SET
-        code = ${normalizedCode},
-        name = ${normalizedName},
-        type = ${accountType},
-        finanical_list_id = 1,
-        finanical_list_assests_id = 2,
-        finanical_list_liabilities_id = NULL,
-        finanical_list_income_id = NULL,
-        father_id = ${finalFatherId},
-        level_no = ${finalLevelNo},
-        currency_id = ${finalCurrencyId},
-        allow_trans_with_diff_curr = ${finalAllowTransWithDiffCurr},
-        iscalc_curr_diff_rates = ${finalIsCalcCurrDiffRates},
-        transaction_type = 0,
-        transaction_type_action = 0,
-        max_transaction_amount = 0,
-        max_transaction_amount_action = 0,
-        max_balance_amount = 0,
-        max_balance_action = NULL,
-        budget_exceeding_perc = NULL,
-        budget_exceeding_action = NULL,
-        unified_report_account_no = NULL,
-        unified_report_group_code = NULL,
-        notes = NULL,
-        show_notes_in_transactions_soa = false,
-        status = 1,
-        last_update_date = CURRENT_TIMESTAMP
-      WHERE id = ${accountId}
-    `
-
-    return accountId
-  }
-
-  const existingAccount = await sql`
-    SELECT id
-    FROM account_tbl
-    WHERE LOWER(code) = LOWER(${normalizedCode})
-    LIMIT 1
-  `
-
-  if (existingAccount.length > 0) {
-    const existingId = Number(existingAccount[0].id)
-    await sql`
-      UPDATE account_tbl
-      SET
-        name = ${normalizedName},
-        type = ${accountType},
-        finanical_list_id = 1,
-        finanical_list_assests_id = 2,
-        finanical_list_liabilities_id = NULL,
-        finanical_list_income_id = NULL,
-        father_id = ${finalFatherId},
-        level_no = ${finalLevelNo},
-        currency_id = ${finalCurrencyId},
-        allow_trans_with_diff_curr = ${finalAllowTransWithDiffCurr},
-        iscalc_curr_diff_rates = ${finalIsCalcCurrDiffRates},
-        status = 1,
-        last_update_date = CURRENT_TIMESTAMP
-      WHERE id = ${existingId}
-    `
-    return existingId
-  }
-
-  const created = await sql`
-    INSERT INTO account_tbl (
-      company_id,
-      code,
-      type,
-      name,
-      name_lang2,
-      father_id,
-      level_no,
-      finanical_list_id,
-      finanical_list_assests_id,
-      finanical_list_liabilities_id,
-      finanical_list_income_id,
-      currency_id,
-      allow_trans_with_diff_curr,
-      iscalc_curr_diff_rates,
-      transaction_type,
-      transaction_type_action,
-      max_transaction_amount,
-      max_transaction_amount_action,
-      max_balance_amount,
-      max_balance_action,
-      budget_exceeding_perc,
-      budget_exceeding_action,
-      unified_report_account_no,
-      unified_report_group_code,
-      notes,
-      show_notes_in_transactions_soa,
-      status,
-      insert_date,
-      last_update_date
-    ) VALUES (
-      2,
-      ${normalizedCode},
-      1,
-      ${normalizedName},
-      NULL,
-      ${finalFatherId},
-      ${finalLevelNo},
-      1,
-      2,
-      NULL,
-      NULL,
-      ${finalCurrencyId},
-      ${finalAllowTransWithDiffCurr},
-      ${finalIsCalcCurrDiffRates},
-      0,
-      0,
-      0,
-      0,
-      0,
-      NULL,
-      NULL,
-      NULL,
-      NULL,
-      NULL,
-      NULL,
-      false,
-      1,
-      CURRENT_DATE,
-      CURRENT_TIMESTAMP
+    CREATE TABLE IF NOT EXISTS customer_branches (
+      customer_id INTEGER NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+      branch_id INTEGER NOT NULL REFERENCES branches(id) ON DELETE CASCADE,
+      PRIMARY KEY (customer_id, branch_id)
     )
-    RETURNING id
   `
-
-  return Number(created[0].id)
-}
+}) }
 
 const persistCustomerClassifications = async (accountId: number, classifications: any[] | undefined) => {
   if (!Array.isArray(classifications)) return
@@ -301,6 +71,7 @@ const persistCustomerStopTransactions = async (accountId: number, rows: any[] | 
   if (!Array.isArray(rows)) return
 
   for (const row of rows) {
+    if (row?.is_stopped === false) continue
     const voucherTypeId = toNullableInt(row?.voucher_types_id)
     if (!voucherTypeId) continue
 
@@ -316,11 +87,41 @@ const persistCustomerStopTransactions = async (accountId: number, rows: any[] | 
 
 export async function GET(request: NextRequest) {
   try {
-    console.log("[v0] GET /api/customers - Fetching customers with portal info")
+    const requestedType = Number(request.nextUrl.searchParams.get("type")) || 1
+    const permission = await authorizeCustomerType(request, requestedType, "lookup")
+    if (!permission.ok) return permission.response
     await ensureCustomerCompatibilityColumns()
+    await ensureCustomerBranchesTable()
+
+    // تصفية حسب الفرع النشط (هيدر x-branch-id — انظر auth-context.tsx) — عميل بلا أي صف بـ
+    // customer_branches يبقى ظاهراً للجميع، وعميل مقيَّد بفرع/فروع معيّنة لا يظهر إلا لمستخدم فرعه
+    // أحدها. activeBranchId مُتحقَّق كعدد صحيح صراحة قبل تضمينه حرفياً بنص الاستعلام (سديد هنا بدل
+    // معامل مربوط $n لأن sql.unsafe المُضمَّن كـfragment لا يُعيد ترقيم معاملاته الداخلية بالنسبة
+    // لمعاملات الاستعلام الخارجي المحيط به — انظر buildTaggedQuery بـlib/database.ts).
+    const activeBranchIdHeader = Number(request.headers.get("x-branch-id"))
+    const activeBranchId = Number.isInteger(activeBranchIdHeader) && activeBranchIdHeader > 0 ? activeBranchIdHeader : null
+    // الفروع لا تُستخدم في التعريفات (الحسابات/العملاء/الأصناف) — في الحركات فقط: لا تصفية حسب الفرع هنا.
+    // صفوف *_branches القديمة تبقى في القاعدة دون أثر.
+    void activeBranchId
+    const branchFilterSql = ""
 
     const typeParam = request.nextUrl.searchParams.get("type");
-    const typeFilter = typeParam === "1" || typeParam === "2" ? Number(typeParam) : null;
+    const typeFilter = typeParam === "1" || typeParam === "2" || typeParam === "3" || typeParam === "4" ? Number(typeParam) : 1;
+    // account_id: يُستخدَم لجلب بيانات العميل (حد الائتمان/العنوان) بعد اختياره عبر AutoCompleteAccount
+    // في شاشات السندات (كإرسالية مبيعات) التي تحمل account_id فقط لا customer_id — إضافي بحت، لا يمس
+    // أي استعلام قائم عند غيابه.
+    const accountIdParam = request.nextUrl.searchParams.get("account_id");
+    const accountIdFilter = accountIdParam && Number.isFinite(Number(accountIdParam)) ? Number(accountIdParam) : null;
+    if (accountIdFilter) {
+      const rows = await sql`
+        SELECT c.*, acc.currency_id AS currency_id, COALESCE(acc.max_balance_amount, 0) AS credit_limit
+        FROM customers c
+        LEFT JOIN account_tbl acc ON acc.id = c.account_id
+        WHERE c.isDeleted = false AND c.account_id = ${accountIdFilter} AND c.type = ${typeFilter}
+        LIMIT 1
+      `
+      return NextResponse.json(permission.lookupOnly ? projectFileLookup(customerFileFamily(typeFilter) || "customers", rows) : rows)
+    }
 
     const customers = typeFilter
       ? await sql`
@@ -335,12 +136,14 @@ export async function GET(request: NextRequest) {
             acc.allow_trans_with_diff_curr AS allow_trans_with_diff_curr,
             acc.iscalc_curr_diff_rates AS iscalc_curr_diff_rates,
             acc.level_no AS level_no,
+            COALESCE(acc.max_balance_amount, 0) AS credit_limit,
             COUNT(cu.id) as user_count,
             CASE WHEN COUNT(cu.id) > 0 THEN true ELSE false END as portal_enabled
           FROM customers c
           LEFT JOIN account_tbl acc ON acc.id = c.account_id
           LEFT JOIN customer_users cu ON c.id = cu.customer_id AND cu.is_active = true
           WHERE c.isDeleted = false AND c.type = ${typeFilter}
+          ${sql.unsafe(branchFilterSql)}
           GROUP BY c.id
                    , acc.father_id
                    , acc.finanical_list_id
@@ -351,7 +154,8 @@ export async function GET(request: NextRequest) {
                    , acc.allow_trans_with_diff_curr
                    , acc.iscalc_curr_diff_rates
                    , acc.level_no
-          ORDER BY c.created_at DESC
+                   , acc.max_balance_amount
+          ORDER BY c.customer_code ASC NULLS LAST, c.id ASC
         `
       : await sql`
           SELECT 
@@ -365,12 +169,14 @@ export async function GET(request: NextRequest) {
             acc.allow_trans_with_diff_curr AS allow_trans_with_diff_curr,
             acc.iscalc_curr_diff_rates AS iscalc_curr_diff_rates,
             acc.level_no AS level_no,
+            COALESCE(acc.max_balance_amount, 0) AS credit_limit,
             COUNT(cu.id) as user_count,
             CASE WHEN COUNT(cu.id) > 0 THEN true ELSE false END as portal_enabled
           FROM customers c
           LEFT JOIN account_tbl acc ON acc.id = c.account_id
           LEFT JOIN customer_users cu ON c.id = cu.customer_id AND cu.is_active = true
           WHERE c.isDeleted = false
+          ${sql.unsafe(branchFilterSql)}
           GROUP BY c.id
                    , acc.father_id
                    , acc.finanical_list_id
@@ -381,43 +187,55 @@ export async function GET(request: NextRequest) {
                    , acc.allow_trans_with_diff_curr
                    , acc.iscalc_curr_diff_rates
                    , acc.level_no
-          ORDER BY c.created_at DESC
+                   , acc.max_balance_amount
+          ORDER BY c.customer_code ASC NULLS LAST, c.id ASC
         `
 
-    console.log("[v0] Customers fetched:", {
-      count: customers.length,
-      sample: customers[0]
-        ? {
-          id: customers[0].id,
-          name: customers[0].name,
-          userCount: customers[0].user_count,
-          portalEnabled: customers[0].portal_enabled,
-        }
-        : null,
-    })
-
+    if (permission.lookupOnly) {
+      return NextResponse.json({ customers: projectFileLookup(customerFileFamily(typeFilter) || "customers", customers) })
+    }
     const customerIds = customers.map((c: { id: any; }) => c.id);
     type VoucherItem = {
       book_name: string;
       type_id: number;
     };
     const vouchersMap: Record<number, VoucherItem[]> = {};
+    let costCenters: any[] = []
+    let stopTransactions: any[] = []
     if (customerIds.length > 0) {
-      const vouchers = await sql`
+      const [vouchers, loadedCostCenters, loadedStopTransactions] = await Promise.all([sql`
         SELECT 
         cv.customer_id,
         cv.voucher_id as type_id ,
         vb.name AS book_name
         FROM customer_vouchers cv
-        LEFT JOIN voucher_books vb ON cv.book_id = vb.id
+        LEFT JOIN voucher_books_tbl vb ON cv.book_id = vb.id
          WHERE cv.customer_id = ANY(${customerIds}::int[])
         ORDER BY cv.customer_id, cv.id ASC
-      `;
-
-
-
-
-
+      `, sql`
+        SELECT
+          c.id AS customer_id,
+          accct.cost_center_type_id,
+          accct.required_in_transactions,
+          accct.default_cost_center_id,
+          cc.name AS cost_center_name
+        FROM customers c
+        LEFT JOIN account_costcenters_tbl accct ON accct.account_id = c.account_id
+        LEFT JOIN cost_centers cc ON cc.id = accct.default_cost_center_id
+        WHERE c.id = ANY(${customerIds}::int[])
+        ORDER BY c.id, accct.id ASC
+      `, sql`
+        SELECT
+          c.id AS customer_id,
+          ast.voucher_types_id,
+          ast.stop_date
+        FROM customers c
+        LEFT JOIN account_stop_transactions_tbl ast ON ast.account_id = c.account_id
+        WHERE c.id = ANY(${customerIds}::int[])
+        ORDER BY c.id, ast.id ASC
+      `])
+      costCenters = loadedCostCenters
+      stopTransactions = loadedStopTransactions
 
       // Group vouchers by customer_id
       vouchers.forEach((v: any) => {
@@ -436,20 +254,6 @@ export async function GET(request: NextRequest) {
     const stopTransactionMap: Record<number, any[]> = {}
 
     if (customerIds.length > 0) {
-      const costCenters = await sql`
-        SELECT
-          c.id AS customer_id,
-          accct.cost_center_type_id,
-          accct.required_in_transactions,
-          accct.default_cost_center_id,
-          cc.name AS cost_center_name
-        FROM customers c
-        LEFT JOIN account_costcenters_tbl accct ON accct.account_id = c.account_id
-        LEFT JOIN cost_centers cc ON cc.id = accct.default_cost_center_id
-        WHERE c.id = ANY(${customerIds}::int[])
-        ORDER BY c.id, accct.id ASC
-      `
-
       costCenters.forEach((row: any) => {
         const customerId = Number(row.customer_id)
         if (!costCenterMap[customerId]) costCenterMap[customerId] = []
@@ -460,17 +264,6 @@ export async function GET(request: NextRequest) {
           cost_center_name: row.cost_center_name || "",
         })
       })
-
-      const stopTransactions = await sql`
-        SELECT
-          c.id AS customer_id,
-          ast.voucher_types_id,
-          ast.stop_date
-        FROM customers c
-        LEFT JOIN account_stop_transactions_tbl ast ON ast.account_id = c.account_id
-        WHERE c.id = ANY(${customerIds}::int[])
-        ORDER BY c.id, ast.id ASC
-      `
 
       stopTransactions.forEach((row: any) => {
         const customerId = Number(row.customer_id)
@@ -501,39 +294,67 @@ export async function GET(request: NextRequest) {
   }
 }
 
+const normalizeEntityCode = (rawValue: unknown, prefix = "C") => {
+  const cleaned = String(rawValue ?? "").trim().toUpperCase().replace(/[^A-Z0-9]/g, "")
+  if (!cleaned) return ""
+
+  const prefixValue = String(prefix).trim().toUpperCase()
+  const numericPart = cleaned.replace(/[^0-9]/g, "")
+  const maxDigits = Math.max(0, 10 - prefixValue.length)
+  const digits = numericPart.slice(0, maxDigits).padEnd(maxDigits, "0")
+  return `${prefixValue}${digits}`.slice(0, 10)
+}
+
 export async function POST(request: NextRequest) {
   try {
     const data = await request.json()
+    const permission = await authorizeCustomerType(request, data.type, "create")
+    if (!permission.ok) return permission.response
+    await ensureCustomerCompatibilityColumns()
+    await ensureCustomerBranchesTable()
     console.log("[v0] Creating customer with data:", data)
+    const contactError = await validateCustomerContactFields(data, data.type)
+    if (contactError) return NextResponse.json({ error: contactError }, { status: 400 })
+    const city = await resolveCustomerCity(data.city_id, data.city)
 
-    const accountHierarchy = await resolveAccountHierarchy(data.father_id, data.level_no)
+    const accountHierarchy = await resolveRequiredParentAccount(data.type, data.father_id)
     const accountCurrencyId = toNullableInt(data.currency_id) ?? 1
     const accountAllowTransWithDiffCurr = toInt(data.allow_trans_with_diff_curr, 0)
     const accountIsCalcCurrDiffRates = toBool(data.iscalc_curr_diff_rates, false)
 
-    // Check if customer code already exists
-    if (data.id === 0) {
+    const accountType = resolveAccountType(data.type)
 
-      if (data.customer_code) {
+    const isNewCustomer = toInt(data.id, 0) === 0
+
+    // Check if customer code already exists or needs generation
+    if (isNewCustomer) {
+      const providedCustomerCode = String(data.customer_code || "").trim()
+
+      if (!providedCustomerCode) {
+        data.customer_code = await generateCustomerNumber(data.type === 2, data.type === 3, data.type === 4)
+      } else {
+        const normalizedProvidedCode = normalizeEntityCode(providedCustomerCode, data.type === 2 ? "S" : "C")
         const existingCustomer = await sql`
-        SELECT id FROM customers WHERE customer_code = ${data.customer_code}
-      `
+          SELECT id FROM customers WHERE customer_code = ${normalizedProvidedCode}
+        `
 
         if (existingCustomer.length > 0) {
-
-          const customerNumber = await generateCustomerNumber(data.type === 2 ? true : false);
-          data.customer_code = customerNumber;
-          const existingCust = await sql`
-        SELECT id FROM customers WHERE customer_code = ${data.customer_code}
-      `
-
-          if (existingCust.length > 0) {
-            return NextResponse.json({ error: "رقم العميل موجود مسبقاً، يرجى اختيار رقم آخر" }, { status: 400 })
-          }
+          data.customer_code = await generateCustomerNumber(data.type === 2, data.type === 3, data.type === 4)
+        } else {
+          data.customer_code = normalizedProvidedCode
         }
       }
 
+      const existingCust = await sql`
+        SELECT id FROM customers WHERE customer_code = ${data.customer_code}
+      `
+
+      if (existingCust.length > 0) {
+        return NextResponse.json({ error: "رقم العميل موجود مسبقاً، يرجى اختيار رقم آخر" }, { status: 400 })
+      }
+
       const accountId = await ensureCustomerAccount({
+        creditLimit: data.credit_limit === undefined ? null : Number(data.credit_limit) || 0,
         code: data.customer_code,
         name: data.customer_name || data.name,
         currencyId: accountCurrencyId,
@@ -541,13 +362,14 @@ export async function POST(request: NextRequest) {
         isCalcCurrDiffRates: accountIsCalcCurrDiffRates,
         fatherId: accountHierarchy.fatherId,
         levelNo: accountHierarchy.levelNo,
-        accountType: Number(data.type) === 2 ? 3 : 2,
+        accountType,
       })
 
       const result = await sql`
   INSERT INTO customers (
     customer_code,
     name,
+    customer_name_en,
     mobile1,
     mobile2,
     whatsapp1,
@@ -557,6 +379,10 @@ export async function POST(request: NextRequest) {
     email,
     status,
     business_nature,
+    job_title,
+    region,
+    sales_commission,
+    collection_commission,
     salesman,
     classification,      -- fixed here
     registration_date,   -- matches table definition
@@ -566,29 +392,42 @@ export async function POST(request: NextRequest) {
     type,
     isDeleted,
     priceCategory,
-    account_id
+    account_id,
+    image_url,
+    tax_number,
+    id_number,
+    city_id
   ) VALUES (
     ${data.customer_code},
     ${data.customer_name || data.name},
+    ${data.customer_name_en || data.name_en || null},
     ${data.mobile1 || null},
     ${data.mobile2 || null},
     ${data.whatsapp1 || null},
     ${data.whatsapp2 || null},
-    ${data.city || null},
+    ${city.name},
     ${data.address || null},
     ${data.email || null},
     ${data.status || 'نشط'},
     ${data.business_nature || null},
+    ${data.job_title || null},
+    ${data.region || null},
+    ${Number(data.sales_commission) || 0},
+    ${Number(data.collection_commission) || 0},
     ${data.salesman || null},
-    ${data.classification || null},        
+    ${data.classification || null},
     ${data.registration_date || new Date().toISOString().split('T')[0]},
-    ${data.transaction_notes || null},     
+    ${data.transaction_notes || null},
     ${data.general_notes || null},
     ${data.api_key || null} ,
     ${data.type || 0} ,
     ${data.isDeleted || false}  ,
     ${Number(data.pricecategory) || Number(data.priceCategory) || 1},
-    ${accountId}
+    ${accountId},
+    ${data.image_url || null},
+    ${String(data.tax_number || "").trim().slice(0, 50) || null},
+    ${normalizeCustomerIdNumber(data.id_number) || null},
+    ${city.id}
   )
   RETURNING *;
 `;
@@ -600,6 +439,19 @@ export async function POST(request: NextRequest) {
       await persistCustomerClassifications(Number(accountId), data.account_classifications)
       await persistCustomerAccountCostCenters(Number(accountId), data.cost_centers)
       await persistCustomerStopTransactions(Number(accountId), data.stop_transactions)
+
+      // فروع تقييد ظهور العميل بالبحث (اختياري) — بلا أي فرع هنا يبقى العميل ظاهراً لكل الفروع.
+      if (Array.isArray(data.branch_ids)) {
+        for (const branchId of data.branch_ids) {
+          const numericBranchId = Number(branchId)
+          if (!Number.isInteger(numericBranchId) || numericBranchId <= 0) continue
+          await sql`
+            INSERT INTO customer_branches (customer_id, branch_id)
+            VALUES (${customer.id}, ${numericBranchId})
+            ON CONFLICT DO NOTHING
+          `
+        }
+      }
 
       // 3️⃣ Save voucherType array (customer_vouchers)
       if (Array.isArray(data.voucher) && data.voucher.length > 0) {
@@ -619,23 +471,32 @@ export async function POST(request: NextRequest) {
       return NextResponse.json(result[0], { status: 201 })
     }
   } catch (error) {
+    if (error instanceof MissingParentAccountError) return NextResponse.json({ error: error.message }, { status: 400 })
     console.error("Error creating customer:", error)
-    return NextResponse.json({ error: "Failed to create customer" }, { status: 500 })
+    const message = error instanceof Error ? error.message : String(error)
+    return NextResponse.json({ error: `فشل إنشاء العميل: ${message}` }, { status: 500 })
   }
 
 }
 
 export async function PUT(request: NextRequest) {
   try {
-    await ensureCustomerCompatibilityColumns()
     const data = await request.json()
+    const permission = await authorizeStoredCustomer(request, data.id, "update", data.type ?? 1)
+    if (!permission.ok) return permission.response
+    await ensureCustomerCompatibilityColumns()
+    await ensureCustomerBranchesTable()
     const { id, voucher, ...updateData } = data
 
     if (!id) {
       return NextResponse.json({ error: "Customer ID is required" }, { status: 400 })
     }
+    const contactError = await validateCustomerContactFields(updateData, updateData.type ?? 1, id)
+    if (contactError) return NextResponse.json({ error: contactError }, { status: 400 })
+    const city = await resolveCustomerCity(updateData.city_id, updateData.city)
 
-    const accountHierarchy = await resolveAccountHierarchy(updateData.father_id, updateData.level_no)
+    const accountType = resolveAccountType(updateData.type)
+    const accountHierarchy = await resolveRequiredParentAccount(updateData.type, updateData.father_id)
     const accountCurrencyId = toNullableInt(updateData.currency_id) ?? 1
     const accountAllowTransWithDiffCurr = toInt(updateData.allow_trans_with_diff_curr, 0)
     const accountIsCalcCurrDiffRates = toBool(updateData.iscalc_curr_diff_rates, false)
@@ -648,6 +509,7 @@ export async function PUT(request: NextRequest) {
     `
 
     const accountId = await ensureCustomerAccount({
+      creditLimit: updateData.credit_limit === undefined ? null : Number(updateData.credit_limit) || 0,
       accountId: existingCustomer[0]?.account_id ? Number(existingCustomer[0].account_id) : null,
       code: updateData.customer_code || updateData.code || "",
       name: updateData.customer_name || updateData.name || "",
@@ -656,7 +518,7 @@ export async function PUT(request: NextRequest) {
       isCalcCurrDiffRates: accountIsCalcCurrDiffRates,
       fatherId: accountHierarchy.fatherId,
       levelNo: accountHierarchy.levelNo,
-      accountType: Number(updateData.type) === 2 ? 3 : 2,
+      accountType,
     })
 
     const result = await sql`
@@ -664,15 +526,21 @@ export async function PUT(request: NextRequest) {
       SET
         customer_code = ${updateData.customer_code || updateData.code || ""},
         name = ${updateData.customer_name || updateData.name || ""},
+        customer_name_en = ${updateData.customer_name_en || updateData.name_en || null},
         mobile1 = ${updateData.mobile1 || ""},
         mobile2 = ${updateData.mobile2 || ""},
         whatsapp1 = ${updateData.whatsapp1 || ""},
         whatsapp2 = ${updateData.whatsapp2 || ""},
-        city = ${updateData.city || ""},
+        city = ${city.name || ""},
+        city_id = ${city.id},
         address = ${updateData.address || ""},
         email = ${updateData.email || ""},
         status = ${updateData.status || "نشط"},
         business_nature = ${updateData.business_nature || ""},
+        job_title = ${updateData.job_title || ""},
+        region = ${updateData.region || ""},
+        sales_commission = ${Number(updateData.sales_commission) || 0},
+        collection_commission = ${Number(updateData.collection_commission) || 0},
         salesman = ${updateData.salesman || ""},
         classification = ${updateData.classifications || updateData.classification || ""},
         registration_date = ${updateData.account_opening_date || updateData.registration_date || new Date().toISOString().split("T")[0]},
@@ -682,6 +550,9 @@ export async function PUT(request: NextRequest) {
         type = ${Number(updateData.type) || 1},
         priceCategory = ${Number(updateData.pricecategory) || Number(updateData.priceCategory) || 0},
         account_id = ${accountId},
+        image_url = ${updateData.image_url || null},
+        tax_number = ${String(updateData.tax_number || "").trim().slice(0, 50) || null},
+        id_number = ${normalizeCustomerIdNumber(updateData.id_number) || null},
         updated_at = CURRENT_TIMESTAMP
       WHERE id = ${id}
       RETURNING *
@@ -690,6 +561,20 @@ export async function PUT(request: NextRequest) {
     await persistCustomerClassifications(Number(accountId), data.account_classifications)
     await persistCustomerAccountCostCenters(Number(accountId), data.cost_centers)
     await persistCustomerStopTransactions(Number(accountId), data.stop_transactions)
+
+    // فروع تقييد ظهور العميل بالبحث (اختياري) — نفس منطق POST أعلاه: حذف ثم إعادة إدراج.
+    await sql`DELETE FROM customer_branches WHERE customer_id = ${id}`
+    if (Array.isArray(data.branch_ids)) {
+      for (const branchId of data.branch_ids) {
+        const numericBranchId = Number(branchId)
+        if (!Number.isInteger(numericBranchId) || numericBranchId <= 0) continue
+        await sql`
+          INSERT INTO customer_branches (customer_id, branch_id)
+          VALUES (${id}, ${numericBranchId})
+          ON CONFLICT DO NOTHING
+        `
+      }
+    }
 
     await sql`DELETE FROM customer_vouchers WHERE customer_id = ${id}`
 
@@ -719,6 +604,7 @@ export async function PUT(request: NextRequest) {
 
     return NextResponse.json(result[0])
   } catch (error) {
+    if (error instanceof MissingParentAccountError) return NextResponse.json({ error: error.message }, { status: 400 })
     console.error("Error updating customer:", error)
     const message = error instanceof Error ? error.message : String(error)
     return NextResponse.json({ error: `فشل تحديث العميل: ${message}` }, { status: 500 })
@@ -734,6 +620,8 @@ export async function DELETE(request: NextRequest) {
       return NextResponse.json({ error: "Customer ID is required" }, { status: 400 })
     }
 
+    const permission = await authorizeStoredCustomer(request, id, "delete")
+    if (!permission.ok) return permission.response
     await sql`DELETE FROM customers WHERE id = ${id}`
 
     return NextResponse.json({ message: "Customer deleted successfully" })

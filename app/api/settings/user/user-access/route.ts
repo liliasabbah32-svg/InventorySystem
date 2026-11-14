@@ -1,76 +1,74 @@
 import { type NextRequest, NextResponse } from "next/server"
-import { neon } from "@neondatabase/serverless"
-import { Pool } from "pg"
-
-let sql: any = null
-
-try {
-    if (!process.env.DATABASE_URL) {
-        console.error("[v0] DATABASE_URL environment variable is not set")
-    } else {
-        const dbUrl = process.env.DATABASE_URL
-
-        if (dbUrl.includes("localhost") || dbUrl.includes("127.0.0.1")) {
-            console.log("[v0] Using local PostgreSQL with pg Pool")
-            const pool = new Pool({ connectionString: dbUrl })
-            sql = async (strings: TemplateStringsArray, ...values: any[]) => {
-                const client = await pool.connect()
-                try {
-                    const query =
-                        strings.reduce(
-                            (prev, curr, i) =>
-                                prev + curr + (i < values.length ? `$${i + 1}` : ""),
-                            ""
-                        )
-                    const result = await client.query(query, values)
-                    return result.rows
-                } finally {
-                    client.release()
-                }
-            }
-        } else {
-            console.log("[v0] Using Neon serverless client")
-            sql = neon(dbUrl)
-        }
-
-        console.log("[v0] Database client initialized successfully")
-    }
-} catch (error) {
-    console.error("[v0] Failed to initialize DB client:", error)
-    sql = null
-}
-
-export default sql
+import sql, { resolveCurrentDbName } from "@/lib/database"
+import { ensurePermissionTables, isSystemAdmin, syncPermissionDefinitions, LEGACY_FULL_ACCESS_SQL } from "@/lib/permissions"
+import { getSessionUser } from "@/lib/tenant-auth"
 
 export async function GET(req: NextRequest) {
     try {
+        if (!(await getSessionUser(req))) {
+            return NextResponse.json({ error: "يجب تسجيل الدخول" }, { status: 401 })
+        }
         const { searchParams } = new URL(req.url)
         const userId = searchParams.get("userId")
+        let branchId = Number(searchParams.get("branchId") || req.headers.get("x-branch-id"))
 
         if (!userId) {
             return NextResponse.json({ error: "userId is required" }, { status: 400 })
         }
 
-        // Fetch access_list joined with user_access
+        // توافق مع مستهلكي الصلاحيات الحاليين (مثل auth-context): إن لم يرسلوا فرعاً، نستخدم
+        // الفرع الأساسي للمستخدم. شاشة الإدارة ترسل branchId صراحة لعرض أي فرع يختاره المسؤول.
+        if (!Number.isInteger(branchId) || branchId <= 0) {
+            const userRows = await sql`SELECT branch_id FROM user_settings WHERE user_id = ${userId} LIMIT 1`
+            // الصفر يعني سياقاً عاماً لمستخدم قديم غير مرتبط بفرع؛ يحافظ على صلاحياته الحالية
+            // من user_access/role_permissions إلى أن يُسند إليه فرع من شاشة المستخدمين.
+            branchId = Number(userRows[0]?.branch_id) || 0
+        }
+
+        const dbName = await resolveCurrentDbName()
+        await ensurePermissionTables(dbName)
+        // A legacy management database must not prevent loading the permissions that
+        // already exist in the tenant database.
+        try {
+          await syncPermissionDefinitions(dbName)
+        } catch (syncError) {
+          console.error("[user-access] permission definition sync failed; continuing", syncError)
+        }
+
         const rows = await sql`
-      SELECT 
+      SELECT
         al.id AS access_id,
-        al.name AS access_name,
-        ac.name AS category_name,
-        COALESCE(ua.is_granted, FALSE) AS is_granted
+        COALESCE(al.name, '') AS access_name,
+        COALESCE(ac.name, 'أخرى') AS category_name,
+        COALESCE(ubp.is_granted, ua.is_granted, rbp.is_granted, rp.is_granted, ${sql.unsafe(LEGACY_FULL_ACCESS_SQL)}) AS is_granted,
+        CASE
+          WHEN ubp.access_id IS NOT NULL THEN 'branch_user'
+          WHEN ua.access_id IS NOT NULL THEN 'user'
+          WHEN rbp.access_id IS NOT NULL THEN 'branch_role'
+          WHEN rp.access_id IS NOT NULL THEN 'role'
+          WHEN ${sql.unsafe(LEGACY_FULL_ACCESS_SQL)} THEN 'legacy'
+          ELSE 'none'
+        END AS permission_source
       FROM access_list al
       LEFT JOIN access_category ac ON al.category_id = ac.id
-      LEFT JOIN user_access ua 
-        ON ua.access_id = al.id AND ua.user_id = ${userId}
+      LEFT JOIN user_settings us ON us.user_id = ${userId}
+      LEFT JOIN user_branch_permissions ubp
+        ON ubp.access_id = al.id AND ubp.user_id = ${userId} AND ubp.branch_id = ${branchId}
+      LEFT JOIN user_access ua ON ua.access_id = al.id AND ua.user_id = ${userId}
+      LEFT JOIN role_branch_permissions rbp
+        ON rbp.role_id = us.job_role_id AND rbp.access_id = al.id AND rbp.branch_id = ${branchId}
+      LEFT JOIN role_permissions rp ON rp.role_id = us.job_role_id AND rp.access_id = al.id
       ORDER BY ac.id, al.id
     `
 
         // Normalize rows to plain JS objects
         const data = Array.isArray(rows) ? rows : rows?.rows || []
+        // مسؤول النظام (المستخدم 0/أول مستخدم/الدور الوظيفي مدير): كل الصلاحيات ممنوحة في كل فرع
+        if (await isSystemAdmin(userId)) return NextResponse.json(data.map((row: any) => ({ ...row, is_granted: true, permission_source: "admin" })))
 
         return NextResponse.json(data)
     } catch (err) {
-        console.error(err)
-        return NextResponse.json({ error: "Failed to fetch access" }, { status: 500 })
+      console.error("[user-access] failed to fetch access", err)
+      return NextResponse.json({ error: "تعذر تحميل صلاحيات المستخدمين", details: err instanceof Error ? err.message : "Unknown error" }, { status: 500 })
     }
 }

@@ -1,67 +1,45 @@
-
 import { type NextRequest, NextResponse } from "next/server"
-import { neon } from "@neondatabase/serverless"
+import sql from "@/lib/database"
 
-import { Pool } from "pg"
-
-let sql: any = null
-
-try {
-  if (!process.env.DATABASE_URL) {
-    console.error("[v0] DATABASE_URL environment variable is not set")
-  } else {
-    const dbUrl = process.env.DATABASE_URL
-
-    if (dbUrl.includes("localhost") || dbUrl.includes("127.0.0.1")) {
-      const pool = new Pool({ connectionString: dbUrl })
-      sql = async (strings: TemplateStringsArray, ...values: any[]) => {
-        const client = await pool.connect()
-        try {
-          const query =
-            strings.reduce(
-              (prev, curr, i) =>
-                prev + curr + (i < values.length ? `$${i + 1}` : ""),
-              ""
-            )
-          const result = await client.query(query, values)
-          return result.rows
-        } finally {
-          client.release()
-        }
-      }
-    } else {
-      console.log("[v0] Using Neon serverless client")
-      sql = neon(dbUrl)
+export async function GET(request: NextRequest, { params }: { params: { id: string } }) {
+  try {
+    const id = Number(params.id)
+    const rows = await sql`
+      SELECT d.*, b.branch_name
+      FROM departments d
+      LEFT JOIN branches b ON d.branch_id = b.id
+      WHERE d.id = ${id}
+      LIMIT 1
+    `
+    if (rows.length === 0) {
+      return NextResponse.json({ error: "القسم غير موجود" }, { status: 404 })
     }
-
-    console.log("[v0] Database client initialized successfully")
+    return NextResponse.json(rows[0])
+  } catch (error) {
+    console.error("Error fetching department:", error)
+    return NextResponse.json({ error: "Failed to fetch department" }, { status: 500 })
   }
-} catch (error) {
-  console.error("[v0] Failed to initialize DB client:", error)
-  sql = null
 }
 
-export default sql
-
-export async function PUT(request: NextRequest) {
+export async function PUT(request: NextRequest, { params }: { params: { id: string } }) {
   try {
+    const id = Number(params.id)
     const data = await request.json()
 
-    if (!data.id) {
-      return NextResponse.json({ error: "معرف القسم مطلوب" }, { status: 400 })
+    if (!data.department_name) {
+      return NextResponse.json({ error: "اسم القسم مطلوب" }, { status: 400 })
     }
 
     const result = await sql`
       UPDATE departments
-      SET 
-        department_code = ${data.department_code},
+      SET
         department_name = ${data.department_name},
         branch_id = ${data.branch_id || null},
         manager = ${data.manager || ""},
         employee_count = ${data.employee_count || 0},
         is_active = ${data.is_active !== false},
         updated_at = CURRENT_TIMESTAMP
-      WHERE id = ${data.id}
+      WHERE id = ${id}
       RETURNING *
     `
 

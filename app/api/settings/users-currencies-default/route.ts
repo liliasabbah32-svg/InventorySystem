@@ -1,0 +1,147 @@
+import { NextRequest, NextResponse } from "next/server"
+import sql, { getTenantPool } from "@/lib/database"
+import { runSchemaOnce } from "@/lib/schema-once"
+import { validateLeafAccounts } from "@/lib/leaf-accounts"
+import { authorizeUserAdmin } from "@/lib/user-admin-access"
+
+const ensureTables = async () => { return runSchemaOnce("app/api/settings/users-currencies-default/route.ts#ensureTables", async () => {
+  await sql`
+    CREATE TABLE IF NOT EXISTS users_currencies_default_account_tbl (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER,
+      currency_id INTEGER,
+      account_id INTEGER,
+      received_cheqs_account_id INTEGER,
+      returned_cheqs_account_id INTEGER,
+      cards_account_id INTEGER,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `
+
+  await sql`ALTER TABLE users_currencies_default_account_tbl DROP COLUMN IF EXISTS account_type`
+  await sql`ALTER TABLE users_currencies_default_account_tbl ADD COLUMN IF NOT EXISTS received_cheqs_account_id INTEGER`
+  await sql`ALTER TABLE users_currencies_default_account_tbl ADD COLUMN IF NOT EXISTS returned_cheqs_account_id INTEGER`
+  await sql`ALTER TABLE users_currencies_default_account_tbl ADD COLUMN IF NOT EXISTS cards_account_id INTEGER`
+  await sql`ALTER TABLE users_currencies_default_account_tbl ADD COLUMN IF NOT EXISTS branch_id INTEGER`
+}) }
+
+const resolveUserKeys = async (rawUserId: unknown) => {
+  const requested = String(rawUserId || "").trim()
+  if (!requested) return { primaryId: null as number | null, lookupIds: [] as number[] }
+
+  const numericRequested = /^\d+$/.test(requested) ? Number(requested) : null
+  const users = await sql`
+    SELECT id, user_id
+    FROM user_settings
+     WHERE user_id = ${requested}::integer
+       OR (${numericRequested}::int IS NOT NULL AND id = ${numericRequested})
+     ORDER BY CASE WHEN user_id = ${requested}::integer THEN 0 ELSE 1 END
+    LIMIT 1
+  `
+  const internalId = users[0]?.id == null ? null : Number(users[0].id)
+  const businessNumericId = /^\d+$/.test(String(users[0]?.user_id || "")) ? Number(users[0].user_id) : null
+  const lookupIds = Array.from(new Set([numericRequested, internalId, businessNumericId].filter((id): id is number => id !== null && Number.isInteger(id) && id > 0)))
+  return { primaryId: internalId || numericRequested, lookupIds }
+}
+
+export async function GET(request: NextRequest) {
+  try {
+    await ensureTables()
+    const { searchParams } = new URL(request.url)
+    const branchId = searchParams.get("branch_id") ? Number(searchParams.get("branch_id")) : null
+    if (branchId !== null && (!Number.isSafeInteger(branchId) || branchId <= 0)) return NextResponse.json({ error: "يجب تحديد الفرع" }, { status: 400 })
+    const { primaryId, lookupIds } = await resolveUserKeys(searchParams.get("user_id"))
+    if (!primaryId || lookupIds.length === 0) return NextResponse.json({ error: "user_id required" }, { status: 400 })
+
+    const rows = await sql`
+      SELECT DISTINCT ON (u.currency_id) u.currency_id, u.branch_id,
+             u.account_id AS cash_account_id,
+             a_cash.code AS cash_account_code,
+             a_cash.name AS cash_account_name,
+             u.received_cheqs_account_id AS incoming_checks_account_id,
+             a_incoming.code AS incoming_checks_account_code,
+             a_incoming.name AS incoming_checks_account_name,
+             u.returned_cheqs_account_id AS returned_checks_account_id,
+             a_returned.code AS returned_checks_account_code,
+             a_returned.name AS returned_checks_account_name,
+             u.cards_account_id AS card_account_id,
+             a_cards.code AS card_account_code,
+             a_cards.name AS card_account_name
+      FROM users_currencies_default_account_tbl u
+      LEFT JOIN account_tbl a_cash ON a_cash.id = u.account_id
+      LEFT JOIN account_tbl a_incoming ON a_incoming.id = u.received_cheqs_account_id
+      LEFT JOIN account_tbl a_returned ON a_returned.id = u.returned_cheqs_account_id
+      LEFT JOIN account_tbl a_cards ON a_cards.id = u.cards_account_id
+      WHERE u.user_id::text = ANY(${lookupIds.map(String)}::text[])
+        AND u.branch_id IS NOT DISTINCT FROM ${branchId}::integer
+      ORDER BY u.currency_id, CASE WHEN u.user_id::text = ${String(primaryId)}::text THEN 0 ELSE 1 END, u.id DESC
+    `
+
+    return NextResponse.json({ rows })
+  } catch (error) {
+    console.error("Error fetching user currency defaults:", error)
+    return NextResponse.json({ error: String(error) }, { status: 500 })
+  }
+}
+
+export async function POST(request: NextRequest) {
+  // إعدادات المستخدمين والصلاحيات: الحفظ للمسؤول أو لمن يملك صلاحية إدارة المستخدمين والصلاحيات
+  const userAdmin = await authorizeUserAdmin(request as any)
+  if (!userAdmin.ok) return userAdmin.response
+  try {
+    const data = await request.json()
+    const { user_id, rows } = data
+    const branchId = Number(data.branch_id)
+    if (!Number.isSafeInteger(branchId) || branchId <= 0) return NextResponse.json({ error: "يجب تحديد الفرع" }, { status: 400 })
+    if (!user_id) return NextResponse.json({ error: "user_id required" }, { status: 400 })
+    if (!Array.isArray(rows)) return NextResponse.json({ error: "rows required" }, { status: 400 })
+    const accountFields = ["cash_account_id", "incoming_checks_account_id", "returned_checks_account_id", "card_account_id"] as const
+    if (rows.some(row => !row || !Number.isSafeInteger(Number(row.currency_id)) || Number(row.currency_id) <= 0 || accountFields.some(field => row[field] != null && (!Number.isSafeInteger(Number(row[field])) || Number(row[field]) <= 0)))) {
+      return NextResponse.json({ error: "بيانات العملة أو الحساب غير صالحة" }, { status: 400 })
+    }
+    const currencyIds = Array.from(new Set(rows.map((row: any) => Number(row.currency_id)).filter((id: number) => Number.isInteger(id) && id > 0)))
+    if (currencyIds.length !== rows.length) return NextResponse.json({ error: "Invalid currency_id" }, { status: 400 })
+    // حسابات الصندوق/الشيكات/البطاقات الافتراضية يجب أن تكون حسابات فرعية
+    const leafAccountsError = await validateLeafAccounts(rows.flatMap((row: any) => accountFields.map((field) => row[field])))
+    if (leafAccountsError) return NextResponse.json({ error: leafAccountsError }, { status: 400 })
+
+    await ensureTables()
+    const { primaryId } = await resolveUserKeys(user_id)
+    if (!primaryId) return NextResponse.json({ error: "user_id invalid" }, { status: 400 })
+    const pool = await getTenantPool()
+    const client = await pool.connect()
+    try {
+      await client.query('BEGIN')
+      // Serialize saves for this user and roll back the replacement if any row fails.
+      await client.query('SELECT pg_advisory_xact_lock($1::int, $2::int)', [72411, primaryId])
+      const branch = await client.query('SELECT id FROM branches WHERE id = $1 AND COALESCE(status, 1) != 3', [branchId])
+      if (!branch.rows.length) {
+        await client.query('ROLLBACK')
+        return NextResponse.json({ error: 'يجب تحديد الفرع' }, { status: 400 })
+      }
+      const currencies = await client.query('SELECT id FROM currency WHERE id = ANY($1::int[])', [currencyIds])
+      if (currencies.rows.length !== currencyIds.length) {
+        await client.query('ROLLBACK')
+        return NextResponse.json({ error: 'Unknown currency' }, { status: 400 })
+      }
+      await client.query('DELETE FROM users_currencies_default_account_tbl WHERE user_id::text = $1::text AND branch_id = $2', [String(primaryId), branchId])
+      for (const row of rows) {
+        await client.query(
+          'INSERT INTO users_currencies_default_account_tbl (user_id, currency_id, account_id, received_cheqs_account_id, returned_cheqs_account_id, cards_account_id, branch_id) VALUES ($1, $2, $3, $4, $5, $6, $7)',
+          [primaryId, Number(row.currency_id), ...accountFields.map(field => row[field] == null ? null : Number(row[field])), branchId],
+        )
+      }
+      await client.query('COMMIT')
+    } catch (error) {
+      await client.query('ROLLBACK')
+      throw error
+    } finally {
+      client.release()
+    }
+
+    return NextResponse.json({ success: true })
+  } catch (error) {
+    console.error("Error saving user currency defaults:", error)
+    return NextResponse.json({ error: String(error) }, { status: 500 })
+  }
+}

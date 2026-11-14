@@ -1,119 +1,76 @@
 import { NextRequest, NextResponse } from "next/server";
-import { Pool } from 'pg';
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-});
-
-async function ensureProductCostCentersTable() {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS product_costcenters_tbl (
-      id SERIAL PRIMARY KEY,
-      product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
-      cost_center_type_id INTEGER,
-      required_in_transactions INTEGER,
-      default_cost_center_id INTEGER
-    )
-  `)
-
-  await pool.query(`
-    CREATE INDEX IF NOT EXISTS idx_product_costcenters_product_id
-    ON product_costcenters_tbl(product_id)
-  `)
-}
-
-async function hasDefaultStoreColumn() {
-  const client = await pool.connect();
-  try {
-    const result = await client.query(`
-      SELECT EXISTS (
-        SELECT 1
-        FROM information_schema.columns
-        WHERE table_name = 'products'
-          AND column_name = 'default_store'
-      ) AS has_column
-    `)
-
-    return Boolean(result.rows[0]?.has_column)
-  } finally {
-    client.release();
-  }
-}
+import { getTenantPool } from "@/lib/database";
 
 export async function GET(
   req: NextRequest,
   { params }: { params: { navigationType: string, id: string } }
 ) {
+  // كانت هذه الشاشة تتصل مباشرة بـprocess.env.DATABASE_URL (قاعدة الإدارة/المرجعية) بدل قاعدة
+  // الشركة الحالية (tenant) — فيفشل أي بحث/تصفّح دوماً مهما كان الصنف موجوداً فعلاً في قاعدة
+  // الشركة، لأن الاستعلام ينفَّذ أصلاً على قاعدة مختلفة تماماً لا تحوي هذا الصنف غالباً. getTenantPool
+  // يحل قاعدة الشركة النشطة لهذا الطلب تحديداً (نفس آلية sql في بقية مسارات API)، مطابقاً app/api/
+  // inventory/products/route.ts الصحيح أصلاً.
+  const pool = await getTenantPool();
   const { navigationType, id } = params;
+  // Support filtering by entity type: "products" or "services"
+  const typeStr = req.nextUrl.searchParams.get("type");
+  let typeParam: number | null = null;
+  if (typeStr === "services") typeParam = 2;
+  else if (typeStr === "products") typeParam = 1;
   let productQuery = "";
   let values: any[] = [];
-  const requestedType = req.nextUrl.searchParams.get("type") || "";
-  const typeCondition = requestedType === "services"
-    ? " AND p.type = 2"
-    : requestedType === "products"
-      ? " AND p.type = 1"
-      : "";
+  // الخدمات: النوع 2 فقط؛ الأصناف: كل ما عدا الخدمات (نوع فارغ = صنف) — التنقل والعدّ لا يخلطان بينهما
+  const typeCondition = (param: string) =>
+    `(${param}::int IS NULL OR (CASE WHEN ${param}::int = 2 THEN COALESCE(type, 1) = 2 ELSE COALESCE(type, 1) <> 2 END))`
+
+  // عدد السجلات (غير المحذوفة) من نفس النوع، أو موقع سجل معيّن ضمنها (id <= upToId) — لعرض "رقم السجل / الإجمالي"
+  const countRecords = async (upToId?: number): Promise<number> => {
+    const countParams: any[] = [typeParam]
+    let extra = ""
+    if (upToId) {
+      countParams.push(upToId)
+      extra = " AND id <= $2"
+    }
+    const counted = await pool.query(
+      `SELECT COUNT(*)::int AS n FROM products WHERE (deleted IS NULL OR deleted = false) AND ${typeCondition("$1")}${extra}`,
+      countParams
+    )
+    return Number(counted.rows[0]?.n || 0)
+  }
 
   try {
-    await ensureProductCostCentersTable()
-    const canJoinDefaultStore = await hasDefaultStoreColumn();
-
+    if (navigationType === "count") {
+      return NextResponse.json({ total: await countRecords() })
+    }
     switch (navigationType) {
       case "first":
-        productQuery = canJoinDefaultStore
-          ? `
-          SELECT p.*, COALESCE(w.warehouse_name, 'بلا تحديد') AS default_store_name
-          FROM products p
-          LEFT JOIN warehouses w ON w.id = p.default_store
-          WHERE (p.deleted IS NULL OR p.deleted = false)${typeCondition}
-          ORDER BY p.id ASC
-          LIMIT 1
-        `
-          : `
-          SELECT p.*, 'بلا تحديد' AS default_store_name
-          FROM products p
-          WHERE (p.deleted IS NULL OR p.deleted = false)${typeCondition}
-          ORDER BY p.id ASC
+        productQuery = `
+          SELECT * FROM products
+          WHERE (deleted IS NULL OR deleted = false)
+          AND ($TYPE_FILTER$)
+          ORDER BY id ASC
           LIMIT 1
         `;
         break;
 
       case "last":
-        productQuery = canJoinDefaultStore
-          ? `
-          SELECT p.*, COALESCE(w.warehouse_name, 'بلا تحديد') AS default_store_name
-          FROM products p
-          LEFT JOIN warehouses w ON w.id = p.default_store
-          WHERE (p.deleted IS NULL OR p.deleted = false)${typeCondition}
-          ORDER BY p.id DESC
-          LIMIT 1
-        `
-          : `
-          SELECT p.*, 'بلا تحديد' AS default_store_name
-          FROM products p
-          WHERE (p.deleted IS NULL OR p.deleted = false)${typeCondition}
-          ORDER BY p.id DESC
+        productQuery = `
+          SELECT * FROM products
+          WHERE (deleted IS NULL OR deleted = false)
+          AND ($TYPE_FILTER$)
+          ORDER BY id DESC
           LIMIT 1
         `;
         break;
 
       case "previous": {
         const currentId = Number(req.nextUrl.searchParams.get("currentId") || 0);
-        productQuery = canJoinDefaultStore
-          ? `
-          SELECT p.*, COALESCE(w.warehouse_name, 'بلا تحديد') AS default_store_name
-          FROM products p
-          LEFT JOIN warehouses w ON w.id = p.default_store
-          WHERE p.id < $1
-          AND (p.deleted IS NULL OR p.deleted = false)${typeCondition}
-          ORDER BY p.id DESC
-          LIMIT 1
-        `
-          : `
-          SELECT p.*, 'بلا تحديد' AS default_store_name
-          FROM products p
-          WHERE p.id < $1
-          AND (p.deleted IS NULL OR p.deleted = false)${typeCondition}
-          ORDER BY p.id DESC
+        productQuery = `
+          SELECT * FROM products
+          WHERE id < $1
+          AND (deleted IS NULL OR deleted = false)
+          AND ($TYPE_FILTER$)
+          ORDER BY id DESC
           LIMIT 1
         `;
         values = [currentId];
@@ -122,22 +79,12 @@ export async function GET(
 
       case "next": {
         const currentId = Number(req.nextUrl.searchParams.get("currentId") || 0);
-        productQuery = canJoinDefaultStore
-          ? `
-          SELECT p.*, COALESCE(w.warehouse_name, 'بلا تحديد') AS default_store_name
-          FROM products p
-          LEFT JOIN warehouses w ON w.id = p.default_store
-          WHERE p.id > $1
-          AND (p.deleted IS NULL OR p.deleted = false)${typeCondition}
-          ORDER BY p.id ASC
-          LIMIT 1
-        `
-          : `
-          SELECT p.*, 'بلا تحديد' AS default_store_name
-          FROM products p
-          WHERE p.id > $1
-          AND (p.deleted IS NULL OR p.deleted = false)${typeCondition}
-          ORDER BY p.id ASC
+        productQuery = `
+          SELECT * FROM products
+          WHERE id > $1
+          AND (deleted IS NULL OR deleted = false)
+          AND ($TYPE_FILTER$)
+          ORDER BY id ASC
           LIMIT 1
         `;
         values = [currentId];
@@ -149,19 +96,11 @@ export async function GET(
         if (!id) {
           return NextResponse.json({ error: "ID is required" }, { status: 400 });
         }
-        productQuery = canJoinDefaultStore
-          ? `
-          SELECT p.*, COALESCE(w.warehouse_name, 'بلا تحديد') AS default_store_name
-          FROM products p
-          LEFT JOIN warehouses w ON w.id = p.default_store
-          WHERE p.id = $1
-          AND (p.deleted IS NULL OR p.deleted = false)${typeCondition}
-        `
-          : `
-          SELECT p.*, 'بلا تحديد' AS default_store_name
-          FROM products p
-          WHERE p.id = $1
-          AND (p.deleted IS NULL OR p.deleted = false)${typeCondition}
+        productQuery = `
+          SELECT * FROM products
+          WHERE id = $1
+          AND (deleted IS NULL OR deleted = false)
+          AND ($TYPE_FILTER$)
         `;
         values = [Number(id)];
         break;
@@ -173,6 +112,18 @@ export async function GET(
     }
 
     const client = await pool.connect();
+    // Replace placeholder with proper parameterized condition (or TRUE when no filter)
+    if (productQuery.includes("$TYPE_FILTER$")) {
+      if (typeParam != null) {
+        const paramIndex = values.length + 1;
+        const cond = typeCondition(`$${paramIndex}`);
+        productQuery = productQuery.replace(/\$TYPE_FILTER\$/g, cond);
+        values.push(typeParam);
+      } else {
+        productQuery = productQuery.replace(/\$TYPE_FILTER\$/g, 'TRUE');
+      }
+    }
+
     const result = await client.query(productQuery, values);
     client.release();
 
@@ -181,6 +132,8 @@ export async function GET(
     }
 
     const product = result.rows[0];
+    product.record_total = await countRecords();
+    product.record_position = await countRecords(Number(product.id));
 
     // fetch units
     const unitsResult = await pool.query(
@@ -217,11 +170,91 @@ export async function GET(
     );
     product.stores = storesResult.rows;
 
-    const costCentersResult = await pool.query(
-      "SELECT id, product_id, cost_center_type_id, required_in_transactions, default_cost_center_id FROM product_costcenters_tbl WHERE product_id=$1 ORDER BY id",
-      [product.id]
-    );
-    product.cost_centers = costCentersResult.rows;
+    // fetch related accounts for autocomplete display (if present)
+    const accountFields = [
+      'selling_account_id',
+      'purchase_account_id',
+      'selling_returns_account_id',
+      'purchase_returns_account_id',
+      'stock_end_account_id',
+      'stock_start_account_id',
+      'production_account_id',
+      'municipality_service_account_id',
+      'lsti3mal_account_id',
+    ];
+
+    for (const field of accountFields) {
+      const accId = product[field];
+      if (accId && Number(accId) > 0) {
+        try {
+          const accRes = await pool.query(
+            'SELECT id, code, name FROM account_tbl WHERE id = $1 LIMIT 1',
+            [Number(accId)]
+          );
+          const acc = accRes.rows[0] || null;
+          const baseName = field.replace(/_id$/, '');
+          product[baseName] = acc;
+          product[`${baseName}_code`] = acc?.code || null;
+        } catch (err) {
+          // ignore account fetch errors
+          const baseName = field.replace(/_id$/, '');
+          product[baseName] = null;
+          product[`${baseName}_code`] = null;
+        }
+      } else {
+        const baseName = field.replace(/_id$/, '');
+        product[baseName] = null;
+        product[`${baseName}_code`] = null;
+      }
+    }
+
+    // fetch cost centers (optional table)
+    try {
+      const ccResult = await pool.query(
+        `SELECT cost_center_type_id, required_in_transactions, default_cost_center_id FROM product_costcenters_tbl WHERE product_id=$1`,
+        [product.id]
+      );
+      product.cost_centers = ccResult.rows;
+    } catch (err) {
+      product.cost_centers = product.cost_centers || [];
+    }
+
+    // fetch product brands (optional table) — نفس نمط مراكز التكلفة أعلاه تماماً
+    try {
+      const brandResult = await pool.query(
+        `SELECT brand_type_id, required_in_transactions, brand_id FROM product_brands_tbl WHERE product_id=$1`,
+        [product.id]
+      );
+      product.product_brands = brandResult.rows;
+    } catch (err) {
+      product.product_brands = product.product_brands || [];
+    }
+
+    // فروع الصنف المقيَّد بها (اختياري — انظر product_branches بـapp/api/inventory/products/
+    // route.ts) — بلا صفوف هنا يبقى الصنف ظاهراً لكل الفروع، فيُعاد مصفوفة فارغة ليعكسها حقل
+    // "الفروع" بنموذج الصنف (لا شيء مُحدَّد = كل الفروع).
+    try {
+      const branchesResult = await pool.query(
+        `SELECT branch_id FROM product_branches WHERE product_id=$1`,
+        [product.id]
+      );
+      product.branch_ids = branchesResult.rows.map((r: any) => r.branch_id);
+    } catch (err) {
+      product.branch_ids = [];
+    }
+
+    // fetch original/factory numbers (optional table, type 1 = رقم أصلي، 2 = رقم مصنع)
+    try {
+      const numbersResult = await pool.query(
+        `SELECT type, number FROM product_numbers WHERE product_id=$1 ORDER BY id`,
+        [product.id]
+      );
+      product.original_numbers = numbersResult.rows.filter((r: any) => r.type === 1).map((r: any) => r.number);
+      product.factory_numbers = numbersResult.rows.filter((r: any) => r.type === 2).map((r: any) => r.number);
+    } catch (err) {
+      product.original_numbers = product.original_number ? [product.original_number] : [];
+      product.factory_numbers = product.factory_number ? [product.factory_number] : [];
+    }
 
     return NextResponse.json(product);
   } catch (error) {

@@ -1,0 +1,738 @@
+import crypto from "crypto"
+import { Client } from "pg"
+import path from "path"
+import { spawn } from "child_process"
+import { existsSync } from "fs"
+import managementSql, { ensureManagementTables } from "./management-db"
+import { getPoolForDb } from "./database"
+import { withDatabaseName } from "./db-url"
+
+function generateDbName(): string {
+  return `co_${crypto.randomBytes(4).toString("hex")}`
+}
+
+function resolvePsqlPath(): string {
+  const configuredPath = process.env.PSQL_PATH?.trim()
+  if (configuredPath) return configuredPath
+
+  if (process.platform === "win32") {
+    const programFiles = process.env.ProgramFiles || "C:\\Program Files"
+    for (const version of ["18", "17", "16", "15", "14"]) {
+      const candidate = path.join(programFiles, "PostgreSQL", version, "bin", "psql.exe")
+      if (existsSync(candidate)) return candidate
+    }
+  }
+
+  return "psql"
+}
+
+function resolveCompanyBootstrapScriptPath(): string {
+  const configuredPath = process.env.COMPANY_BOOTSTRAP_SCRIPT_PATH?.trim()
+  const projectScriptPath = path.join(process.cwd(), "scripts", "company-bootstrap.sql")
+  if (configuredPath && existsSync(configuredPath)) return configuredPath
+  if (existsSync(projectScriptPath)) return projectScriptPath
+
+  throw new Error(
+    `Company bootstrap script was not found at "${configuredPath || projectScriptPath}". ` +
+    "Set COMPANY_BOOTSTRAP_SCRIPT_PATH to an existing SQL script.",
+  )
+}
+
+async function generateUniqueDbName(): Promise<string> {
+  for (let attempt = 0; attempt < 10; attempt++) {
+    const candidate = generateDbName()
+    const existing = await managementSql`SELECT id FROM companies WHERE db_name = ${candidate}`
+    if (existing.length === 0) return candidate
+  }
+  throw new Error("تعذّر توليد معرّف فريد لقاعدة بيانات الشركة")
+}
+
+function runCompanyBootstrapScript(dbName: string): Promise<void> {
+  const databaseUrl = process.env.DATABASE_URL?.trim()
+  if (!databaseUrl) throw new Error("DATABASE_URL is not configured")
+
+  const scriptPath = resolveCompanyBootstrapScriptPath()
+  const targetUrl = new URL(withDatabaseName(databaseUrl, dbName))
+  const restoreEnv: NodeJS.ProcessEnv = {
+    ...process.env,
+    PGHOST: targetUrl.hostname,
+    PGPORT: targetUrl.port || "5432",
+    PGUSER: decodeURIComponent(targetUrl.username),
+    PGPASSWORD: decodeURIComponent(targetUrl.password),
+    PGDATABASE: dbName,
+  }
+  const sslMode = targetUrl.searchParams.get("sslmode")
+  if (sslMode) restoreEnv.PGSSLMODE = sslMode
+
+  return new Promise((resolve, reject) => {
+    const child = spawn(
+      resolvePsqlPath(),
+      ["--no-psqlrc", "--set", "ON_ERROR_STOP=1", "--dbname", dbName, "--file", scriptPath],
+      { env: restoreEnv, windowsHide: true },
+    )
+    let stderr = ""
+    child.stderr.on("data", (chunk) => {
+      stderr += String(chunk)
+    })
+    child.on("error", (error: NodeJS.ErrnoException) => {
+      const hint = error.code === "ENOENT"
+        ? " Install PostgreSQL client tools or set PSQL_PATH to the full psql executable path."
+        : ""
+      reject(new Error(`Unable to start psql: ${error.message}.${hint}`))
+    })
+    child.on("close", (code) => {
+      if (code === 0) resolve()
+      else reject(new Error(`Company bootstrap script failed with exit code ${code}: ${stderr.trim()}`))
+    })
+  })
+}
+
+async function createCompanyDatabaseFromScript(dbName: string) {
+  if (!process.env.DATABASE_URL) {
+    throw new Error("DATABASE_URL is not configured")
+  }
+
+  const { Pool } = await import("pg")
+  const adminUrl = withDatabaseName(process.env.DATABASE_URL, "postgres")
+
+  if (!adminUrl) {
+    throw new Error("تعذّر بناء رابط الاتصال لقاعدة الشركة الجديدة")
+  }
+
+  const adminPool = new Pool({ connectionString: adminUrl })
+  try {
+    const existing = await adminPool.query("SELECT 1 FROM pg_database WHERE datname = $1", [dbName])
+    if (existing.rows.length > 0) throw new Error(`Database ${dbName} already exists`)
+    // Always create an empty database, then build it from the versioned SQL
+    // bootstrap script. No backup file or template database is used.
+    await adminPool.query(`CREATE DATABASE "${dbName}"`)
+    try {
+      await runCompanyBootstrapScript(dbName)
+    } catch (error) {
+      await adminPool.query(
+        `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()`,
+        [dbName],
+      ).catch(() => {})
+      await adminPool.query(`DROP DATABASE IF EXISTS "${dbName}"`).catch(() => {})
+      throw error
+    }
+  } finally {
+    await adminPool.end().catch(() => {})
+  }
+}
+
+async function ensureBasicProductsTable(tenantClient: ReturnType<typeof getPoolForDb>) {
+  // تأكد من وجود جدول products الأساسي
+  await tenantClient.query(
+    `CREATE TABLE IF NOT EXISTS products (
+      id SERIAL PRIMARY KEY,
+      product_code VARCHAR(100) UNIQUE NOT NULL,
+      product_name VARCHAR(255) NOT NULL,
+      product_name_en VARCHAR(255),
+      barcode VARCHAR(100),
+      description TEXT,
+      category_id INTEGER,
+      subcategory VARCHAR(100),
+      classifications VARCHAR(255),
+      product_type VARCHAR(50),
+      brand VARCHAR(100),
+      model VARCHAR(100),
+      default_store INTEGER,
+      manufacturer_number VARCHAR(100),
+      original_number VARCHAR(100),
+      supplier_id INTEGER,
+      supplier_name VARCHAR(255),
+      supplier_code VARCHAR(100),
+      main_unit VARCHAR(50),
+      secondary_unit VARCHAR(50),
+      conversion_factor NUMERIC(10,4) DEFAULT 1,
+      selling_price NUMERIC(15,2),
+      retail_price NUMERIC(15,2),
+      wholesale_price NUMERIC(15,2),
+      last_purchase_price NUMERIC(15,2),
+      average_cost NUMERIC(15,2),
+      currency VARCHAR(10) DEFAULT 'SAR',
+      tax_rate NUMERIC(5,2) DEFAULT 0,
+      discount_rate NUMERIC(5,2) DEFAULT 0,
+      min_stock_level NUMERIC(15,2),
+      max_stock_level NUMERIC(15,2),
+      reorder_point NUMERIC(15,2),
+      order_quantity NUMERIC(15,2),
+      max_quantity NUMERIC(15,2),
+      location VARCHAR(100),
+      weight NUMERIC(10,2),
+      dimensions VARCHAR(100),
+      color VARCHAR(50),
+      size VARCHAR(50),
+      material VARCHAR(100),
+      country_of_origin VARCHAR(100),
+      warranty_period INTEGER,
+      shelf_life INTEGER,
+      has_batch BOOLEAN DEFAULT false,
+      batch_tracking BOOLEAN DEFAULT false,
+      has_expiry BOOLEAN DEFAULT false,
+      expiry_tracking BOOLEAN DEFAULT false,
+      serial_tracking BOOLEAN DEFAULT false,
+      has_colors BOOLEAN DEFAULT false,
+      status VARCHAR(20) DEFAULT 'active',
+      entry_date DATE,
+      image_url TEXT,
+      product_image TEXT,
+      attachments TEXT,
+      notes TEXT,
+      general_notes TEXT,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )`,
+    [],
+  )
+
+  // إنشاء الفهارس الأساسية
+  // The canonical bootstrap script predates products.barcode. CREATE TABLE IF NOT EXISTS does
+  // not add missing columns to an existing table, so migrate it before
+  // creating the barcode index below.
+  await tenantClient.query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS barcode VARCHAR(100)`, [])
+
+  await tenantClient.query(`CREATE INDEX IF NOT EXISTS idx_products_code ON products(product_code)`, [])
+  await tenantClient.query(`CREATE INDEX IF NOT EXISTS idx_products_name ON products(product_name)`, [])
+  await tenantClient.query(`CREATE INDEX IF NOT EXISTS idx_products_barcode ON products(barcode)`, [])
+  await tenantClient.query(`CREATE INDEX IF NOT EXISTS idx_products_category_id ON products(category_id)`, [])
+  await tenantClient.query(`CREATE INDEX IF NOT EXISTS idx_products_status ON products(status)`, [])
+
+  // تأكد من وجود الجداول الأخرى الأساسية
+  await tenantClient.query(
+    `CREATE TABLE IF NOT EXISTS branches (
+      id SERIAL PRIMARY KEY,
+      branch_code VARCHAR(50) NOT NULL,
+      branch_name VARCHAR(255) NOT NULL,
+      branch_symbol VARCHAR(1),
+      is_active BOOLEAN DEFAULT true,
+      status INTEGER DEFAULT 1,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )`,
+    [],
+  )
+  await tenantClient.query(`ALTER TABLE branches ADD COLUMN IF NOT EXISTS branch_symbol VARCHAR(1)`, [])
+  await tenantClient.query(
+    `CREATE UNIQUE INDEX IF NOT EXISTS branches_branch_symbol_key ON branches (branch_symbol) WHERE branch_symbol IS NOT NULL`,
+    [],
+  )
+
+  await tenantClient.query(
+    `CREATE TABLE IF NOT EXISTS departments (
+      id SERIAL PRIMARY KEY,
+      department_code VARCHAR(50),
+      department_name VARCHAR(255),
+      branch_id INTEGER REFERENCES branches(id),
+      is_active BOOLEAN DEFAULT true,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )`,
+    [],
+  )
+
+  await tenantClient.query(
+    `CREATE TABLE IF NOT EXISTS user_settings (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER,
+      username VARCHAR(100),
+      email VARCHAR(100),
+      password_hash VARCHAR(255),
+      full_name VARCHAR(255),
+      role VARCHAR(100),
+      department VARCHAR(100),
+      organization_id INTEGER,
+      permissions JSONB,
+      branch_id INTEGER,
+      font_family VARCHAR(100) DEFAULT 'Cairo',
+      font_size INTEGER DEFAULT 14,
+      datagrid_settings JSONB DEFAULT '{}',
+      is_active BOOLEAN DEFAULT true,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )`,
+    [],
+  )
+
+  await tenantClient.query(
+    `CREATE TABLE IF NOT EXISTS user_access (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER,
+      access_id INTEGER,
+      is_granted BOOLEAN DEFAULT false,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )`,
+    [],
+  )
+
+  await tenantClient.query(
+    `CREATE TABLE IF NOT EXISTS voucher_book_user_permissions_tbl (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER,
+      voucher_type_id INTEGER,
+      vch_book_id INTEGER,
+      is_default BOOLEAN DEFAULT false,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )`,
+    [],
+  )
+}
+
+async function ensureModernVoucherItemsTable(tenantClient: ReturnType<typeof getPoolForDb>) {
+  // تأكد من وجود جدول رؤوس الفواتير أولاً
+  await tenantClient.query(
+    `CREATE TABLE IF NOT EXISTS voucher_header_tbl (
+      id SERIAL PRIMARY KEY,
+      voucher_type_id INTEGER,
+      vch_book_id INTEGER,
+      vch_date TIMESTAMP WITHOUT TIME ZONE,
+      vch_code VARCHAR(50),
+      branch_id INTEGER,
+      user_id INTEGER,
+      notes TEXT,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )`,
+    [],
+  )
+
+  await tenantClient.query(`DROP TABLE IF EXISTS public.voucher_items CASCADE`, [])
+  await tenantClient.query(`DROP TABLE IF EXISTS public.voucher_items_tbl CASCADE`, [])
+
+  await tenantClient.query(
+    `CREATE TABLE IF NOT EXISTS voucher_items_tbl (
+      id SERIAL PRIMARY KEY,
+      voucher_id INTEGER NOT NULL REFERENCES voucher_header_tbl(id) ON DELETE CASCADE,
+      item_id INTEGER,
+      item_name VARCHAR(140),
+      unit_id INTEGER,
+      qnty DOUBLE PRECISION,
+      bonus DOUBLE PRECISION,
+      discount DOUBLE PRECISION,
+      pos_discount_percent NUMERIC(9,4),
+      campaign_discount DOUBLE PRECISION DEFAULT 0,
+      campaign_id INTEGER,
+      vat_classification_id INTEGER,
+      vat_amount DOUBLE PRECISION,
+      vat_ratio DOUBLE PRECISION,
+      price DOUBLE PRECISION,
+      note VARCHAR(200),
+      cost_price DOUBLE PRECISION,
+      barcode VARCHAR(150),
+      size_id INTEGER,
+      color_taste_id INTEGER,
+      length INTEGER,
+      width INTEGER,
+      height INTEGER,
+      count INTEGER,
+      order_item_id INTEGER,
+      delivery_item_id INTEGER,
+      production_date DATE,
+      expiry_date DATE,
+      batch_no VARCHAR(30),
+      store_id INTEGER,
+      journal_id INTEGER,
+      return_sales_invoice_id INTEGER
+    )`,
+    [],
+  )
+  await tenantClient.query(`CREATE INDEX IF NOT EXISTS idx_voucher_items_tbl_voucher_id ON voucher_items_tbl(voucher_id)`, [])
+}
+
+async function ensureModernProductColumns(tenantClient: ReturnType<typeof getPoolForDb>) {
+  const productColumns: Array<[string, string]> = [
+    ["barcode", "VARCHAR(100)"],
+    ["product_name_en", "TEXT"],
+    ["category_id", "INTEGER"],
+    ["main_stock_id", "INTEGER"],
+    ["default_store", "INTEGER"],
+    ["brand", "TEXT"],
+    ["model", "TEXT"],
+    ["factory_number", "TEXT"],
+    ["original_number", "TEXT"],
+    ["measurment_unit", "INTEGER DEFAULT 1"],
+    ["measurment_id", "INTEGER DEFAULT 1"],
+    ["last_purchase_price", "NUMERIC(18,4) DEFAULT 0"],
+    ["currency_id", "INTEGER DEFAULT 1"],
+    ["tax_rate", "NUMERIC(18,4) DEFAULT 0"],
+    ["discount_rate", "NUMERIC(18,4) DEFAULT 0"],
+    ["location", "TEXT"],
+    ["has_expiry_date", "BOOLEAN DEFAULT false"],
+    ["has_batch_number", "BOOLEAN DEFAULT false"],
+    ["serial_tracking", "BOOLEAN DEFAULT false"],
+    ["status", "INTEGER DEFAULT 1"],
+    ["type", "INTEGER DEFAULT 1"],
+    ["service_type", "INTEGER DEFAULT 0"],
+    ["product_type", "INTEGER DEFAULT 1"],
+    ["tax_classification_id", "INTEGER"],
+    ["length", "NUMERIC(18,4) DEFAULT 0"],
+    ["width", "NUMERIC(18,4) DEFAULT 0"],
+    ["height", "NUMERIC(18,4) DEFAULT 0"],
+    ["density", "NUMERIC(18,4) DEFAULT 0"],
+    ["color", "TEXT"],
+    ["size", "TEXT"],
+    ["notes", "TEXT"],
+    ["manufacturer_company", "TEXT"],
+    ["product_image", "TEXT"],
+    ["selling_account_id", "INTEGER"],
+    ["purchase_account_id", "INTEGER"],
+    ["selling_returns_account_id", "INTEGER"],
+    ["purchase_returns_account_id", "INTEGER"],
+    ["stock_end_account_id", "INTEGER"],
+    ["stock_start_account_id", "INTEGER"],
+    ["production_account_id", "INTEGER"],
+    ["municipality_service_account_id", "INTEGER"],
+    ["lsti3mal_account_id", "INTEGER"],
+    ["deleted", "BOOLEAN DEFAULT false"],
+    ["updated_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"],
+    ["created_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"],
+    ["entry_date", "DATE DEFAULT CURRENT_DATE"],
+    ["has_colors", "BOOLEAN DEFAULT false"],
+    ["attributes", "JSONB NOT NULL DEFAULT '[]'::jsonb"],
+  ]
+
+  for (const [columnName, columnType] of productColumns) {
+    await tenantClient.query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS ${columnName} ${columnType}`, [])
+  }
+
+  await tenantClient.query(`ALTER TABLE IF EXISTS product_attributes_tbl RENAME TO attributes_tbl`, [])
+  await tenantClient.query(`ALTER TABLE IF EXISTS product_attribute_values_tbl RENAME TO attribute_values_tbl`, [])
+  await tenantClient.query(`CREATE TABLE IF NOT EXISTS attributes_tbl (id SERIAL PRIMARY KEY, name TEXT NOT NULL UNIQUE)`, [])
+  await tenantClient.query(`CREATE TABLE IF NOT EXISTS attribute_values_tbl (id SERIAL PRIMARY KEY, attr_id INTEGER NOT NULL REFERENCES attributes_tbl(id) ON DELETE CASCADE, name TEXT NOT NULL, UNIQUE(attr_id, name))`, [])
+  await tenantClient.query(`CREATE TABLE IF NOT EXISTS product_atrributes_values_tbl (id BIGSERIAL UNIQUE, product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE, attr_id INTEGER NOT NULL REFERENCES attributes_tbl(id) ON DELETE CASCADE, value_id INTEGER NOT NULL REFERENCES attribute_values_tbl(id) ON DELETE CASCADE, image_url TEXT, PRIMARY KEY(product_id, attr_id, value_id))`, [])
+  await tenantClient.query(`CREATE TABLE IF NOT EXISTS voucher_item_attributes_tbl (id BIGSERIAL PRIMARY KEY, voucher_item_id INTEGER NOT NULL REFERENCES voucher_items_tbl(id) ON DELETE CASCADE, product_attribute_value_id BIGINT NOT NULL REFERENCES product_atrributes_values_tbl(id) ON DELETE CASCADE, UNIQUE(voucher_item_id, product_attribute_value_id))`, [])
+  await tenantClient.query(`CREATE TABLE IF NOT EXISTS order_item_attributes_tbl (id BIGSERIAL PRIMARY KEY, order_item_id INTEGER NOT NULL, product_attribute_value_id BIGINT NOT NULL REFERENCES product_atrributes_values_tbl(id) ON DELETE CASCADE, UNIQUE(order_item_id, product_attribute_value_id))`, [])
+}
+
+// بعد إنشاء قاعدة الشركة من dump المشروع مباشرة، نمنح admin جميع التعريفات الموجودة في قاعدة
+// الشركة الجديدة دون الحاجة إلى أي قالب منفصل أو قاعدة مرجعية خارجية.
+async function seedAccessListsAndGrantAdmin(tenantClient: ReturnType<typeof getPoolForDb>) {
+  const accessList = await tenantClient.query(`SELECT id FROM access_list ORDER BY id`, [])
+  for (const item of accessList) {
+    await tenantClient.query(
+      `INSERT INTO user_access (user_id, access_id, is_granted) VALUES ($1, $2, true)
+       ON CONFLICT (user_id, access_id) DO UPDATE SET is_granted = true`,
+      ["1", item.id],
+    )
+  }
+}
+
+async function seedManagementAccessDefinitions(tenantClient: ReturnType<typeof getPoolForDb>) {
+  const categories = await tenantClient.query(`SELECT id, name FROM access_category ORDER BY id`, [])
+  for (const category of categories) {
+    await managementSql`
+      INSERT INTO access_category (id, name)
+      VALUES (${category.id}, ${category.name})
+      ON CONFLICT (id) DO NOTHING
+    `
+  }
+
+  const items = await tenantClient.query(`SELECT id, name, category_id FROM access_list ORDER BY id`, [])
+  for (const item of items) {
+    await managementSql`
+      INSERT INTO access_list (id, name, category_id)
+      VALUES (${item.id}, ${item.name}, ${item.category_id})
+      ON CONFLICT DO NOTHING
+    `
+  }
+
+  await managementSql`SELECT setval(pg_get_serial_sequence('access_category', 'id'), COALESCE((SELECT MAX(id) FROM access_category), 1))`
+  await managementSql`SELECT setval(pg_get_serial_sequence('access_list', 'id'), COALESCE((SELECT MAX(id) FROM access_list), 1))`
+}
+
+// صلاحيات دفاتر السندات (voucher_book_user_permissions_tbl — انظر app/api/voucher-book-permissions/
+// _lib.ts لشرح الجداول الثلاثة) لمستخدم admin (user_id='1'/id=1 المُنشأ للتو): تُمنَح كل الدفاتر
+// (voucher_books_tbl، مُستنسَخة ببياناتها أصلاً ضمن LOOKUP_TABLES أعلاه) لكل نوع سند (voucher_types_tbl)
+// دون استثناء — بلا هذا لا يستطيع admin استخدام أي سند إطلاقاً بشركة حديثة التزويد (شاشة كل سند تفرض
+// دفتراً من ضمن صلاحيات المستخدم). الدفتر الافتراضي (is_default=1) هو الدفتر المُسمّى "0" تحديداً
+// (يُنشَأ دوماً ضمن ensureTables بذلك المسار) لا أول دفتر بالترتيب، مطابقاً لطلب المستخدم صراحةً.
+async function seedVoucherBookPermissionsForAdmin(
+  tenantClient: ReturnType<typeof getPoolForDb>,
+  adminUserRowId: number,
+) {
+  const types = await tenantClient.query(`SELECT id FROM voucher_types_tbl WHERE COALESCE(status, 1) != 3`, [])
+  const books = await tenantClient.query(`SELECT id, name FROM voucher_books_tbl`, [])
+  if (books.length === 0) return
+
+  const defaultBook = books.find((b: any) => String(b.name).trim() === "0") ?? books[0]
+
+  // The dump can already contain permissions for its placeholder admin. Replace
+  // those rows instead of appending another full copy on every provisioning retry.
+  await tenantClient.query(`DELETE FROM voucher_book_user_permissions_tbl WHERE user_id = $1`, [adminUserRowId])
+
+  for (const type of types) {
+    for (const book of books) {
+      await tenantClient.query(
+        `INSERT INTO voucher_book_user_permissions_tbl (user_id, voucher_type_id, vch_book_id, is_default) VALUES ($1, $2, $3, $4)`,
+        [adminUserRowId, type.id, book.id, book.id === defaultBook.id ? 1 : 0],
+      )
+    }
+  }
+}
+
+async function ensureDefaultVoucherBooks(tenantClient: ReturnType<typeof getPoolForDb>) {
+  await tenantClient.query(
+    `INSERT INTO voucher_books_tbl (name)
+     SELECT book_name
+     FROM unnest(ARRAY['0', 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z']) AS book_names(book_name)
+     WHERE NOT EXISTS (
+       SELECT 1 FROM voucher_books_tbl existing WHERE existing.name = book_name
+     )`,
+    [],
+  )
+}
+
+// فرع وقسم افتراضيان لكل شركة جديدة — بلا أي فرع/قسم، شاشات كثيرة (تسجيل الدخول نفسه عبر
+// user_settings.branch_id، شاشات المخزون والسندات) تفترض وجود فرع واحد على الأقل.
+async function seedDefaultBranchAndSection(tenantClient: ReturnType<typeof getPoolForDb>) {
+  const branchResult = await tenantClient.query(
+    `INSERT INTO branches (branch_code, branch_name, branch_symbol, is_active, status)
+     VALUES ($1, $2, $3, true, 1)
+     ON CONFLICT (branch_code) DO UPDATE SET
+       -- اسم الفرع قابل للتعديل (البداية السريعة/الفروع) — لا يُعاد للاسم الافتراضي
+       branch_name = COALESCE(NULLIF(branches.branch_name, ''), EXCLUDED.branch_name),
+       branch_symbol = COALESCE(branches.branch_symbol, EXCLUDED.branch_symbol),
+       is_active = true,
+       status = 1
+     RETURNING id`,
+    ["0001", "الفرع الرئيسي", "0"],
+  )
+  const branchId = branchResult[0].id
+
+  await tenantClient.query(
+    `INSERT INTO departments (department_code, department_name, branch_id, is_active)
+     VALUES ($1, $2, $3, true)
+     ON CONFLICT (department_code) DO UPDATE SET
+       department_name = EXCLUDED.department_name,
+       branch_id = EXCLUDED.branch_id,
+       is_active = true`,
+    ["D1", "الادارة", branchId],
+  )
+
+  return branchId
+}
+
+// مستودع افتراضي واحد باسم "الرئيسي" (مطابق لاسم الفرع الافتراضي) — بلا هذا تُنشئ /api/warehouses
+// GET (أول استدعاء لها فقط، إذ الجدول فارغ) خمسة مستودعات إنجليزية الاسم (MAIN/SALES/PROD/DMGD/RETN)
+// بدل مستودع واحد يطابق تسمية الفرع؛ إدراجه هنا مسبقاً يجعل ذلك المسار اللاحق بلا أثر (شرطه
+// COUNT(*) = 0 لن يتحقق).
+async function seedDefaultStore(tenantClient: ReturnType<typeof getPoolForDb>) {
+  await tenantClient.query(
+    `CREATE TABLE IF NOT EXISTS warehouses (
+      id SERIAL PRIMARY KEY,
+      warehouse_code VARCHAR(10) UNIQUE NOT NULL,
+      warehouse_name VARCHAR(100) NOT NULL,
+      warehouse_name_en VARCHAR(100),
+      description TEXT,
+      location VARCHAR(200),
+      is_active BOOLEAN DEFAULT true,
+      status INTEGER DEFAULT 1,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )`,
+    [],
+  )
+  await tenantClient.query(
+    `INSERT INTO warehouses (warehouse_code, warehouse_name, warehouse_name_en, is_active, status)
+     VALUES ($1, $2, $3, true, 1)
+     ON CONFLICT (warehouse_code) DO UPDATE SET
+       warehouse_name = EXCLUDED.warehouse_name,
+       warehouse_name_en = EXCLUDED.warehouse_name_en,
+       is_active = true,
+       status = 1`,
+    ["MAIN", "الرئيسي", "Main"],
+  )
+}
+
+async function seedDefaultPriceCategory(tenantClient: ReturnType<typeof getPoolForDb>) {
+  await tenantClient.query(
+    `INSERT INTO pricecategory (name, name_en, status)
+     SELECT $1::text, $1::text, 1
+     WHERE NOT EXISTS (
+       SELECT 1 FROM pricecategory
+       WHERE LOWER(TRIM(name)) = LOWER($1::text) AND COALESCE(status, 1) <> 3
+     )`,
+    ["مفرق"],
+  )
+}
+
+async function tableExists(tenantClient: ReturnType<typeof getPoolForDb>, tableName: string) {
+  const rows = await tenantClient.query(
+    `SELECT to_regclass($1) AS table_name`,
+    [`public.${tableName}`],
+  )
+  return !!rows[0]?.table_name
+}
+
+async function seedDefaultSystemSettings(tenantClient: ReturnType<typeof getPoolForDb>) {
+  if (!(await tableExists(tenantClient, "system_settings"))) {
+    await tenantClient.query(
+      `CREATE TABLE IF NOT EXISTS system_settings (
+        id VARCHAR(100) PRIMARY KEY,
+        description VARCHAR(255),
+        value TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )`,
+      [],
+    )
+  }
+
+  await tenantClient.query(`ALTER TABLE system_settings ALTER COLUMN id DROP IDENTITY IF EXISTS`, [])
+  await tenantClient.query(`ALTER TABLE system_settings ALTER COLUMN id DROP DEFAULT`, [])
+  await tenantClient.query(`ALTER TABLE system_settings ALTER COLUMN id TYPE VARCHAR(100) USING id::TEXT`, [])
+  await tenantClient.query(`ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS description TEXT`, [])
+  await tenantClient.query(`ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS value TEXT`, [])
+
+  const rows = [
+    ["invoice_prefix", "INV"],
+    ["sales_invoice_prefix", "INV"],
+    ["delivery_sell_prefix", "DSL"],
+    ["purchase_invoice_prefix", "PU"],
+    ["invoice_start", "1"],
+    ["sales_invoice_start", "1"],
+    ["delivery_sell_start", "1"],
+    ["purchase_invoice_start", "1"],
+  ] as const
+
+  for (const [key, value] of rows) {
+    await tenantClient.query(
+      `INSERT INTO system_settings (id, description, value) VALUES ($1, $2, $3)
+       ON CONFLICT (id) DO UPDATE SET description = EXCLUDED.description, value = EXCLUDED.value`,
+      [key, key, value],
+    )
+  }
+}
+
+// Only immutable application metadata survives the bootstrap script. Editable
+// files and definitions start empty; branch, department, warehouse and price
+// category defaults are inserted explicitly after this cleanup.
+const FRESH_COMPANY_LOOKUP_TABLES = new Set([
+  "access_category",
+  "access_list",
+  "voucher_types_tbl",
+  "voucher_status_tbl",
+  "voucher_journal_type_tbl",
+  "voucher_journal_type_caption_tbl",
+])
+
+const SCHEMA_METADATA_TABLES = new Set(["_prisma_migrations", "schema_migrations"])
+
+function quoteIdentifier(identifier: string): string {
+  return `"${identifier.replace(/"/g, '""')}"`
+}
+
+async function clearFreshCompanyNonLookupData(tenantClient: ReturnType<typeof getPoolForDb>) {
+  const tables = await tenantClient.query(
+    `SELECT table_name
+     FROM information_schema.tables
+     WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
+     ORDER BY table_name`,
+    [],
+  )
+
+  const tablesToClear = tables
+    .map((row: { table_name: string }) => row.table_name)
+    .filter((tableName: string) =>
+      !FRESH_COMPANY_LOOKUP_TABLES.has(tableName) &&
+      !SCHEMA_METADATA_TABLES.has(tableName) &&
+      tableName !== "spatial_ref_sys" &&
+      tableName !== "geography_columns" &&
+      tableName !== "geometry_columns"
+    )
+
+  if (tablesToClear.length === 0) return
+
+  const tableList = tablesToClear.map(quoteIdentifier).join(", ")
+  await tenantClient.query(`TRUNCATE TABLE ${tableList} RESTART IDENTITY CASCADE`, [])
+}
+
+export async function provisionCompanyDatabase(
+  company: { id: number; name: string; requestedByEmail: string; requestedByFullName: string; requestedByPasswordHash: string },
+  approvedByUserId: number,
+  // expiryDays: مدة الاشتراك الممنوحة عند التزويد (365 للاعتماد العادي عبر لوحة الإدارة، 10 للشركة
+  // التجريبية ذاتية الاعتماد — انظر app/api/management/companies/trial/route.ts).
+  options: { expiryDays?: number } = {},
+) {
+  await ensureManagementTables()
+
+  const dbName = await generateUniqueDbName()
+  await createCompanyDatabaseFromScript(dbName)
+
+  const tenantClient = getPoolForDb(dbName)
+
+  // تأكد من وجود الجداول الأساسية (خاصة products) قبل محاولة إضافة الأعمدة
+  await ensureBasicProductsTable(tenantClient)
+  await ensureModernProductColumns(tenantClient)
+  await ensureModernVoucherItemsTable(tenantClient)
+  await clearFreshCompanyNonLookupData(tenantClient)
+  await ensureDefaultVoucherBooks(tenantClient)
+  const branchId = await seedDefaultBranchAndSection(tenantClient)
+  await seedDefaultStore(tenantClient)
+  await seedDefaultPriceCategory(tenantClient)
+  await seedDefaultSystemSettings(tenantClient)
+  await seedManagementAccessDefinitions(tenantClient)
+
+  // A bootstrapped or partially seeded database may contain the placeholder admin under
+  // either unique key. Clear both identities before inserting the company's owner;
+  // ON CONFLICT can target only one constraint and therefore cannot handle both safely.
+  await tenantClient.query(
+    `DELETE FROM voucher_book_user_permissions_tbl
+     WHERE user_id IN (
+       SELECT id FROM user_settings WHERE user_id = $1 OR LOWER(username) = LOWER($2)
+     )`,
+    [1, "admin"],
+  )
+  await tenantClient.query(
+    `DELETE FROM user_settings WHERE user_id = $1 OR LOWER(username) = LOWER($2)`,
+    [1, "admin"],
+  )
+  const insertedAdmin = await tenantClient.query(
+    `INSERT INTO user_settings (
+      user_id, username, email, password_hash, full_name, role, department,
+      organization_id, permissions, branch_id, is_active
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+    RETURNING id`,
+    [
+      1,
+      "admin",
+      company.requestedByEmail,
+      company.requestedByPasswordHash,
+      company.requestedByFullName,
+      "مدير النظام",
+      "الإدارة",
+      1,
+      JSON.stringify([]),
+      branchId,
+      true,
+    ],
+  )
+  const adminUserRowId = Number(insertedAdmin[0]?.id)
+  if (!Number.isInteger(adminUserRowId) || adminUserRowId <= 0) {
+    throw new Error("Failed to create the tenant administrator")
+  }
+
+  await seedAccessListsAndGrantAdmin(tenantClient)
+  await seedVoucherBookPermissionsForAdmin(tenantClient, adminUserRowId)
+
+  // Seed first, then validate every existing reference and establish integer user IDs.
+  const migrationUrl = new URL(process.env.DATABASE_URL!)
+  migrationUrl.pathname = `/${dbName}`
+  const migrationClient = new Client({ connectionString: migrationUrl.toString() })
+  try {
+    await migrationClient.connect()
+    const { migrate } = require("./integer-user-ids-migration.cjs")
+    await migrate(migrationClient, true)
+  } finally {
+    await migrationClient.end()
+  }
+
+  // اشتراك بمدة expiryDays (سنة واحدة افتراضياً) من تاريخ الاعتماد الفعلي، ونطاق مستخدمين افتراضي
+  // = 1 (محجوز لاستخدام مستقبلي — لا فرض/تحقق فعلي لعدد المستخدمين مقابل هذا الحد بعد).
+  const expiryDays = options.expiryDays ?? 365
+  const updated = await managementSql`
+    UPDATE companies
+    SET db_name = ${dbName}, status = 'approved', approved_by = ${approvedByUserId}, approved_at = CURRENT_TIMESTAMP,
+        expiry_date = CURRENT_TIMESTAMP + (${expiryDays} * INTERVAL '1 day'), number_of_users = 1
+    WHERE id = ${company.id}
+    RETURNING expiry_date
+  `
+
+  return { dbName, expiryDate: updated[0]?.expiry_date ?? null }
+}

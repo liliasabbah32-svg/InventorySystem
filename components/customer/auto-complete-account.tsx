@@ -1,12 +1,16 @@
 "use client"
 
+import { tr, appDir } from "@/lib/i18n"
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { Search, X, CircleDollarSign } from "lucide-react"
+import { normalizeArabicSearch } from "@/lib/arabic-search"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
-import AccountSearchDialog, { AccountItem } from "@/components/customer/account-search-dialog"
-import AccountCostCenters from "@/components/customer/account-cost-centers"
+import AccountSearchDialog, { AccountItem, isParentAccount, PARENT_ACCOUNT_MESSAGE } from "@/components/customer/account-search-dialog"
+import AccountCostCenters, { type JournalCostCenterSelection } from "@/components/customer/account-cost-centers"
+import { getAccountList } from "@/components/customer/account-data"
+import { useToast } from "@/hooks/use-toast"
 
 const accountApiUrl = "/api/accounts"
 
@@ -23,19 +27,51 @@ interface AutoCompleteAccountProps {
   showCostCenterButton?: boolean
   costCenterButtonDisabled?: boolean
   showCostCenterDialog?: boolean
+  costCenters?: JournalCostCenterSelection[]
+  onCostCentersChange?: (value: JournalCostCenterSelection[]) => void
   leafOnly?: boolean
   displayNameFirst?: boolean
   showSearchButton?: boolean
+  /** Enter على مربع فارغ ينقل التركيز لزر البحث (Enter عليه يفتح البحث) بدل فتح نافذة البحث مباشرة */
+  emptyEnterFocusesSearch?: boolean
   showClearButton?: boolean
   requiredTypeValues?: number[]
   searchAllowedTypeValues?: number[]
   searchDefaultTypeValue?: string
   showFinancialListFilter?: boolean
   showTypeFilter?: boolean
+  showDeliveryOnlyFilter?: boolean
+  lockDeliveryOnlyFilter?: boolean
+  deliveryVchTypes?: number[]
+  showOrderOnlyFilter?: boolean
+  lockOrderOnlyFilter?: boolean
+  orderType?: number | null
+  branchId?: number | null
   displayIdOnly?: boolean
+  // يظهر فقط عندما يُمرَّر requiredTypeValues: عند مغادرة الحقل (بعد كتابة يدوية) إن لم يوجد
+  // الحساب أصلاً أو كان موجوداً لكن نوعه خارج requiredTypeValues، تُمسح القيمة المدخلة وتُعرض
+  // هذه الرسالة بدل قبول حساب لا يطابق النوع المطلوب بصمت.
+  notFoundMessage?: string
+  emptyActionLabel?: string
+  emptyActionHref?: string
+  /**
+   * عملة الحركة: عند تمريرها يُطبَّق إعداد الحساب "السماح بعمل حركة على الحساب بغير عملته" (allow_trans_with_diff_curr)
+   * عند اختيار حساب عملته مختلفة: 0 = بلا تنبيه، 1 = يُقبل مع تنبيه، 2 = يُرفض الاختيار. (الخادم يرفض 2 عند الحفظ أيضاً)
+   */
+  voucherCurrencyId?: number | null
 }
 
-const normalizeAccountCode = (value: string) => value.toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 8)
+const normalizeAccountCode = (value: string) => value.toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 50)
+
+// كل أكواد الحسابات بطول ثابت 10: البادئة الحرفية (إن وُجدت) + أرقام مكمَّلة بأصفار من اليسار —
+// C1 → C000000001، C200 → C000000200، 11 → 0000000011 (نفس قاعدة adjustAccountCode بقيد اليومية).
+const ACCOUNT_CODE_LENGTH = 10
+const padAccountCode = (code: string) => {
+  const match = /^([A-Z]*)(\d+)$/.exec(code)
+  if (!match || code.length >= ACCOUNT_CODE_LENGTH) return code
+  const [, prefix, digits] = match
+  return prefix + digits.padStart(ACCOUNT_CODE_LENGTH - prefix.length, "0")
+}
 
 const formatAccountLabel = (account: AccountItem, displayNameFirst = false, displayIdOnly = false) =>
   displayIdOnly
@@ -43,8 +79,7 @@ const formatAccountLabel = (account: AccountItem, displayNameFirst = false, disp
     : displayNameFirst
       ? `${account.name} / ${account.code}`
       : `${account.code} - ${account.name}`
-const isLeafAccount = (account: AccountItem, allAccounts: AccountItem[]) =>
-  !allAccounts.some((candidate) => Number(candidate.father_id ?? 0) === Number(account.id))
+const isLeafAccount = (account: AccountItem, allAccounts: AccountItem[]) => !isParentAccount(account, allAccounts)
 
 const mapAccount = (item: any): AccountItem => ({
   id: Number(item.id),
@@ -60,6 +95,7 @@ const mapAccount = (item: any): AccountItem => ({
         ? Number(item.parent_account_id)
         : null,
   father_name: item.father_name || item.parent_account_name || undefined,
+  has_children: item.has_children == null ? undefined : Boolean(item.has_children),
   level_no: Number(item.level_no || 1),
   finanical_list_id: Number(item.finanical_list_id || 1),
   finanical_list_assests_id: item.finanical_list_assests_id != null ? Number(item.finanical_list_assests_id) : null,
@@ -100,17 +136,33 @@ export default function AutoCompleteAccount({
   showCostCenterButton = true,
   costCenterButtonDisabled = false,
   showCostCenterDialog = true,
-  leafOnly = false,
+  costCenters,
+  onCostCentersChange,
+  leafOnly = true,
   displayNameFirst = false,
   showSearchButton = true,
+  emptyEnterFocusesSearch = false,
   showClearButton = true,
   requiredTypeValues,
   searchAllowedTypeValues,
   searchDefaultTypeValue,
   showFinancialListFilter,
   showTypeFilter = true,
+  showDeliveryOnlyFilter = false,
+  lockDeliveryOnlyFilter = false,
+  deliveryVchTypes = [],
+  showOrderOnlyFilter = false,
+  lockOrderOnlyFilter = false,
+  orderType = null,
+  branchId = null,
   displayIdOnly = false,
+  notFoundMessage,
+  emptyActionLabel,
+  emptyActionHref,
+  voucherCurrencyId = null,
 }: AutoCompleteAccountProps) {
+  const { toast } = useToast()
+  const inputRef = useRef<HTMLInputElement | null>(null)
   const [accounts, setAccounts] = useState<AccountItem[]>([])
   const [selectedAccount, setSelectedAccount] = useState<AccountItem | null>(null)
   const [searchDialogOpen, setSearchDialogOpen] = useState(false)
@@ -119,13 +171,56 @@ export default function AutoCompleteAccount({
   const [isFocused, setIsFocused] = useState(false)
   const [displayValue, setDisplayValue] = useState(value)
   const onValueChangeRef = useRef(onValueChange)
+  const typedTextRef = useRef<string | null>(null)
+  const searchOpeningRef = useRef(false)
+  // كل الحسابات قبل استبعاد الرئيسية — لتمييز "كود حساب رئيسي" عن "كود غير موجود" عند الكتابة
+  const allAccountsRef = useRef<AccountItem[]>([])
 
   const normalizedValue = useMemo(() => (valueMode === "id" ? String(value).trim() : normalizeAccountCode(value)), [value, valueMode])
   const resolvedDisplayValue = useMemo(() => {
     if (selectedAccount) return formatAccountLabel(selectedAccount, displayNameFirst, displayIdOnly)
-    if (isFocused) return value
+    if (isFocused) return displayValue
+    // When using id mode, avoid showing the raw numeric id while async resolving
+    if (valueMode === "id") return ""
     return value
-  }, [displayIdOnly, displayNameFirst, isFocused, selectedAccount, value])
+  }, [displayIdOnly, displayNameFirst, displayValue, isFocused, selectedAccount, value])
+
+  const suggestionTypeValues = requiredTypeValues?.length ? requiredTypeValues : searchAllowedTypeValues
+  const matchingAccounts = useMemo(() => {
+    const query = normalizeArabicSearch(displayValue).trim()
+    if (!isFocused || !query || selectedAccount) return []
+    const words = query.split(/\s+/).filter(Boolean)
+    return accounts.filter((account) => {
+      if (suggestionTypeValues?.length && !suggestionTypeValues.includes(Number(account.type ?? 0))) return false
+      const searchable = normalizeArabicSearch(`${account.code} ${account.name} ${account.name_lang2 || ""}`)
+      return words.every((word) => searchable.includes(word))
+    }).slice(0, 8)
+  }, [accounts, displayValue, isFocused, selectedAccount, suggestionTypeValues])
+
+  // السهمان ↑↓ يتنقلان بين الاقتراحات و Enter يختار المظلَّل (-1 = لا شيء مظلَّل)
+  const [highlightedIndex, setHighlightedIndex] = useState(-1)
+  const suggestionListRef = useRef<HTMLDivElement | null>(null)
+  useEffect(() => { setHighlightedIndex(-1) }, [matchingAccounts])
+  useEffect(() => {
+    if (highlightedIndex < 0) return
+    suggestionListRef.current?.querySelectorAll<HTMLElement>("[role=option]")[highlightedIndex]?.scrollIntoView({ block: "nearest" })
+  }, [highlightedIndex])
+  // النص المكتوب عند فتح نافذة البحث — يُبحث به فيها مباشرة
+  const [searchSeed, setSearchSeed] = useState("")
+  const searchButtonRef = useRef<HTMLButtonElement | null>(null)
+
+  // يُطبَّق عند اختيار المستخدم حساباً (لا عند تحميل حساب محفوظ مسبقاً)
+  const currencyAllows = (account: AccountItem) => {
+    const voucherCurrency = Number(voucherCurrencyId)
+    if (!voucherCurrency || account.currency_id == null || Number(account.currency_id) === voucherCurrency) return true
+    const mode = Number(account.allow_trans_with_diff_curr || 0)
+    if (mode === 2) {
+      toast({ title: tr("تعذر اختيار الحساب"), description: tr("عملة الحركة تختلف عن عملة الحساب لا يمكن اختياره: {0} - {1}", account.code, account.name), variant: "destructive" })
+      return false
+    }
+    if (mode === 1) toast({ title: tr("تنبيه"), description: tr("عملة الحركة تختلف عن عملة الحساب: {0} - {1}", account.code, account.name) })
+    return true
+  }
 
   const notifySelection = useCallback(
     (account: AccountItem | null) => {
@@ -139,19 +234,15 @@ export default function AutoCompleteAccount({
     onValueChangeRef.current = onValueChange
   }, [onValueChange])
 
-  const loadAccounts = useCallback(async () => {
+  const loadAccounts = useCallback(async (forceRefresh = false) => {
     setLoadingAccounts(true)
     try {
-      const response = await fetch(accountApiUrl)
-      if (!response.ok) {
-        throw new Error(`Failed to load accounts: ${response.status}`)
-      }
-
-      const data = await response.json()
-      const mappedAccounts = (Array.isArray(data) ? data : [])
+      const data = await getAccountList(accountApiUrl, forceRefresh)
+      const mappedAccounts = data
         .map(mapAccount)
         .filter((account: AccountItem) => Number(account.status ?? 1) !== 3)
 
+      allAccountsRef.current = mappedAccounts
       const nextAccounts = leafOnly ? mappedAccounts.filter((account) => isLeafAccount(account, mappedAccounts)) : mappedAccounts
 
       setAccounts(nextAccounts)
@@ -179,7 +270,12 @@ export default function AutoCompleteAccount({
       if (!normalizedCode) return null
 
       const loadedAccounts = await loadAccounts()
-      return loadedAccounts.find((account) => normalizeAccountCode(account.code) === normalizedCode) || null
+      const paddedCode = padAccountCode(normalizedCode)
+      const exact = loadedAccounts.find((account) => normalizeAccountCode(account.code) === paddedCode)
+      if (exact) return exact
+      // احتياط لأكواد مخزَّنة بطول أقصر من 10 (بيانات قديمة مثل C0000005): مطابقة بعد تكميل الطرفين
+      const candidates = loadedAccounts.filter((account) => padAccountCode(normalizeAccountCode(account.code)) === paddedCode)
+      return candidates.length === 1 ? candidates[0] : null
     },
     [loadAccounts],
   )
@@ -233,54 +329,136 @@ export default function AutoCompleteAccount({
   }, [normalizedValue, resolveAccountByCode, resolveAccountById, value, valueMode])
 
   useEffect(() => {
+    if (isFocused && typedTextRef.current !== null) return
     setDisplayValue(resolvedDisplayValue)
-  }, [resolvedDisplayValue])
+  }, [resolvedDisplayValue, isFocused])
 
   useEffect(() => {
-    void loadAccounts()
+    void loadAccounts().catch((error) => console.error("Failed to load accounts:", error))
   }, [])
 
+  // النص المكتوب منذ آخر تركيز (null = لم يُكتب شيء). لا يُعتمد على value القادم من الصفحة: صفحات كثيرة
+  // لا تخزّن كل حرف (تتجاهل onValueChange أو تخزّن معرّفاً بوضع id)، فكان Enter يرى الحقل "فارغاً"
+  // ويفتح البحث دائماً، وكان blur يبحث بنص قديم. في وضع id لا يُمرَّر النص المكتوب للصفحة كمعرّف
+  // (كتابة 11 كانت تختار الحساب ذا المعرّف 11 بدل الكود 0000000011).
   const handleChange = (event: React.ChangeEvent<HTMLInputElement>) => {
-    const nextValue = valueMode === "id" ? event.target.value : normalizeAccountCode(event.target.value)
-    setDisplayValue(nextValue)
-    onValueChange(nextValue)
+    const text = event.target.value.slice(0, 100)
+    typedTextRef.current = text
+    setDisplayValue(text)
+    if (valueMode === "code") onValueChange(text)
+    else if (!text) onValueChange("")
+    notifySelection(null)
+  }
+
+  const handleOpenSearch = () => {
+    setSearchSeed(typedTextRef.current?.trim() || "")
+    searchOpeningRef.current = true
+    setSearchDialogOpen(true)
+  }
+
+  // يُطبِّق النص المكتوب: يُكمَّل الكود لعشر خانات (C1 → C000000001) ثم يُبحث عنه. موجود ⇐ يُختار.
+  // غير موجود ⇐ عند Enter تُفتح نافذة البحث، وعند مغادرة الحقل يُمسح (مع رسالة للحقول المقيّدة بنوع).
+  const commitTypedText = async (fromEnter: boolean) => {
+    const typed = typedTextRef.current
+    if (typed === null) {
+      if (fromEnter && !selectedAccount && !normalizedValue && showSearchButton && !disabled) void handleOpenSearch()
+      return
+    }
+    if (!typed) {
+      typedTextRef.current = null
+      onValueChange("")
+      notifySelection(null)
+      if (fromEnter && showSearchButton && !disabled) void handleOpenSearch()
+      return
+    }
+
+    // Name searches (including Arabic and multiword names) should stay intact
+    // and be selected from the suggestions or the full search dialog.
+    if (!/^[a-z\d]+$/i.test(typed.trim())) {
+      const matches = matchingAccounts
+      if (matches.length === 1) {
+        handleSelectFromSearch(matches[0])
+      } else if (fromEnter && showSearchButton && !disabled) {
+        void handleOpenSearch()
+      }
+      return
+    }
+
+    const padded = padAccountCode(typed)
+    setDisplayValue(padded)
+    if (valueMode === "code" && padded !== value) onValueChange(padded)
+
+    const account = await resolveAccountByCode(typed)
+    const typeOk =
+      !requiredTypeValues || requiredTypeValues.length === 0 || (account != null && requiredTypeValues.includes(Number(account.type ?? 0)))
+
+    if (account && typeOk && !currencyAllows(account)) {
+      typedTextRef.current = null
+      onValueChange("")
+      setDisplayValue("")
+      notifySelection(null)
+      return
+    }
+    if (account && typeOk) {
+      typedTextRef.current = null
+      notifySelection(account)
+      onValueChange(valueMode === "id" ? String(account.id) : account.code)
+      setDisplayValue(formatAccountLabel(account, displayNameFirst, displayIdOnly))
+      return
+    }
+
+    // كود حساب رئيسي (له حسابات فرعية): يُرفض برسالة واضحة بدل "غير موجود"
+    if (!account && leafOnly) {
+      const paddedTyped = padAccountCode(typed)
+      const parent = allAccountsRef.current.find((item) => padAccountCode(normalizeAccountCode(item.code)) === paddedTyped)
+      if (parent && isParentAccount(parent, allAccountsRef.current)) {
+        toast({ title: tr("تعذر اختيار الحساب"), description: `${PARENT_ACCOUNT_MESSAGE}: ${parent.code} - ${parent.name}`, variant: "destructive" })
+        typedTextRef.current = null
+        onValueChange("")
+        setDisplayValue("")
+        notifySelection(null)
+        if (fromEnter && showSearchButton && !disabled) void handleOpenSearch()
+        return
+      }
+    }
+    if (fromEnter && showSearchButton && !disabled) {
+      void handleOpenSearch()
+      return
+    }
+    // requiredTypeValues: الحقل لا يقبل إلا حسابات من هذا النوع — كود غير موجود أو من نوع آخر يُرفض
+    // بالكامل بدل قبوله بصمت (خلاف searchAllowedTypeValues التي تُصفّي نافذة البحث فقط).
+    if (requiredTypeValues && requiredTypeValues.length > 0) {
+      toast({ title: tr("خطأ"), description: notFoundMessage || tr("الحساب غير موجود"), variant: "destructive" })
+    }
+    typedTextRef.current = null
+    onValueChange("")
+    setDisplayValue("")
     notifySelection(null)
   }
 
   const handleBlur = async () => {
     setIsFocused(false)
-    const normalizedInput = valueMode === "id" ? String(value).trim() : normalizeAccountCode(value)
-    if (normalizedInput !== value) {
-      onValueChange(normalizedInput)
-    }
-
-    if (!normalizedInput) {
-      notifySelection(null)
-      return
-    }
-
-    const account =
-      valueMode === "id"
-        ? (await resolveAccountById(normalizedInput)) || (await resolveAccountByCode(normalizedInput))
-        : await resolveAccountByCode(normalizedInput)
-    notifySelection(account)
-
-    if (account) {
-      onValueChange(valueMode === "id" ? String(account.id) : account.code)
-      setDisplayValue(formatAccountLabel(account, displayNameFirst, displayIdOnly))
-    }
+    // فتح نافذة البحث (بعد Enter لكود غير موجود) يُفقد الحقل التركيز — لا يُمسح النص حينها
+    if (searchOpeningRef.current || searchDialogOpen) return
+    await commitTypedText(false)
   }
 
-  const handleOpenSearch = async () => {
-    await loadAccounts()
-    setSearchDialogOpen(true)
-  }
 
   const handleSelectFromSearch = (account: AccountItem) => {
+    typedTextRef.current = null
+    searchOpeningRef.current = false
+    if (!currencyAllows(account)) {
+      setSearchDialogOpen(false)
+      setTimeout(() => inputRef.current?.focus(), 50)
+      return
+    }
     onValueChange(valueMode === "id" ? String(account.id) : normalizeAccountCode(account.code))
     notifySelection(account)
     setDisplayValue(formatAccountLabel(account, displayNameFirst, displayIdOnly))
     setSearchDialogOpen(false)
+    // نافذة البحث تمنع onCloseAutoFocus (حتى لا تسرقه من شبكات Wijmo المجاورة) — لذا يجب إعادة
+    // التركيز صراحة هنا، وإلا يضيع التركيز تماماً بعد الاختيار ولا يعود مفتاح Enter يعمل كـ Tab.
+    setTimeout(() => inputRef.current?.focus(), 50)
   }
 
   const handleClear = () => {
@@ -301,30 +479,86 @@ export default function AutoCompleteAccount({
   const showAnyAction = showSearchAction || showCostCenterAction || showClearAction
 
   return (
-    <div className={className} dir="rtl">
-      <Label className="mb-2 block text-sm font-medium">{label}</Label>
+    <div className={className} dir={appDir()}>
+      {label && <Label className="mb-2 block text-sm font-medium">{label}</Label>}
       <div className="flex items-center gap-2">
+        <div className="relative min-w-0 flex-1">
         <Input
+          ref={inputRef}
           value={displayValue}
           onChange={handleChange}
           onBlur={handleBlur}
           onFocus={() => {
+            typedTextRef.current = null
             setIsFocused(true)
             setDisplayValue(selectedAccount ? formatAccountLabel(selectedAccount, displayNameFirst, displayIdOnly) : value)
           }}
           onKeyDown={(event) => {
-            if (event.key === "Enter") {
+            if ((event.key === "ArrowDown" || event.key === "ArrowUp") && matchingAccounts.length > 0) {
               event.preventDefault()
-              void handleBlur()
+              event.stopPropagation()
+              const last = matchingAccounts.length - 1
+              setHighlightedIndex((index) => event.key === "ArrowDown" ? (index >= last ? 0 : index + 1) : (index <= 0 ? last : index - 1))
+              return
+            }
+            if (event.key === "Escape" && highlightedIndex >= 0) {
+              event.preventDefault()
+              setHighlightedIndex(-1)
+              return
+            }
+            if (event.key === "Enter") {
+              const highlighted = highlightedIndex >= 0 ? matchingAccounts[highlightedIndex] : undefined
+              if (highlighted) {
+                event.preventDefault()
+                event.stopPropagation()
+                handleSelectFromSearch(highlighted)
+                return
+              }
+              // لا كتابة وحساب مختار ⇐ يُترك Enter للتنقل (Enter كـTab)
+              if (typedTextRef.current === null && (selectedAccount || normalizedValue)) return
+              // المربع فارغ ⇐ التركيز لزر البحث (emptyEnterFocusesSearch)
+              if (emptyEnterFocusesSearch && !String(typedTextRef.current ?? "").trim() && !selectedAccount && searchButtonRef.current && !disabled) {
+                event.preventDefault()
+                event.stopPropagation()
+                if (typedTextRef.current !== null) { typedTextRef.current = null; onValueChange(""); notifySelection(null) }
+                searchButtonRef.current.focus()
+                return
+              }
+              event.preventDefault()
+              void commitTypedText(true)
+            } else if (event.key === "F10" && showSearchButton && !disabled) {
+              event.preventDefault()
+              void handleOpenSearch()
             }
           }}
-          maxLength={8}
+          maxLength={100}
           placeholder={placeholder}
-          className={`text-right uppercase ${inputClassName}`}
+          className={`text-start ${inputClassName}`}
           disabled={disabled}
           autoComplete="off"
           inputMode="text"
         />
+        {matchingAccounts.length > 0 && (
+          <div ref={suggestionListRef} className="absolute inset-x-0 top-full z-50 mt-1 max-h-64 overflow-y-auto rounded-md border bg-white p-1 shadow-lg" role="listbox">
+            {matchingAccounts.map((account, index) => (
+              <button
+                key={account.id}
+                type="button"
+                role="option"
+                tabIndex={-1}
+                aria-selected={index === highlightedIndex}
+                onMouseEnter={() => setHighlightedIndex(index)}
+                className={`flex w-full items-center justify-between gap-3 rounded px-3 py-2 text-start text-sm hover:bg-slate-100 focus:bg-slate-100 ${index === highlightedIndex ? "bg-blue-100 text-blue-900" : ""}`}
+                onMouseDown={(event) => event.preventDefault()}
+                onClick={() => handleSelectFromSearch(account)}
+              >
+                <span>{account.name}</span>
+                <span className="shrink-0 text-xs text-muted-foreground">{account.code}</span>
+              </button>
+            ))}
+          </div>
+        )}
+        </div>
         {showAnyAction && (
           <div className="flex items-center gap-2 shrink-0">
             {showSearchAction && (
@@ -333,9 +567,11 @@ export default function AutoCompleteAccount({
                 variant="outline"
                 size="sm"
                 className="h-9 px-3 border-slate-200 bg-slate-50 text-slate-700 hover:bg-blue-50 hover:text-blue-700"
+                ref={searchButtonRef}
                 onClick={() => void handleOpenSearch()}
                 disabled={disabled}
-                title="بحث عن الحساب"
+                tabIndex={-1}
+                title={tr("بحث عن الحساب (F10)")}
               >
                 <Search className="h-4 w-4" />
               </Button>
@@ -347,8 +583,9 @@ export default function AutoCompleteAccount({
                 size="sm"
                 className="h-9 px-3 border-slate-200 bg-slate-50 text-emerald-700 hover:bg-emerald-50 hover:text-emerald-800"
                 onClick={handleOpenCostCenters}
+                tabIndex={-1}
                 disabled={disabled || costCenterButtonDisabled || !selectedAccount}
-                title="مراكز الكلفة"
+                title={tr("مراكز الكلفة")}
               >
                 <CircleDollarSign className="h-4 w-4" />
               </Button>
@@ -361,7 +598,8 @@ export default function AutoCompleteAccount({
                 className="h-9 px-3 border-slate-200 bg-slate-50 text-rose-600 hover:bg-rose-50 hover:text-rose-700"
                 onClick={handleClear}
                 disabled={disabled}
-                title="مسح"
+                tabIndex={-1}
+                title={tr("مسح")}
               >
                 <X className="h-4 w-4" />
               </Button>
@@ -374,9 +612,11 @@ export default function AutoCompleteAccount({
             variant="default"
             size="sm"
             className="h-9 px-3 shrink-0"
+            ref={searchButtonRef}
             onClick={() => void handleOpenSearch()}
             disabled={disabled}
-            title="بحث عن الحساب"
+            tabIndex={-1}
+            title={tr("بحث عن الحساب (F10)")}
           >
             <Search className="h-4 w-4" />
           </Button>
@@ -385,13 +625,36 @@ export default function AutoCompleteAccount({
 
       <AccountSearchDialog
         open={searchDialogOpen}
-        onOpenChange={setSearchDialogOpen}
+        onOpenChange={(open) => {
+          setSearchDialogOpen(open)
+          if (open) return
+          // أُغلقت دون اختيار: كود مكتوب غير موجود لا يبقى معلّقاً بالحقل
+          if (searchOpeningRef.current && typedTextRef.current !== null) {
+            typedTextRef.current = null
+            onValueChange("")
+            setDisplayValue("")
+            notifySelection(null)
+          }
+          searchOpeningRef.current = false
+          setTimeout(() => inputRef.current?.focus(), 50)
+        }}
         accounts={accounts}
         onSelect={handleSelectFromSearch}
         allowedTypeValues={requiredTypeValues ?? searchAllowedTypeValues}
         defaultTypeValue={searchDefaultTypeValue}
         showFinancialListFilter={showFinancialListFilter}
         showTypeFilter={showTypeFilter}
+        showDeliveryOnlyFilter={showDeliveryOnlyFilter}
+        lockDeliveryOnlyFilter={lockDeliveryOnlyFilter}
+        deliveryVchTypes={deliveryVchTypes}
+        showOrderOnlyFilter={showOrderOnlyFilter}
+        lockOrderOnlyFilter={lockOrderOnlyFilter}
+        orderType={orderType}
+        branchId={branchId}
+        leafOnly={leafOnly}
+        emptyActionLabel={emptyActionLabel}
+        emptyActionHref={emptyActionHref}
+        initialSearch={searchSeed}
       />
 
       {showCostCenterDialog && (
@@ -399,6 +662,8 @@ export default function AutoCompleteAccount({
           open={costCentersOpen}
           onOpenChange={setCostCentersOpen}
           account={selectedAccount}
+          value={costCenters}
+          onChange={onCostCentersChange}
         />
       )}
     </div>

@@ -1,8 +1,11 @@
 "use client"
 
-import { useEffect, useMemo, useRef, useState } from "react"
-import { AlertCircle, CheckCircle, Download, FileSpreadsheet, Plus, RefreshCw, Upload } from "lucide-react"
-import DataGridView from "@/components/common/DataGridView"
+import { tr, appDir } from "@/lib/i18n"
+import { confirmYesNo } from "@/components/ui/confirm-host"
+import { consumeNewRecordParam } from "@/lib/new-record-param"
+import { useEffect, useMemo, useState } from "react"
+import { BookOpen as BookOpenIcon, CheckCircle, FileSpreadsheet, Plus, RefreshCw } from "lucide-react"
+import { VoucherListHero, VoucherStats } from "@/components/common/voucher-list-shell"
 import UnifiedAccounts from "@/components/customer/unified-accounts-refactored"
 import { Accordion, AccordionItem, AccordionTrigger, AccordionContent } from "@/components/ui/accordion"
 
@@ -12,11 +15,12 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog"
+import { useWorkspace } from "@/contexts/workspace-context"
 import { Alert, AlertDescription } from "@/components/ui/alert"
 import { Textarea } from "@/components/ui/textarea"
-import { Dropdown as PrimeDropdown } from "primereact/dropdown"
+import PrimeDropdown from "@/components/common/FocusDropdown"
 import MultiSelect from "@/components/common/MultiSelect"
-import * as XLSX from "xlsx"
+import { AccountsImportDialog } from "@/components/import/accounts-import"
 
 interface AccountType {
   id: number
@@ -62,36 +66,8 @@ interface FormState {
   status: string
 }
 
-type ExcelAccountRow = {
-  rowIndex: number
-  code: string
-  name: string
-  name_lang2: string
-  father_reference: string
-  finanical_list_id: number | null
-  finanical_list_name: string
-  currency_id: number | null
-  currency_name: string
-  currency_code: string
-  raw_balance_sheet_assets: string
-  raw_balance_sheet_liabilities: string
-  raw_income_statement_item: string
-  finanical_list_assests_id: number | null
-  finanical_list_liabilities_id: number | null
-  finanical_list_income_id: number | null
-  status: string
-  errors: string[]
-  isValid: boolean
-}
-
-type ExcelImportSummary = {
-  success: number
-  failed: number
-  duplicates: number
-  errors: string[]
-}
-
 export default function Accounts() {
+  const { fullscreenEnabled } = useWorkspace()
   const [dialogOpen, setDialogOpen] = useState(false)
   const [showUnifiedPopup, setShowUnifiedPopup] = useState(false)
   const [showExcelImportDialog, setShowExcelImportDialog] = useState(false)
@@ -110,19 +86,6 @@ export default function Accounts() {
   const [search, setSearch] = useState("")
   const [filterFinancialList, setFilterFinancialList] = useState<string[]>([])
   const [filterStatus, setFilterStatus] = useState("")
-  const [excelFile, setExcelFile] = useState<File | null>(null)
-  const [excelRows, setExcelRows] = useState<ExcelAccountRow[]>([])
-  const [excelProcessing, setExcelProcessing] = useState(false)
-  const [excelImporting, setExcelImporting] = useState(false)
-  const [excelImportProgress, setExcelImportProgress] = useState({ current: 0, total: 0 })
-  const [excelSummary, setExcelSummary] = useState<ExcelImportSummary | null>(null)
-  const [excelStep, setExcelStep] = useState<"upload" | "preview" | "result">("upload")
-  const [excelTemplateType, setExcelTemplateType] = useState("none")
-  const [excelExportRows, setExcelExportRows] = useState<any[]>([])
-  const [excelExportLoading, setExcelExportLoading] = useState(false)
-  const [excelExportError, setExcelExportError] = useState("")
-  const [excelValidationAccounts, setExcelValidationAccounts] = useState<Array<{ code: string; name: string }>>([])
-  const excelInputRef = useRef<HTMLInputElement>(null)
   
 
   const [formData, setFormData] = useState<FormState>({
@@ -147,112 +110,6 @@ export default function Accounts() {
     loadData()
   }, [])
 
-  const normalizeLookupValue = (value: unknown) =>
-    String(value ?? "")
-      .trim()
-      .replace(/\s+/g, "")
-      .toLowerCase()
-
-  const normalizeReferenceValue = (value: unknown) =>
-    String(value ?? "")
-      .trim()
-      .replace(/[\s_-]+/g, "")
-      .toLowerCase()
-
-  const getExcelCell = (row: any, keys: string[]) => {
-    for (const key of keys) {
-      const value = row?.[key]
-      if (value !== undefined && value !== null && String(value).trim() !== "") {
-        return String(value).trim()
-      }
-    }
-    return ""
-  }
-
-  const resolveByIdOrName = (value: string, items: Array<{ id: number; name: string }>) => {
-    const trimmed = String(value ?? "").trim()
-    if (!trimmed) return null
-
-    const numeric = Number(trimmed)
-    if (Number.isFinite(numeric)) {
-      const byId = items.find((item) => Number(item.id) === numeric)
-      return byId ?? { id: numeric, name: trimmed }
-    }
-
-    const normalized = normalizeLookupValue(trimmed)
-    return items.find((item) => normalizeLookupValue(item.name) === normalized) || null
-  }
-
-  const resolveAccountReference = (value: string, items: Account[]) => {
-    const trimmed = String(value ?? "").trim()
-    if (!trimmed) return null
-
-    const numeric = Number(trimmed)
-    if (Number.isFinite(numeric)) {
-      const byId = items.find((item) => Number(item.id) === numeric)
-      if (byId) return byId
-    }
-
-    const normalized = normalizeReferenceValue(trimmed)
-    return (
-      items.find((item) => {
-        return (
-          normalizeReferenceValue(item.code) === normalized ||
-          normalizeReferenceValue(item.name) === normalized ||
-          normalizeReferenceValue(item.name_lang2) === normalized
-        )
-      }) || null
-    )
-  }
-
-  const resolveCurrency = (value: string) => {
-    const trimmed = String(value ?? "").trim()
-    if (!trimmed) return null
-
-    const normalized = normalizeLookupValue(trimmed)
-    const numeric = Number(trimmed)
-    const aliasMap: Record<string, string[]> = {
-      nis: ["nis", "ils", "شيقل", "شيكل", "شيكلاسرائيلي", "شيقلاسرائيلي"],
-      ils: ["nis", "ils", "شيقل", "شيكل", "شيكلاسرائيلي", "شيقلاسرائيلي"],
-    }
-
-    const normalizedAliases = aliasMap[normalized] || [normalized]
-
-    return (
-      currencies.find((currency) => {
-        const currencyId = Number(currency.currency_id ?? currency.id)
-        const currencyName = String(currency.currency_name ?? currency.name ?? "")
-        const currencyCode = String(currency.currency_code ?? currency.code ?? "")
-        const currencyNameNormalized = normalizeLookupValue(currencyName)
-        const currencyCodeNormalized = normalizeLookupValue(currencyCode)
-
-        if (Number.isFinite(numeric) && currencyId === numeric) return true
-
-        return (
-          normalizedAliases.includes(currencyNameNormalized) ||
-          normalizedAliases.includes(currencyCodeNormalized)
-        )
-      }) || null
-    )
-  }
-
-  const currencyFallbackFor = (value: string) => {
-    const normalized = normalizeLookupValue(value)
-    if (!["nis", "ils", "شيقل", "شيكل", "شيكلاسرائيلي", "شيقلاسرائيلي"].includes(normalized)) {
-      return null
-    }
-
-    const baseCurrency = currencies.find((currency) => Number(currency.currency_id ?? currency.id) === 1 || normalizeLookupValue(currency.currency_code ?? currency.code) === "nis")
-    if (baseCurrency) return baseCurrency
-
-    return {
-      currency_id: 1,
-      currency_name: "شيقل",
-      currency_code: "NIS",
-      id: 1,
-    }
-  }
-  
   const normalizeAccountRecord = (item: any): Account => {
     const finanicalListId = Number(item.finanical_list_id ?? item.financial_list_id ?? 1) || 1
     const statusValue = item.status ?? item.account_status ?? "نشط"
@@ -262,7 +119,8 @@ export default function Accounts() {
       ...item,
       code: item.code || item.account_code || "",
       name: item.name || item.account_name || "",
-      type: Number(item.type || 0),
+      // /api/accounts يعيد النوع باسم classification_type_id — بدونه كان الفلتر (النوع 1) عند فتح الشاشة يُخفي كل الحسابات
+      type: Number(item.type ?? item.classification_type_id ?? 0),
       level_no: Number(item.level_no || 1),
       finanical_list_id: finanicalListId,
       finanical_list_name:
@@ -288,857 +146,18 @@ export default function Accounts() {
 
     if (!cleaned) return ""
 
-    if (cleaned.length >= 8) {
-      return cleaned.slice(0, 8)
+    if (cleaned.length >= 10) {
+      return cleaned.slice(0, 10)
     }
 
+    // إكمال الرقم إلى 10 خانات بإضافة أصفار في النهاية (لا البداية) — كود مثل "110000000" (9 خانات)
+    // يجب أن يصبح "1100000000" لا "0110000000"، حتى لا يتغيّر الرقم الفعلي المقصود بإضافة صفر
+    // بمقدمته (يُحوّله لحساب مختلف تماماً ضمن هيكل الحسابات).
     if (/^\d+$/.test(cleaned)) {
-      return cleaned.padStart(8, "0")
+      return cleaned.padEnd(10, "0")
     }
 
-    return cleaned.padEnd(8, "0").slice(0, 8)
-  }
-
-  const normalizeFatherCodeFromJson = (value: unknown) => {
-    const trimmed = String(value ?? "").trim()
-    if (!trimmed) return ""
-
-    const collapsed = trimmed.replace(/\s+/g, "")
-    if (collapsed.endsWith("0")) {
-      const shortened = collapsed.slice(0, -1)
-      return shortened || collapsed
-    }
-
-    return collapsed
-  }
-
-  const loadExcelValidationAccounts = async () => {
-    const response = await fetch("/api/accounts?type=1")
-    if (!response.ok) {
-      throw new Error("فشل تحميل الحسابات للتحقق من التكرار")
-    }
-
-    const data = await response.json()
-    const latestAccounts = Array.isArray(data)
-      ? data.map((item: any) => ({
-          code: normalizeAccountCode(String(item.code || item.account_code || "")),
-          name: String(item.name || item.account_name || "").trim(),
-        }))
-      : []
-
-    setExcelValidationAccounts(latestAccounts)
-    return latestAccounts
-  }
-
-  const getExcelDuplicateError = (code: string, name: string, latestAccounts: Array<{ code: string; name: string }>) => {
-    const normalizedCode = normalizeAccountCode(code)
-    const normalizedName = normalizeLookupValue(name)
-
-    if (normalizedCode && latestAccounts.some((account) => normalizeAccountCode(account.code) === normalizedCode)) {
-      return `رقم الحساب موجود مسبقاً: ${normalizedCode}`
-    }
-
-    if (normalizedName && latestAccounts.some((account) => normalizeLookupValue(account.name) === normalizedName)) {
-      return `اسم الحساب موجود مسبقاً: ${name}`
-    }
-
-    return null
-  }
-
-  const getExcelFatherSelfError = (code: string, fatherReference: string) => {
-    const normalizedCode = normalizeAccountCode(code)
-    const normalizedFather = normalizeAccountCode(fatherReference)
-
-    if (normalizedCode && normalizedFather && normalizedCode === normalizedFather) {
-      return "لا يمكن ان يكون الحساب تابع لنفسه"
-    }
-
-    return null
-  }
-
-  const mapFinancialList = (value: string) => {
-    const normalized = normalizeLookupValue(value)
-    if (!normalized) return null
-
-    if (["1", "الميزانيةالعمومية", "الميزانية", "ميزانيةعمومية", "balance", "balancesheet"].includes(normalized)) return 1
-    if (["2", "قائمةالدخل", "الدخل", "income", "incomestatement"].includes(normalized)) return 2
-    if (["3", "تقييمبضاعة", "تقييم", "merchandise", "inventoryvaluation"].includes(normalized)) return 3
-
-    const numeric = Number(value)
-    return [1, 2, 3].includes(numeric) ? numeric : null
-  }
-
-  const buildExcelRows = (rawRows: any[], latestAccounts: Array<{ code: string; name: string }> = excelValidationAccounts) => {
-    const seenCodes = new Set<string>()
-
-    return rawRows.map((row, index) => {
-      const errors: string[] = []
-      const rawCode = getExcelCell(row, ["رقم الحساب", "account_code", "code"])
-      const rawName = getExcelCell(row, ["اسم الحساب", "account_name", "name"])
-      const rawFinancialList = getExcelCell(row, ["القائمة المالية", "financial_list", "finanical_list_id"])
-      const rawCurrency = getExcelCell(row, ["العملة", "currency", "currency_name", "currency_code", "currency_id"])
-      const rawFather = getExcelCell(row, ["حساب الاب", "الحساب الأب", "father_code", "father_account_code", "father", "parent_account", "father_id"])
-      const rawBalanceSheetAssets = getExcelCell(row, ["أصول الميزانية", "اصول الميزانية", "balance_sheet_assets", "finanical_list_assests_id"])
-      const rawBalanceSheetLiabilities = getExcelCell(row, ["خصوم الميزانية", "balance_sheet_liabilities", "finanical_list_liabilities_id"])
-      const rawBalanceSheetItem = getExcelCell(row, ["اصول وخصوم الميزانية", "أصول وخصوم الميزانية", "balance_sheet_item"])
-      const rawIncomeItem = getExcelCell(row, ["بند قائمة الدخل", "income_statement_item", "finanical_list_income_id"])
-
-      const code = normalizeAccountCode(rawCode)
-      const name = rawName.trim()
-      const name_lang2 = name
-      const finanical_list_id = mapFinancialList(rawFinancialList)
-      const currencyMatch = resolveCurrency(rawCurrency) ?? currencyFallbackFor(rawCurrency)
-
-      let currency_id: number | null = null
-      let currency_name = ""
-      let currency_code = ""
-      let finanical_list_assests_id: number | null = null
-      let finanical_list_liabilities_id: number | null = null
-      let finanical_list_income_id: number | null = null
-
-      if (code) {
-        if (seenCodes.has(code)) {
-          errors.push(`رقم الحساب مكرر داخل الملف: ${code}`)
-        }
-        const duplicateError = getExcelDuplicateError(code, name, latestAccounts)
-        if (duplicateError) {
-          errors.push(duplicateError)
-        }
-        seenCodes.add(code)
-      }
-
-      if (!code) errors.push("رقم الحساب مطلوب")
-      if (!name) errors.push("اسم الحساب مطلوب")
-      if (!finanical_list_id) errors.push("القائمة المالية مطلوبة")
-      const fatherSelfError = getExcelFatherSelfError(code, rawFather)
-      if (fatherSelfError) errors.push(fatherSelfError)
-      if (!rawCurrency) {
-        errors.push("العملة مطلوبة")
-      } else if (!currencyMatch) {
-        errors.push(`العملة غير موجودة: ${rawCurrency}`)
-      } else {
-        currency_id = Number(currencyMatch.currency_id ?? currencyMatch.id)
-        currency_name = String(currencyMatch.currency_name ?? currencyMatch.name ?? "")
-        currency_code = String(currencyMatch.currency_code ?? currencyMatch.code ?? "")
-      }
-
-      if (finanical_list_id === 1) {
-        const assetSource = rawBalanceSheetAssets || rawBalanceSheetItem
-        const liabilitySource = rawBalanceSheetLiabilities || rawBalanceSheetItem
-
-        if (!assetSource && !liabilitySource) {
-          errors.push("يجب تحديد أصول الميزانية وخصومها")
-        } else {
-          const assetMatch = assetSource ? resolveByIdOrName(assetSource, balanceSheetAssets) : null
-          const liabilityMatch = liabilitySource ? resolveByIdOrName(liabilitySource, balanceSheetLiabilities) : null
-
-          if (assetSource && !assetMatch) {
-            errors.push(`أصول الميزانية غير موجودة: ${assetSource}`)
-          }
-
-          if (assetMatch) {
-            finanical_list_assests_id = assetMatch?.id ?? null
-          }
-
-          if (liabilitySource && !liabilityMatch) {
-            errors.push(`خصوم الميزانية غير موجودة: ${liabilitySource}`)
-          }
-
-          if (liabilityMatch) {
-            finanical_list_liabilities_id = liabilityMatch?.id ?? null
-          }
-        }
-      }
-
-      if (finanical_list_id === 2 || finanical_list_id === 3) {
-        if (!rawIncomeItem) {
-          errors.push("بند قائمة الدخل مطلوب")
-        } else {
-          const incomeMatch = resolveByIdOrName(rawIncomeItem, incomeStatementItems)
-          if (!incomeMatch) {
-            errors.push(`بند قائمة الدخل غير موجود: ${rawIncomeItem}`)
-          }
-          if (incomeMatch) {
-            finanical_list_income_id = incomeMatch.id
-          }
-        }
-      }
-
-      return {
-        rowIndex: index + 2,
-        code,
-        name,
-        name_lang2,
-        father_reference: rawFather,
-        finanical_list_id,
-        finanical_list_name:
-          finanical_list_id === 1 ? "الميزانية العمومية" : finanical_list_id === 2 ? "قائمة الدخل" : finanical_list_id === 3 ? "تقييم بضاعة" : "",
-        currency_id,
-        currency_name,
-        currency_code,
-        raw_balance_sheet_assets: rawBalanceSheetAssets || rawBalanceSheetItem,
-        raw_balance_sheet_liabilities: rawBalanceSheetLiabilities || rawBalanceSheetItem,
-        raw_income_statement_item: rawIncomeItem,
-        finanical_list_assests_id,
-        finanical_list_liabilities_id,
-        finanical_list_income_id,
-        status: getExcelCell(row, ["الحالة", "status"]) || "نشط",
-        errors,
-        isValid: errors.length === 0,
-      } as ExcelAccountRow
-    })
-  }
-
-  const resetExcelImport = () => {
-    setExcelFile(null)
-    setExcelRows([])
-    setExcelSummary(null)
-    setExcelStep("upload")
-    setExcelProcessing(false)
-    setExcelImporting(false)
-    setExcelImportProgress({ current: 0, total: 0 })
-    setExcelTemplateType("none")
-    setExcelExportRows([])
-    setExcelExportLoading(false)
-    setExcelExportError("")
-    if (excelInputRef.current) {
-      excelInputRef.current.value = ""
-    }
-  }
-
-  const loadExportRows = async (typeId: string) => {
-    if (typeId === "none") {
-      setExcelExportRows([])
-      setExcelExportError("")
-      setExcelExportLoading(false)
-      return
-    }
-
-    setExcelExportLoading(true)
-    setExcelExportError("")
-    try {
-      const response = await fetch(`/api/accounts-export-source?type=${encodeURIComponent(typeId)}`)
-      if (!response.ok) {
-        throw new Error("فشل تحميل بيانات الحسابات")
-      }
-
-      const data = await response.json()
-      setExcelExportRows(Array.isArray(data?.rows) ? data.rows : [])
-    } catch (err: any) {
-      console.error(err)
-      setExcelExportRows([])
-      setExcelExportError(err?.message || "فشل تحميل البيانات")
-    } finally {
-      setExcelExportLoading(false)
-    }
-  }
-
-  useEffect(() => {
-    if (!showExcelImportDialog) return
-
-    void loadExcelValidationAccounts().catch((err) => {
-      console.error(err)
-    })
-
-    if (excelTemplateType === "none") {
-      setExcelExportRows([])
-      setExcelExportError("")
-      setExcelExportLoading(false)
-      return
-    }
-
-    void loadExportRows(excelTemplateType)
-  }, [excelTemplateType, showExcelImportDialog])
-
-  const excelGridColumns = [
-    { header: "##", name: "rowIndex", width: 60, isReadOnly: true },
-    { header: "رقم الحساب", name: "code", width: 120, isReadOnly: true },
-    { header: "اسم الحساب", name: "name", width: 180, isReadOnly: true },
-    { header: "اسم الحساب بالانجليزي", name: "name_lang2", width: 200, isReadOnly: true },
-    { header: "الحساب الأب", name: "father_code", width: 120, isReadOnly: true },
-    { header: "العملة", name: "currency_name", width: 100, isReadOnly: true },
-    { header: "القائمة المالية", name: "finanical_list_name", width: 140, isReadOnly: true },
-    { header: "بند أصول الميزانية", name: "finanical_list_assests_id", width: 140, isReadOnly: true },
-    { header: "بند خصوم الميزانية", name: "finanical_list_liabilities_id", width: 140, isReadOnly: true },
-    { header: "بند قائمة الدخل", name: "finanical_list_income_id", width: 140, isReadOnly: true },
-    { header: "التحقق", name: "validation_text", width: 220, isReadOnly: true },
-  ]
-
-  const excelGridScheme = { isReport: true, columns: excelGridColumns }
-
-  const getCurrencyDisplay = (currencyId: unknown) => {
-    const numericId = Number(currencyId)
-    const matchedCurrency = currencies.find((currency) => Number(currency.currency_id ?? currency.id) === numericId)
-    const fallbackCurrency = currencies[0] || null
-    const displayCurrency = matchedCurrency || fallbackCurrency
-
-    if (!displayCurrency) {
-      return {
-        currency_id: Number.isFinite(numericId) ? numericId : 1,
-        currency_name: "",
-        currency_code: "",
-      }
-    }
-
-    return {
-      currency_id: Number(displayCurrency.currency_id ?? displayCurrency.id ?? numericId ?? 1),
-      currency_name: String(displayCurrency.currency_name ?? displayCurrency.name ?? ""),
-      currency_code: String(displayCurrency.currency_code ?? displayCurrency.code ?? ""),
-    }
-  }
-
-  const getFinancialListLabel = (financialList: unknown) => {
-    switch (String(financialList ?? "").trim()) {
-      case "1":
-        return "الميزانية العمومية"
-      case "2":
-        return "قائمة الدخل"
-      case "3":
-        return "تقييم بضاعة"
-      default:
-        return String(financialList ?? "")
-    }
-  }
-
-  const buildExportGridRow = (row: any, index: number) => {
-    const exportRow: any = row
-    const currencyDisplay = getCurrencyDisplay(exportRow.currency_id)
-    const code = normalizeAccountCode(String(exportRow.code ?? ""))
-    const name = String(exportRow.name ?? "").trim()
-    const errors: string[] = []
-    const fatherReference = normalizeFatherCodeFromJson(exportRow.father_code || exportRow.father_account_code || exportRow.father || exportRow.father_id || "")
-
-    if (!code) errors.push("رقم الحساب مطلوب")
-    if (!name) errors.push("اسم الحساب مطلوب")
-    const duplicateError = getExcelDuplicateError(code, name, excelValidationAccounts)
-    if (duplicateError) errors.push(duplicateError)
-    const fatherSelfError = getExcelFatherSelfError(code, fatherReference)
-    if (fatherSelfError) errors.push(fatherSelfError)
-
-    const financialListId = Number(exportRow.financial_list ?? exportRow.finanical_list_id ?? 1) || 1
-    if (financialListId === 1) {
-      const assetValue = String(exportRow.finanical_list_assests_id ?? exportRow.financial_list_assests ?? exportRow.financial_list_assests_id ?? "").trim()
-      const liabilityValue = String(exportRow.finanical_list_liabilities_id ?? exportRow.financial_list_liabilities ?? exportRow.financial_list_liabilities_id ?? "").trim()
-      const combinedValue = String(exportRow.balance_sheet_item ?? "").trim()
-
-      if (!assetValue && !liabilityValue && !combinedValue) {
-        errors.push("يجب تحديد أصول الميزانية وخصومها")
-      }
-    }
-
-    if (financialListId === 2 || financialListId === 3) {
-      const incomeValue = String(exportRow.finanical_list_income_id ?? exportRow.financial_list_income ?? exportRow.financial_list_income_id ?? "").trim()
-      if (!incomeValue) {
-        errors.push("بند قائمة الدخل مطلوب")
-      }
-    }
-
-    return {
-      ...exportRow,
-      rowIndex: index + 1,
-      code,
-      name,
-      name_lang2: name,
-      father_code: normalizeFatherCodeFromJson(exportRow.father_code || exportRow.father_account_code || exportRow.father || exportRow.father_id || ""),
-      currency_id: currencyDisplay.currency_id,
-      currency_name: currencyDisplay.currency_name,
-      currency_code: currencyDisplay.currency_code,
-      finanical_list_name: getFinancialListLabel(exportRow.financial_list ?? exportRow.finanical_list_id ?? exportRow.finanical_list_name),
-      finanical_list_assests_id:
-        exportRow.finanical_list_assests_id || exportRow.financial_list_assests || exportRow.financial_list_assests_id || "",
-      finanical_list_liabilities_id:
-        exportRow.finanical_list_liabilities_id || exportRow.financial_list_liabilities || exportRow.financial_list_liabilities_id || "",
-      finanical_list_income_id:
-        exportRow.finanical_list_income_id || exportRow.financial_list_income || exportRow.financial_list_income_id || "",
-      validation_text: errors.length === 0 ? "صالح" : errors[0],
-    }
-  }
-
-  const buildPreviewGridRow = (row: any) => {
-    const previewRow: any = row
-    const currencyDisplay = getCurrencyDisplay(previewRow.currency_id)
-    const fatherReference = normalizeFatherCodeFromJson(previewRow.father_code || previewRow.father_account_code || previewRow.father || previewRow.father_id || "")
-    const code = normalizeAccountCode(String(previewRow.code ?? ""))
-    const name = String(previewRow.name ?? previewRow.name_lang2 ?? "").trim()
-    const errors: string[] = Array.isArray(previewRow.errors) ? [...previewRow.errors] : []
-
-    const duplicateError = getExcelDuplicateError(code, name, excelValidationAccounts)
-    if (duplicateError && !errors.includes(duplicateError)) errors.push(duplicateError)
-    const fatherSelfError = getExcelFatherSelfError(code, fatherReference)
-    if (fatherSelfError && !errors.includes(fatherSelfError)) errors.push(fatherSelfError)
-
-    const financialListId = Number(previewRow.financial_list ?? previewRow.finanical_list_id ?? 1) || 1
-    if (financialListId === 1) {
-      const assetValue = String(previewRow.finanical_list_assests_id ?? previewRow.financial_list_assests_id ?? "").trim()
-      const liabilityValue = String(previewRow.finanical_list_liabilities_id ?? previewRow.financial_list_liabilities_id ?? "").trim()
-      const combinedValue = String(previewRow.balance_sheet_item ?? "").trim()
-      if (!assetValue && !liabilityValue && !combinedValue) {
-        errors.push("يجب تحديد أصول الميزانية وخصومها")
-      }
-    }
-
-    if (financialListId === 2 || financialListId === 3) {
-      const incomeValue = String(previewRow.finanical_list_income_id ?? previewRow.financial_list_income_id ?? "").trim()
-      if (!incomeValue) {
-        errors.push("بند قائمة الدخل مطلوب")
-      }
-    }
-
-    return {
-      ...previewRow,
-      code,
-      name,
-      father_code: normalizeFatherCodeFromJson(previewRow.father_code || previewRow.father_account_code || previewRow.father || previewRow.father_id || ""),
-      currency_id: currencyDisplay.currency_id,
-      currency_name: currencyDisplay.currency_name,
-      currency_code: currencyDisplay.currency_code,
-      name_lang2: previewRow.name || previewRow.name_lang2 || "",
-      finanical_list_name: getFinancialListLabel(previewRow.finanical_list_name || previewRow.financial_list_name),
-      finanical_list_assests_id: previewRow.finanical_list_assests_id || previewRow.financial_list_assests_id || "",
-      finanical_list_liabilities_id: previewRow.finanical_list_liabilities_id || previewRow.financial_list_liabilities_id || "",
-      finanical_list_income_id: previewRow.finanical_list_income_id || previewRow.financial_list_income_id || "",
-      validation_text: errors.length === 0 ? "صالح" : errors[0],
-    }
-  }
-
-  const buildImportRowFromExportRow = (row: any, index: number): ExcelAccountRow => {
-    const currencyDisplay = getCurrencyDisplay(row.currency_id)
-    const code = normalizeAccountCode(String(row.code ?? ""))
-    const name = String(row.name ?? "").trim()
-    const errors: string[] = []
-    const fatherReference = normalizeFatherCodeFromJson(row.father_code ?? row.father_account_code ?? row.father ?? row.father_id ?? "")
-
-    if (!code) errors.push("رقم الحساب مطلوب")
-    if (!name) errors.push("اسم الحساب مطلوب")
-    const duplicateError = getExcelDuplicateError(code, name, excelValidationAccounts)
-    if (duplicateError) errors.push(duplicateError)
-    const fatherSelfError = getExcelFatherSelfError(code, fatherReference)
-    if (fatherSelfError) errors.push(fatherSelfError)
-
-    const finanical_list_id = Number(row.financial_list ?? row.finanical_list_id ?? 1) || 1
-    if (finanical_list_id === 1) {
-      const assetValue = String(row.finanical_list_assests_id ?? row.financial_list_assests ?? row.financial_list_assests_id ?? "").trim()
-      const liabilityValue = String(row.finanical_list_liabilities_id ?? row.financial_list_liabilities ?? row.financial_list_liabilities_id ?? "").trim()
-      const combinedValue = String(row.balance_sheet_item ?? "").trim()
-
-      if (!assetValue && !liabilityValue && !combinedValue) {
-        errors.push("يجب تحديد أصول الميزانية وخصومها")
-      }
-    }
-
-    if (finanical_list_id === 2 || finanical_list_id === 3) {
-      const incomeValue = String(row.finanical_list_income_id ?? row.financial_list_income ?? row.financial_list_income_id ?? "").trim()
-      if (!incomeValue) {
-        errors.push("بند قائمة الدخل مطلوب")
-      }
-    }
-
-    return {
-      rowIndex: index + 1,
-      code,
-      name,
-      name_lang2: name,
-      father_reference: fatherReference,
-      finanical_list_id,
-      finanical_list_name: getFinancialListLabel(row.financial_list ?? row.finanical_list_id ?? row.finanical_list_name),
-      currency_id: currencyDisplay.currency_id,
-      currency_name: currencyDisplay.currency_name,
-      currency_code: currencyDisplay.currency_code,
-      raw_balance_sheet_assets: String(row.finanical_list_assests_id ?? row.financial_list_assests ?? row.financial_list_assests_id ?? "").trim(),
-      raw_balance_sheet_liabilities: String(row.finanical_list_liabilities_id ?? row.financial_list_liabilities ?? row.financial_list_liabilities_id ?? "").trim(),
-      raw_income_statement_item: String(row.finanical_list_income_id ?? row.financial_list_income ?? row.financial_list_income_id ?? "").trim(),
-      finanical_list_assests_id: null,
-      finanical_list_liabilities_id: null,
-      finanical_list_income_id: null,
-      status: String(row.status ?? "نشط"),
-      errors,
-      isValid: errors.length === 0,
-    }
-  }
-
-  const getRowsToImport = () => {
-    if (excelRows.length > 0) {
-      return excelRows.filter((row) => row.isValid)
-    }
-
-    if (excelTemplateType !== "none" && excelExportRows.length > 0) {
-      return excelExportRows.map(buildImportRowFromExportRow).filter((row) => row.isValid)
-    }
-
-    return [] as ExcelAccountRow[]
-  }
-
-  const processExcelFile = async (file: File) => {
-    setExcelProcessing(true)
-    setError("")
-    setMessage("")
-
-    try {
-      const data = await file.arrayBuffer()
-      const workbook = XLSX.read(data, { type: "array" })
-      const sheetName = workbook.SheetNames[0]
-      const worksheet = workbook.Sheets[sheetName]
-      const rawRows: any[] = XLSX.utils.sheet_to_json(worksheet, { defval: "" })
-      const latestAccounts = await loadExcelValidationAccounts()
-
-      if (!rawRows.length) {
-        setError("ملف Excel فارغ")
-        setExcelRows([])
-        setExcelStep("upload")
-        return
-      }
-
-      setExcelRows(buildExcelRows(rawRows, latestAccounts))
-      setExcelStep("preview")
-    } catch (err) {
-      console.error(err)
-      setError("حدث خطأ أثناء قراءة ملف Excel")
-      setExcelRows([])
-      setExcelStep("upload")
-    } finally {
-      setExcelProcessing(false)
-    }
-  }
-
-  const handleExcelFileChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
-    const selectedFile = event.target.files?.[0]
-    if (!selectedFile) return
-
-    if (!selectedFile.name.match(/\.(xlsx|xls)$/i)) {
-      setError("يرجى اختيار ملف Excel (.xlsx أو .xls)")
-      return
-    }
-
-    setExcelFile(selectedFile)
-    await processExcelFile(selectedFile)
-  }
-
-  const importExcelAccounts = async () => {
-    const rowsToImport = getRowsToImport()
-    if (!rowsToImport.length) {
-      setError("لا توجد حسابات صالحة للاستيراد")
-      return
-    }
-
-    setExcelImporting(true)
-    setExcelSummary(null)
-    setError("")
-    setMessage("")
-    setExcelImportProgress({ current: 0, total: rowsToImport.length })
-
-    const summary: ExcelImportSummary = { success: 0, failed: 0, duplicates: 0, errors: [] }
-
-    const accountReferenceMap = new Map<string, number>()
-    const accountCodeReferenceMap = new Map<string, number>()
-    const accountIdReferenceMap = new Map<string, number>()
-    const assetItemCache = new Map<string, { id: number; name: string }>()
-    const liabilityItemCache = new Map<string, { id: number; name: string }>()
-    const incomeItemCache = new Map<string, { id: number; name: string }>()
-
-    const seedAccountReference = (account: Partial<Account> & { account_code?: string; account_name?: string; parent_account_id?: number | null }) => {
-      const accountId = Number(account.id)
-      if (!Number.isFinite(accountId) || accountId <= 0) return
-
-      const idValue = normalizeReferenceValue(account.id)
-      if (idValue) {
-        accountIdReferenceMap.set(idValue, accountId)
-      }
-
-      const codeValues = [account.code, account.account_code]
-      for (const value of codeValues) {
-        const normalized = normalizeReferenceValue(value)
-        if (normalized) {
-          accountCodeReferenceMap.set(normalized, accountId)
-        }
-      }
-
-      const nameValues = [account.name, account.name_lang2, account.account_name]
-      for (const value of nameValues) {
-        const normalized = normalizeReferenceValue(value)
-        if (normalized && !accountReferenceMap.has(normalized)) {
-          accountReferenceMap.set(normalized, accountId)
-        }
-      }
-    }
-
-    const resolveAccountId = async (reference: string) => {
-      const normalized = normalizeReferenceValue(reference)
-      if (!normalized) return null
-
-      const searchCode = String(reference ?? "").trim().toUpperCase()
-      if (!searchCode) return null
-
-      const existingByCode = accountCodeReferenceMap.get(normalized)
-      if (existingByCode) return existingByCode
-
-      const existingById = accountIdReferenceMap.get(normalized)
-      if (existingById) return existingById
-
-      try {
-        const response = await fetch(`/api/accounts/search?code=${encodeURIComponent(searchCode)}`)
-        if (!response.ok) return null
-
-        const account = await response.json()
-        const foundId = Number(account?.id)
-        if (!Number.isFinite(foundId) || foundId <= 0) return null
-
-        seedAccountReference({
-          id: foundId,
-          code: String(account?.code ?? searchCode),
-          name: String(account?.name ?? account?.account_name ?? ""),
-          name_lang2: String(account?.name_lang2 ?? ""),
-          father_id: account?.father_id ?? null,
-          level_no: Number(account?.level_no ?? 1),
-          finanical_list_id: Number(account?.finanical_list_id ?? 1),
-          type: account?.type ?? null,
-          allow_trans_with_diff_curr: Number(account?.allow_trans_with_diff_curr ?? 0),
-          iscalc_curr_diff_rates: Boolean(account?.iscalc_curr_diff_rates),
-          transaction_type: Number(account?.transaction_type ?? 0),
-          max_transaction_amount: Number(account?.max_transaction_amount ?? 0),
-          max_balance_amount: Number(account?.max_balance_amount ?? 0),
-          status: String(account?.status ?? "نشط"),
-        })
-
-        return foundId
-      } catch {
-        const existing = accountReferenceMap.get(normalized)
-        if (existing) return existing
-        return null
-      }
-    }
-
-    const seedLookupCache = (
-      items: Array<{ id: number; name: string }>,
-      cache: Map<string, { id: number; name: string }>,
-    ) => {
-      for (const item of items) {
-        const normalized = normalizeReferenceValue(item.name)
-        if (normalized) {
-          cache.set(normalized, item)
-        }
-        const numericKey = normalizeReferenceValue(item.id)
-        if (numericKey) {
-          cache.set(numericKey, item)
-        }
-      }
-    }
-
-    const resolveOrCreateLookupItem = async (
-      rawValue: string,
-      cache: Map<string, { id: number; name: string }>,
-      endpoint: string,
-    ) => {
-      const trimmed = String(rawValue ?? "").trim()
-      if (!trimmed) return null
-
-      const normalized = normalizeReferenceValue(trimmed)
-      const cached = cache.get(normalized)
-      if (cached) return cached
-
-      const numeric = Number(trimmed)
-      if (Number.isFinite(numeric)) {
-        const fromNumeric = [...cache.values()].find((item) => Number(item.id) === numeric)
-        if (fromNumeric) {
-          cache.set(normalized, fromNumeric)
-          return fromNumeric
-        }
-      }
-
-      const response = await fetch(endpoint, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name: trimmed, status: 1 }),
-      })
-
-      if (!response.ok) {
-        let errorMessage = `فشل حفظ البند: ${trimmed}`
-        try {
-          const errorData = await response.json()
-          errorMessage = errorData.error || errorMessage
-        } catch {
-          // no-op
-        }
-        throw new Error(errorMessage)
-      }
-
-      const created = await response.json()
-      const createdItem = { id: Number(created.id), name: String(created.name ?? trimmed) }
-      if (!Number.isFinite(createdItem.id)) {
-        throw new Error(`تعذر حفظ البند: ${trimmed}`)
-      }
-
-      cache.set(normalized, createdItem)
-      cache.set(normalizeReferenceValue(createdItem.id), createdItem)
-      return createdItem
-    }
-
-    seedLookupCache(balanceSheetAssets, assetItemCache)
-    seedLookupCache(balanceSheetLiabilities, liabilityItemCache)
-    seedLookupCache(incomeStatementItems, incomeItemCache)
-
-    try {
-      for (const row of rowsToImport) {
-        const nextCurrent = summary.success + summary.failed + summary.duplicates + 1
-        setExcelImportProgress({ current: nextCurrent, total: rowsToImport.length })
-        
-        const resolvedAsset = row.raw_balance_sheet_assets
-          ? await resolveOrCreateLookupItem(row.raw_balance_sheet_assets, assetItemCache, "/api/balance-sheet-assets-items")
-          : null
-        const resolvedLiability = row.raw_balance_sheet_liabilities
-          ? await resolveOrCreateLookupItem(row.raw_balance_sheet_liabilities, liabilityItemCache, "/api/balance-sheet-liabilities-items")
-          : null
-        const resolvedIncome = row.raw_income_statement_item
-          ? await resolveOrCreateLookupItem(row.raw_income_statement_item, incomeItemCache, "/api/income-statement-items")
-          : null
-
-        const payload = {
-          code: row.code,
-          name: row.name,
-          name_lang2: row.name_lang2,
-          type: 1,
-          parent_code: row.father_reference || null,
-          father_id: null,
-          level_no: row.father_reference ? 2 : 1,
-          finanical_list_id: row.finanical_list_id ?? 1,
-          finanical_list_assests_id: resolvedAsset?.id ?? row.finanical_list_assests_id,
-          finanical_list_liabilities_id: resolvedLiability?.id ?? row.finanical_list_liabilities_id,
-          finanical_list_income_id: resolvedIncome?.id ?? row.finanical_list_income_id,
-          currency_id: row.currency_id ?? 1,
-          allow_trans_with_diff_curr: 0,
-          iscalc_curr_diff_rates: false,
-          transaction_type: 0,
-          transaction_type_action: 0,
-          max_transaction_amount: 0,
-          max_transaction_amount_action: 0,
-          max_balance_amount: 0,
-          max_balance_action: null,
-          budget_exceeding_perc: null,
-          budget_exceeding_action: null,
-          unified_report_account_no: null,
-          unified_report_group_code: null,
-          notes: null,
-          show_notes_in_transactions_soa: false,
-          status: row.status || "نشط",
-        }
-
-        const response = await fetch("/api/accounts", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload),
-        })
-
-        if (!response.ok) {
-          let errorMessage = "فشل استيراد الحساب"
-          try {
-            const errorData = await response.json()
-            errorMessage = errorData.error || errorMessage
-          } catch {
-            // no-op
-          }
-
-          if (errorMessage.includes("موجود")) {
-            summary.duplicates += 1
-          } else {
-            summary.failed += 1
-          }
-          summary.errors.push(`السطر ${row.rowIndex}: ${errorMessage}`)
-          continue
-        }
-
-                  const createdAccount = await response.json()
-                  seedAccountReference({
-                    id: Number(createdAccount?.id ?? 0),
-                    code: createdAccount?.code || createdAccount?.account_code || row.code,
-                    name: createdAccount?.name || createdAccount?.account_name || row.name,
-                    name_lang2: createdAccount?.name_lang2 || row.name_lang2,
-                    father_id: createdAccount?.father_id ?? null,
-                    level_no: Number(createdAccount?.level_no ?? (row.father_reference ? 2 : 1)),
-                    finanical_list_id: Number(createdAccount?.finanical_list_id ?? row.finanical_list_id ?? 1),
-                    type: createdAccount?.type ?? null,
-                    allow_trans_with_diff_curr: Number(createdAccount?.allow_trans_with_diff_curr ?? 0),
-                    iscalc_curr_diff_rates: Boolean(createdAccount?.iscalc_curr_diff_rates),
-                    transaction_type: Number(createdAccount?.transaction_type ?? 0),
-                    max_transaction_amount: Number(createdAccount?.max_transaction_amount ?? 0),
-                    max_balance_amount: Number(createdAccount?.max_balance_amount ?? 0),
-                    status: createdAccount?.status || row.status || "نشط",
-                  })
-
-        summary.success += 1
-      }
-
-      setExcelSummary(summary)
-      setExcelImportProgress({ current: rowsToImport.length, total: rowsToImport.length })
-      setExcelStep("result")
-      await loadData()
-    } catch (err: any) {
-      console.error(err)
-      setExcelSummary({ success: 0, failed: rowsToImport.length, duplicates: 0, errors: [err?.message || "خطأ غير متوقع أثناء الاستيراد"] })
-      setExcelImportProgress({ current: rowsToImport.length, total: rowsToImport.length })
-      setExcelStep("result")
-    } finally {
-      setExcelImporting(false)
-    }
-  }
-
-  const downloadExcelTemplate = async (typeId = "none") => {
-    const templateTypeName =
-      typeId === "commercial"
-        ? "مؤسسة تجارية"
-        : typeId === "commercial_continuous_inventory"
-          ? "مؤسسة تجارية - جرد مستمر"
-          : typeId === "services"
-            ? "خدمات"
-            : "بلا"
-
-    let sourceRows = excelExportRows
-    if (!sourceRows.length) {
-      const response = await fetch(`/api/accounts-export-source?type=${encodeURIComponent(typeId)}`)
-      if (!response.ok) {
-        throw new Error("فشل تحميل بيانات الحسابات من ملف accounts.json")
-      }
-
-      const data = await response.json()
-      sourceRows = Array.isArray(data?.rows) ? data.rows : []
-      setExcelExportRows(sourceRows)
-    }
-    const parentCodeById = new Map(sourceRows.map((row: any) => [String(row.id ?? ""), row.code]))
-
-    const templateRows = sourceRows.map((row: any) => ({
-      "نوع هيكل الحسابات الافتراضي": templateTypeName,
-      type: String(row.type ?? ""),
-      "رقم الحساب": row.code || "",
-      "اسم الحساب": row.name || "",
-      "اسم الحساب انجليزي": row.name_lang2 || "",
-      "الحساب الأب": row.father ? normalizeFatherCodeFromJson(parentCodeById.get(String(row.father)) || String(row.father)) : "",
-      "العملة": row.currency_id ? String(row.currency_id) : "",
-      "القائمة المالية": String(row.financial_list ?? row.finanical_list_id ?? ""),
-      "اسم القائمة المالية": row.finanical_list_name || row.financial_list_name || "",
-      "أصول الميزانية": row.financial_list_assests || row.finanical_list_assests || "",
-      "خصوم الميزانية": row.financial_list_liabilities || row.finanical_list_liabilities || "",
-      "بند قائمة الدخل": row.financial_list_income || row.finanical_list_income || "",
-      "default_type": row.default_type || "",
-      "السماح بفرق العملة": row.allow_trans_with_diff_curr ? "1" : "0",
-      "احتساب فروقات العملة": row.iscalc_curr_diff_rates ? "1" : "0",
-      "نوع الحركة": String(row.transaction_type ?? "0"),
-      "أقصى مبلغ حركة": String(row.max_transaction_amount ?? 0),
-      "أقصى رصيد": String(row.max_balance_amount ?? 0),
-      "ملاحظات": row.notes || "",
-      "الحالة": row.status || "",
-    }))
-
-    const worksheet = XLSX.utils.json_to_sheet(templateRows)
-    const workbook = XLSX.utils.book_new()
-    XLSX.utils.book_append_sheet(workbook, worksheet, "Accounts Template")
-    const buffer = XLSX.write(workbook, { bookType: "xlsx", type: "array" })
-    const blob = new Blob([buffer], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" })
-    const url = URL.createObjectURL(blob)
-    const link = document.createElement("a")
-    link.href = url
-    link.download = typeId ? `accounts_export_type_${typeId}.xlsx` : "accounts_export_all.xlsx"
-    document.body.appendChild(link)
-    link.click()
-    document.body.removeChild(link)
-    URL.revokeObjectURL(url)
+    return cleaned.padEnd(10, "0").slice(0, 10)
   }
 
   const loadData = async () => {
@@ -1205,10 +224,10 @@ export default function Accounts() {
     () => ({
       name: "AccountsScheme",
       columns: [
-        { header: "رقم الحساب", name: "code", width: 180, isReadOnly: true },
-        { header: "اسم الحساب", name: "name", width: "*", minWidth: 320, isReadOnly: true },
-        { header: "القائمة المالية", name: "finanical_list_name", width: 240, isReadOnly: true },
-        { header: "الحالة", name: "status", width: 160, isReadOnly: true },
+        { header: tr("رقم الحساب"), name: "code", width: 180, isReadOnly: true },
+        { header: tr("اسم الحساب"), name: "name", width: "*", minWidth: 320, isReadOnly: true },
+        { header: tr("القائمة المالية"), name: "finanical_list_name", width: 240, isReadOnly: true },
+        { header: tr("الحالة"), name: "status", width: 160, isReadOnly: true },
       ],
     }),
     [],
@@ -1228,19 +247,19 @@ export default function Accounts() {
 
   const stats = useMemo(
     () => [
-      { label: "إجمالي الحسابات", value: accounts.length, color: "bg-blue-50" },
+      { label: tr("إجمالي الحسابات"), value: accounts.length, color: "bg-blue-50" },
       {
-        label: "الميزانية العمومية",
+        label: tr("الميزانية العمومية"),
         value: accounts.filter((item) => Number(item.finanical_list_id) === 1).length,
         color: "bg-green-50",
       },
       {
-        label: "قائمة الدخل",
+        label: tr("قائمة الدخل"),
         value: accounts.filter((item) => Number(item.finanical_list_id) === 2).length,
         color: "bg-amber-50",
       },
       {
-        label: "تقييم بضاعة",
+        label: tr("تقييم بضاعة"),
         value: accounts.filter((item) => Number(item.finanical_list_id) === 3).length,
         color: "bg-slate-50",
       },
@@ -1274,6 +293,12 @@ export default function Accounts() {
     setSelectedUnifiedAccountId(null)
     setShowUnifiedPopup(true)
   }
+
+  // /?section=accounts&new=1 (زر "تعريف حساب" في بحث الحسابات): يفتح نافذة حساب جديد داخل النظام
+  useEffect(() => {
+    if (consumeNewRecordParam("accounts")) handleNew()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   const handleOpenUnifiedAccount = (account: Account) => {
     setSelectedUnifiedAccountId(account.id)
@@ -1311,7 +336,11 @@ export default function Accounts() {
     setMessage("")
 
     if (!formData.code.trim() || !formData.name.trim()) {
-      setError("Code and Name are required")
+      setError(tr("رقم الحساب واسم الحساب مطلوبان"))
+      return
+    }
+    if (!["1", "2", "3"].includes(formData.finanical_list_id)) {
+      setError(tr("يرجى اختيار القائمة المالية"))
       return
     }
 
@@ -1322,7 +351,7 @@ export default function Accounts() {
       const method = isEdit ? "PUT" : "POST"
 
       const payload = {
-        code: formData.code.trim(),
+        code: normalizeAccountCode(formData.code),
         name: formData.name.trim(),
         name_lang2: formData.name_lang2.trim() || null,
         type: formData.type ? Number(formData.type) : null,
@@ -1402,7 +431,7 @@ export default function Accounts() {
 
       resetForm()
       setDialogOpen(false)
-      setMessage(isEdit ? "تم تعديل الحساب بنجاح" : "تم إنشاء الحساب بنجاح")
+      setMessage(isEdit ? tr("تم تعديل الحساب بنجاح") : tr("تم إنشاء الحساب بنجاح"))
     } catch (err) {
       console.error(err)
       setError("Error saving account")
@@ -1412,7 +441,7 @@ export default function Accounts() {
   }
 
   const handleDelete = async (id: number) => {
-    if (!window.confirm("هل أنت متأكد من حذف الحساب؟")) return
+    if (!(await confirmYesNo(tr("هل أنت متأكد من حذف الحساب؟")))) return
 
     try {
       const response = await fetch(`/api/accounts/${id}`, { method: "DELETE" })
@@ -1420,7 +449,7 @@ export default function Accounts() {
         setError("Failed to delete account")
         return
       }
-      setMessage("تم حذف الحساب بنجاح")
+      setMessage(tr("تم حذف الحساب بنجاح"))
       setAccounts((prev) => prev.filter((item) => Number(item.id) !== Number(id)))
     } catch (err) {
       console.error(err)
@@ -1429,55 +458,49 @@ export default function Accounts() {
   }
 
   if (loading) {
-    return <div className="p-6 text-center">جاري التحميل...</div>
+    return (
+      <div className="flex items-center justify-center min-h-[400px]" dir={appDir()}>
+        <div className="text-center">
+          <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-primary mx-auto mb-4"></div>
+          <p className="text-muted-foreground">{tr("جاري تحميل الحسابات المحاسبية...")}</p>
+        </div>
+      </div>
+    )
   }
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-slate-50 via-white to-blue-50 p-4 lg:p-6" dir="rtl">
-      <div className="space-y-6">
-        {/* Header */}
-        <div className="flex flex-col gap-4 rounded-xl border bg-white p-5 shadow-sm sm:flex-row sm:items-center sm:justify-between">
-          <div>
-            <p className="text-sm uppercase tracking-wide text-muted-foreground">نظام الحسابات</p>
-            <h2 className="text-2xl font-semibold">إدارة الحسابات</h2>
-            <p className="text-sm text-muted-foreground">إدارة الحسابات المحاسبية وتصنيفاتها</p>
-          </div>
-          <div className="flex flex-wrap gap-2">
-            <Button className="h-11 gap-2" variant="outline" onClick={() => setShowExcelImportDialog(true)}>
-              <FileSpreadsheet className="h-4 w-4" /> استيراد من اكسل
-            </Button>
-            <Button className="h-11 gap-2" onClick={handleNew}>
-              <Plus className="h-4 w-4" /> حساب جديد
-            </Button>
-          </div>
-        </div>
+    <div className="min-h-screen bg-slate-50 p-3 sm:p-5 dark:bg-slate-950" dir={appDir()}>
+      <div className="voucher-list-page space-y-5">
+        {/* Header: نفس تصميم صفحات الملفات والحركات (VoucherListHero) */}
+        <VoucherListHero
+          category={tr("نظام الحسابات")}
+          icon={BookOpenIcon}
+          title={tr("إدارة الحسابات")}
+          subtitle={tr("إدارة الحسابات المحاسبية وتصنيفاتها")}
+          addLabel={tr("حساب جديد")}
+          onNew={handleNew}
+          actions={
+            <button
+              type="button"
+              onClick={() => setShowExcelImportDialog(true)}
+              className="inline-flex h-11 items-center gap-2 rounded-xl bg-white/15 px-4 text-sm font-bold text-white ring-1 ring-white/30 transition hover:bg-white/25"
+            >
+              <FileSpreadsheet className="h-4 w-4" />
+              {tr("استيراد من اكسل")}
+            </button>
+          }
+        />
 
-        {/* Stats Cards (now collapsible) */}
-        <Accordion type="single" collapsible className="w-full">
-          <AccordionItem value="stats">
-            <AccordionTrigger className="text-sm font-medium">الاحصائيات</AccordionTrigger>
-            <AccordionContent>
-              <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-                {stats.map((stat) => (
-                  <Card key={stat.label} className={stat.color}>
-                    <CardContent className="p-6 text-right">
-                      <p className="text-sm font-medium text-slate-600">{stat.label}</p>
-                      <p className="mt-2 text-3xl font-semibold">{stat.value}</p>
-                    </CardContent>
-                  </Card>
-                ))}
-              </div>
-            </AccordionContent>
-          </AccordionItem>
-        </Accordion>
+        {/* الإحصائيات */}
+        <VoucherStats stats={stats.map((stat) => ({ label: stat.label, value: stat.value }))} />
 
         
 
         {/* Dialog */}
         <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
-          <DialogContent className="w-full max-w-2xl max-h-[90vh] overflow-y-auto" dir="rtl">
+          <DialogContent className="w-full max-w-2xl max-h-[90vh] overflow-y-auto" dir={appDir()}>
             <DialogHeader>
-              <DialogTitle>اضافة حساب او تعديل حساب</DialogTitle>
+              <DialogTitle>{tr("اضافة حساب او تعديل حساب")}</DialogTitle>
             </DialogHeader>
 
             <div className="space-y-6">
@@ -1494,25 +517,31 @@ export default function Accounts() {
 
               <div className="grid gap-4 lg:grid-cols-2">
                 <div>
-                  <Label className="mb-2 block">كود الحساب</Label>
-                  <Input value={formData.code} onChange={(e) => setFormData({ ...formData, code: e.target.value })} />
+                  <Label className="mb-2 block">{tr("كود الحساب")}</Label>
+                  <Input
+                    value={formData.code}
+                    maxLength={10}
+                    dir="ltr"
+                    onChange={(e) => setFormData({ ...formData, code: e.target.value.replace(/[^A-Za-z0-9]/g, "").toUpperCase().slice(0, 10) })}
+                    onBlur={() => setFormData((current) => ({ ...current, code: normalizeAccountCode(current.code) }))}
+                  />
                 </div>
                 <div>
-                  <Label className="mb-2 block">اسم الحساب</Label>
-                  <Input value={formData.name} onChange={(e) => setFormData({ ...formData, name: e.target.value })} />
+                  <Label className="mb-2 block">{tr("اسم الحساب")}</Label>
+                  <Input maxLength={100} value={formData.name} onChange={(e) => setFormData({ ...formData, name: e.target.value })} />
                 </div>
               </div>
 
               <div className="grid gap-4 lg:grid-cols-2">
                 <div>
-                  <Label className="mb-2 block">الاسم بلغة أخرى</Label>
+                  <Label className="mb-2 block">{tr("الاسم بلغة أخرى")}</Label>
                   <Input value={formData.name_lang2} onChange={(e) => setFormData({ ...formData, name_lang2: e.target.value })} />
                 </div>
                 <div>
-                  <Label className="mb-2 block">نوع الحساب</Label>
+                  <Label className="mb-2 block">{tr("نوع الحساب")}</Label>
                   <Select value={formData.type} onValueChange={(val) => setFormData({ ...formData, type: val })}>
                     <SelectTrigger>
-                      <SelectValue placeholder="اختر نوع الحساب" />
+                      <SelectValue placeholder={tr("اختر نوع الحساب")} />
                     </SelectTrigger>
                     <SelectContent>
                       {types.map((type) => (
@@ -1527,18 +556,19 @@ export default function Accounts() {
 
               <div className="grid gap-4 lg:grid-cols-2">
                 <div>
-                  <Label className="mb-2 block">القائمة المالية</Label>
+                  <Label className="mb-2 block">{tr("القائمة المالية")}</Label>
                   <PrimeDropdown
                     inputId="financial_list_id"
                     value={formData.finanical_list_id}
                     options={[
-                      { label: "الميزانية العمومية", value: "1" },
-                      { label: "قائمة الدخل", value: "2" },
-                      { label: "تقييم بضاعة", value: "3" },
+                      { label: tr("اختر"), value: "" },
+                      { label: tr("الميزانية العمومية"), value: "1" },
+                      { label: tr("قائمة الدخل"), value: "2" },
+                      { label: tr("تقييم بضاعة"), value: "3" },
                     ]}
                     optionLabel="label"
                     optionValue="value"
-                    placeholder="اختر القائمة المالية"
+                    placeholder={tr("اختر القائمة المالية")}
                     className="invoice-currency-dropdown w-full"
                     panelClassName="invoice-currency-dropdown-panel"
                     appendTo="self"
@@ -1546,18 +576,18 @@ export default function Accounts() {
                   />
                 </div>
                 <div>
-                  <Label className="mb-2 block">الحالة</Label>
+                  <Label className="mb-2 block">{tr("الحالة")}</Label>
                   <PrimeDropdown
                     inputId="status"
                     value={formData.status}
                     options={[
-                      { label: "نشط", value: "نشط" },
-                      { label: "موقوف", value: "موقوف" },
-                      { label: "محذوف", value: "محذوف" },
+                      { label: tr("نشط"), value: "نشط" },
+                      { label: tr("موقوف"), value: "موقوف" },
+                      { label: tr("محذوف"), value: "محذوف" },
                     ]}
                     optionLabel="label"
                     optionValue="value"
-                    placeholder="اختر الحالة"
+                    placeholder={tr("اختر الحالة")}
                     className="invoice-currency-dropdown w-full"
                     panelClassName="invoice-currency-dropdown-panel"
                     appendTo="self"
@@ -1567,218 +597,48 @@ export default function Accounts() {
               </div>
 
               <div>
-                <Label className="mb-2 block">ملاحظات</Label>
+                <Label className="mb-2 block">{tr("ملاحظات")}</Label>
                 <Textarea value={formData.notes} onChange={(e) => setFormData({ ...formData, notes: e.target.value })} className="h-24" />
               </div>
             </div>
 
             <DialogFooter>
               <Button variant="outline" onClick={() => setDialogOpen(false)} disabled={saving}>
-                إلغاء
+                {tr("إلغاء")}
               </Button>
               <Button onClick={handleSave} disabled={saving}>
-                {saving ? "جاري الحفظ..." : "حفظ الحساب"}
+                {saving ? tr("جاري الحفظ...") : tr("حفظ الحساب")}
               </Button>
             </DialogFooter>
           </DialogContent>
         </Dialog>
 
-        <Dialog open={showExcelImportDialog} onOpenChange={(open) => {
-          setShowExcelImportDialog(open)
-          if (!open) {
-            resetExcelImport()
-          }
-        }}>
-          <DialogContent
-            className="w-full max-w-6xl max-h-[92vh] overflow-hidden p-0 flex flex-col"
-            dir="rtl"
-            onPointerDownOutside={(event) => event.preventDefault()}
-          >
-            <div className="flex min-h-0 flex-1 flex-col">
-              <div className="shrink-0 px-4 pb-2 pt-4 sm:px-6 sm:pt-6">
-                <DialogHeader>
-                  <DialogTitle>استيراد الحسابات من اكسل</DialogTitle>
-                </DialogHeader>
-              </div>
-
-              <div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-4 pb-4 sm:px-6">
-              <div className="flex w-full flex-nowrap items-end gap-2 overflow-x-auto pb-1">
-                <div className="min-w-[260px] shrink-0">
-                  <Label className="mb-2 block text-sm">نوع هيكل الحسابات الافتراضي</Label>
-                  <Select value={excelTemplateType} onValueChange={(value) => {
-                    setExcelTemplateType(value)
-                  }}>
-                    <SelectTrigger className="h-11">
-                      <SelectValue placeholder="اختر" />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="none">بلا</SelectItem>
-                      <SelectItem value="commercial">مؤسسة تجارية</SelectItem>
-                      <SelectItem value="commercial_continuous_inventory">مؤسسة تجارية - جرد مستمر</SelectItem>
-                      <SelectItem value="services">خدمات</SelectItem>
-                    </SelectContent>
-                  </Select>
-                </div>
-                <Button variant="outline" className="gap-2 shrink-0" onClick={() => { void downloadExcelTemplate(excelTemplateType) }}>
-                  <Download className="h-4 w-4" /> تحميل قالب
-                </Button>
-                <Button
-                  variant="secondary"
-                  className="gap-2 shrink-0"
-                  onClick={() => excelInputRef.current?.click()}
-                  disabled={excelProcessing || excelImporting}
-                >
-                  <Upload className="h-4 w-4" /> اختيار ملف
-                </Button>
-                <Input ref={excelInputRef} type="file" accept=".xlsx,.xls" className="hidden" onChange={handleExcelFileChange} />
-              </div>
-
-              <Alert>
-                <AlertCircle className="h-4 w-4" />
-                <AlertDescription>
-                  الملف يجب أن يحتوي على الأعمدة: رقم الحساب، اسم الحساب، اسم الحساب انجليزي، العملة، القائمة المالية، أصول الميزانية، خصوم الميزانية، وبند قائمة الدخل.
-                  إذا كان رقم الحساب أقصر من 8 أحرف سيتم ضبطه تلقائياً إلى 8 أحرف إنجليزية/أرقام.
-                </AlertDescription>
-              </Alert>
-
-              {excelFile && <div className="text-sm text-muted-foreground">الملف المحدد: {excelFile.name}</div>}
-
-              {excelProcessing && <div className="text-sm text-muted-foreground">جاري قراءة ملف Excel...</div>}
-
-              {excelExportLoading && <div className="text-sm text-muted-foreground">جاري تحميل الحسابات من accounts.json...</div>}
-              {excelExportError && <Alert className="border-red-200 bg-red-50 text-red-900"><AlertDescription>{excelExportError}</AlertDescription></Alert>}
-
-              {excelStep === "upload" && excelTemplateType !== "none" && excelExportRows.length > 0 && (
-                <div className="space-y-3">
-                  <div className="text-sm text-muted-foreground">
-                    تم تحميل {excelExportRows.length} حسابًا للنوع المحدد.
-                  </div>
-                  <div className="w-full max-h-[260px] overflow-hidden rounded-md border">
-                    <DataGridView
-                      style={{ maxHeight: "260px", minHeight: "180px", width: "100%" }}
-                      idProperty="rowIndex"
-                      scheme={excelGridScheme}
-                      dataSource={excelExportRows.map(buildExportGridRow)}
-                      showContextMenu={false}
-                      copyItemStoreDown={true}
-                      dontConvertToCards={true}
-                      isReport={true}
-                      hideSearch={true}
-                      allowSorting={true}
-                    />
-                  </div>
-                </div>
-              )}
-
-              {excelStep === "preview" && excelRows.length > 0 && (
-                <div className="space-y-4">
-                  <div className="w-full max-h-[70vh] overflow-hidden rounded-md border">
-                    <DataGridView
-                      style={{ maxHeight: "70vh", minHeight: "50vh", width: "100%" }}
-                      idProperty="rowIndex"
-                      scheme={excelGridScheme}
-                      dataSource={excelRows.map(buildPreviewGridRow)}
-                      showContextMenu={false}
-                      copyItemStoreDown={true}
-                      dontConvertToCards={true}
-                      isReport={true}
-                      hideSearch={true}
-                      allowSorting={true}
-                    />
-                  </div>
-
-                  <div className="flex flex-wrap gap-3 text-sm">
-                    <span className="rounded-full bg-green-50 px-3 py-1 text-green-700">صالحة: {excelRows.filter((row) => row.isValid).length}</span>
-                    <span className="rounded-full bg-red-50 px-3 py-1 text-red-700">غير صالحة: {excelRows.filter((row) => !row.isValid).length}</span>
-                  </div>
-                </div>
-              )}
-
-              {excelStep === "result" && excelSummary && (
-                <div className="space-y-3">
-                  <Alert className="border-green-200 bg-green-50 text-green-900">
-                    <CheckCircle className="h-4 w-4" />
-                    <AlertDescription>
-                      تم الاستيراد بنجاح: {excelSummary.success}، فشل: {excelSummary.failed}، مكررة: {excelSummary.duplicates}
-                    </AlertDescription>
-                  </Alert>
-                  {excelSummary.errors.length > 0 && (
-                    <Alert className="border-red-200 bg-red-50 text-red-900">
-                      <AlertDescription>
-                        <div className="space-y-1">
-                          {excelSummary.errors.slice(0, 10).map((item) => (
-                            <div key={item}>{item}</div>
-                          ))}
-                        </div>
-                      </AlertDescription>
-                    </Alert>
-                  )}
-                </div>
-              )}
-              </div>
-
-              <div className="shrink-0 border-t bg-background px-4 py-4 sm:px-6">
-                {excelImporting && excelImportProgress.total > 0 && (
-                  <div className="mb-4 space-y-2">
-                    <div className="flex items-center justify-between text-sm text-muted-foreground">
-                      <span>جاري استيراد البيانات...</span>
-                      <span>
-                        {excelImportProgress.current}/{excelImportProgress.total}
-                      </span>
-                    </div>
-                    <div className="h-2 overflow-hidden rounded-full bg-slate-200">
-                      <div
-                        className="h-full rounded-full bg-blue-600 transition-all duration-200"
-                        style={{
-                          width: `${Math.min(100, Math.round((excelImportProgress.current / excelImportProgress.total) * 100))}%`,
-                        }}
-                      />
-                    </div>
-                  </div>
-                )}
-                <div className="flex justify-end gap-2">
-                  <Button variant="outline" onClick={() => setShowExcelImportDialog(false)} disabled={excelImporting}>
-                    إلغاء
-                  </Button>
-                  <Button variant="secondary" onClick={resetExcelImport} disabled={excelProcessing || excelImporting}>
-                    إعادة ضبط
-                  </Button>
-                  <Button
-                    onClick={importExcelAccounts}
-                    disabled={excelProcessing || excelImporting || getRowsToImport().length === 0}
-                  >
-                    {excelImporting ? "جاري الاستيراد..." : "استيراد البيانات"}
-                  </Button>
-                </div>
-              </div>
-            </div>
-          </DialogContent>
-        </Dialog>
+        <AccountsImportDialog open={showExcelImportDialog} onOpenChange={setShowExcelImportDialog} onImported={() => { void loadData() }} />
 
         {/* Search & Filters */}
         <Card>
           <CardHeader>
-            <CardTitle>قائمة الحسابات</CardTitle>
+            <CardTitle>{tr("قائمة الحسابات")}</CardTitle>
           </CardHeader>
           <CardContent>
             <div className="mb-6 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
               <div>
-                <Label className="mb-2 block text-sm">اسم الحساب</Label>
-                <Input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="ابحث برقم أو اسم الحساب" className="h-10" />
+                <Label className="mb-2 block text-sm">{tr("اسم الحساب")}</Label>
+                <Input value={search} onChange={(e) => setSearch(e.target.value)} placeholder={tr("ابحث برقم أو اسم الحساب")} className="h-10" />
               </div>
               <div>
                 <MultiSelect
-                  caption="القائمة المالية"
+                  caption={tr("القائمة المالية")}
                   inputId="filterFinancialList"
                   value={filterFinancialList}
                   options={[
-                    { label: "الميزانية العمومية", value: "1" },
-                    { label: "قائمة الدخل", value: "2" },
-                    { label: "تقييم بضاعة", value: "3" },
+                    { label: tr("الميزانية العمومية"), value: "1" },
+                    { label: tr("قائمة الدخل"), value: "2" },
+                    { label: tr("تقييم بضاعة"), value: "3" },
                   ]}
                   optionLabel="label"
                   optionValue="value"
-                  placeholder="كل القوائم المالية"
+                  placeholder={tr("كل القوائم المالية")}
                   showFilter={true}
                   showCheck={true}
                   showMultiSelect={true}
@@ -1786,18 +646,18 @@ export default function Accounts() {
                 />
               </div>
               <div>
-                <Label className="mb-2 block text-sm">الحالة</Label>
+                <Label className="mb-2 block text-sm">{tr("الحالة")}</Label>
                 <PrimeDropdown
                   inputId="filterStatus"
                   value={filterStatus || ""}
                   options={[
-                    { label: "كل الحالات", value: "" },
-                    { label: "نشط", value: "نشط" },
-                    { label: "موقوف", value: "موقوف" },
+                    { label: tr("كل الحالات"), value: "" },
+                    { label: tr("نشط"), value: "نشط" },
+                    { label: tr("موقوف"), value: "موقوف" },
                   ]}
                   optionLabel="label"
                   optionValue="value"
-                  placeholder="كل الحالات"
+                  placeholder={tr("كل الحالات")}
                   className="invoice-currency-dropdown w-full"
                   panelClassName="invoice-currency-dropdown-panel"
                   appendTo="self"
@@ -1805,8 +665,8 @@ export default function Accounts() {
                 />
               </div>
               <div className="flex items-end">
-                <Button variant="secondary" className="h-10 w-full" onClick={refreshAccounts}>
-                  <RefreshCw className="mr-2 h-4 w-4" /> تحديث
+                <Button variant="outline" className="h-10 w-full rounded-xl border-emerald-200 bg-emerald-50 font-bold text-emerald-700 hover:bg-emerald-100" onClick={refreshAccounts}>
+                  <RefreshCw className="ms-2 h-4 w-4" />{tr(" تحديث")}
                 </Button>
               </div>
             </div>
@@ -1824,22 +684,22 @@ export default function Accounts() {
 
             {/* Table */}
             <div className="overflow-x-auto rounded-md border border-slate-200 bg-white">
-              <table className="w-full text-right text-sm">
+              <table className="w-full text-start text-sm">
                 <thead className="bg-slate-50 border-b border-slate-200">
                   <tr>
                     <th className="px-4 py-3 font-semibold text-slate-700 w-12">##</th>
-                    <th className="px-4 py-3 font-semibold text-slate-700 min-w-[120px]">رقم الحساب</th>
-                    <th className="px-4 py-3 font-semibold text-slate-700 min-w-[200px]">اسم الحساب</th>
-                    <th className="px-4 py-3 font-semibold text-slate-700 min-w-[150px]">القائمة المالية</th>
-                    <th className="px-4 py-3 font-semibold text-slate-700 min-w-[100px]">الحالة</th>
-                    <th className="px-4 py-3 font-semibold text-slate-700 w-20">الإجراءات</th>
+                    <th className="px-4 py-3 font-semibold text-slate-700 min-w-[120px]">{tr("رقم الحساب")}</th>
+                    <th className="px-4 py-3 font-semibold text-slate-700 min-w-[200px]">{tr("اسم الحساب")}</th>
+                    <th className="px-4 py-3 font-semibold text-slate-700 min-w-[150px]">{tr("القائمة المالية")}</th>
+                    <th className="px-4 py-3 font-semibold text-slate-700 min-w-[100px]">{tr("الحالة")}</th>
+                    <th className="px-4 py-3 font-semibold text-slate-700 w-20">{tr("الإجراءات")}</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-200">
                   {filteredAccounts.length === 0 ? (
                     <tr>
                       <td colSpan={6} className="px-4 py-8 text-center text-slate-500">
-                        لا توجد حسابات متطابقة
+                        {tr("لا توجد حسابات متطابقة")}
                       </td>
                     </tr>
                   ) : (
@@ -1870,7 +730,7 @@ export default function Accounts() {
                           <button
                             onClick={() => handleOpenUnifiedAccount(account)}
                             className="p-1.5 hover:bg-blue-100 rounded text-blue-600 transition"
-                            title="تفاصيل"
+                            title={tr("تفاصيل")}
                           >
                             <CheckCircle className="h-4 w-4" />
                           </button>
@@ -1885,14 +745,11 @@ export default function Accounts() {
         </Card>
         {/* Unified accounts opened as local popup (like فاتورة جديدة) */}
         <Dialog open={showUnifiedPopup} onOpenChange={setShowUnifiedPopup}>
-          <DialogContent
-            hideCloseButton
-            className="w-full max-w-[95vw] sm:max-w-[90vw] md:max-w-[85vw] lg:max-w-[100vh] h-[95vh] max-h-[95vh] p-0 gap-0 flex flex-col overflow-x-hidden overflow-y-hidden"
-            dir="rtl"
-            onPointerDownOutside={(event) => event.preventDefault()}
-          >
-            <div className="flex min-w-0 flex-1 overflow-hidden">
-              {showUnifiedPopup && (
+          <DialogContent inline={fullscreenEnabled && showUnifiedPopup} className="flex h-[min(90dvh,900px)] max-h-[calc(100dvh-1rem)] w-[95vw] max-w-[1200px] flex-col overflow-hidden p-0" dir={appDir()}
+                    onPointerDownOutside={(event) => event.preventDefault()}
+                    onEscapeKeyDown={(event) => event.preventDefault()}
+                  >
+              
                 <UnifiedAccounts
                   action={selectedUnifiedAccountId == null ? "new" : undefined}
                   accountId={selectedUnifiedAccountId}
@@ -1902,8 +759,6 @@ export default function Accounts() {
                     setSelectedUnifiedAccountId(null)
                   }}
                 />
-              )}
-            </div>
           </DialogContent>
         </Dialog>
       </div>

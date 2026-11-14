@@ -1,46 +1,5 @@
 import { type NextRequest, NextResponse } from "next/server"
-import { neon } from "@neondatabase/serverless"
-
-import { Pool } from "pg"
-
-let sql: any = null
-
-try {
-  if (!process.env.DATABASE_URL) {
-    console.error("[v0] DATABASE_URL environment variable is not set")
-  } else {
-    const dbUrl = process.env.DATABASE_URL
-
-    if (dbUrl.includes("localhost") || dbUrl.includes("127.0.0.1")) {
-      const pool = new Pool({ connectionString: dbUrl })
-      sql = async (strings: TemplateStringsArray, ...values: any[]) => {
-        const client = await pool.connect()
-        try {
-          const query =
-            strings.reduce(
-              (prev, curr, i) =>
-                prev + curr + (i < values.length ? `$${i + 1}` : ""),
-              ""
-            )
-          const result = await client.query(query, values)
-          return result.rows
-        } finally {
-          client.release()
-        }
-      }
-    } else {
-      console.log("[v0] Using Neon serverless client")
-      sql = neon(dbUrl)
-    }
-
-    console.log("[v0] Database client initialized successfully")
-  }
-} catch (error) {
-  console.error("[v0] Failed to initialize DB client:", error)
-  sql = null
-}
-
-export default sql
+import sql from "@/lib/database"
 
 export async function GET() {
   try {
@@ -63,7 +22,7 @@ export async function GET() {
       SELECT d.*, b.branch_name
       FROM departments d
       LEFT JOIN branches b ON d.branch_id = b.id
-      ORDER BY d.department_name
+      ORDER BY d.department_code ASC
     `
     return NextResponse.json(departments)
   } catch (error) {
@@ -76,20 +35,24 @@ export async function POST(request: NextRequest) {
   try {
     const data = await request.json()
 
-    if (!data.department_name || !data.department_code) {
-      return NextResponse.json({ error: "اسم القسم ورمزه مطلوبان" }, { status: 400 })
+    if (!data.department_name) {
+      return NextResponse.json({ error: "اسم القسم مطلوب" }, { status: 400 })
     }
 
     const result = await sql`
-      INSERT INTO departments (department_code, department_name, branch_id, manager, employee_count, is_active)
-      VALUES (
-        ${data.department_code},
+      WITH next_department AS (
+        SELECT nextval(pg_get_serial_sequence('departments', 'id')) AS id
+      )
+      INSERT INTO departments (id, department_code, department_name, branch_id, manager, employee_count, is_active)
+      SELECT
+        id,
+        LPAD(id::text, 4, '0'),
         ${data.department_name},
         ${data.branch_id || null},
         ${data.manager || ""},
         ${data.employee_count || 0},
         ${data.is_active !== false}
-      )
+      FROM next_department
       RETURNING *
     `
 

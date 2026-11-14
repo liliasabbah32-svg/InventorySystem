@@ -15,6 +15,32 @@
   overflow-y: hidden;
 }
 
+/* Per-user DataGridView appearance settings. */
+.wj-flexgrid .wj-header {
+  height: var(--datagrid-header-height, 40px) !important;
+  min-height: var(--datagrid-header-height, 40px) !important;
+  background: var(--datagrid-header-color, #2c3e50) !important;
+  /* الخلفية !important فيجب أن يكون لون الخط كذلك، وإلا يغلبه لون wijmo الافتراضي (أسود) حسب ترتيب تحميل
+     ملفات CSS — كما يحدث عند فتح سند من تقرير/أداة بتبويب جديد. */
+  color: #ffffff !important;
+  font-family: var(--datagrid-header-font-family, "Cairo"), sans-serif !important;
+}
+
+.wj-flexgrid .wj-header *,
+.wj-flexgrid .wj-header .wj-elem-filter {
+  color: inherit;
+}
+
+.wj-flexgrid .wj-cell:not(.wj-header) {
+  min-height: var(--datagrid-row-height, 50px) !important;
+}
+
+.wj-flexgrid .wj-state-selected:not(.wj-header),
+.wj-flexgrid .wj-row .wj-cell.wj-state-selected:not(.wj-header),
+.wj-flexgrid .wj-cell.wj-state-selected:not(.wj-header) {
+  background: var(--datagrid-selected-row-color, #6fe27b) !important;
+}
+
 .wj-flexgrid .wj-header {
   background: #2c3e50;       /* Dark, modern header */
   color: #ffffff;
@@ -37,14 +63,55 @@
   transition: background 0.2s, color 0.2s;
 }
 
+.wj-flexgrid .wj-colfooters {
+  background: #eaf4f2 !important;
+  color: #203747 !important;
+  font-weight: 700;
+}
+
+.wj-flexgrid .wj-colfooters .wj-cell {
+  background: #eaf4f2 !important;
+  color: #203747 !important;
+  border-top: 2px solid #9fe3d1 !important;
+}
+
 /* Alternating rows */
 .wj-flexgrid .wj-row:nth-child(even) .wj-cell {
   background: #f9f9f9;
 }
 
+/* Cell editor: يظهر Wijmo افتراضياً مربع إدخال بحدود/ظل داخل الخلية أثناء التحرير — إزالته
+   يجعل التحرير يبدو متصلاً بالخلية نفسها بدل صندوق منفصل بداخلها. */
+.wj-flexgrid .wj-cell input,
+.wj-flexgrid .wj-cell .wj-form-control,
+.wj-flexgrid .wj-cell.wj-state-editing {
+  border: none !important;
+  box-shadow: none !important;
+  background: transparent !important;
+  outline: none !important;
+}
+
+.wj-flexgrid .wj-cell input,
+.wj-flexgrid .wj-cell .wj-form-control {
+  padding: 0 !important;
+  margin: 0 !important;
+}
+
 /* Hover effect on body rows */
 .wj-flexgrid .wj-row:hover .wj-cell:not(.wj-header) {
   background: #f1f9f5;
+}
+
+/* Account Excel preview/export: preserve readable contrast on alternating rows. */
+.excel-account-grid .wj-flexgrid .wj-row:hover .wj-cell:not(.wj-header),
+.excel-account-grid .wj-flexgrid .wj-row:nth-child(even):hover .wj-cell:not(.wj-header) {
+  background: #dbeafe !important;
+  color: #172554 !important;
+}
+
+/* Product Excel preview: keep Wijmo's row viewport scrollable inside the dialog. */
+.excel-product-grid.wj-flexgrid {
+  overflow-y: auto !important;
 }
 
 /* Keep selected rows visually stable on hover */
@@ -118,101 +185,109 @@ html[dir="rtl"] .wj-flexgrid .wj-header {
   text-align: right;
 }
 
-/* Button Styling - Grid Buttons */
+/* Button Styling - Grid Buttons — أزرار أيقونية "ناعمة" (soft-fill): خلفية بلون خفيف (12%) لنوع
+   الزر منذ حالة السكون (لا انتظار hover لإدراك دلالة اللون)، تتكثّف مع ظل ورفعة خفيفة عند :hover،
+   وانضغاطة قصيرة عند :active — بدل مظهر ghost المسطّح السابق. الألوان عبر color-mix مع متغيرات
+   الثيم نفسها (app/globals.css) فتتبع الفاتح/الداكن تلقائياً بلا تكرار قيم hex. */
 .wj-flexgrid button,
 .wj-cell-maker-btn {
-  padding: 8px 12px;
-  border-radius: 0;
+  padding: 0;
+  border-radius: clamp(6px, calc(var(--datagrid-row-height, 50px) - 18px), 10px);
   border: none;
   outline: none;
-  font-weight: 600;
+  font-weight: 500;
   font-size: 14px;
   cursor: pointer;
-  transition: all 0.3s ease;
-  color: white !important;
-  min-width: 40px;
+  transition: background-color 0.18s ease, color 0.18s ease, box-shadow 0.18s ease, transform 0.12s ease;
+  width: clamp(20px, calc(var(--datagrid-row-height, 50px) - 8px), 32px);
+  height: clamp(20px, calc(var(--datagrid-row-height, 50px) - 8px), 32px);
+  min-width: clamp(20px, calc(var(--datagrid-row-height, 50px) - 8px), 32px);
   display: inline-flex;
   align-items: center;
   justify-content: center;
   gap: 4px;
-  background-color: #bfdbfe !important;
-  color: #1e40af !important;
+  background-color: color-mix(in srgb, var(--foreground) 7%, transparent) !important;
+  color: var(--muted-foreground) !important;
 }
 
 .wj-flexgrid button:hover,
 .wj-cell-maker-btn:hover {
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
-  transform: translateY(-2px);
-  background-color: #93c5fd !important;
+  background-color: color-mix(in srgb, var(--primary) 16%, transparent) !important;
+  color: var(--primary) !important;
+  box-shadow: 0 2px 6px color-mix(in srgb, var(--primary) 25%, transparent);
+  transform: translateY(-1px);
 }
 
 .wj-flexgrid button:active,
 .wj-cell-maker-btn:active {
-  transform: translateY(0);
+  transform: translateY(0) scale(0.93);
+  box-shadow: none;
 }
 
 .wj-flexgrid button:disabled,
 .wj-cell-maker-btn:disabled {
-  opacity: 0.5;
+  opacity: 0.45;
   cursor: not-allowed;
   transform: none;
+  box-shadow: none;
 }
 
-/* DELETE BUTTONS - Light Red (pi-trash icon) */
+/* DELETE BUTTONS — لون "destructive" منذ حالة السكون (pi-trash icon)، يتكثّف مع ظل أحمر خفيف
+   ورفعة عند :hover — مميّز بصرياً فوراً عن بقية الأزرار كإجراء لا رجعة فيه. */
 .wj-flexgrid button.pi-trash,
 .wj-cell-maker-btn.pi-trash,
 .wj-flexgrid button[title*="حذف"],
 .wj-flexgrid button.btn-delete {
-  background-color: #fecaca !important;
-  color: #7f1d1d !important;
+  background-color: color-mix(in srgb, var(--destructive) 13%, transparent) !important;
+  color: var(--destructive) !important;
 }
 
 .wj-flexgrid button.pi-trash:hover,
 .wj-cell-maker-btn.pi-trash:hover,
 .wj-flexgrid button[title*="حذف"]:hover,
 .wj-flexgrid button.btn-delete:hover {
-  background-color: #fca5a5 !important;
-  color: #7f1d1d !important;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15) !important;
-  transform: translateY(-2px) !important;
+  background-color: color-mix(in srgb, var(--destructive) 24%, transparent) !important;
+  color: var(--destructive) !important;
+  box-shadow: 0 2px 6px color-mix(in srgb, var(--destructive) 30%, transparent) !important;
+  transform: translateY(-1px);
 }
 
-/* SEARCH BUTTONS - Light Blue (pi-search icon) */
+/* SEARCH BUTTONS - soft-fill بلون "primary" (pi-search icon) */
 .wj-flexgrid button.pi-search,
 .wj-cell-maker-btn.pi-search,
 .wj-flexgrid button[title*="بحث"],
 .wj-flexgrid button.btn-search {
-  background-color: #bfdbfe !important;
-  color: #1e40af !important;
+  background-color: color-mix(in srgb, var(--primary) 12%, transparent) !important;
+  color: var(--primary) !important;
 }
 
 .wj-flexgrid button.pi-search:hover,
 .wj-cell-maker-btn.pi-search:hover,
 .wj-flexgrid button[title*="بحث"]:hover,
 .wj-flexgrid button.btn-search:hover {
-  background-color: #93c5fd !important;
-  color: #1e40af !important;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15) !important;
-  transform: translateY(-2px) !important;
+  background-color: color-mix(in srgb, var(--primary) 22%, transparent) !important;
+  color: var(--primary) !important;
+  box-shadow: 0 2px 6px color-mix(in srgb, var(--primary) 28%, transparent) !important;
+  transform: translateY(-1px);
 }
 
-/* EDIT BUTTONS - Light Blue (pi-pencil icon) */
+/* EDIT BUTTONS - soft-fill بلون "primary" (pi-pencil icon) */
 .wj-flexgrid button.pi-pencil,
 .wj-cell-maker-btn.pi-pencil,
 .wj-flexgrid button[title*="تغيير"],
 .wj-flexgrid button.btn-status {
-  background-color: #bfdbfe !important;
-  color: #1e40af !important;
+  background-color: color-mix(in srgb, var(--primary) 12%, transparent) !important;
+  color: var(--primary) !important;
 }
 
 .wj-flexgrid button.pi-pencil:hover,
 .wj-cell-maker-btn.pi-pencil:hover,
 .wj-flexgrid button[title*="تغيير"]:hover,
 .wj-flexgrid button.btn-status:hover {
-  background-color: #93c5fd !important;
-  color: #1e40af !important;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15) !important;
-  transform: translateY(-2px) !important;
+  background-color: color-mix(in srgb, var(--primary) 22%, transparent) !important;
+  color: var(--primary) !important;
+  box-shadow: 0 2px 6px color-mix(in srgb, var(--primary) 28%, transparent) !important;
+  transform: translateY(-1px);
 }
 
 /* Ensure all button text and icons are styled appropriately */
@@ -222,4 +297,566 @@ html[dir="rtl"] .wj-flexgrid .wj-header {
 .wj-cell-maker-btn svg {
   color: inherit !important;
   fill: inherit !important;
+  font-size: 14px;
 }
+
+/* CALENDAR BUTTONS - soft-fill بلون بنفسجي مميَّز عن primary (pi-calendar icon) */
+.wj-flexgrid button.pi-calendar,
+.wj-cell-maker-btn.pi-calendar,
+.wj-flexgrid button[title*="تقويم"],
+.wj-flexgrid button.btn-calendar {
+  background-color: color-mix(in srgb, #8b5cf6 14%, transparent) !important;
+  color: #8b5cf6 !important;
+}
+
+.wj-flexgrid button.pi-calendar:hover,
+.wj-cell-maker-btn.pi-calendar:hover,
+.wj-flexgrid button[title*="تقويم"]:hover,
+.wj-flexgrid button.btn-calendar:hover {
+  background-color: color-mix(in srgb, #8b5cf6 24%, transparent) !important;
+  color: #8b5cf6 !important;
+  box-shadow: 0 2px 6px color-mix(in srgb, #8b5cf6 30%, transparent) !important;
+  transform: translateY(-1px);
+}
+
+/* ===============================
+   Modern voucher grid overrides (scoped) — opt-in via wrapping element
+   with class "modernVoucherGrid" (used by unified-receipt-voucher.tsx)
+   so other grids in the app keep their existing look.
+================================ */
+.modernVoucherGrid .wj-flexgrid {
+  font-family: inherit;
+  font-size: 13.5px;
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
+  box-shadow: 0 1px 3px rgba(15, 23, 42, 0.06);
+}
+
+.modernVoucherGrid .wj-flexgrid .wj-header {
+  background: linear-gradient(135deg, #1e3a8a 0%, #1d4ed8 55%, #2563eb 100%);
+  color: #ffffff;
+  font-weight: 700;
+  font-size: 13px;
+  letter-spacing: 0.3px;
+  border-bottom: none;
+  padding: 10px 12px;
+}
+
+.modernVoucherGrid .wj-flexgrid .wj-cell {
+  border-bottom: 1px solid #eef2f7;
+  padding: 6px 12px;
+}
+
+.modernVoucherGrid .wj-flexgrid .wj-row:nth-child(even) .wj-cell {
+  background: #f8fafc;
+}
+
+.modernVoucherGrid .wj-flexgrid .wj-row:hover .wj-cell:not(.wj-header) {
+  background: #eff6ff;
+}
+
+.modernVoucherGrid .wj-flexgrid .wj-state-selected:not(.wj-header),
+.modernVoucherGrid .wj-flexgrid .wj-row .wj-cell.wj-state-selected:not(.wj-header),
+.modernVoucherGrid .wj-flexgrid .wj-cell.wj-state-selected:not(.wj-header) {
+  background: #bfdbfe !important;
+  color: #1e3a8a !important;
+  border-color: transparent !important;
+}
+
+.modernVoucherGrid .wj-flexgrid .wj-cell:focus:not(.wj-header) {
+  outline: none;
+  background: #93c5fd !important;
+  color: #1e3a8a !important;
+  box-shadow: inset 0 0 0 2px #2563eb;
+}
+
+.modernVoucherGrid .wj-flexgrid .wj-report-row-selected .wj-cell,
+.modernVoucherGrid .wj-flexgrid .wj-report-row-selected:hover .wj-cell {
+  background: #dbeafe !important;
+  color: #1e3a8a !important;
+}
+
+.modernVoucherGrid .wj-cell-maker-btn {
+  border-radius: 10px !important;
+}
+
+/* Grid actions are compact icon buttons. Their action name remains available
+   through title/aria-label; a scheme can still request a text button explicitly
+   with buttonLabel. */
+.wj-flexgrid .wj-cell:has(> .wj-cell-maker-btn),
+.wj-flexgrid .wj-cell:has(> button) {
+  text-align: center !important;
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  padding: 4px !important;
+  overflow: visible !important;
+}
+
+.wj-flexgrid .wj-cell > .wj-cell-maker-btn {
+  width: clamp(28px, calc(var(--datagrid-row-height, 50px) - 10px), 36px) !important;
+  min-width: clamp(28px, calc(var(--datagrid-row-height, 50px) - 10px), 36px) !important;
+  height: clamp(28px, calc(var(--datagrid-row-height, 50px) - 10px), 36px) !important;
+  min-height: clamp(28px, calc(var(--datagrid-row-height, 50px) - 10px), 36px) !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  border: 1px solid color-mix(in srgb, currentColor 20%, transparent) !important;
+  border-radius: 11px !important;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.08), inset 0 1px 0 color-mix(in srgb, white 60%, transparent);
+  overflow: visible;
+  font-size: 0;
+  line-height: 1;
+}
+
+.wj-flexgrid .wj-cell > .wj-cell-maker-btn:not(:empty) {
+  width: calc(100% - 2px) !important;
+  min-width: 0 !important;
+  padding-inline: 10px !important;
+  gap: 6px;
+  overflow: hidden;
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.wj-flexgrid .wj-cell > .wj-cell-maker-btn::before {
+  font-size: 15px !important;
+  line-height: 1 !important;
+}
+
+.wj-flexgrid .wj-cell > .wj-cell-maker-btn:hover {
+  transform: translateY(-1px) scale(1.04);
+  box-shadow: 0 5px 12px color-mix(in srgb, currentColor 18%, transparent) !important;
+}
+
+.wj-flexgrid .wj-cell > .wj-cell-maker-btn:focus-visible {
+  outline: 2px solid color-mix(in srgb, currentColor 45%, transparent) !important;
+  outline-offset: 2px;
+}
+
+/* Keep selected-row content readable. Wijmo/theme rules can apply a white
+   foreground after the selected green background, especially in report grids. */
+.wj-flexgrid .wj-row.wj-report-row-selected .wj-cell,
+.wj-flexgrid .wj-row.wj-report-row-selected .wj-cell *,
+.wj-flexgrid .wj-row .wj-cell.wj-state-selected:not(.wj-header),
+.wj-flexgrid .wj-row .wj-cell.wj-state-selected:not(.wj-header) *,
+.wj-flexgrid .wj-cell.wj-state-selected:not(.wj-header),
+.wj-flexgrid .wj-cell.wj-state-selected:not(.wj-header) * {
+  color: #164e63 !important;
+}
+
+.wj-flexgrid .wj-row.wj-report-row-selected .wj-cell,
+.wj-flexgrid .wj-row .wj-cell.wj-state-selected:not(.wj-header),
+.wj-flexgrid .wj-cell.wj-state-selected:not(.wj-header) {
+  background: var(--datagrid-selected-row-color, #bbf7d0) !important;
+}
+
+/* Customer/product template grids: keep the destructive row action visible and
+   let its hit target occupy the complete action cell. */
+.customer-products-template-editor .wj-flexgrid .wj-cell:has(> button[title*="حذف"]) {
+  padding: 3px !important;
+  overflow: visible !important;
+}
+
+.customer-products-template-editor .wj-flexgrid .wj-cell > button[title*="حذف"] {
+  width: 100% !important;
+  min-width: 100% !important;
+  height: 100% !important;
+  min-height: 100% !important;
+  margin: 0 !important;
+  border: 1px solid color-mix(in srgb, var(--destructive) 24%, transparent) !important;
+  border-radius: 8px !important;
+  background: color-mix(in srgb, var(--destructive) 14%, var(--background)) !important;
+  color: var(--destructive) !important;
+  box-shadow: inset 0 1px 0 color-mix(in srgb, white 45%, transparent);
+}
+
+.customer-products-template-editor .wj-flexgrid .wj-cell > button[title*="حذف"]:hover {
+  background: var(--destructive) !important;
+  color: var(--destructive-foreground) !important;
+  box-shadow: 0 3px 10px color-mix(in srgb, var(--destructive) 30%, transparent) !important;
+  transform: translateY(-1px);
+}
+
+/* Make the customer/product template editor a near full-screen dialog. The
+   first dialog row is reserved exclusively for the close button, above the
+   toolbar, and the auto margin pins it to the physical left in RTL layouts. */
+[role="dialog"]:has(.customer-products-template-editor) {
+  display: flex !important;
+  flex-direction: column !important;
+  width: min(1400px, calc(100vw - 3rem)) !important;
+  max-width: min(1400px, calc(100vw - 3rem)) !important;
+  height: auto !important;
+  max-height: 94vh !important;
+}
+
+@media (max-width: 768px) {
+  [role="dialog"]:has(.customer-products-template-editor) {
+    width: calc(100vw - 1rem) !important;
+    max-width: calc(100vw - 1rem) !important;
+  }
+}
+
+[role="dialog"]:has(.customer-products-template-editor) > div:first-of-type {
+  position: absolute;
+  z-index: 30;
+  top: 0;
+  left: 0;
+  display: block !important;
+  width: 0;
+  height: 0;
+  overflow: visible;
+}
+
+[role="dialog"]:has(.customer-products-template-editor) > div:first-of-type button {
+  position: absolute !important;
+  top: 10px;
+  left: 14px;
+  margin: 0 !important;
+  border-color: color-mix(in srgb, var(--destructive) 35%, transparent) !important;
+  background: color-mix(in srgb, var(--destructive) 12%, transparent) !important;
+  color: var(--destructive) !important;
+  box-shadow: 0 2px 8px color-mix(in srgb, var(--destructive) 20%, transparent);
+}
+
+[role="dialog"]:has(.customer-products-template-editor) > div:has(> .customer-products-template-editor) {
+  order: 0;
+  min-height: 0;
+  max-height: 94vh;
+  flex: 1 1 auto;
+}
+
+[role="dialog"]:has(.customer-products-template-editor) .customer-products-template-editor {
+  max-height: 94vh;
+}
+
+/* Reserve the toolbar's left edge for the overlaid close action. */
+[role="dialog"]:has(.customer-products-template-editor)
+  .customer-products-template-editor
+  > :first-child {
+  padding-left: 4.25rem !important;
+}
+
+/* Final user overrides must remain after the named grid themes above. */
+.wj-flexgrid .wj-header,
+.modernVoucherGrid .wj-flexgrid .wj-header {
+  height: var(--datagrid-header-height, 40px) !important;
+  min-height: var(--datagrid-header-height, 40px) !important;
+  background: var(--datagrid-header-color, #2c3e50) !important;
+  font-family: var(--datagrid-header-font-family, "Cairo"), sans-serif !important;
+}
+
+.wj-flexgrid .wj-state-selected:not(.wj-header),
+.wj-flexgrid .wj-row .wj-cell.wj-state-selected:not(.wj-header),
+.wj-flexgrid .wj-cell.wj-state-multi-selected:not(.wj-header),
+.wj-flexgrid .wj-row .wj-cell.wj-state-multi-selected:not(.wj-header),
+.wj-flexgrid .wj-report-row-selected .wj-cell,
+.modernVoucherGrid .wj-flexgrid .wj-state-selected:not(.wj-header),
+.modernVoucherGrid .wj-flexgrid .wj-row .wj-cell.wj-state-selected:not(.wj-header),
+.modernVoucherGrid .wj-flexgrid .wj-row .wj-cell.wj-state-multi-selected:not(.wj-header),
+.modernVoucherGrid .wj-flexgrid .wj-report-row-selected .wj-cell {
+  background: var(--datagrid-selected-row-color, #6fe27b) !important;
+  color: #14532d !important;
+}
+
+/* Row selection marks the active cell as selected and the other cells as
+   multi-selected. Give both the same contrast, including on hover. */
+.wj-flexgrid .wj-row .wj-cell.wj-state-multi-selected:not(.wj-header) *,
+.wj-flexgrid .wj-cell.wj-state-multi-selected:not(.wj-header) *,
+.wj-flexgrid .wj-row .wj-cell.wj-state-selected:not(.wj-header) *,
+.wj-flexgrid .wj-row.wj-report-row-selected .wj-cell * {
+  color: #14532d !important;
+}
+
+.wj-flexgrid .wj-row:hover .wj-cell.wj-state-selected:not(.wj-header),
+.wj-flexgrid .wj-row:hover .wj-cell.wj-state-multi-selected:not(.wj-header),
+.wj-flexgrid .wj-cell.wj-state-selected:focus:not(.wj-header),
+.wj-flexgrid .wj-cell.wj-state-multi-selected:focus:not(.wj-header),
+.wj-flexgrid .wj-row.wj-report-row-selected:hover .wj-cell:not(.wj-header) {
+  background: var(--datagrid-selected-row-color, #6fe27b) !important;
+  color: #14532d !important;
+}
+
+/* Search dialogs use row selection: the focused cell must not have a different color. */
+.modern-search-grid .wj-flexgrid .wj-cell.wj-state-selected:not(.wj-header),
+.modern-search-grid .wj-flexgrid .wj-row .wj-cell.wj-state-selected:not(.wj-header),
+.modern-search-grid .wj-flexgrid .wj-cell.wj-state-selected:focus:not(.wj-header) {
+  background: #bfdbfe !important;
+  color: #1e3a8a !important;
+  box-shadow: none !important;
+}
+
+.modern-search-grid .wj-flexgrid .wj-row:hover .wj-cell.wj-state-selected:not(.wj-header) {
+  background: #bfdbfe !important;
+  color: #1e3a8a !important;
+}
+
+/* Account import preview selects a complete row: Wijmo marks the active cell as
+   selected and the remaining row cells as multi-selected. Keep both states
+   identical so no white text is rendered over white alternating rows. */
+.excel-account-grid .wj-flexgrid .wj-cell.wj-state-selected:not(.wj-header),
+.excel-account-grid .wj-flexgrid .wj-cell.wj-state-multi-selected:not(.wj-header),
+.excel-account-grid .wj-flexgrid .wj-row:hover .wj-cell.wj-state-selected:not(.wj-header),
+.excel-account-grid .wj-flexgrid .wj-row:hover .wj-cell.wj-state-multi-selected:not(.wj-header) {
+  background: #bbf7d0 !important;
+  color: #14532d !important;
+  border-color: #86efac !important;
+}
+
+/* Order/delivery source pickers: compact, colorful read-only grids. */
+.invoice-source-grid .wj-flexgrid {
+  border: 0;
+  border-radius: 0;
+  font-size: 14px;
+}
+
+.invoice-source-grid .wj-flexgrid .wj-header {
+  background: linear-gradient(135deg, #1e3a8a, #2563eb) !important;
+  color: #fff !important;
+  border-color: #3b82f6 !important;
+  font-weight: 800 !important;
+}
+
+.invoice-source-grid .wj-flexgrid .wj-row:nth-child(even) .wj-cell:not(.wj-header) {
+  background: #f8fafc;
+  color: #1e293b;
+}
+
+.invoice-source-grid .wj-flexgrid .wj-row:hover .wj-cell:not(.wj-header) {
+  background: #e0f2fe !important;
+  color: #0c4a6e !important;
+}
+
+.invoice-source-grid .wj-flexgrid .wj-cell.wj-state-selected:not(.wj-header),
+.invoice-source-grid .wj-flexgrid .wj-cell:focus:not(.wj-header) {
+  background: #bfdbfe !important;
+  color: #1e3a8a !important;
+  box-shadow: none !important;
+}
+
+/* DataGridView actions: compact modern controls with stable action colors. */
+.wj-flexgrid .wj-cell:has(> .wj-cell-maker-btn) {
+  gap: 4px;
+  padding: 3px !important;
+}
+
+.wj-flexgrid .wj-cell > .wj-cell-maker-btn {
+  width: 30px !important;
+  min-width: 30px !important;
+  height: 30px !important;
+  min-height: 30px !important;
+  border: 1px solid #dbe3ec !important;
+  border-radius: 9px !important;
+  background: linear-gradient(180deg, #fff, #f1f5f9) !important;
+  color: #475569 !important;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, .08), 0 4px 10px rgba(15, 23, 42, .05) !important;
+  font-weight: 700;
+  transform: none;
+}
+
+.wj-flexgrid .wj-cell > .wj-cell-maker-btn:hover {
+  border-color: #94a3b8 !important;
+  background: linear-gradient(180deg, #f8fafc, #e2e8f0) !important;
+  color: #0f172a !important;
+  box-shadow: 0 6px 14px rgba(15, 23, 42, .16) !important;
+  transform: translateY(-2px) !important;
+}
+
+.wj-flexgrid .wj-cell > .wj-cell-maker-btn:active {
+  box-shadow: 0 1px 3px rgba(15, 23, 42, .12) !important;
+  transform: translateY(0) scale(.96) !important;
+}
+
+.wj-flexgrid .wj-cell > .wj-cell-maker-btn:focus-visible {
+  outline: 3px solid rgba(14, 165, 233, .28) !important;
+  outline-offset: 2px;
+}
+
+.wj-flexgrid .wj-cell > .wj-cell-maker-btn:disabled {
+  filter: grayscale(.35);
+  opacity: .42;
+  box-shadow: none !important;
+  transform: none !important;
+}
+
+.wj-flexgrid .wj-cell > .wj-cell-maker-btn.btn-info,
+.wj-flexgrid .wj-cell > .wj-cell-maker-btn.pi-search,
+.wj-flexgrid .wj-cell > .wj-cell-maker-btn.pi-pencil,
+.wj-flexgrid .wj-cell > .wj-cell-maker-btn.pi-eye,
+.wj-flexgrid .wj-cell > .wj-cell-maker-btn.pi-qrcode {
+  border-color: #bae6fd !important;
+  background: linear-gradient(180deg, #f0f9ff, #e0f2fe) !important;
+  color: #0369a1 !important;
+}
+
+.wj-flexgrid .wj-cell > .wj-cell-maker-btn.btn-info:hover,
+.wj-flexgrid .wj-cell > .wj-cell-maker-btn.pi-search:hover,
+.wj-flexgrid .wj-cell > .wj-cell-maker-btn.pi-pencil:hover,
+.wj-flexgrid .wj-cell > .wj-cell-maker-btn.pi-eye:hover,
+.wj-flexgrid .wj-cell > .wj-cell-maker-btn.pi-qrcode:hover {
+  border-color: #0284c7 !important;
+  background: linear-gradient(135deg, #0284c7, #0369a1) !important;
+  color: #fff !important;
+  box-shadow: 0 7px 16px rgba(2, 132, 199, .28) !important;
+}
+
+.wj-flexgrid .wj-cell > .wj-cell-maker-btn.btn-success,
+.wj-flexgrid .wj-cell > .wj-cell-maker-btn.pi-plus,
+.wj-flexgrid .wj-cell > .wj-cell-maker-btn.pi-save {
+  border-color: #bbf7d0 !important;
+  background: linear-gradient(180deg, #f0fdf4, #dcfce7) !important;
+  color: #15803d !important;
+}
+
+.wj-flexgrid .wj-cell > .wj-cell-maker-btn.btn-success:hover,
+.wj-flexgrid .wj-cell > .wj-cell-maker-btn.pi-plus:hover,
+.wj-flexgrid .wj-cell > .wj-cell-maker-btn.pi-save:hover {
+  border-color: #16a34a !important;
+  background: linear-gradient(135deg, #16a34a, #15803d) !important;
+  color: #fff !important;
+  box-shadow: 0 7px 16px rgba(22, 163, 74, .28) !important;
+}
+
+.wj-flexgrid .wj-cell > .wj-cell-maker-btn.btn-warning,
+.wj-flexgrid .wj-cell > .wj-cell-maker-btn.pi-calendar,
+.wj-flexgrid .wj-cell > .wj-cell-maker-btn.pi-money-bill {
+  border-color: #fde68a !important;
+  background: linear-gradient(180deg, #fffbeb, #fef3c7) !important;
+  color: #b45309 !important;
+}
+
+.wj-flexgrid .wj-cell > .wj-cell-maker-btn.btn-warning:hover,
+.wj-flexgrid .wj-cell > .wj-cell-maker-btn.pi-calendar:hover,
+.wj-flexgrid .wj-cell > .wj-cell-maker-btn.pi-money-bill:hover {
+  border-color: #d97706 !important;
+  background: linear-gradient(135deg, #f59e0b, #d97706) !important;
+  color: #fff !important;
+  box-shadow: 0 7px 16px rgba(217, 119, 6, .28) !important;
+}
+
+.wj-flexgrid .wj-cell > .wj-cell-maker-btn.btn-danger,
+.wj-flexgrid .wj-cell > .wj-cell-maker-btn.pi-trash {
+  border-color: #fecdd3 !important;
+  background: linear-gradient(180deg, #fff1f2, #ffe4e6) !important;
+  color: #be123c !important;
+}
+
+.wj-flexgrid .wj-cell > .wj-cell-maker-btn.btn-danger:hover,
+.wj-flexgrid .wj-cell > .wj-cell-maker-btn.pi-trash:hover {
+  border-color: #e11d48 !important;
+  background: linear-gradient(135deg, #f43f5e, #be123c) !important;
+  color: #fff !important;
+  box-shadow: 0 7px 16px rgba(225, 29, 72, .3) !important;
+}
+
+.wj-flexgrid .wj-cell > .wj-cell-maker-btn::before,
+.wj-flexgrid .wj-cell > .wj-cell-maker-btn i,
+.wj-flexgrid .wj-cell > .wj-cell-maker-btn svg {
+  color: inherit !important;
+  font-size: 14px !important;
+  font-weight: 700 !important;
+}
+
+/* Keep compact rows from clipping action controls into tiny circles. */
+.wj-flexgrid .wj-row .wj-cell > .wj-cell-maker-btn {
+  max-width: calc(100% - 2px);
+  max-height: calc(100% - 2px);
+}
+
+.dark .wj-flexgrid .wj-cell > .wj-cell-maker-btn.btn-default {
+  border-color: #475569 !important;
+  background: linear-gradient(180deg, #334155, #1e293b) !important;
+  color: #e2e8f0 !important;
+}
+
+/* Grid action buttons — SVG mask icons (no font glyphs), one tone per action, solid fill on hover. */
+.wj-flexgrid .wj-cell > button.wj-cell-maker-btn.dgv-action {
+  --dgv-tone:#475569;
+  --dgv-fill:#f1f5f9;
+  --dgv-ring:#cbd5e1;
+  position:relative;
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  gap:5px;
+  width:var(--dgv-action-size,30px) !important;
+  min-width:var(--dgv-action-size,30px) !important;
+  height:var(--dgv-action-size,30px) !important;
+  min-height:var(--dgv-action-size,30px) !important;
+  margin:0 !important;
+  padding:0 !important;
+  border:1px solid var(--dgv-ring) !important;
+  border-radius:9px !important;
+  background:var(--dgv-fill) !important;
+  color:var(--dgv-tone) !important;
+  box-shadow:0 1px 0 rgb(15 23 42 / 4%) !important;
+  font-family:inherit;
+  line-height:1;
+  cursor:pointer;
+  transition:background-color .14s ease,color .14s ease,border-color .14s ease,box-shadow .14s ease;
+}
+.wj-flexgrid .wj-cell > button.wj-cell-maker-btn.dgv-action::before {
+  content:"" !important;
+  display:block;
+  flex:0 0 16px;
+  width:16px;
+  height:16px;
+  background:currentColor;
+  mask:var(--dgv-icon) center / contain no-repeat;
+  -webkit-mask:var(--dgv-icon) center / contain no-repeat;
+}
+/* Tone per action, then explicit className tones (btn-danger …) win over the action default. */
+.wj-flexgrid .wj-cell > button.wj-cell-maker-btn.dgv-action-delete { --dgv-tone:#e11d48; --dgv-fill:#fff1f2; --dgv-ring:#fecdd3; }
+.wj-flexgrid .wj-cell > button.wj-cell-maker-btn.dgv-action-edit { --dgv-tone:#4f46e5; --dgv-fill:#eef2ff; --dgv-ring:#c7d2fe; }
+.wj-flexgrid .wj-cell > button.wj-cell-maker-btn.dgv-action-add,
+.wj-flexgrid .wj-cell > button.wj-cell-maker-btn.dgv-action-save { --dgv-tone:#059669; --dgv-fill:#ecfdf5; --dgv-ring:#a7f3d0; }
+.wj-flexgrid .wj-cell > button.wj-cell-maker-btn.dgv-action-view,
+.wj-flexgrid .wj-cell > button.wj-cell-maker-btn.dgv-action-search { --dgv-tone:#0284c7; --dgv-fill:#f0f9ff; --dgv-ring:#bae6fd; }
+.wj-flexgrid .wj-cell > button.wj-cell-maker-btn.dgv-action-calendar,
+.wj-flexgrid .wj-cell > button.wj-cell-maker-btn.dgv-action-money { --dgv-tone:#d97706; --dgv-fill:#fffbeb; --dgv-ring:#fde68a; }
+.wj-flexgrid .wj-cell > button.wj-cell-maker-btn.dgv-action.btn-danger { --dgv-tone:#e11d48; --dgv-fill:#fff1f2; --dgv-ring:#fecdd3; }
+.wj-flexgrid .wj-cell > button.wj-cell-maker-btn.dgv-action.btn-success { --dgv-tone:#059669; --dgv-fill:#ecfdf5; --dgv-ring:#a7f3d0; }
+.wj-flexgrid .wj-cell > button.wj-cell-maker-btn.dgv-action.btn-warning { --dgv-tone:#d97706; --dgv-fill:#fffbeb; --dgv-ring:#fde68a; }
+.wj-flexgrid .wj-cell > button.wj-cell-maker-btn.dgv-action:hover:not(:disabled) {
+  background:var(--dgv-tone) !important;
+  border-color:var(--dgv-tone) !important;
+  color:#fff !important;
+  box-shadow:0 4px 10px -4px var(--dgv-tone) !important;
+  transform:none !important;
+}
+.wj-flexgrid .wj-cell > button.wj-cell-maker-btn.dgv-action:active:not(:disabled) { box-shadow:inset 0 2px 4px rgb(15 23 42 / 25%) !important; }
+.wj-flexgrid .wj-cell > button.wj-cell-maker-btn.dgv-action:focus-visible { outline:2px solid var(--dgv-tone) !important; outline-offset:2px; }
+.wj-flexgrid .wj-cell > button.wj-cell-maker-btn.dgv-action:disabled { opacity:.4; cursor:not-allowed; }
+/* Buttons with a text label become compact pills. */
+.wj-flexgrid .wj-cell > button.wj-cell-maker-btn.dgv-action:not(:empty),
+.wj-flexgrid .wj-cell > button.wj-cell-maker-btn.dgv-action.has-label {
+  width:auto !important;
+  max-width:100%;
+  padding-inline:10px 11px !important;
+  border-radius:999px !important;
+  font-size:11.5px;
+  font-weight:700;
+  white-space:nowrap;
+}
+.wj-flexgrid .wj-cell > button.wj-cell-maker-btn.dgv-action:not(:empty)::before,
+.wj-flexgrid .wj-cell > button.wj-cell-maker-btn.dgv-action.has-label::before { flex-basis:14px; width:14px; height:14px; }
+/* Selected grid rows: keep the buttons readable on the highlighted background. */
+.wj-flexgrid .wj-state-selected > button.wj-cell-maker-btn.dgv-action,
+.wj-flexgrid .wj-state-multi-selected > button.wj-cell-maker-btn.dgv-action { background:#fff !important; }
+.dark .wj-flexgrid .wj-cell > button.wj-cell-maker-btn.dgv-action { --dgv-fill:#1e293b; --dgv-tone:#cbd5e1; --dgv-ring:#334155; box-shadow:none !important; }
+.dark .wj-flexgrid .wj-cell > button.wj-cell-maker-btn.dgv-action-delete,
+.dark .wj-flexgrid .wj-cell > button.wj-cell-maker-btn.dgv-action.btn-danger { --dgv-fill:#3b1720; --dgv-tone:#fda4af; --dgv-ring:#5f1f2e; }
+.dark .wj-flexgrid .wj-cell > button.wj-cell-maker-btn.dgv-action-edit { --dgv-fill:#1e1b4b; --dgv-tone:#a5b4fc; --dgv-ring:#312e81; }
+.dark .wj-flexgrid .wj-cell > button.wj-cell-maker-btn.dgv-action-add,
+.dark .wj-flexgrid .wj-cell > button.wj-cell-maker-btn.dgv-action-save,
+.dark .wj-flexgrid .wj-cell > button.wj-cell-maker-btn.dgv-action.btn-success { --dgv-fill:#052e24; --dgv-tone:#6ee7b7; --dgv-ring:#065f46; }
+.dark .wj-flexgrid .wj-cell > button.wj-cell-maker-btn.dgv-action-view,
+.dark .wj-flexgrid .wj-cell > button.wj-cell-maker-btn.dgv-action-search { --dgv-fill:#082f49; --dgv-tone:#7dd3fc; --dgv-ring:#075985; }
+.dark .wj-flexgrid .wj-cell > button.wj-cell-maker-btn.dgv-action-calendar,
+.dark .wj-flexgrid .wj-cell > button.wj-cell-maker-btn.dgv-action-money,
+.dark .wj-flexgrid .wj-cell > button.wj-cell-maker-btn.dgv-action.btn-warning { --dgv-fill:#3b2a0a; --dgv-tone:#fcd34d; --dgv-ring:#78350f; }
+.dark .wj-flexgrid .wj-cell > button.wj-cell-maker-btn.dgv-action:hover:not(:disabled) { color:#0f172a !important; }
+.dark .wj-flexgrid .wj-state-selected > button.wj-cell-maker-btn.dgv-action,
+.dark .wj-flexgrid .wj-state-multi-selected > button.wj-cell-maker-btn.dgv-action { background:#0f172a !important; }
+@media(prefers-reduced-motion:reduce) { .wj-flexgrid .wj-cell > button.wj-cell-maker-btn.dgv-action { transition:none; } }

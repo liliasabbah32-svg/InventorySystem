@@ -1,0 +1,228 @@
+import { cookies } from "next/headers"
+import { shouldUseSecureCookies } from "./cookie-security"
+import crypto from "crypto"
+import sql, { ensureManagementTables } from "./management-db"
+import { hashPassword, needsPasswordRehash, verifyPassword } from "./auth"
+
+export interface ManagementUser {
+  id: number
+  full_name: string
+  email: string
+  email_verified: boolean
+  is_platform_admin: boolean
+}
+
+const SESSION_DURATION_MS = 4 * 24 * 60 * 60 * 1000 // 4 days
+const SESSION_COOKIE = "mgmt_session"
+const PLATFORM_ADMIN_EMAIL = "sabbahsoft2026@gmail.com"
+
+function isPlatformAdmin(user: { email: string; is_platform_admin: boolean }): boolean {
+  return Boolean(user.is_platform_admin) || user.email.trim().toLowerCase() === PLATFORM_ADMIN_EMAIL
+}
+
+function generateToken(): string {
+  return crypto.randomBytes(32).toString("hex")
+}
+
+export async function signupManagementUser(data: { fullName: string; email: string; password: string; mobile?: string }) {
+  await ensureManagementTables()
+
+  const email = data.email.trim().toLowerCase()
+  // رقم الجوال: أرقام فقط (تُحذف المسافات والشرطات) مع + اختيارية، 9-15 رقماً
+  const mobile = String(data.mobile || "").replace(/[\s-]/g, "")
+  if (!data.fullName?.trim()) return { success: false, error: "الاسم الكامل مطلوب" }
+  if (!email) return { success: false, error: "البريد الإلكتروني مطلوب" }
+  if (!mobile) return { success: false, error: "رقم الجوال مطلوب" }
+  if (!/^\+?\d{9,15}$/.test(mobile)) return { success: false, error: "رقم الجوال غير صحيح" }
+  if (!data.password || data.password.length < 6) return { success: false, error: "كلمة المرور يجب أن تكون 6 أحرف على الأقل" }
+
+  const existing = await sql`SELECT id FROM users WHERE email = ${email}`
+  if (existing.length > 0) return { success: false, error: "البريد الإلكتروني مستخدَم مسبقاً" }
+
+  const passwordHash = await hashPassword(data.password)
+
+  // البريد الإلكتروني يُعتبر مؤكَّداً فور التسجيل (بلا خطوة تحقق عبر رابط بريدي) — يستطيع
+  // المستخدم تسجيل الدخول مباشرة بعد إنشاء الحساب.
+  const inserted = await sql`
+    INSERT INTO users (full_name, email, password_hash, email_verified, mobile)
+    VALUES (${data.fullName.trim()}, ${email}, ${passwordHash}, true, ${mobile})
+    RETURNING id, full_name, email
+  `
+  const user = inserted[0]
+
+  // دعوات الشركات المعلّقة لهذا البريد ⇐ عضويات (تظهر الشركات للمستخدم فوراً بعد التسجيل)
+  try {
+    const { acceptCompanyInvitations } = await import("@/lib/company-invitations")
+    await acceptCompanyInvitations(email, Number(user.id), passwordHash)
+  } catch (error) {
+    console.error("[management-auth] accepting company invitations failed", error)
+  }
+
+  return { success: true, user }
+}
+
+export async function verifyManagementEmail(token: string) {
+  await ensureManagementTables()
+  if (!token) return { success: false, error: "رمز التحقق مطلوب" }
+
+  const result = await sql`
+    UPDATE users SET email_verified = true, email_verification_token = NULL, updated_at = CURRENT_TIMESTAMP
+    WHERE email_verification_token = ${token}
+    RETURNING id, email
+  `
+  if (result.length === 0) return { success: false, error: "رمز التحقق غير صالح" }
+  return { success: true }
+}
+
+export async function loginManagementUser(data: { email: string; password: string }) {
+  await ensureManagementTables()
+  console.log("[LOGIN DEBUG] Database configured:",
+    !!process.env.DATABASE_URL
+  )
+  const email = data.email?.trim().toLowerCase()
+  if (!email || !data.password) return { success: false, error: "البريد الإلكتروني وكلمة المرور مطلوبان" }
+
+  const rows = await sql`
+    SELECT id, full_name, email, password_hash, email_verified, is_platform_admin, is_active
+    FROM users WHERE email = ${email}
+  `
+  console.log("[LOGIN DEBUG] Matching users:", rows.length)
+  if (rows.length === 0) return { success: false, error: "البريد الإلكتروني أو كلمة المرور غير صحيحة" }
+
+  const user = rows[0]
+  if (!(await verifyPassword(data.password, user.password_hash))) {
+    return { success: false, error: "البريد الإلكتروني أو كلمة المرور غير صحيحة" }
+  }
+  // تجزئة SHA-256 قديمة: تُستبدل بـbcrypt الآن (كلمة المرور الصريحة متاحة فقط لحظة الدخول)
+  if (needsPasswordRehash(user.password_hash)) {
+    const upgraded = await hashPassword(data.password)
+    await sql`UPDATE users SET password_hash = ${upgraded} WHERE id = ${user.id}`.catch((error: unknown) =>
+      console.error("[management-auth] password rehash failed:", error))
+  }
+
+  if (!user.email_verified) {
+    return { success: false, error: "يرجى تأكيد بريدك الإلكتروني أولاً قبل تسجيل الدخول" }
+  }
+
+  if (!user.is_active) {
+    return { success: false, error: "تم إيقاف هذا الحساب — يرجى التواصل مع إدارة النظام" }
+  }
+
+  const sessionToken = generateToken()
+  const expiresAt = new Date(Date.now() + SESSION_DURATION_MS)
+  await sql`
+    INSERT INTO management_sessions (user_id, session_token, expires_at)
+    VALUES (${user.id}, ${sessionToken}, ${expiresAt})
+  `
+
+  const cookieStore = await cookies()
+  cookieStore.set(SESSION_COOKIE, sessionToken, {
+    httpOnly: true,
+    secure: await shouldUseSecureCookies(),
+    sameSite: "lax",
+    expires: expiresAt,
+    path: "/",
+  })
+
+  const { password_hash, ...userWithoutPassword } = user
+  return {
+    success: true,
+    user: {
+      ...userWithoutPassword,
+      is_platform_admin: isPlatformAdmin(user),
+    } as ManagementUser,
+  }
+}
+
+export async function getManagementSession(): Promise<ManagementUser | null> {
+  try {
+    await ensureManagementTables()
+    const cookieStore = await cookies()
+    const sessionToken = cookieStore.get(SESSION_COOKIE)?.value
+    if (!sessionToken) return null
+
+    const sessionRows = await sql`SELECT user_id, expires_at FROM management_sessions WHERE session_token = ${sessionToken}`
+    if (sessionRows.length === 0) return null
+
+    const session = sessionRows[0]
+    if (new Date(session.expires_at) < new Date()) {
+      await sql`DELETE FROM management_sessions WHERE session_token = ${sessionToken}`
+      cookieStore.delete(SESSION_COOKIE)
+      return null
+    }
+
+    const userRows = await sql`
+      SELECT id, full_name, email, email_verified, is_platform_admin, is_active
+      FROM users WHERE id = ${session.user_id}
+    `
+    if (userRows.length === 0) return null
+    const user = userRows[0]
+    if (!user.is_active) {
+      await sql`DELETE FROM management_sessions WHERE session_token = ${sessionToken}`
+      cookieStore.delete(SESSION_COOKIE)
+      return null
+    }
+    return {
+      ...user,
+      is_platform_admin: isPlatformAdmin(user),
+    } as ManagementUser
+  } catch (error) {
+    console.error("[management-auth] getManagementSession error:", error)
+    return null
+  }
+}
+
+/**
+ * تغيير كلمة مرور المستخدم المسجّل دخوله (بوابة الإدارة): يتحقق من الحالية، ويكتب الجديدة لحساب الإدارة ولكل شركة
+ * مرتبط بها البريد، وينهي جلسات الإدارة الأخرى لهذا الحساب (تبقى الجلسة الحالية).
+ */
+export async function changeManagementPassword(currentPassword: string, newPassword: string): Promise<{ ok: boolean; error?: string; status?: number }> {
+  const user = await getManagementSession()
+  if (!user) return { ok: false, error: "يجب تسجيل الدخول", status: 401 }
+  if (!currentPassword) return { ok: false, error: "أدخل كلمة المرور الحالية", status: 400 }
+  if (String(newPassword || "").length < 6) return { ok: false, error: "كلمة المرور الجديدة يجب أن تكون 6 أحرف على الأقل", status: 400 }
+  const row = (await sql`SELECT password_hash FROM users WHERE id = ${user.id}`)[0]
+  if (!row || !(await verifyPassword(currentPassword, row.password_hash))) return { ok: false, error: "كلمة المرور الحالية غير صحيحة", status: 400 }
+  if (await verifyPassword(newPassword, row.password_hash)) return { ok: false, error: "كلمة المرور الجديدة مطابقة للحالية", status: 400 }
+  const hash = await hashPassword(newPassword)
+  await sql`UPDATE users SET password_hash = ${hash}, updated_at = CURRENT_TIMESTAMP WHERE id = ${user.id}`
+  const { writePasswordToCompanies } = await import("./password-codes")
+  await writePasswordToCompanies(user.email, hash)
+  const token = (await cookies()).get(SESSION_COOKIE)?.value || ""
+  await sql`DELETE FROM management_sessions WHERE user_id = ${user.id} AND session_token <> ${token}`
+  return { ok: true }
+}
+
+/** مسؤول الموقع يعيّن كلمة مرور مستخدم بدون القديمة: تُكتب في كل شركاته وتُنهى كل جلساته. */
+export async function adminSetManagementPassword(userId: number, newPassword: string): Promise<{ ok: boolean; error?: string; status?: number }> {
+  const admin = await getManagementSession()
+  if (!admin || !admin.is_platform_admin) return { ok: false, error: "لا تملك صلاحية القيام بهذا الإجراء", status: 403 }
+  if (String(newPassword || "").length < 6) return { ok: false, error: "كلمة المرور الجديدة يجب أن تكون 6 أحرف على الأقل", status: 400 }
+  const row = (await sql`SELECT id, email FROM users WHERE id = ${userId}`)[0]
+  if (!row) return { ok: false, error: "المستخدم غير موجود", status: 404 }
+  const hash = await hashPassword(newPassword)
+  await sql`UPDATE users SET password_hash = ${hash}, updated_at = CURRENT_TIMESTAMP WHERE id = ${userId}`
+  const { writePasswordToCompanies } = await import("./password-codes")
+  await writePasswordToCompanies(row.email, hash)
+  if (userId === admin.id) {
+    const token = (await cookies()).get(SESSION_COOKIE)?.value || ""
+    await sql`DELETE FROM management_sessions WHERE user_id = ${userId} AND session_token <> ${token}`
+  } else {
+    await sql`DELETE FROM management_sessions WHERE user_id = ${userId}`
+  }
+  return { ok: true }
+}
+
+export async function logoutManagementUser(): Promise<void> {
+  try {
+    await ensureManagementTables()
+    const cookieStore = await cookies()
+    const sessionToken = cookieStore.get(SESSION_COOKIE)?.value
+    if (sessionToken) {
+      await sql`DELETE FROM management_sessions WHERE session_token = ${sessionToken}`
+    }
+    cookieStore.delete(SESSION_COOKIE)
+  } catch (error) {
+    console.error("[management-auth] logout error:", error)
+  }
+}

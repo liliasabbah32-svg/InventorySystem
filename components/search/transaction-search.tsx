@@ -1,5 +1,7 @@
 "use client"
 
+import { normalizeArabicSearch } from "@/lib/arabic-search"
+import { tr } from "@/lib/i18n"
 import { useState, useEffect, useMemo } from "react"
 import {
   Search,
@@ -166,7 +168,7 @@ const TransactionSearch = ({
     let filtered = salesOrders
 
     if (debouncedSearchTerm) {
-      const searchLower = debouncedSearchTerm.toLowerCase()
+      const searchLower = normalizeArabicSearch(debouncedSearchTerm)
       filtered = filtered.filter((order) => {
         const searchableFields = [
           order.order_number,
@@ -180,8 +182,8 @@ const TransactionSearch = ({
           .toLowerCase()
 
         return (
-          searchableFields.includes(searchLower) ||
-          searchLower.split(" ").some((word) => word.length > 1 && searchableFields.includes(word))
+          normalizeArabicSearch(searchableFields).includes(searchLower) ||
+          searchLower.split(" ").some((word) => word.length > 1 && normalizeArabicSearch(searchableFields).includes(word))
         )
       })
     }
@@ -208,7 +210,7 @@ const TransactionSearch = ({
     let filtered = purchaseOrders
 
     if (debouncedSearchTerm) {
-      const searchLower = debouncedSearchTerm.toLowerCase()
+      const searchLower = normalizeArabicSearch(debouncedSearchTerm)
       filtered = filtered.filter((order) => {
         const searchableFields = [
           order.order_number,
@@ -222,8 +224,8 @@ const TransactionSearch = ({
           .toLowerCase()
 
         return (
-          searchableFields.includes(searchLower) ||
-          searchLower.split(" ").some((word) => word.length > 1 && searchableFields.includes(word))
+          normalizeArabicSearch(searchableFields).includes(searchLower) ||
+          searchLower.split(" ").some((word) => word.length > 1 && normalizeArabicSearch(searchableFields).includes(word))
         )
       })
     }
@@ -250,7 +252,7 @@ const TransactionSearch = ({
     let filtered = movements
 
     if (debouncedSearchTerm) {
-      const searchLower = debouncedSearchTerm.toLowerCase()
+      const searchLower = normalizeArabicSearch(debouncedSearchTerm)
       filtered = filtered.filter((movement) => {
         const searchableFields = [
           movement.product_name,
@@ -265,8 +267,8 @@ const TransactionSearch = ({
           .toLowerCase()
 
         return (
-          searchableFields.includes(searchLower) ||
-          searchLower.split(" ").some((word) => word.length > 1 && searchableFields.includes(word))
+          normalizeArabicSearch(searchableFields).includes(searchLower) ||
+          searchLower.split(" ").some((word) => word.length > 1 && normalizeArabicSearch(searchableFields).includes(word))
         )
       })
     }
@@ -316,7 +318,7 @@ const TransactionSearch = ({
 
   const formatDate = (dateString: string) => {
     const date = new Date(dateString)
-    return date.toLocaleDateString("ar-SA", { year: "numeric", month: "2-digit", day: "2-digit" })
+    return date.toLocaleDateString("en-GB", { year: "numeric", month: "2-digit", day: "2-digit" })
   }
 
   const getMovementIcon = (type: string) => {
@@ -371,25 +373,25 @@ const TransactionSearch = ({
           <div className="grid grid-cols-2 gap-4 text-sm">
             <div className="flex items-center gap-2">
               <User className="h-3 w-3 text-muted-foreground" />
-              <span className="search-result-subtitle">الزبون: {order.customer_name}</span>
+              <span className="search-result-subtitle">{tr("العميل: ")}{order.customer_name}</span>
             </div>
 
             <div className="flex items-center gap-2">
               <Calendar className="h-3 w-3 text-muted-foreground" />
-              <span className="search-result-subtitle">التاريخ: {formatDate(order.order_date)}</span>
+              <span className="search-result-subtitle">{tr("التاريخ: ")}{formatDate(order.order_date)}</span>
             </div>
 
             <div className="flex items-center gap-2">
               <DollarSign className="h-3 w-3 text-muted-foreground" />
               <span className="search-result-subtitle font-semibold text-green-600">
-                {order.total_amount?.toLocaleString()} {order.currency_code || "ريال"}
+                {order.total_amount?.toLocaleString("en-US")} {order.currency_code || tr("ريال")}
               </span>
             </div>
 
             {order.salesman && (
               <div className="flex items-center gap-2">
                 <User className="h-3 w-3 text-muted-foreground" />
-                <span className="search-result-subtitle">المندوب: {order.salesman}</span>
+                <span className="search-result-subtitle">{tr("المندوب: ")}{order.salesman}</span>
               </div>
             )}
           </div>
@@ -402,7 +404,7 @@ const TransactionSearch = ({
           )}
         </div>
         <Button variant="ghost" size="sm" className="text-primary">
-          اختيار
+          {tr("اختيار")}
         </Button>
       </div>
     </div>
@@ -425,25 +427,25 @@ const TransactionSearch = ({
           <div className="grid grid-cols-2 gap-4 text-sm">
             <div className="flex items-center gap-2">
               <User className="h-3 w-3 text-muted-foreground" />
-              <span className="search-result-subtitle">المورد: {order.supplier_name}</span>
+              <span className="search-result-subtitle">{tr("المورد: ")}{order.supplier_name}</span>
             </div>
 
             <div className="flex items-center gap-2">
               <Calendar className="h-3 w-3 text-muted-foreground" />
-              <span className="search-result-subtitle">التاريخ: {formatDate(order.order_date)}</span>
+              <span className="search-result-subtitle">{tr("التاريخ: ")}{formatDate(order.order_date)}</span>
             </div>
 
             <div className="flex items-center gap-2">
               <DollarSign className="h-3 w-3 text-muted-foreground" />
               <span className="search-result-subtitle font-semibold text-green-600">
-                {order.total_amount?.toLocaleString()} {order.currency_code || "ريال"}
+                {order.total_amount?.toLocaleString("en-US")} {order.currency_code || tr("ريال")}
               </span>
             </div>
 
             {order.expected_delivery_date && (
               <div className="flex items-center gap-2">
                 <Calendar className="h-3 w-3 text-muted-foreground" />
-                <span className="search-result-subtitle">التسليم: {formatDate(order.expected_delivery_date)}</span>
+                <span className="search-result-subtitle">{tr("التسليم: ")}{formatDate(order.expected_delivery_date)}</span>
               </div>
             )}
           </div>
@@ -456,7 +458,7 @@ const TransactionSearch = ({
           )}
         </div>
         <Button variant="ghost" size="sm" className="text-primary">
-          اختيار
+          {tr("اختيار")}
         </Button>
       </div>
     </div>
@@ -479,25 +481,25 @@ const TransactionSearch = ({
           <div className="grid grid-cols-2 gap-4 text-sm">
             <div className="flex items-center gap-2">
               <Package className="h-3 w-3 text-muted-foreground" />
-              <span className="search-result-subtitle">الرقم: {movement.product_code}</span>
+              <span className="search-result-subtitle">{tr("الرقم: ")}{movement.product_code}</span>
             </div>
 
             <div className="flex items-center gap-2">
               <Calendar className="h-3 w-3 text-muted-foreground" />
-              <span className="search-result-subtitle">التاريخ: {formatDate(movement.created_at)}</span>
+              <span className="search-result-subtitle">{tr("التاريخ: ")}{formatDate(movement.created_at)}</span>
             </div>
 
             <div className="flex items-center gap-2">
               <Package className="h-3 w-3 text-muted-foreground" />
               <span className="search-result-subtitle font-semibold">
-                الكمية: {movement.quantity?.toLocaleString()}
+                {tr("الكمية: ")}{movement.quantity?.toLocaleString("en-US")}
               </span>
             </div>
 
             {movement.unit_cost && (
               <div className="flex items-center gap-2">
                 <DollarSign className="h-3 w-3 text-muted-foreground" />
-                <span className="search-result-subtitle">السعر: {movement.unit_cost?.toLocaleString()}</span>
+                <span className="search-result-subtitle">{tr("السعر: ")}{movement.unit_cost?.toLocaleString("en-US")}</span>
               </div>
             )}
 
@@ -505,14 +507,14 @@ const TransactionSearch = ({
               <div className="flex items-center gap-2">
                 <FileText className="h-3 w-3 text-muted-foreground" />
                 <span className="search-result-subtitle">
-                  المرجع: {movement.reference_type} #{movement.reference_id}
+                  {tr("المرجع: ")}{movement.reference_type} #{movement.reference_id}
                 </span>
               </div>
             )}
 
             <div className="flex items-center gap-2">
               <User className="h-3 w-3 text-muted-foreground" />
-              <span className="search-result-subtitle">المستخدم: {movement.created_by}</span>
+              <span className="search-result-subtitle">{tr("المستخدم: ")}{movement.created_by}</span>
             </div>
           </div>
 
@@ -524,7 +526,7 @@ const TransactionSearch = ({
           )}
         </div>
         <Button variant="ghost" size="sm" className="text-primary">
-          اختيار
+          {tr("اختيار")}
         </Button>
       </div>
     </div>
@@ -535,7 +537,7 @@ const TransactionSearch = ({
       <div className="search-header">
         <div className="flex items-center gap-2">
           <FileText className="h-5 w-5 text-primary" />
-          <h2 className="search-title">البحث عن الحركات والمعاملات</h2>
+          <h2 className="search-title">{tr("البحث عن الحركات والمعاملات")}</h2>
         </div>
         <div className="flex items-center gap-2">
           <Button
@@ -545,7 +547,7 @@ const TransactionSearch = ({
             className="flex items-center gap-2 search-button"
           >
             <Filter className="h-4 w-4" />
-            فلاتر
+            {tr("فلاتر")}
           </Button>
           {isModal && onClose && (
             <Button variant="ghost" size="sm" onClick={onClose} className="search-button">
@@ -557,13 +559,13 @@ const TransactionSearch = ({
 
       {/* Search Input */}
       <div className="relative">
-        <Search className="absolute right-3 top-1/2 transform -translate-y-1/2 h-4 w-4 text-muted-foreground" />
+        <Search className="absolute start-3 top-1/2 transform -translate-y-1/2 h-4 w-4 text-muted-foreground" />
         <Input
           type="text"
-          placeholder="ابحث برقم الطلب، اسم الزبون/المورد، أو الصنف..."
+          placeholder={tr("ابحث برقم الطلب، اسم العميل/المورد، أو الصنف...")}
           value={searchTerm}
           onChange={(e) => setSearchTerm(e.target.value)}
-          className="search-input pr-10"
+          className="search-input ps-10"
           autoFocus={isModal}
         />
       </div>
@@ -572,30 +574,30 @@ const TransactionSearch = ({
       {showFilters && (
         <Card>
           <CardHeader>
-            <CardTitle className="text-sm">فلاتر البحث المتقدم</CardTitle>
+            <CardTitle className="text-sm">{tr("فلاتر البحث المتقدم")}</CardTitle>
           </CardHeader>
           <CardContent>
             <div className="search-filters">
               <div className="space-y-2">
-                <Label>الحالة</Label>
+                <Label>{tr("الحالة")}</Label>
                 <Select
                   value={filters.status}
                   onValueChange={(value) => setFilters((prev) => ({ ...prev, status: value }))}
                 >
                   <SelectTrigger>
-                    <SelectValue placeholder="اختر الحالة" />
+                    <SelectValue placeholder={tr("اختر الحالة")} />
                   </SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="all">جميع الحالات</SelectItem>
-                    <SelectItem value="قيد التنفيذ">قيد التنفيذ</SelectItem>
-                    <SelectItem value="مكتمل">مكتمل</SelectItem>
-                    <SelectItem value="ملغي">ملغي</SelectItem>
+                    <SelectItem value="all">{tr("جميع الحالات")}</SelectItem>
+                    <SelectItem value="قيد التنفيذ">{tr("قيد التنفيذ")}</SelectItem>
+                    <SelectItem value="مكتمل">{tr("مكتمل")}</SelectItem>
+                    <SelectItem value="ملغي">{tr("ملغي")}</SelectItem>
                   </SelectContent>
                 </Select>
               </div>
 
               <div className="space-y-2">
-                <Label>من تاريخ</Label>
+                <Label>{tr("من تاريخ")}</Label>
                 <Input
                   type="date"
                   value={filters.dateFrom}
@@ -604,7 +606,7 @@ const TransactionSearch = ({
               </div>
 
               <div className="space-y-2">
-                <Label>إلى تاريخ</Label>
+                <Label>{tr("إلى تاريخ")}</Label>
                 <Input
                   type="date"
                   value={filters.dateTo}
@@ -613,10 +615,10 @@ const TransactionSearch = ({
               </div>
 
               <div className="space-y-2">
-                <Label>المندوب</Label>
+                <Label>{tr("المندوب")}</Label>
                 <Input
                   type="text"
-                  placeholder="اسم المندوب"
+                  placeholder={tr("اسم المندوب")}
                   value={filters.salesman}
                   onChange={(e) => setFilters((prev) => ({ ...prev, salesman: e.target.value }))}
                 />
@@ -624,7 +626,7 @@ const TransactionSearch = ({
             </div>
             <div className="mt-4">
               <Button variant="outline" onClick={clearFilters} className="w-full bg-transparent search-button">
-                مسح الفلاتر
+                {tr("مسح الفلاتر")}
               </Button>
             </div>
           </CardContent>
@@ -635,15 +637,15 @@ const TransactionSearch = ({
       {searchType === "all" ? (
         <Tabs value={activeTab} onValueChange={setActiveTab} className="w-full">
           <TabsList className="grid w-full grid-cols-3">
-            <TabsTrigger value="sales">طلبات البيع</TabsTrigger>
-            <TabsTrigger value="purchases">طلبات الشراء</TabsTrigger>
-            <TabsTrigger value="movements">حركات المخزون</TabsTrigger>
+            <TabsTrigger value="sales">{tr("طلبات البيع")}</TabsTrigger>
+            <TabsTrigger value="purchases">{tr("طلبات الشراء")}</TabsTrigger>
+            <TabsTrigger value="movements">{tr("حركات المخزون")}</TabsTrigger>
           </TabsList>
 
           <TabsContent value="sales" className="space-y-4">
             <div className="flex items-center justify-between">
               <p className="text-sm text-muted-foreground">
-                {loading ? "جاري البحث..." : `تم العثور على ${filteredSalesOrders.length} طلب بيع`}
+                {loading ? tr("جاري البحث...") : tr("تم العثور على {0} طلب بيع", filteredSalesOrders.length)}
               </p>
               {debouncedSearchTerm && (
                 <Badge variant="secondary" className="flex items-center gap-1">
@@ -661,7 +663,7 @@ const TransactionSearch = ({
               ) : filteredSalesOrders.length === 0 ? (
                 <div className="text-center py-8 text-muted-foreground">
                   <FileText className="h-12 w-12 mx-auto mb-4 opacity-50" />
-                  <p>لم يتم العثور على طلبات بيع مطابقة</p>
+                  <p>{tr("لم يتم العثور على طلبات بيع مطابقة")}</p>
                 </div>
               ) : (
                 filteredSalesOrders.map(renderSalesOrderCard)
@@ -672,7 +674,7 @@ const TransactionSearch = ({
           <TabsContent value="purchases" className="space-y-4">
             <div className="flex items-center justify-between">
               <p className="text-sm text-muted-foreground">
-                {loading ? "جاري البحث..." : `تم العثور على ${filteredPurchaseOrders.length} طلب شراء`}
+                {loading ? tr("جاري البحث...") : tr("تم العثور على {0} طلب شراء", filteredPurchaseOrders.length)}
               </p>
               {debouncedSearchTerm && (
                 <Badge variant="secondary" className="flex items-center gap-1">
@@ -690,7 +692,7 @@ const TransactionSearch = ({
               ) : filteredPurchaseOrders.length === 0 ? (
                 <div className="text-center py-8 text-muted-foreground">
                   <FileText className="h-12 w-12 mx-auto mb-4 opacity-50" />
-                  <p>لم يتم العثور على طلبات شراء مطابقة</p>
+                  <p>{tr("لم يتم العثور على طلبات شراء مطابقة")}</p>
                 </div>
               ) : (
                 filteredPurchaseOrders.map(renderPurchaseOrderCard)
@@ -701,7 +703,7 @@ const TransactionSearch = ({
           <TabsContent value="movements" className="space-y-4">
             <div className="flex items-center justify-between">
               <p className="text-sm text-muted-foreground">
-                {loading ? "جاري البحث..." : `تم العثور على ${filteredMovements.length} حركة مخزون`}
+                {loading ? tr("جاري البحث...") : tr("تم العثور على {0} حركة مخزون", filteredMovements.length)}
               </p>
               {debouncedSearchTerm && (
                 <Badge variant="secondary" className="flex items-center gap-1">
@@ -719,7 +721,7 @@ const TransactionSearch = ({
               ) : filteredMovements.length === 0 ? (
                 <div className="text-center py-8 text-muted-foreground">
                   <FileText className="h-12 w-12 mx-auto mb-4 opacity-50" />
-                  <p>لم يتم العثور على حركات مخزون مطابقة</p>
+                  <p>{tr("لم يتم العثور على حركات مخزون مطابقة")}</p>
                 </div>
               ) : (
                 filteredMovements.map(renderMovementCard)
@@ -733,12 +735,12 @@ const TransactionSearch = ({
           <div className="flex items-center justify-between">
             <p className="text-sm text-muted-foreground">
               {loading
-                ? "جاري البحث..."
+                ? tr("جاري البحث...")
                 : searchType === "sales"
-                  ? `تم العثور على ${filteredSalesOrders.length} طلب بيع`
+                  ? tr("تم العثور على {0} طلب بيع", filteredSalesOrders.length)
                   : searchType === "purchases"
-                    ? `تم العثور على ${filteredPurchaseOrders.length} طلب شراء`
-                    : `تم العثور على ${filteredMovements.length} حركة مخزون`}
+                    ? tr("تم العثور على {0} طلب شراء", filteredPurchaseOrders.length)
+                    : tr("تم العثور على {0} حركة مخزون", filteredMovements.length)}
             </p>
             {debouncedSearchTerm && (
               <Badge variant="secondary" className="flex items-center gap-1">
@@ -757,7 +759,7 @@ const TransactionSearch = ({
               filteredSalesOrders.length === 0 ? (
                 <div className="text-center py-8 text-muted-foreground">
                   <FileText className="h-12 w-12 mx-auto mb-4 opacity-50" />
-                  <p>لم يتم العثور على نتائج مطابقة</p>
+                  <p>{tr("لم يتم العثور على نتائج مطابقة")}</p>
                 </div>
               ) : (
                 filteredSalesOrders.map(renderSalesOrderCard)
@@ -766,7 +768,7 @@ const TransactionSearch = ({
               filteredPurchaseOrders.length === 0 ? (
                 <div className="text-center py-8 text-muted-foreground">
                   <FileText className="h-12 w-12 mx-auto mb-4 opacity-50" />
-                  <p>لم يتم العثور على نتائج مطابقة</p>
+                  <p>{tr("لم يتم العثور على نتائج مطابقة")}</p>
                 </div>
               ) : (
                 filteredPurchaseOrders.map(renderPurchaseOrderCard)
@@ -774,7 +776,7 @@ const TransactionSearch = ({
             ) : filteredMovements.length === 0 ? (
               <div className="text-center py-8 text-muted-foreground">
                 <FileText className="h-12 w-12 mx-auto mb-4 opacity-50" />
-                <p>لم يتم العثور على نتائج مطابقة</p>
+                <p>{tr("لم يتم العثور على نتائج مطابقة")}</p>
               </div>
             ) : (
               filteredMovements.map(renderMovementCard)

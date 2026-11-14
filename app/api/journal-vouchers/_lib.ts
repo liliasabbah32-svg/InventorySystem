@@ -1,0 +1,132 @@
+import sql, { memoInTransaction } from "@/lib/database"
+import { withBranchSymbol } from "@/lib/branch-symbol"
+import {
+  ensureTables as ensureVoucherTables,
+  saveJournalRows,
+  saveNoteRows,
+  fetchDetails,
+  archiveAndDeleteVoucher,
+  markVoucherPrinted,
+  validateJournalAccountCurrencies,
+  validateJournalCostCenters,
+  JOURNAL_TYPE_COUNTER_ACCOUNT,
+} from "../receipts/_lib"
+import { buildVoucherCode, normalizeVoucherPrefix } from "@/lib/voucher-code"
+
+export { buildVoucherCode, normalizeVoucherPrefix }
+
+// سند قيد يشارك نفس جداول سند القبض/الصرف (voucher_header_tbl / voucher_journal_detail_tbl /
+// voucher_costcenter_tbl / voucher_notes_tbl) — الفرق الوحيد هنا: كل سطر في "الحسابات" هو
+// طرف مدين أو دائن مباشرة (لا صناديق/شيكات/بطاقات)، ولا يوجد عميل/حساب مقابل منفصل.
+export const ensureTables = ensureVoucherTables
+
+export async function unlinkPayrollJournal(voucherId: number) {
+  // Payroll is optional and its journal column is installed by the HR schema.
+  const columns = await sql`SELECT 1 FROM pg_attribute
+    WHERE attrelid=to_regclass('payroll_tbl') AND attname='journal_id' AND NOT attisdropped`
+  if (columns.length) await sql`UPDATE payroll_tbl SET journal_id=NULL WHERE journal_id=${voucherId}`
+}
+export {
+  saveJournalRows,
+  saveNoteRows,
+  fetchDetails,
+  archiveAndDeleteVoucher,
+  markVoucherPrinted,
+  validateJournalAccountCurrencies,
+  validateJournalCostCenters,
+  JOURNAL_TYPE_COUNTER_ACCOUNT,
+}
+
+// per voucher_types_tbl (3 = "سند قيد", مختلف عن سند القبض/الصرف 4/5).
+export const JOURNAL_VCH_TYPE = 3
+
+export const getVoucherNumberSettings = async (
+  requestUrl: string,
+): Promise<{ prefix: string; startNumber: number }> => {
+  const defaultPrefix = "J"
+  try {
+    // مباشرة من القاعدة بدل طلب HTTP داخلي لـ/api/settings/system: ذلك الطلب لا يحمل كوكي الشركة (فيقرأ
+    // الإعدادات الافتراضية لا إعدادات الشركة)، وعلى Cloudflare هو طلب Worker إضافي كامل مع كل توليد رقم.
+    void requestUrl
+    const { loadStoredSettings } = await import("@/app/api/settings/system/route")
+    const settings = await loadStoredSettings()
+    const prefixRaw = String(settings?.journal_prefix || defaultPrefix).trim().toUpperCase()
+    const prefix = /^[A-Z]{1,3}$/.test(prefixRaw) ? prefixRaw : defaultPrefix
+    const startNumber = Number(settings?.journal_start) || 1
+    return { prefix, startNumber }
+  } catch (error) {
+    console.error("Failed to load journal voucher numbering settings, using defaults:", error)
+    return { prefix: defaultPrefix, startNumber: 1 }
+  }
+}
+
+export const nextVoucherSequence = async (codePrefix: string, startNumber: number): Promise<number> => {
+  const rows = await sql`
+    SELECT vch_code FROM voucher_header_tbl WHERE vch_type = ${JOURNAL_VCH_TYPE} AND vch_code LIKE ${codePrefix + "%"}
+  `
+  let maxNumber = 0
+  for (const row of rows) {
+    const suffix = String(row.vch_code || "").slice(codePrefix.length)
+    const match = suffix.match(/^[A-Za-z]?([0-9]+)$/)
+    const value = Number(match?.[1] ?? suffix)
+    if (Number.isFinite(value) && value > maxNumber) maxNumber = value
+  }
+  return maxNumber >= startNumber ? maxNumber + 1 : startNumber
+}
+
+// جزء الكود الذي يلي بادئة السند: رمز الفرع (إن مُرّر branchId) + رمز دفتر السندات، مثل "AD".
+export const resolveVoucherBookName = async (bookId: number | null, branchId?: number | null): Promise<string> => {
+  if (!bookId) return ""
+  // داخل معاملة (حفظ فاتورة الكاشير مثلاً) تُقرأ مرة واحدة (memoInTransaction في lib/database.ts)
+  const rows = await memoInTransaction(`voucher-book-name:${bookId}`, () => sql`SELECT name FROM voucher_books_tbl WHERE id = ${bookId}` as Promise<any[]>)
+  return withBranchSymbol(String(rows[0]?.name || ""), branchId)
+}
+
+// كل سطر مُدخَل في شبكة "الحسابات" (مدين أو دائن، وليس كلاهما) يصبح سطر
+// journal_type_id=JOURNAL_TYPE_COUNTER_ACCOUNT مباشرة — القيد نفسه هو محتوى السند، بخلاف سند
+// القبض/الصرف حيث الحسابات المقابلة تُكمّل طرفي نقدي/شيكات/بطاقات.
+export interface JournalRow {
+  journal_type_id: number
+  account_id: number
+  credit_debit: number
+  amount: number
+  note: string
+  cost_centers: any[]
+  order_no: number
+  currency_id: number | null
+  rate: number
+  base_curr_amount: number
+}
+
+export const buildJournalRows = (data: any): JournalRow[] => {
+  const currencyId = data.currency_id || null
+  const rate = Number(data.rate || 1)
+
+  const journalRows: any[] = (Array.isArray(data.journal) ? data.journal : []).filter((row: any) => {
+    if (!row?.account_id) return false
+    const amount = Number(row?.amount || 0)
+    const debit = Number(row?.debit || (Number(row?.credit_debit) === 1 ? amount : 0))
+    const credit = Number(row?.credit || (Number(row?.credit_debit) === 2 ? amount : 0))
+    return debit + credit > 0
+  })
+
+  return journalRows.map((row: any, index: number): JournalRow => {
+    // Editor rows use debit/credit; rows returned from the API use credit_debit + amount.
+    const storedAmount = Number(row.amount || 0)
+    const debit = Number(row.debit || (Number(row.credit_debit) === 1 ? storedAmount : 0))
+    const credit = Number(row.credit || (Number(row.credit_debit) === 2 ? storedAmount : 0))
+    const amount = debit > 0 ? debit : credit
+    return {
+      journal_type_id: JOURNAL_TYPE_COUNTER_ACCOUNT,
+      account_id: Number(row.account_id),
+      credit_debit: debit > 0 ? 1 : 2,
+      amount,
+      note: row.note || "",
+      cost_centers: Array.isArray(row.cost_centers) ? row.cost_centers : [],
+      order_no: index + 1,
+      currency_id: currencyId,
+      rate,
+      base_curr_amount: Math.round(amount * rate * 100) / 100,
+    }
+  })
+}

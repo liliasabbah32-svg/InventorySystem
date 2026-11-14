@@ -1,0 +1,202 @@
+Import manufacturing components from Excel
+Each extra user
+Each extra branch
+Each POS point
+Each restaurant location
+Edit price
+Edit price in sales invoice
+Edit price in sales delivery
+Edit price in consignment delivery
+Edit price in consignment delivery return
+Edit price in sales return
+Edit price in purchase invoice
+Edit price in purchase delivery
+Edit price in purchase return
+Enter item discount
+Enter item discount in sales invoice
+Enter item discount in sales delivery
+Enter item discount in consignment delivery
+Enter item discount in consignment delivery return
+Enter item discount in sales return
+Enter item discount in purchase invoice
+Enter item discount in purchase delivery
+Enter item discount in purchase return
+Enter general discount
+Enter general discount in sales invoice
+Enter general discount in sales delivery
+Enter general discount in consignment delivery
+Enter general discount in consignment delivery return
+Enter general discount in sales return
+Enter general discount in purchase invoice
+Enter general discount in purchase delivery
+Enter general discount in purchase return
+Edit VAT rate
+Edit VAT rate in sales invoice
+Edit VAT rate in sales delivery
+Edit VAT rate in consignment delivery
+Edit VAT rate in consignment delivery return
+Edit VAT rate in sales return
+Edit VAT rate in purchase invoice
+Edit VAT rate in purchase delivery
+Edit VAT rate in purchase return
+Customer balance
+Top receivables
+Item stock
+Compare sales
+Copy reply
+No reply came from the assistant. Rephrase the question or try again.
+Choose the license you need and send your request to the sales team. All your data stays as it is.
+The sales team will contact you soon, and the subscription is activated once management approves it.
+Contact details for sales
+Mobile number *
+WhatsApp (if different from mobile)
+Edit price in sales order
+Edit price in purchase order
+Enter item discount in sales order
+Enter item discount in purchase order
+Enter general discount in sales order
+Enter general discount in purchase order
+Edit VAT rate in sales order
+Edit VAT rate in purchase order
+Print sales order
+Print sales invoice
+Print sales delivery
+Print consignment delivery
+Print consignment delivery return
+Print sales return
+Print purchase order
+Print purchase invoice
+Print purchase delivery
+Print purchase return
+Print goods receipt voucher
+Print goods issue voucher
+Print internal delivery
+Print usage voucher
+Print production voucher
+Print receipt voucher
+Print payment voucher
+Print cheque payment voucher
+Print journal voucher
+Print credit note
+Print debit note
+Copy sales order
+Copy sales invoice
+Copy sales delivery
+Copy consignment delivery
+Copy consignment delivery return
+Copy sales return
+Copy purchase order
+Copy purchase invoice
+Copy purchase delivery
+Copy purchase return
+Copy goods receipt voucher
+Copy goods issue voucher
+Copy internal delivery
+Copy usage voucher
+Copy production voucher
+Copy receipt voucher
+Copy payment voucher
+Copy cheque payment voucher
+Copy journal voucher
+Copy credit note
+Copy debit note
+Send SMS for sales order
+Send SMS for sales invoice
+Send SMS for sales delivery
+Send SMS for consignment delivery
+Send SMS for consignment delivery return
+Send SMS for sales return
+Send SMS for purchase order
+Send SMS for purchase invoice
+Send SMS for purchase delivery
+Send SMS for purchase return
+Send SMS for goods receipt voucher
+Send SMS for goods issue voucher
+Send SMS for internal delivery
+Send SMS for usage voucher
+Send SMS for production voucher
+Send SMS for receipt voucher
+Send SMS for payment voucher
+Send SMS for cheque payment voucher
+Send SMS for journal voucher
+Send SMS for credit note
+Send SMS for debit note
+Send WhatsApp for sales order
+Send WhatsApp for sales invoice
+Send WhatsApp for sales delivery
+Send WhatsApp for consignment delivery
+Send WhatsApp for consignment delivery return
+Send WhatsApp for sales return
+Send WhatsApp for purchase order
+Send WhatsApp for purchase invoice
+Send WhatsApp for purchase delivery
+Send WhatsApp for purchase return
+Send WhatsApp for goods receipt voucher
+Send WhatsApp for goods issue voucher
+Send WhatsApp for internal delivery
+Send WhatsApp for usage voucher
+Send WhatsApp for production voucher
+Send WhatsApp for receipt voucher
+Send WhatsApp for payment voucher
+Send WhatsApp for cheque payment voucher
+Send WhatsApp for journal voucher
+Send WhatsApp for credit note
+Send WhatsApp for debit note
+Add your mobile number so our team can contact you about your companies and subscriptions.
+Later
+Could not save the mobile number
+Mobile number saved
+Limit reached: two trial companies
+A user cannot create more than two trial companies
+No cost vouchers yet
+Voucher {0} — journal {1}
+New landed cost voucher
+Cancel the voucher and its journal? The costs will be removed from item cost.
+Voucher cancelled
+Cost voucher
+Edit currency
+Edit currency details
+Edit the currency name and code
+Currency details updated successfully
+Could not update the currency
+Existing vouchers are linked to the same currency and will show the new name and code.
+Currency name and code are required
+Currency code must be English letters (up to 10)
+Currency not found
+Salary advances
+Loans
+Cash deduction
+Advance
+Loan
+Employee advances — deducted from the selected month's net salary
+Employee loans — paid in monthly salary installments starting from the selected month
+Cash deductions on employees — deducted from the selected month's net salary
+New advance
+New loan
+New cash deduction
+Employee advances account (credit in the salary journal)
+Employee loans account (credit in the salary journal)
+Cash deductions account (credit in the salary journal)
+{0} settings
+The account is required to post the salary journal when salaries include deductions of this type.
+Deduction year
+Deduction month
+All months
+Account settings
+Deducted from net salary when the month's salary is opened or recalculated; an open salary is updated immediately. Saving, editing or deleting is blocked if the employee's salary for that month is closed/paid.
+Deducted from paid salaries
+Installments
+From month
+Deducted
+Included in a closed/paid salary
+Number of installments *
+First deduction month *
+Salary deduction month *
+Installment schedule
+Delete {0} for employee {1}?
+Advances, loans & deductions
+Employee is required
+Date is required
+Installments must be between 1 and 120
+Salary deduction month is required
+Cannot save: the employee's salary for {0} is closed/paid

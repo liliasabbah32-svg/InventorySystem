@@ -1,0 +1,96 @@
+import { NextResponse, type NextRequest } from "next/server"
+import { withVoucherAudit } from "@/lib/voucher-audit"
+import sql, { withTenantTransaction } from "@/lib/database"
+import { authorizeStoredVoucher } from "@/lib/transaction-permissions"
+import { rollbackChequeOperationsForVoucher } from "@/app/api/cheques/_lib"
+import { ensureChequePaymentTables, fetchChequePaymentVoucher } from "../_lib"
+import { workingPeriodErrorMessage } from "@/lib/working-period"
+
+export async function GET(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
+  await ensureChequePaymentTables()
+  const id = Number((await params).id)
+  const authorization = await authorizeStoredVoucher(request, id, "view")
+  if (!authorization.ok) return authorization.response
+  const row = await fetchChequePaymentVoucher(id)
+  return row
+    ? NextResponse.json(row)
+    : NextResponse.json({ error: "السند غير موجود" }, { status: 404 })
+}
+
+async function deleteHandler(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
+  try {
+    await ensureChequePaymentTables()
+    const id = Number((await params).id)
+    const authorization = await authorizeStoredVoucher(request, id, "delete")
+    if (!authorization.ok) return authorization.response
+
+    return await withTenantTransaction(async () => {
+      const changed = await sql`
+        SELECT c.cheq_num, c.status_id, latest.new_status_id
+        FROM cheque_payment_voucher_items i
+        JOIN cheques_tbl c ON c.id = i.cheque_id
+        LEFT JOIN LATERAL (
+          SELECT l.new_status_id
+          FROM cheque_operations_log_tbl l
+          WHERE l.cheque_id = c.id AND l.voucher_id = ${id} AND COALESCE(l.status, 1) <> 9
+          ORDER BY l.operation_date DESC, l.id DESC
+          LIMIT 1
+        ) latest ON TRUE
+        WHERE i.voucher_id = ${id}
+        FOR UPDATE OF c
+      `
+      const invalid = changed.find((row: any) => Number(row.status_id) !== Number(row.new_status_id))
+      if (invalid) {
+        return NextResponse.json({ error: `لا يمكن حذف السند: تغيّرت حالة الشيك رقم ${invalid.cheq_num} بعد هذا السند` }, { status: 409 })
+      }
+      const rollback = await rollbackChequeOperationsForVoucher(id)
+      if (rollback.error) return NextResponse.json({ error: rollback.error }, { status: 409 })
+
+      const updated = await sql`
+        UPDATE voucher_header_tbl
+        SET status=3,vch_status=1,last_update_date=CURRENT_TIMESTAMP
+        WHERE id=${id} AND vch_type=21 AND status<>3
+        RETURNING id
+      `
+      if (!updated.length) throw new Error("CHEQUE_PAYMENT_VOUCHER_NOT_FOUND")
+      return NextResponse.json({ success: true, restored_cheques: rollback.restored })
+    })
+  } catch (error) {
+    if (error instanceof Error && error.message === "CHEQUE_PAYMENT_VOUCHER_NOT_FOUND") {
+      return NextResponse.json({ error: "السند غير موجود أو ملغي" }, { status: 404 })
+    }
+    console.error("Cheque payment delete error:", error)
+    return NextResponse.json({ error: workingPeriodErrorMessage(error) || "تعذر إلغاء سند صرف الشيكات" }, { status: workingPeriodErrorMessage(error) ? 400 : 500 })
+  }
+}
+
+async function patchHandler(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
+  try {
+    await ensureChequePaymentTables()
+    const id = Number((await params).id)
+    const { action } = await request.json()
+    if (!["save", "save_print", "post", "post_print"].includes(action)) {
+      return NextResponse.json({ error: "إجراء الحفظ غير صحيح" }, { status: 400 })
+    }
+    const posting = action === "post" || action === "post_print"
+    const authorization = await authorizeStoredVoucher(request, id, posting ? "post" : "update")
+    if (!authorization.ok) return authorization.response
+    return await withTenantTransaction(async () => {
+      const rows = await sql`SELECT id,status FROM voucher_header_tbl WHERE id=${id} AND vch_type=21 FOR UPDATE`
+      if (!rows[0] || Number(rows[0].status) !== 1) {
+        return NextResponse.json({ error: "السند غير موجود أو معتمد أو ملغي" }, { status: 409 })
+      }
+      if (posting) {
+        await sql`UPDATE voucher_header_tbl SET status=2,vch_status=2,is_printed=${action === "post_print" ? 1 : 0},last_update_date=CURRENT_TIMESTAMP WHERE id=${id}`
+      }
+      return NextResponse.json(await fetchChequePaymentVoucher(id))
+    })
+  } catch (error) {
+    console.error("Cheque payment save error:", error)
+    return NextResponse.json({ error: workingPeriodErrorMessage(error) || "تعذر حفظ سند صرف الشيكات" }, { status: workingPeriodErrorMessage(error) ? 400 : 500 })
+  }
+}
+
+// أرشفة السندات (تقرير ارشفة السندات): نسخة قبل/بعد + نوع العملية والمستخدم
+export const PATCH = withVoucherAudit(patchHandler, { source: "voucher", kind: "save" })
+export const DELETE = withVoucherAudit(deleteHandler, { source: "voucher", kind: "delete" })

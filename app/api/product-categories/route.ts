@@ -1,43 +1,14 @@
 import { type NextRequest, NextResponse } from "next/server"
-import { neon } from "@neondatabase/serverless"
-import { Pool } from "pg"
+import { findUsages, usageMessage } from "@/lib/delete-guard"
+import sql from "@/lib/database"
+import { runSchemaOnce } from "@/lib/schema-once"
 
+async function ensureProductCategoryStatus() { return runSchemaOnce("app/api/product-categories/route.ts#ensureProductCategoryStatus", async () => {
+  await sql`ALTER TABLE product_categories ADD COLUMN IF NOT EXISTS status INTEGER NOT NULL DEFAULT 1`
+  await sql`ALTER TABLE product_categories ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`
+}) }
 // --- Database setup ---
-let sql: any = null
 
-try {
-  if (!process.env.DATABASE_URL) {
-    console.error("[v0] DATABASE_URL environment variable is not set")
-  } else {
-    const dbUrl = process.env.DATABASE_URL
-
-    if (dbUrl.includes("localhost") || dbUrl.includes("127.0.0.1")) {
-      console.log("[v0] Using local PostgreSQL with pg Pool")
-      const pool = new Pool({ connectionString: dbUrl })
-      sql = async (strings: TemplateStringsArray, ...values: any[]) => {
-        const client = await pool.connect()
-        try {
-          const query = strings.reduce(
-            (prev, curr, i) => prev + curr + (i < values.length ? `$${i + 1}` : ""),
-            ""
-          )
-          const result = await client.query(query, values)
-          return result.rows
-        } finally {
-          client.release()
-        }
-      }
-    } else {
-      console.log("[v0] Using Neon serverless client")
-      sql = neon(dbUrl)
-    }
-
-    console.log("[v0] Database client initialized successfully")
-  }
-} catch (error) {
-  console.error("[v0] Failed to initialize DB client:", error)
-  sql = null
-}
 
 // ❌ Remove this line:
 // export default sql
@@ -46,6 +17,7 @@ try {
 // --- GET all customer categories ---
 export async function GET() {
   try {
+    await ensureProductCategoryStatus()
     const categories = await sql`SELECT * FROM product_categories ORDER BY id`
     return NextResponse.json({ categories })
   } catch (error) {
@@ -57,8 +29,9 @@ export async function GET() {
 // --- POST a new category ---
 export async function POST(request: NextRequest) {
   try {
+    await ensureProductCategoryStatus()
     const body = await request.json()
-    const { name } = body
+    const { name, status } = body
 
     if (!name) {
       return NextResponse.json({ error: "Category name is required" }, { status: 400 })
@@ -69,8 +42,8 @@ export async function POST(request: NextRequest) {
     const newId = lastId + 1
 
     const result = await sql`
-      INSERT INTO product_categories (id, name)
-      VALUES (${newId}, ${name})
+      INSERT INTO product_categories (id, name, status)
+      VALUES (${newId}, ${name}, ${status ?? 1})
       RETURNING *
     `
 
@@ -84,7 +57,8 @@ export async function POST(request: NextRequest) {
 // --- PUT to update existing category ---
 export async function PUT(request: NextRequest) {
   try {
-    const { id, name } = await request.json()
+    await ensureProductCategoryStatus()
+    const { id, name, status } = await request.json()
 
     if (!id) {
       return NextResponse.json({ error: "Category ID is required" }, { status: 400 })
@@ -94,6 +68,7 @@ export async function PUT(request: NextRequest) {
       UPDATE product_categories
       SET
         name = COALESCE(${name}, name),
+        status = COALESCE(${status}, status),
         updated_at = CURRENT_TIMESTAMP
       WHERE id = ${id}
       RETURNING *
@@ -107,5 +82,24 @@ export async function PUT(request: NextRequest) {
   } catch (error) {
     console.error("Error updating product category:", error)
     return NextResponse.json({ error: "Failed to update product category" }, { status: 500 })
+  }
+}
+
+export async function DELETE(request: NextRequest) {
+  try {
+    await ensureProductCategoryStatus()
+    const id = Number(new URL(request.url).searchParams.get("id"))
+    if (!id) return NextResponse.json({ error: "Category ID is required" }, { status: 400 })
+    // فحص الارتباط قبل الحذف: لا يُحذف تعريف مستخدم في تعريفات أخرى أو حركات (lib/delete-guard.ts)
+    const usageRow = (await sql`SELECT * FROM product_categories WHERE id = ${id}`)[0] as any
+    const usages = await findUsages(id, { idColumns: /^category_id$/, excludeTables: ["product_categories"], excludeColumns: ["access_list.category_id"] })
+    if (usages.length) return NextResponse.json({ error: usageMessage("تصنيف الأصناف", String(usageRow?.name || ""), usages) }, { status: 400 })
+
+    const deleted = await sql`UPDATE product_categories SET status = 3, updated_at = CURRENT_TIMESTAMP WHERE id = ${id} RETURNING *`
+    if (!deleted.length) return NextResponse.json({ error: "Category not found" }, { status: 404 })
+    return NextResponse.json({ category: deleted[0] })
+  } catch (error) {
+    console.error("Error deleting product category:", error)
+    return NextResponse.json({ error: "Failed to delete product category" }, { status: 500 })
   }
 }

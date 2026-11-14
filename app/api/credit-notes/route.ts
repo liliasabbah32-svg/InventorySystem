@@ -1,0 +1,246 @@
+import { validateAccountStops } from "@/lib/account-stops"
+import { type NextRequest, NextResponse } from "next/server"
+import { withVoucherAudit } from "@/lib/voucher-audit"
+import sql from "@/lib/database"
+import {
+  ensureTables,
+  buildCreditNoteJournalRows,
+  saveJournalRows,
+  fetchCreditNoteDetails,
+  validateJournalAccountCurrencies,
+  validateCreditNoteVatAccount,
+  CREDIT_NOTE_VCH_TYPE,
+  getCreditNoteNumberSettings,
+  buildVoucherCode,
+  nextVoucherSequence,
+  resolveVoucherBookName,
+} from "./_lib"
+import { authorizeTransaction, transactionFamilyForVoucherType } from "@/lib/transaction-permissions"
+import { workingPeriodErrorMessage } from "@/lib/working-period"
+
+export async function GET(request: NextRequest) {
+  try {
+    await ensureTables()
+
+    const { searchParams } = new URL(request.url)
+    const vchType = Number(searchParams.get("vch_type") || 10)
+    const family = transactionFamilyForVoucherType(vchType)
+    if (!family) return NextResponse.json({ error: "نوع الحركة غير صالح" }, { status: 400 })
+    const authorization = await authorizeTransaction(request, family, "view", searchParams.get("branch_id"))
+    if (!authorization.ok) return authorization.response
+
+    const rows = await sql`
+      SELECT * FROM voucher_header_tbl
+      WHERE vch_type = ${vchType} AND status != 3 AND branch_id = ANY(${authorization.branchIds}::int[])
+      ORDER BY id DESC
+    `
+
+    return NextResponse.json(rows)
+  } catch (error) {
+    console.error("Error fetching credit/debit notes:", error)
+    return NextResponse.json({ error: "Failed to fetch credit/debit notes" }, { status: 500 })
+  }
+}
+
+async function postHandler(request: NextRequest) {
+  try {
+    await ensureTables()
+    const data = await request.json()
+    const family = transactionFamilyForVoucherType(Number(data.vch_type))
+    if (!family) return NextResponse.json({ error: "نوع الحركة غير صالح" }, { status: 400 })
+    const authorization = await authorizeTransaction(request, family, "create", data.branch_id)
+    if (!authorization.ok) return authorization.response
+    if (Number(data.status || 1) === 2) {
+      const posting = await authorizeTransaction(request, family, "post", authorization.branchId)
+      if (!posting.ok) return posting.response
+    }
+
+    const vchType = Number(data.vch_type)
+    if (!vchType || !data.vch_code || !data.vch_date) {
+      return NextResponse.json({ error: "بيانات السند غير مكتملة" }, { status: 400 })
+    }
+    if (!(Number(data.rate) > 0)) {
+      return NextResponse.json({ error: "سعر الصرف يجب أن يكون أكبر من صفر" }, { status: 400 })
+    }
+
+    if (!data.account_id) return NextResponse.json({ error: "يجب اختيار العميل" }, { status: 400 })
+    if (!data.debit_account_id)
+      return NextResponse.json({ error: `يجب اختيار ${vchType === CREDIT_NOTE_VCH_TYPE ? "الحساب المدين" : "الحساب الدائن"}` }, { status: 400 })
+    const vatAccountError = await validateCreditNoteVatAccount(data)
+    if (vatAccountError) return NextResponse.json({ error: vatAccountError }, { status: 400 })
+
+    const amount = Number(data.amount || 0)
+    if (amount <= 0) return NextResponse.json({ error: "يجب إدخال المبلغ" }, { status: 400 })
+
+    const journalRows = buildCreditNoteJournalRows(data, vchType)
+    const totalDebit = journalRows.filter((r) => r.credit_debit === 1).reduce((s, r) => s + r.amount, 0)
+    const totalCredit = journalRows.filter((r) => r.credit_debit === 2).reduce((s, r) => s + r.amount, 0)
+    if (Math.round((totalDebit - totalCredit) * 100) / 100 !== 0) {
+      const format = (value: number) => value.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+      return NextResponse.json({ error: `القيد غير متوازن: إجمالي المدين ${format(totalDebit)}، وإجمالي الدائن ${format(totalCredit)}. يجب أن يتساوى الطرفان قبل الترحيل.` }, { status: 400 })
+    }
+    const currencyError = await validateJournalAccountCurrencies(journalRows, data.currency_id ? Number(data.currency_id) : null)
+    if (currencyError) return NextResponse.json({ error: currencyError }, { status: 400 })
+    const stopError = await validateAccountStops(journalRows.map((row: any) => row.account_id), vchType, data.vch_date)
+    if (stopError) return NextResponse.json({ error: stopError }, { status: 400 })
+
+    const status = Number(data.status || 1)
+    const settings = await getCreditNoteNumberSettings(request.url, vchType)
+    const bookName = await resolveVoucherBookName(Number(data.vch_book_id) || null, authorization.branchId)
+    const generateNextCode = async () => buildVoucherCode(settings.prefix, bookName, await nextVoucherSequence(vchType, `${settings.prefix}${bookName}`, settings.startNumber))
+    let voucherCode = String(data.vch_code).trim()
+    let result: any[] = []
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      const existing = await sql`SELECT id FROM voucher_header_tbl WHERE vch_type = ${vchType} AND vch_code = ${voucherCode}`
+      if (existing.length > 0) voucherCode = await generateNextCode()
+      try {
+        result = await sql`
+      INSERT INTO voucher_header_tbl (
+        vch_type, vch_code, vch_date, vch_book_id, branch_id, currency_id, rate,
+        account_id, customer_name, debit_account_id, vat_account_id,
+        amount, amount_journal_type_8, vat, vat_percent,
+        payment_classification_id, salesman_id, manual_voucher, manual_date, note, status, vch_status, is_printed,
+        insert_user
+      ) VALUES (
+        ${vchType}, ${voucherCode}, ${data.vch_date}, ${data.vch_book_id || null}, ${authorization.branchId}, ${data.currency_id || null}, ${Number(data.rate || 1)},
+        ${data.account_id}, ${data.customer_name || ""}, ${data.debit_account_id}, ${data.vat_account_id || null},
+        ${amount}, ${Number(data.amount_journal_type_8 || 0)}, ${Number(data.vat || 0)}, ${Number(data.vat_percent || 0)},
+        ${data.payment_classification_id || null}, ${data.salesman_id || null}, ${data.manual_voucher || ""}, ${data.manual_date || null}, ${data.note || ""}, ${status}, ${status === 2 ? 2 : 1}, ${Number(data.is_printed || 0)},
+        ${data.insert_user || null}
+      )
+      RETURNING *
+        `
+        break
+      } catch (error: any) {
+        if (String(error?.code || "") !== "23505") throw error
+        voucherCode = await generateNextCode()
+      }
+    }
+    if (!result.length) return NextResponse.json({ error: "تعذر توليد رقم سند متاح من دفتر السندات" }, { status: 409 })
+
+    const voucher = result[0]
+    await saveJournalRows(voucher.id, journalRows)
+
+    const details = await fetchCreditNoteDetails(voucher.id)
+    return NextResponse.json({ ...voucher, ...details }, { status: 201 })
+  } catch (error) {
+    console.error("Error creating credit/debit note:", error)
+    return NextResponse.json({ error: workingPeriodErrorMessage(error) || "Failed to create credit/debit note" }, { status: workingPeriodErrorMessage(error) ? 400 : 500 })
+  }
+}
+
+async function putHandler(request: NextRequest) {
+  try {
+    await ensureTables()
+    const data = await request.json()
+    const family = transactionFamilyForVoucherType(Number(data.vch_type))
+    if (!family) return NextResponse.json({ error: "نوع الحركة غير صالح" }, { status: 400 })
+    const action = Number(data.status) === 3 ? "delete" : "update"
+    const authorization = await authorizeTransaction(request, family, action, data.branch_id)
+    if (!authorization.ok) return authorization.response
+    if (Number(data.status) === 2) {
+      const posting = await authorizeTransaction(request, family, "post", authorization.branchId)
+      if (!posting.ok) return posting.response
+    }
+
+    if (!data.id) {
+      return NextResponse.json({ error: "معرف السند مطلوب" }, { status: 400 })
+    }
+
+    const vchType = Number(data.vch_type)
+    if (!vchType || !data.vch_code || !data.vch_date) {
+      return NextResponse.json({ error: "بيانات السند غير مكتملة" }, { status: 400 })
+    }
+    if (!(Number(data.rate) > 0)) {
+      return NextResponse.json({ error: "سعر الصرف يجب أن يكون أكبر من صفر" }, { status: 400 })
+    }
+
+    const duplicate = await sql`
+      SELECT id FROM voucher_header_tbl WHERE vch_type = ${vchType} AND vch_code = ${data.vch_code} AND id != ${data.id}
+    `
+    if (duplicate.length > 0) {
+      return NextResponse.json({ error: "رقم السند مستخدم مسبقاً" }, { status: 400 })
+    }
+
+    const status = Number(data.status ?? 1)
+
+    // سند مُرحَّل (status=2) مقفل: التعديل العادي عليه ممنوع من الواجهة، ونمنعه هنا أيضاً كخط
+    // دفاع ثانٍ — الاستثناء الوحيد هو إلغاؤه منطقياً (status=3) عبر تأكيد الحذف.
+    const currentRows = await sql`SELECT status FROM voucher_header_tbl WHERE id = ${data.id}`
+    if (currentRows.length > 0 && Number(currentRows[0].status) === 2 && status !== 3) {
+      return NextResponse.json({ error: "السند معتمد ولا يمكن تعديله" }, { status: 400 })
+    }
+
+    const amount = Number(data.amount || 0)
+    let journalRows: any[] = []
+    if (status !== 3) {
+      if (!data.account_id) return NextResponse.json({ error: "يجب اختيار العميل" }, { status: 400 })
+      if (!data.debit_account_id)
+        return NextResponse.json({ error: `يجب اختيار ${vchType === CREDIT_NOTE_VCH_TYPE ? "الحساب المدين" : "الحساب الدائن"}` }, { status: 400 })
+      const vatAccountError = await validateCreditNoteVatAccount(data)
+      if (vatAccountError) return NextResponse.json({ error: vatAccountError }, { status: 400 })
+      if (amount <= 0) return NextResponse.json({ error: "يجب إدخال المبلغ" }, { status: 400 })
+
+      journalRows = buildCreditNoteJournalRows(data, vchType)
+      const totalDebit = journalRows.filter((r) => r.credit_debit === 1).reduce((s, r) => s + r.amount, 0)
+      const totalCredit = journalRows.filter((r) => r.credit_debit === 2).reduce((s, r) => s + r.amount, 0)
+      if (Math.round((totalDebit - totalCredit) * 100) / 100 !== 0) {
+        const format = (value: number) => value.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+        return NextResponse.json({ error: `القيد غير متوازن: إجمالي المدين ${format(totalDebit)}، وإجمالي الدائن ${format(totalCredit)}. يجب أن يتساوى الطرفان قبل الترحيل.` }, { status: 400 })
+      }
+      const currencyError = await validateJournalAccountCurrencies(journalRows, data.currency_id ? Number(data.currency_id) : null)
+      if (currencyError) return NextResponse.json({ error: currencyError }, { status: 400 })
+      const stopError = await validateAccountStops(journalRows.map((row: any) => row.account_id), vchType, data.vch_date)
+      if (stopError) return NextResponse.json({ error: stopError }, { status: 400 })
+    }
+
+    const result = await sql`
+      UPDATE voucher_header_tbl
+      SET
+        vch_code = ${data.vch_code},
+        vch_date = ${data.vch_date},
+        vch_book_id = ${data.vch_book_id || null},
+        branch_id = ${authorization.branchId},
+        currency_id = ${data.currency_id || null},
+        rate = ${Number(data.rate || 1)},
+        account_id = ${data.account_id || null},
+        customer_name = ${data.customer_name || ""},
+        debit_account_id = ${data.debit_account_id || null},
+        vat_account_id = ${data.vat_account_id || null},
+        amount = ${amount},
+        amount_journal_type_8 = ${Number(data.amount_journal_type_8 || 0)},
+        vat = ${Number(data.vat || 0)},
+        vat_percent = ${Number(data.vat_percent || 0)},
+        payment_classification_id = ${data.payment_classification_id || null},
+        salesman_id = ${data.salesman_id || null},
+        manual_voucher = ${data.manual_voucher || ""},
+        manual_date = ${data.manual_date || null},
+        note = ${data.note || ""},
+        status = ${status},
+        vch_status = ${status === 2 ? 2 : 1},
+        is_printed = ${Number(data.is_printed || 0)},
+        last_update_date = CURRENT_TIMESTAMP
+      WHERE id = ${data.id}
+      RETURNING *
+    `
+
+    if (result.length === 0) {
+      return NextResponse.json({ error: "السند غير موجود" }, { status: 404 })
+    }
+
+    const voucher = result[0]
+    if (status !== 3) {
+      await saveJournalRows(voucher.id, journalRows)
+    }
+
+    const details = await fetchCreditNoteDetails(voucher.id)
+    return NextResponse.json({ ...voucher, ...details })
+  } catch (error) {
+    console.error("Error updating credit/debit note:", error)
+    return NextResponse.json({ error: workingPeriodErrorMessage(error) || "Failed to update credit/debit note" }, { status: workingPeriodErrorMessage(error) ? 400 : 500 })
+  }
+}
+
+// أرشفة السندات (تقرير ارشفة السندات): نسخة قبل/بعد + نوع العملية والمستخدم
+export const POST = withVoucherAudit(postHandler, { source: "voucher", kind: "save" })
+export const PUT = withVoucherAudit(putHandler, { source: "voucher", kind: "save" })

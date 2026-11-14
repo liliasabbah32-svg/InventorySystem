@@ -1,9 +1,6 @@
 import { type NextRequest, NextResponse } from "next/server"
 import { getWorkflowStatistics } from "@/lib/workflow"
-import { neon } from "@neondatabase/serverless"
-
-const sql = neon(process.env.DATABASE_URL!)
-
+import sql from "@/lib/database"
 export async function GET(request: NextRequest) {
   try {
     const { searchParams } = new URL(request.url)
@@ -44,7 +41,7 @@ export async function GET(request: NextRequest) {
         EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - ows.stage_start_time))/3600 as hours_in_stage
       FROM order_workflow_status ows
       JOIN workflow_stages ws ON ows.current_stage_id = ws.id
-      LEFT JOIN sales_orders so ON ows.order_type = 'sales' AND ows.order_id = so.id
+      LEFT JOIN orders so ON ows.order_type = 'sales' AND ows.order_id = so.id
       LEFT JOIN purchase_orders po ON ows.order_type = 'purchase' AND ows.order_id = po.id
       ${department ? sql`WHERE ows.assigned_to_department = ${department}` : sql``}
       ORDER BY ows.created_at DESC
@@ -65,7 +62,7 @@ export async function GET(request: NextRequest) {
         EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - ows.stage_start_time))/3600 as hours_overdue
       FROM order_workflow_status ows
       JOIN workflow_stages ws ON ows.current_stage_id = ws.id
-      LEFT JOIN sales_orders so ON ows.order_type = 'sales' AND ows.order_id = so.id
+      LEFT JOIN orders so ON ows.order_type = 'sales' AND ows.order_id = so.id
       LEFT JOIN purchase_orders po ON ows.order_type = 'purchase' AND ows.order_id = po.id
       WHERE ows.is_overdue = true
       ${department ? sql`AND ows.assigned_to_department = ${department}` : sql``}

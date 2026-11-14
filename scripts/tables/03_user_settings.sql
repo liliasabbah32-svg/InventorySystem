@@ -1,7 +1,7 @@
 -- جدول إعدادات المستخدمين
 CREATE TABLE IF NOT EXISTS user_settings (
     id SERIAL PRIMARY KEY,
-    user_id VARCHAR(255) UNIQUE NOT NULL,
+    user_id INTEGER UNIQUE NOT NULL,
     username VARCHAR(100) UNIQUE NOT NULL,
     password_hash VARCHAR(255),
     email VARCHAR(255),
@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS user_settings (
     sms_notifications BOOLEAN DEFAULT false,
     sidebar_collapsed BOOLEAN DEFAULT false,
     dashboard_layout JSONB,
+    datagrid_settings JSONB DEFAULT '{}',
     avatar_url TEXT,
     last_login TIMESTAMP,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,

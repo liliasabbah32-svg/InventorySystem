@@ -2,6 +2,7 @@
 
 import { useEffect } from "react"
 import { useTheme } from "next-themes"
+import { reapplyUserFont } from "@/lib/user-font"
 
 interface ThemeLoaderProps {
   userId?: string
@@ -13,6 +14,8 @@ export function ThemeLoader({ userId }: ThemeLoaderProps) {
   useEffect(() => {
     const loadUserTheme = async () => {
       if (!userId) return
+      // الخط المحفوظ فوراً — لا ينتظر الشبكة (وإن فشل الطلب يبقى الخط الصحيح)
+      reapplyUserFont()
 
       try {
         let userData: any = null
@@ -22,6 +25,34 @@ export function ThemeLoader({ userId }: ThemeLoaderProps) {
           userData = await userResponse.json()
           if (userData.theme_preference) {
             setTheme(userData.theme_preference)
+          }
+          if (userData.font_family || userData.font_size) {
+            const root = document.documentElement
+            const gridSettings = userData.datagrid_settings || {}
+            root.style.setProperty("--font-family-custom", userData.font_family || "Cairo")
+            root.style.setProperty("--font-size-custom", `${userData.font_size || 14}px`)
+            root.style.setProperty("--datagrid-header-height", `${gridSettings.headerHeight || 40}px`)
+            root.style.setProperty("--datagrid-header-color", gridSettings.headerColor || "#2c3e50")
+            root.style.setProperty("--datagrid-header-font-family", gridSettings.headerFontFamily || "Cairo")
+            root.style.setProperty("--datagrid-row-height", `${gridSettings.rowHeight || 50}px`)
+            root.style.setProperty("--datagrid-selected-row-color", gridSettings.selectedRowColor || "#6fe27b")
+            const saved = JSON.parse(localStorage.getItem("erp-font-settings") || "{}")
+            localStorage.setItem("erp-font-settings", JSON.stringify({
+              ...saved,
+              fontFamily: userData.font_family || "Cairo",
+              fontSize: userData.font_size || 14,
+              gridHeaderHeight: gridSettings.headerHeight || 40,
+              gridHeaderColor: gridSettings.headerColor || "#2c3e50",
+              gridHeaderFontFamily: gridSettings.headerFontFamily || "Cairo",
+              gridRowHeight: gridSettings.rowHeight || 50,
+              gridSelectedRowColor: gridSettings.selectedRowColor || "#6fe27b",
+            }))
+            window.dispatchEvent(new CustomEvent("datagrid-settings-updated", {
+              detail: {
+                gridHeaderHeight: gridSettings.headerHeight || 40,
+                gridRowHeight: gridSettings.rowHeight || 50,
+              },
+            }))
           }
         }
 
@@ -34,9 +65,7 @@ export function ThemeLoader({ userId }: ThemeLoaderProps) {
             root.style.setProperty("--primary", themeData.primary_color || "#059669")
             root.style.setProperty("--accent", themeData.accent_color || "#10b981")
             root.style.setProperty("--radius", `${themeData.border_radius || 8}px`)
-            root.style.setProperty("--font-sans", themeData.font_family || "var(--font-geist-sans)")
-
-            document.body.style.fontSize = `${themeData.font_size || 14}px`
+            // خط الثيم لم يعد يتجاوز خط المستخدم (--font-sans وحجم body كانا يُكتبان هنا بعد خط المستخدم فيلغيانه)
 
             // Apply dark mode if enabled
             if (themeData.dark_mode && userData?.theme_preference !== "light") {
@@ -46,6 +75,9 @@ export function ThemeLoader({ userId }: ThemeLoaderProps) {
         }
       } catch (error) {
         console.error("[v0] Error loading theme settings:", error)
+      } finally {
+        // خط المستخدم آخر ما يُطبَّق دائماً
+        reapplyUserFont()
       }
     }
 

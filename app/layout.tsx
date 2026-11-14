@@ -41,13 +41,18 @@ import { Inter } from "next/font/google"
 import { Suspense } from "react"
 import { AuthProvider } from "@/components/auth/auth-context"
 import { FontProvider } from "@/components/settings/font-settings"
+import ClientProviders from "@/components/ClientProviders"
 import { ThemeProvider } from "@/components/theme-provider"
 import { ThemeSettingsProvider } from "@/contexts/theme-context"
 import { WindowManagerProvider } from "@/contexts/window-manager-context"
 import { Toaster } from "@/components/ui/toaster"
-import { GlobalSearchProvider } from "@/components/global-search-provider"
-import { GlobalShortcuts } from "@/components/global-shortcuts"
-import { PrimeReactProvider } from "primereact/api"
+import { USER_FONT_BOOT_SCRIPT } from "@/lib/user-font"
+import { APP_MODE_BOOT_SCRIPT } from "@/lib/app-mode"
+import { cookies } from "next/headers"
+import { LANG_COOKIE, tr } from "@/lib/i18n"
+import { I18N_BUILD } from "@/lib/i18n-build"
+import { HydrationLanguageGate } from "@/components/i18n/hydration-language-gate"
+import { DomTranslationFallback } from "@/components/i18n/dom-translation-fallback"
 import "./globals.css"
 
 const inter = Inter({
@@ -57,18 +62,18 @@ const inter = Inter({
 })
 
 export const metadata: Metadata = {
-  title: "نظام إدارة الموارد - ERP System",
-  description: "نظام إدارة الموارد المتكامل باللغة العربية",
+  title: "NoonERP System",
+  description: tr("نون ERP — نظام عربي متكامل لإدارة الأعمال"),
   generator: "v0.app",
   manifest: "/manifest.json",
   appleWebApp: {
     capable: true,
     statusBarStyle: "default",
-    title: "نظام الطلبيات",
+    title: "NoonERP System",
   },
   icons: {
-    icon: "/icon-192.png",
-    apple: "/icon-192.png",
+    icon: [{ url: "/brand/noonerp-favicon.png?v=3", type: "image/png", sizes: "64x64" }, { url: "/icon-192.png?v=2", type: "image/png", sizes: "192x192" }],
+    apple: "/apple-touch-icon.png",
   },
   other: {
     "mobile-web-app-capable": "yes",
@@ -82,17 +87,26 @@ export const viewport = {
   initialScale: 1,
   maximumScale: 1,
   userScalable: false,
-  themeColor: "#2563eb",
+  themeColor: "#059669",
 }
 
-export default function RootLayout({
+export default async function RootLayout({
   children,
 }: Readonly<{
   children: React.ReactNode
 }>) {
+  // لغة الواجهة (lib/i18n.ts): من كوكي app_lang — الإنجليزية ⇐ اتجاه LTR وتحميل القاموس قبل تشغيل التطبيق
+  const language = (await cookies()).get(LANG_COOKIE)?.value === "en" ? "en" : "ar"
   return (
-    <html lang="ar" dir="rtl">
-      <body className={`font-sans ${inter.variable} antialiased`}>
+    <html lang={language} dir={language === "en" ? "ltr" : "rtl"} suppressHydrationWarning>
+      {/* القاموس بسكربت حاجب في أول <head>: يُنفَّذ قبل وحدات التطبيق، فالتسميات المحسوبة عند تحميل الوحدات (القائمة
+          الجانبية، قوائم الحقول) تُترجم. next/script beforeInteractive لا يضمن ذلك في App Router (يُحمَّل غير متزامن). */}
+      <head>{language === "en" && <script src={`/locales/en.js?v=${I18N_BUILD}`} />}</head>
+      <body className={`font-sans ${inter.variable} antialiased`} suppressHydrationWarning>
+        {/* خط المستخدم المحفوظ قبل أول رسم (lib/user-font.ts) — لا وميض للحجم الافتراضي ولا انتظار للشبكة */}
+        <script dangerouslySetInnerHTML={{ __html: USER_FONT_BOOT_SCRIPT }} />
+        {/* مشغّل الكاشير/المطعم (?app=...) — يُحفظ قبل أي تحويل لصفحة الدخول (lib/app-mode.ts) */}
+        <script dangerouslySetInnerHTML={{ __html: APP_MODE_BOOT_SCRIPT }} />
         <link rel="preconnect" href="https://fonts.googleapis.com" />
         <link rel="preconnect" href="https://fonts.gstatic.com" crossOrigin="anonymous" />
         <link
@@ -109,13 +123,12 @@ export default function RootLayout({
             >
               <ThemeSettingsProvider>
                 <WindowManagerProvider>
-                  <PrimeReactProvider>
-                    <GlobalSearchProvider>
-                      <GlobalShortcuts />
-                      <Suspense fallback={null}>{children}</Suspense>
-                      <Toaster />
-                    </GlobalSearchProvider>
-                  </PrimeReactProvider>
+                    <ClientProviders>
+                      <HydrationLanguageGate language={language}>
+                        <Suspense fallback={null}>{children}</Suspense>
+                        {language === "en" && <DomTranslationFallback />}
+                      </HydrationLanguageGate>
+                    </ClientProviders>
                 </WindowManagerProvider>
               </ThemeSettingsProvider>
             </ThemeProvider>
@@ -126,7 +139,9 @@ export default function RootLayout({
             __html: `
               if ('serviceWorker' in navigator) {
                 window.addEventListener('load', function() {
-                  navigator.serviceWorker.register('/sw.js');
+                  navigator.serviceWorker.register('/sw.js').catch(function(error) {
+                    console.error('[service-worker] Registration failed:', error);
+                  });
                 });
               }
             `,

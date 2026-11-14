@@ -1,338 +1,118 @@
-// File: /app/api/customers/navigations/[navigationType]/route.ts
-import { NextRequest, NextResponse } from "next/server";
-import { Pool } from "pg";
+import { type NextRequest, NextResponse } from "next/server"
+import sql from "@/lib/database"
+import { authorizeCustomerType, authorizeStoredCustomer } from "@/app/api/customers/_permissions"
 
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-});
-
-export async function GET(
-  req: NextRequest,
-  { params }: { params: { navigationType: string } }
-) {
-  let { navigationType } = params;
-  const type = Number(req.nextUrl.searchParams.get("type") || 1); // 1=customer,2=supplier
-  const currentId = Number(req.nextUrl.searchParams.get("currentId") || 0);
-  const byId = Number(req.nextUrl.searchParams.get("id") || 0);
-  if(navigationType === "previous" && currentId === 0) navigationType = "last";
-  let query = "";
-  let values: any[] = [type];
-
+// تصفّح سجلات الزبائن/الموردين (أول/سابق/تالي/آخر/برقم مُعيَّن) لشاشة components/products/customers.tsx —
+// كلاهما مخزَّن في نفس جدول customers (يُميَّز بينهما بعمود type: 1=زبون، 2=مورد)، بنفس شكل
+// الاستعلام المستخدَم في القائمة الرئيسية GET /api/customers (JOIN account_tbl لجلب حقول الحساب
+// المرتبطة: father_id، finanical_list_id... التي تعتمد عليها شاشة التعديل مباشرة).
+export async function GET(request: NextRequest, { params }: { params: { navigationType: string } }) {
   try {
+    const { navigationType } = params
+    const typeParam = request.nextUrl.searchParams.get("type")
+    const parsedType = Number(typeParam)
+    const type = [1, 2, 3, 4].includes(parsedType) ? parsedType : 1
+    const permission = navigationType === "ById"
+      ? await authorizeStoredCustomer(request, request.nextUrl.searchParams.get("id"), "view")
+      : await authorizeCustomerType(request, type, "view")
+    if (!permission.ok) return permission.response
+
+    let rows: any[]
+
     switch (navigationType) {
       case "first":
-        query = `
-          SELECT
-            c.*,
-            acc.father_id,
-            acc.finanical_list_id,
-            acc.finanical_list_assests_id,
-            acc.finanical_list_liabilities_id,
-            acc.finanical_list_income_id,
-            acc.currency_id,
-            acc.allow_trans_with_diff_curr,
-            acc.iscalc_curr_diff_rates,
-            acc.level_no,
-            COALESCE(accct.cost_centers, '[]'::json) AS cost_centers,
-            COALESCE(ast.stop_transactions, '[]'::json) AS stop_transactions
+        rows = await sql`
+          SELECT c.*, acc.father_id, acc.finanical_list_id, acc.finanical_list_assests_id,
+                 acc.finanical_list_liabilities_id, acc.finanical_list_income_id, acc.currency_id,
+                 acc.allow_trans_with_diff_curr, acc.iscalc_curr_diff_rates, acc.level_no
           FROM customers c
-          INNER JOIN account_tbl acc ON acc.id = c.account_id
-          LEFT JOIN (
-            SELECT
-              account_id,
-              json_agg(
-                json_build_object(
-                  'cost_center_type_id', cost_center_type_id,
-                  'required_in_transactions', required_in_transactions,
-                  'default_cost_center_id', default_cost_center_id,
-                  'cost_center_name', cc.name
-                )
-                ORDER BY accct.id ASC
-              ) AS cost_centers
-            FROM account_costcenters_tbl accct
-            LEFT JOIN cost_centers cc ON cc.id = accct.default_cost_center_id
-            GROUP BY account_id
-          ) accct ON accct.account_id = c.account_id
-          LEFT JOIN (
-            SELECT
-              account_id,
-              json_agg(
-                json_build_object(
-                  'voucher_types_id', voucher_types_id,
-                  'stop_date', stop_date
-                )
-                ORDER BY account_stop_transactions_tbl.id ASC
-              ) AS stop_transactions
-            FROM account_stop_transactions_tbl
-            GROUP BY account_id
-          ) ast ON ast.account_id = c.account_id
-          WHERE c.type=$1 AND (c.isDeleted IS NULL OR c.isDeleted = false)
+          LEFT JOIN account_tbl acc ON acc.id = c.account_id
+          WHERE c.isDeleted = false AND c.type = ${type}
           ORDER BY c.id ASC
           LIMIT 1
-        `;
-        break;
+        `
+        break
 
       case "last":
-        query = `
-          SELECT
-            c.*,
-            acc.father_id,
-            acc.finanical_list_id,
-            acc.finanical_list_assests_id,
-            acc.finanical_list_liabilities_id,
-            acc.finanical_list_income_id,
-            acc.currency_id,
-            acc.allow_trans_with_diff_curr,
-            acc.iscalc_curr_diff_rates,
-            acc.level_no,
-            COALESCE(accct.cost_centers, '[]'::json) AS cost_centers,
-            COALESCE(ast.stop_transactions, '[]'::json) AS stop_transactions
+        rows = await sql`
+          SELECT c.*, acc.father_id, acc.finanical_list_id, acc.finanical_list_assests_id,
+                 acc.finanical_list_liabilities_id, acc.finanical_list_income_id, acc.currency_id,
+                 acc.allow_trans_with_diff_curr, acc.iscalc_curr_diff_rates, acc.level_no
           FROM customers c
-          INNER JOIN account_tbl acc ON acc.id = c.account_id
-          LEFT JOIN (
-            SELECT
-              account_id,
-              json_agg(
-                json_build_object(
-                  'cost_center_type_id', cost_center_type_id,
-                  'required_in_transactions', required_in_transactions,
-                  'default_cost_center_id', default_cost_center_id,
-                  'cost_center_name', cc.name
-                )
-                ORDER BY accct.id ASC
-              ) AS cost_centers
-            FROM account_costcenters_tbl accct
-            LEFT JOIN cost_centers cc ON cc.id = accct.default_cost_center_id
-            GROUP BY account_id
-          ) accct ON accct.account_id = c.account_id
-          LEFT JOIN (
-            SELECT
-              account_id,
-              json_agg(
-                json_build_object(
-                  'voucher_types_id', voucher_types_id,
-                  'stop_date', stop_date
-                )
-                ORDER BY account_stop_transactions_tbl.id ASC
-              ) AS stop_transactions
-            FROM account_stop_transactions_tbl
-            GROUP BY account_id
-          ) ast ON ast.account_id = c.account_id
-          WHERE c.type=$1 AND (c.isDeleted IS NULL OR c.isDeleted = false)
+          LEFT JOIN account_tbl acc ON acc.id = c.account_id
+          WHERE c.isDeleted = false AND c.type = ${type}
           ORDER BY c.id DESC
           LIMIT 1
-        `;
-        break;
+        `
+        break
 
-      case "previous":
-        query = `
-          SELECT
-            c.*,
-            acc.father_id,
-            acc.finanical_list_id,
-            acc.finanical_list_assests_id,
-            acc.finanical_list_liabilities_id,
-            acc.finanical_list_income_id,
-            acc.currency_id,
-            acc.allow_trans_with_diff_curr,
-            acc.iscalc_curr_diff_rates,
-            acc.level_no,
-            COALESCE(accct.cost_centers, '[]'::json) AS cost_centers,
-            COALESCE(ast.stop_transactions, '[]'::json) AS stop_transactions
+      case "next": {
+        const currentId = Number(request.nextUrl.searchParams.get("currentId") || 0)
+        rows = await sql`
+          SELECT c.*, acc.father_id, acc.finanical_list_id, acc.finanical_list_assests_id,
+                 acc.finanical_list_liabilities_id, acc.finanical_list_income_id, acc.currency_id,
+                 acc.allow_trans_with_diff_curr, acc.iscalc_curr_diff_rates, acc.level_no
           FROM customers c
-          INNER JOIN account_tbl acc ON acc.id = c.account_id
-          LEFT JOIN (
-            SELECT
-              account_id,
-              json_agg(
-                json_build_object(
-                  'cost_center_type_id', cost_center_type_id,
-                  'required_in_transactions', required_in_transactions,
-                  'default_cost_center_id', default_cost_center_id,
-                  'cost_center_name', cc.name
-                )
-                ORDER BY accct.id ASC
-              ) AS cost_centers
-            FROM account_costcenters_tbl accct
-            LEFT JOIN cost_centers cc ON cc.id = accct.default_cost_center_id
-            GROUP BY account_id
-          ) accct ON accct.account_id = c.account_id
-          INNER JOIN (
-            SELECT
-              account_id,
-              json_agg(
-                json_build_object(
-                  'voucher_types_id', voucher_types_id,
-                  'stop_date', stop_date
-                )
-                ORDER BY account_stop_transactions_tbl.id ASC
-              ) AS stop_transactions
-            FROM account_stop_transactions_tbl
-            GROUP BY account_id
-          ) ast ON ast.account_id = c.account_id
-          WHERE c.type=$1 AND c.id < $2 AND (c.isDeleted IS NULL OR c.isDeleted = false)
-          ORDER BY c.id DESC
-          LIMIT 1
-        `;
-        values.push(currentId);
-        break;
-
-      case "next":
-        query = `
-          SELECT
-            c.*,
-            acc.father_id,
-            acc.finanical_list_id,
-            acc.finanical_list_assests_id,
-            acc.finanical_list_liabilities_id,
-            acc.finanical_list_income_id,
-            acc.currency_id,
-            acc.allow_trans_with_diff_curr,
-            acc.iscalc_curr_diff_rates,
-            acc.level_no,
-            COALESCE(accct.cost_centers, '[]'::json) AS cost_centers,
-            COALESCE(ast.stop_transactions, '[]'::json) AS stop_transactions
-          FROM customers c
-          INNER JOIN account_tbl acc ON acc.id = c.account_id
-          LEFT JOIN (
-            SELECT
-              account_id,
-              json_agg(
-                json_build_object(
-                  'cost_center_type_id', cost_center_type_id,
-                  'required_in_transactions', required_in_transactions,
-                  'default_cost_center_id', default_cost_center_id,
-                  'cost_center_name', cc.name
-                )
-                ORDER BY accct.id ASC
-              ) AS cost_centers
-            FROM account_costcenters_tbl accct
-            LEFT JOIN cost_centers cc ON cc.id = accct.default_cost_center_id
-            GROUP BY account_id
-          ) accct ON accct.account_id = c.account_id
-          LEFT JOIN (
-            SELECT
-              account_id,
-              json_agg(
-                json_build_object(
-                  'voucher_types_id', voucher_types_id,
-                  'stop_date', stop_date
-                )
-                ORDER BY account_stop_transactions_tbl.id ASC
-              ) AS stop_transactions
-            FROM account_stop_transactions_tbl
-            GROUP BY account_id
-          ) ast ON ast.account_id = c.account_id
-          WHERE c.type=$1 AND c.id > $2 AND (c.isDeleted IS NULL OR c.isDeleted = false)
+          LEFT JOIN account_tbl acc ON acc.id = c.account_id
+          WHERE c.isDeleted = false AND c.type = ${type} AND c.id > ${currentId}
           ORDER BY c.id ASC
           LIMIT 1
-        `;
-        values.push(currentId);
-        break;
+        `
+        break
+      }
 
-      case "ById":
-        if (!byId) {
-          return NextResponse.json({ error: "ID is required" }, { status: 400 });
-        }
-        query = `
-          SELECT
-            c.*,
-            acc.father_id,
-            acc.finanical_list_id,
-            acc.finanical_list_assests_id,
-            acc.finanical_list_liabilities_id,
-            acc.finanical_list_income_id,
-            acc.currency_id,
-            acc.allow_trans_with_diff_curr,
-            acc.iscalc_curr_diff_rates,
-            acc.level_no,
-            COALESCE(accct.cost_centers, '[]'::json) AS cost_centers,
-            COALESCE(ast.stop_transactions, '[]'::json) AS stop_transactions
+      case "previous": {
+        const currentId = Number(request.nextUrl.searchParams.get("currentId") || 0)
+        rows = await sql`
+          SELECT c.*, acc.father_id, acc.finanical_list_id, acc.finanical_list_assests_id,
+                 acc.finanical_list_liabilities_id, acc.finanical_list_income_id, acc.currency_id,
+                 acc.allow_trans_with_diff_curr, acc.iscalc_curr_diff_rates, acc.level_no
           FROM customers c
-          INNER JOIN account_tbl acc ON acc.id = c.account_id
-          LEFT JOIN (
-            SELECT
-              account_id,
-              json_agg(
-                json_build_object(
-                  'cost_center_type_id', cost_center_type_id,
-                  'required_in_transactions', required_in_transactions,
-                  'default_cost_center_id', default_cost_center_id,
-                  'cost_center_name', cc.name
-                )
-                ORDER BY accct.id ASC
-              ) AS cost_centers
-            FROM account_costcenters_tbl accct
-            LEFT JOIN cost_centers cc ON cc.id = accct.default_cost_center_id
-            GROUP BY account_id
-          ) accct ON accct.account_id = c.account_id
-          LEFT JOIN (
-            SELECT
-              account_id,
-              json_agg(
-                json_build_object(
-                  'voucher_types_id', voucher_types_id,
-                  'stop_date', stop_date
-                )
-                ORDER BY account_stop_transactions_tbl.id ASC
-              ) AS stop_transactions
-            FROM account_stop_transactions_tbl
-            GROUP BY account_id
-          ) ast ON ast.account_id = c.account_id
-          WHERE c.type=$1 AND c.id=$2 AND (c.isDeleted IS NULL OR c.isDeleted = false)
-        `;
-        values.push(byId);
-        break;
+          LEFT JOIN account_tbl acc ON acc.id = c.account_id
+          WHERE c.isDeleted = false AND c.type = ${type} AND c.id < ${currentId}
+          ORDER BY c.id DESC
+          LIMIT 1
+        `
+        break
+      }
+
+      case "ById": {
+        const id = Number(request.nextUrl.searchParams.get("id") || 0)
+        if (!id) {
+          return NextResponse.json({ error: "المعرّف مطلوب" }, { status: 400 })
+        }
+        rows = await sql`
+          SELECT c.*, acc.father_id, acc.finanical_list_id, acc.finanical_list_assests_id,
+                 acc.finanical_list_liabilities_id, acc.finanical_list_income_id, acc.currency_id,
+                 acc.allow_trans_with_diff_curr, acc.iscalc_curr_diff_rates, acc.level_no
+          FROM customers c
+          LEFT JOIN account_tbl acc ON acc.id = c.account_id
+          WHERE c.isDeleted = false AND c.id = ${id}
+        `
+        break
+      }
 
       default:
-        return NextResponse.json({ error: "Invalid navigation type" }, { status: 400 });
+        return NextResponse.json({ error: "نوع تصفّح غير صالح" }, { status: 400 })
     }
 
-    const client = await pool.connect();
-    const result = await client.query(query, values);
-    
-
-    if (!result.rows.length) {
-      return NextResponse.json({ error: "No record found" }, { status: 404 });
+    if (rows.length === 0) {
+      return NextResponse.json({})
     }
 
-    const customer = result.rows[0];
+    const customer = rows[0]
+    // فروع تقييد ظهور العميل بالبحث (اختياري — انظر customer_branches بـapp/api/customers/route.ts)
+    // — بلا صفوف هنا يبقى ظاهراً لكل الفروع، فتُعاد مصفوفة فارغة ليعكسها حقل "الفروع" بنموذج التعديل.
+    try {
+      const branchRows = await sql`SELECT branch_id FROM customer_branches WHERE customer_id = ${customer.id}`
+      customer.branch_ids = branchRows.map((r: any) => r.branch_id)
+    } catch {
+      customer.branch_ids = []
+    }
 
-    const vouchersResult = await client.query(
-      `
-      SELECT cv.id AS customer_voucher_id,
-             cv.voucher_id AS type_id,
-             vt.name AS type_name,
-             cv.book_id,
-             vb.name AS book_name,
-             ROW_NUMBER() OVER (ORDER BY cv.id ASC) AS ser
-      FROM customer_vouchers cv
-      LEFT JOIN voucher_types vt ON cv.voucher_id = vt.id
-      LEFT JOIN voucher_books vb ON cv.book_id = vb.id
-      WHERE cv.customer_id = $1
-      ORDER BY cv.id ASC
-      `,
-      [customer.id]
-    );
-
-    client.release();
-
-    // Add voucherType array to customer object
-    customer.voucherType = vouchersResult.rows.map((v: any) => ({
-      type_id: v.type_id,
-      type_name: v.type_name,
-      book_id: v.book_id,
-      book_name: v.book_name,
-      ser: v.ser,
-    }));
-    customer.cost_centers = Array.isArray(customer.cost_centers) ? customer.cost_centers : [];
-    customer.stop_transactions = Array.isArray(customer.stop_transactions) ? customer.stop_transactions : [];
-    // Optional: add serial number or other computed fields
-    customer.ser = 1;
-
-    return NextResponse.json(customer);
+    return NextResponse.json(customer)
   } catch (error) {
-    console.error("Navigation API error:", error);
-    return NextResponse.json({ error: "Server error" }, { status: 500 });
+    console.error("[customer/navigations] error:", error)
+    return NextResponse.json({ error: "حدث خطأ أثناء تصفّح السجلات" }, { status: 500 })
   }
 }

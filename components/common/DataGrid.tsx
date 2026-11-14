@@ -61,6 +61,7 @@ export default function CustomFlexGrid({
     beginningEdit,
     selectionChanged,
     onRowDoubleClick,
+    keyActionEnter,
     ref: forwardedRef
 }: CustomFlexGridProps) {
 
@@ -70,9 +71,9 @@ export default function CustomFlexGrid({
 
 
     const handleInitialized = (grid: wjGrid.FlexGrid) => {
-        flexRef.current = grid; // ✅ works now
-        console.log("flexRef.current ",flexRef.current)
-        initialized;
+        flexRef.current = grid;
+        grid.showAlternatingRows = true;
+        initialized?.(grid);
 
         if (onRowDoubleClick) {
             grid.hostElement.addEventListener("dblclick", (e: MouseEvent) => {
@@ -88,11 +89,11 @@ export default function CustomFlexGrid({
         <div className={styles.customFlexgrid}>
             <FlexGrid
                 ref={flexRef}
+                style={{ width: '100%', minWidth: 0 }}
                 itemsSource={dataSource}
                 headersVisibility={headersVisibility || "Column"}
                 isReadOnly={isReport || false}
                 wordWrap={true}
-                showAlternatingRows={true}
                 allowDragging={allowDragging || "None"}
                 cssClass={styles.customFlexgrid}
                 allowResizing="Both"
@@ -102,6 +103,8 @@ export default function CustomFlexGrid({
                 beginningEdit={beginningEdit}
                 selectionChanged={selectionChanged}
                 onRowDoubleClick={onRowDoubleClick}
+                // يُمرَّر فقط إن حُدِّد: Wijmo يرفض undefined لخاصية enum ("Invalid enum value: undefined")
+                {...(keyActionEnter !== undefined ? { keyActionEnter } : {})}
             >
                 {/* Optional row headers for numbering */}
                 {allowDragging && (allowDragging === "Rows" || allowDragging === "Both") && (

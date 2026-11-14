@@ -1,5 +1,6 @@
-"use client"
+﻿"use client"
 
+import { tr } from "@/lib/i18n"
 import { useEffect, useCallback } from "react"
 import { useRouter } from "next/navigation"
 import { toast } from "@/hooks/use-toast"
@@ -33,26 +34,19 @@ export function GlobalShortcuts() {
             event.preventDefault()
             router.push("/sales-orders")
             toast({
-              title: "طلبية المبيعات",
-              description: "تم فتح شاشة طلبيات المبيعات",
+              title: tr("طلبية المبيعات"),
+              description: tr("تم فتح شاشة طلبيات المبيعات"),
             })
             break
           case "t":
             event.preventDefault()
             router.push("/purchase-orders")
             toast({
-              title: "طلبية المشتريات",
-              description: "تم فتح شاشة طلبيات المشتريات",
+              title: tr("طلبية المشتريات"),
+              description: tr("تم فتح شاشة طلبيات المشتريات"),
             })
             break
-          case "s":
-            event.preventDefault()
-            router.push("/products")
-            toast({
-              title: "الأصناف",
-              description: "تم فتح شاشة الأصناف",
-            })
-            break
+          // Ctrl+S (فتح الأصناف) أُزيل بطلب المستخدم — Ctrl+S داخل الحركات = حفظ (lib/hotkeys.ts)
         }
       } else if (altKey && !ctrlKey) {
         switch (key.toLowerCase()) {
@@ -61,19 +55,11 @@ export function GlobalShortcuts() {
             const customerSupplierEvent = new CustomEvent("openCustomerSupplierSearch")
             window.dispatchEvent(customerSupplierEvent)
             toast({
-              title: "البحث عن الزبائن والموردين",
-              description: "تم فتح شاشة البحث",
+              title: tr("البحث عن العملاء والموردين"),
+              description: tr("تم فتح شاشة البحث"),
             })
             break
-          case "s":
-            event.preventDefault()
-            const productEvent = new CustomEvent("openProductSearch")
-            window.dispatchEvent(productEvent)
-            toast({
-              title: "البحث عن الأصناف",
-              description: "تم فتح شاشة البحث",
-            })
-            break
+          // Alt+S (بحث الأصناف) أُزيل بطلب المستخدم — يُفتح البحث من أزراره فقط
         }
       }
     },
@@ -93,17 +79,15 @@ export function GlobalShortcuts() {
 // مكون لعرض الاختصارات المتاحة
 export function ShortcutsHelp() {
   const shortcuts = [
-    { key: "Ctrl + K", description: "البحث الشامل في النظام" },
-    { key: "Ctrl + O", description: "طلبية المبيعات" },
-    { key: "Ctrl + T", description: "طلبية المشتريات" },
-    { key: "Ctrl + S", description: "شاشة الأصناف" },
-    { key: "Alt + T", description: "البحث عن الزبائن والموردين" },
-    { key: "Alt + S", description: "البحث عن الأصناف" },
+    { key: "Ctrl + K", description: tr("البحث الشامل في النظام") },
+    { key: "Ctrl + O", description: tr("طلبية المبيعات") },
+    { key: "Ctrl + T", description: tr("طلبية المشتريات") },
+    { key: "Alt + T", description: tr("البحث عن العملاء والموردين") },
   ]
 
   return (
     <div className="bg-card border rounded-lg p-4">
-      <h3 className="font-semibold mb-3 text-card-foreground">الاختصارات المتاحة</h3>
+      <h3 className="font-semibold mb-3 text-card-foreground">{tr("الاختصارات المتاحة")}</h3>
       <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
         {shortcuts.map((shortcut, index) => (
           <div key={index} className="flex justify-between items-center py-1">
@@ -115,3 +99,6 @@ export function ShortcutsHelp() {
     </div>
   )
 }
+
+
+

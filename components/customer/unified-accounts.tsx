@@ -1,5 +1,7 @@
 "use client"
 
+import { tr, appDir } from "@/lib/i18n"
+import { confirmYesNo } from "@/components/ui/confirm-host"
 import { useState, useEffect, useMemo, useCallback } from "react"
 import { useSearchParams } from "next/navigation"
 import { Button } from "@/components/ui/button"
@@ -86,6 +88,14 @@ interface FormState {
 interface UnifiedAccountsProps {
   action?: "new"
   onOpenChange?: (open: boolean) => void
+}
+
+const normalizeAccountCode = (value: string) =>
+  String(value ?? "").replace(/[^A-Za-z0-9]/g, "").toUpperCase().slice(0, 10)
+
+const completeAccountCode = (value: string) => {
+  const normalized = normalizeAccountCode(value)
+  return normalized ? normalized.padEnd(10, "0") : ""
 }
 
 export default function UnifiedAccounts({ action, onOpenChange }: UnifiedAccountsProps) {
@@ -274,7 +284,11 @@ export default function UnifiedAccounts({ action, onOpenChange }: UnifiedAccount
     setMessage("")
 
     if (!formData.code.trim() || !formData.name.trim()) {
-      setError("Code and Name are required")
+      setError(tr("رقم الحساب واسم الحساب مطلوبان"))
+      return
+    }
+    if (!["1", "2", "3"].includes(formData.finanical_list_id)) {
+      setError(tr("يرجى اختيار القائمة المالية"))
       return
     }
 
@@ -288,7 +302,7 @@ export default function UnifiedAccounts({ action, onOpenChange }: UnifiedAccount
       const method = isEdit ? "PUT" : "POST"
 
       const payload = {
-        code: formData.code.trim(),
+        code: completeAccountCode(formData.code),
         name: formData.name.trim(),
         name_lang2: formData.name_lang2.trim() || null,
         type: formData.type ? Number(formData.type) : null,
@@ -376,7 +390,7 @@ export default function UnifiedAccounts({ action, onOpenChange }: UnifiedAccount
 
   const handleDelete = async () => {
     if (!currentAccount || currentAccount.id <= 0) return
-    if (!window.confirm("Are you sure?")) return
+    if (!(await confirmYesNo("Are you sure?"))) return
 
     try {
       const response = await fetch(`/api/accounts/${currentAccount.id}`, { method: "DELETE" })
@@ -436,7 +450,7 @@ export default function UnifiedAccounts({ action, onOpenChange }: UnifiedAccount
   }
 
   return (
-    <div className="space-y-4 p-4 lg:p-6" dir="rtl">
+    <div className="space-y-4 p-4 lg:p-6" dir={appDir()}>
       <div className="sticky top-2 z-20 rounded-xl border bg-white/95 p-4 shadow-sm backdrop-blur">
         <UniversalToolbar
           currentRecord={accounts.length > 0 ? currentIndex + 1 : 0}
@@ -464,7 +478,7 @@ export default function UnifiedAccounts({ action, onOpenChange }: UnifiedAccount
                 <Button
                   key={account.id}
                   variant={currentIndex === idx ? "default" : "outline"}
-                  className="text-left h-auto p-3"
+                  className="text-end h-auto p-3"
                   onClick={() => {
                     setCurrentIndex(idx)
                     loadAccountToForm(account)
@@ -484,14 +498,14 @@ export default function UnifiedAccounts({ action, onOpenChange }: UnifiedAccount
       <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
         <DialogContent
           className="w-full max-w-[95vw] sm:max-w-[90vw] md:max-w-[85vw] lg:max-w-[100vh] h-[95vh] max-h-[95vh] p-0 gap-0 flex flex-col overflow-hidden"
-          dir="rtl"
+          dir={appDir()}
           onPointerDownOutside={(e) => e.preventDefault()}
         >
           <div className="flex items-center justify-between border-b bg-gradient-to-r from-blue-50 to-slate-50 px-6 py-4">
             <h2 className="text-xl font-semibold">
               {currentAccount?.id != null && currentAccount.id > 0 
-                ? `تعديل الحساب: ${currentAccount.code}` 
-                : "إضافة حساب جديد"}
+                ? tr("تعديل الحساب: {0}", currentAccount.code) 
+                : tr("إضافة حساب جديد")}
             </h2>
             <Button variant="ghost" onClick={() => setDialogOpen(false)}>
               ✕
@@ -513,17 +527,21 @@ export default function UnifiedAccounts({ action, onOpenChange }: UnifiedAccount
 
             <div className="grid gap-4 md:grid-cols-2">
               <div>
-                <Label className="mb-2 block">Code *</Label>
+                <Label className="mb-2 block">{tr("رقم الحساب *")}</Label>
                 <Input
                   value={formData.code}
-                  onChange={(e) => setFormData({ ...formData, code: e.target.value })}
-                  placeholder="Account code"
+                  maxLength={10}
+                  dir="ltr"
+                  onChange={(e) => setFormData({ ...formData, code: normalizeAccountCode(e.target.value) })}
+                  onBlur={() => setFormData((current) => ({ ...current, code: completeAccountCode(current.code) }))}
+                  placeholder="A100000000"
                 />
               </div>
               <div>
-                <Label className="mb-2 block">Name (AR) *</Label>
+                <Label className="mb-2 block">{tr("اسم الحساب *")}</Label>
                 <Input
                   value={formData.name}
+                  maxLength={100}
                   onChange={(e) => setFormData({ ...formData, name: e.target.value })}
                   placeholder="Account name"
                 />
@@ -579,16 +597,23 @@ export default function UnifiedAccounts({ action, onOpenChange }: UnifiedAccount
                 />
               </div>
               <div>
-                <Label className="mb-2 block">القائمة المالية</Label>
-                <Input
-                  type="number"
-                  value={formData.finanical_list_id}
+                <Label className="mb-2 block">{tr("القائمة المالية")}</Label>
+                <Select
+                  value={formData.finanical_list_id || "__choose__"}
                   disabled={Boolean(formData.father_id)}
-                  onChange={(e) => setFormData({ ...formData, finanical_list_id: e.target.value })}
-                />
+                  onValueChange={(value) => setFormData({ ...formData, finanical_list_id: value === "__choose__" ? "" : value })}
+                >
+                  <SelectTrigger><SelectValue placeholder={tr("اختر")} /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="__choose__">{tr("اختر")}</SelectItem>
+                    <SelectItem value="1">{tr("الميزانية العمومية")}</SelectItem>
+                    <SelectItem value="2">{tr("قائمة الدخل")}</SelectItem>
+                    <SelectItem value="3">{tr("تقييم بضاعة")}</SelectItem>
+                  </SelectContent>
+                </Select>
               </div>
               <div>
-                <Label className="mb-2 block">أصول الميزانية</Label>
+                <Label className="mb-2 block">{tr("أصول الميزانية")}</Label>
                 <Input
                   type="number"
                   value={formData.finanical_list_assests_id}
@@ -597,7 +622,7 @@ export default function UnifiedAccounts({ action, onOpenChange }: UnifiedAccount
                 />
               </div>
               <div>
-                <Label className="mb-2 block">خصوم الميزانية</Label>
+                <Label className="mb-2 block">{tr("خصوم الميزانية")}</Label>
                 <Input
                   type="number"
                   value={formData.finanical_list_liabilities_id}
@@ -606,7 +631,7 @@ export default function UnifiedAccounts({ action, onOpenChange }: UnifiedAccount
                 />
               </div>
               <div>
-                <Label className="mb-2 block">قائمة الدخل</Label>
+                <Label className="mb-2 block">{tr("قائمة الدخل")}</Label>
                 <Input
                   type="number"
                   value={formData.finanical_list_income_id}
@@ -660,8 +685,8 @@ export default function UnifiedAccounts({ action, onOpenChange }: UnifiedAccount
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="نشط">نشط</SelectItem>
-                    <SelectItem value="موقوف">موقوف</SelectItem>
+                    <SelectItem value="نشط">{tr("نشط")}</SelectItem>
+                    <SelectItem value="موقوف">{tr("موقوف")}</SelectItem>
                   </SelectContent>
                 </Select>
               </div>

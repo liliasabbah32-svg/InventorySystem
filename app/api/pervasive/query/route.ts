@@ -1,10 +1,12 @@
+import { authorizeUserAdmin } from "@/lib/user-admin-access"
 import { type NextRequest, NextResponse } from "next/server"
-import { neon } from "@neondatabase/serverless"
+import sql from "@/lib/database"
 import { decrypt } from "@/lib/encryption"
 
-const sql = neon(process.env.DATABASE_URL!)
-
 export async function POST(request: NextRequest) {
+  // أداة إدارية/تطوير: للمسؤول فقط
+  const admin = await authorizeUserAdmin(request)
+  if (!admin.ok) return admin.response
   try {
     const { connectionId, query, params } = await request.json()
 

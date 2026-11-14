@@ -1,100 +1,89 @@
-import { type NextRequest, NextResponse } from "next/server"
-import { neon } from "@neondatabase/serverless"
+import { type NextRequest } from "next/server"
+import { findUsages, usageMessage } from "@/lib/delete-guard"
+import { NextResponse } from "next/server"
+import sql from "@/lib/database"
+import { saveWarehouseCostCenters } from "@/lib/cost-center-defaults"
+import { runSchemaOnce } from "@/lib/schema-once"
+async function ensureWarehousesTable() { return runSchemaOnce("app/api/warehouses/[id]/route.ts#ensureWarehousesTable", async () => {
+  await sql`
+    CREATE TABLE IF NOT EXISTS warehouses (
+      id SERIAL PRIMARY KEY,
+      warehouse_code VARCHAR(10) UNIQUE NOT NULL,
+      warehouse_name VARCHAR(100) NOT NULL,
+      warehouse_name_en VARCHAR(100),
+      description TEXT,
+      location VARCHAR(200),
+      is_active BOOLEAN DEFAULT true,
+      status INTEGER DEFAULT 1,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `
+  await sql`ALTER TABLE warehouses ADD COLUMN IF NOT EXISTS status INTEGER DEFAULT 1`
+  await sql`ALTER TABLE warehouses ADD COLUMN IF NOT EXISTS default_printer VARCHAR(150)`
+}) }
 
-import { Pool } from "pg"
-
-let sql: any = null
-
-try {
-  if (!process.env.DATABASE_URL) {
-    console.error("[v0] DATABASE_URL environment variable is not set")
-  } else {
-    const dbUrl = process.env.DATABASE_URL
-
-    if (dbUrl.includes("localhost") || dbUrl.includes("127.0.0.1")) {
-      console.log("[v0] Using local PostgreSQL with pg Pool")
-      const pool = new Pool({ connectionString: dbUrl })
-      sql = async (strings: TemplateStringsArray, ...values: any[]) => {
-        const client = await pool.connect()
-        try {
-          const query =
-            strings.reduce(
-              (prev, curr, i) =>
-                prev + curr + (i < values.length ? `$${i + 1}` : ""),
-              ""
-            )
-          const result = await client.query(query, values)
-          return result.rows
-        } finally {
-          client.release()
-        }
-      }
-    } else {
-      console.log("[v0] Using Neon serverless client")
-      sql = neon(dbUrl)
-    }
-
-    console.log("[v0] Database client initialized successfully")
-  }
-} catch (error) {
-  console.error("[v0] Failed to initialize DB client:", error)
-  sql = null
-}
-
-export default sql
-type Warehouse = {
-  id: number
-  warehouse_code: string
-  warehouse_name: string
-  warehouse_name_en?: string
-  description?: string
-  location?: string
-  is_active: boolean
-  created_at: string
-  updated_at: string
-}
-export async function PUT(request: NextRequest) {
+export async function PUT(request: NextRequest, { params }: { params: { id: string } }) {
   try {
-    const data = await request.json();
+    await ensureWarehousesTable()
 
-    if (!data.id) {
-      return NextResponse.json({ error: "معرف المستودع مطلوب" }, { status: 400 });
-    }
+    const id = Number(params.id)
+    const data = await request.json()
+    const status = Number(data.status ?? 1)
+    const isActive = status === 1
 
-    if (!data.warehouse_name?.trim() || !data.warehouse_code?.trim()) {
-      return NextResponse.json({ error: "اسم المستودع ورمزه مطلوبان" }, { status: 400 });
-    }
-
-    // Optional: check if the new warehouse_code is already used by another warehouse
-    const existing = await sql`
-      SELECT id FROM warehouses
-      WHERE warehouse_code = ${data.warehouse_code} AND id != ${data.id}
-    `;
-    if (existing.length > 0) {
-      return NextResponse.json({ error: "رمز المستودع موجود مسبقاً" }, { status: 400 });
-    }
-
-    const result: Warehouse[] = await sql`
+    const result = await sql`
       UPDATE warehouses
       SET
-        warehouse_code = ${data.warehouse_code.trim()},
-        warehouse_name = ${data.warehouse_name.trim()},
-        warehouse_name_en = ${data.warehouse_name_en?.trim() || ""},
-        description = ${data.description?.trim() || ""},
-        location = ${data.location?.trim() || ""},
-        is_active = ${data.is_active !== false},
+        warehouse_name = ${data.warehouse_name},
+        warehouse_name_en = ${data.warehouse_name_en || ""},
+        description = ${data.description || ""},
+        location = ${data.location || ""},
+        is_active = ${isActive},
+        status = ${status},
+        default_printer = ${String(data.default_printer || "").trim() || null},
         updated_at = CURRENT_TIMESTAMP
-      WHERE id = ${data.id}
+      WHERE id = ${id}
       RETURNING *
-    `;
+    `
 
     if (result.length === 0) {
-      return NextResponse.json({ error: "المستودع غير موجود" }, { status: 404 });
+      return NextResponse.json({ error: "المستودع غير موجود" }, { status: 404 })
     }
 
-    return NextResponse.json({ ...result[0], name: result[0].warehouse_name });
+    await saveWarehouseCostCenters(id, data.cost_centers)
+    return NextResponse.json(result[0])
   } catch (error) {
-    console.error("Error updating warehouse:", error);
-    return NextResponse.json({ error: "حدث خطأ أثناء تحديث المستودع" }, { status: 500 });
+    console.error("Error updating warehouse:", error)
+    return NextResponse.json({ error: "Failed to update warehouse" }, { status: 500 })
   }
 }
+
+export async function DELETE(request: NextRequest, { params }: { params: { id: string } }) {
+  try {
+    await ensureWarehousesTable()
+
+    const id = Number(params.id)
+    // فحص الارتباط قبل الحذف: لا يُحذف تعريف مستخدم في تعريفات أخرى أو حركات (lib/delete-guard.ts)
+    const usageRow = (await sql`SELECT * FROM warehouses WHERE id = ${id}`)[0] as any
+    const usages = await findUsages(id, { idColumns: /^(warehouse_id|.+_warehouse_id|store_id|.+_store_id|default_store|main_stock_id)$/, textColumns: /^warehouse$/, excludeTables: ["warehouses", "product_warehouses"], textValues: [usageRow?.warehouse_name, usageRow?.warehouse_code, id] })
+    if (usages.length) return NextResponse.json({ error: usageMessage("المستودع", String(usageRow?.warehouse_name || ""), usages) }, { status: 400 })
+
+    const result = await sql`
+      UPDATE warehouses
+      SET status = 3, is_active = false, updated_at = CURRENT_TIMESTAMP
+      WHERE id = ${id}
+      RETURNING *
+    `
+
+    if (result.length === 0) {
+      return NextResponse.json({ error: "المستودع غير موجود" }, { status: 404 })
+    }
+
+    return NextResponse.json({ success: true })
+  } catch (error) {
+    console.error("Error deleting warehouse:", error)
+    return NextResponse.json({ error: "Failed to delete warehouse" }, { status: 500 })
+  }
+}
+

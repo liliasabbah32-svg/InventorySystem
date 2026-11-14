@@ -1,13 +1,14 @@
+import { authorizeUserAdmin } from "@/lib/user-admin-access"
 import { type NextRequest, NextResponse } from "next/server"
-import { neon } from "@neondatabase/serverless"
-
-const sql = neon(process.env.DATABASE_URL!)
-
+import sql from "@/lib/database"
 declare global {
   var diagnosticsCache: { data: any; timestamp: number } | undefined
 }
 
 export async function GET(request: NextRequest) {
+  // أداة إدارية/تطوير: للمسؤول فقط
+  const admin = await authorizeUserAdmin(request)
+  if (!admin.ok) return admin.response
   try {
     const cacheKey = "system-diagnostics"
     const cacheTime = 30000 // 30 seconds

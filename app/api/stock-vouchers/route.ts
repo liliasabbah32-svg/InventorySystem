@@ -1,0 +1,425 @@
+import { validateAccountStops } from "@/lib/account-stops"
+import { type NextRequest, NextResponse } from "next/server"
+import { withVoucherAudit } from "@/lib/voucher-audit"
+import { validateNegativeStock } from "@/lib/negative-stock-guard"
+import sql from "@/lib/database"
+import {
+  ensureTables,
+  saveVoucherItems,
+  fetchVoucherItems,
+  applyVoucherStockEffect,
+  reverseStockMovement,
+  buildUseVoucherJournalRows,
+  validateVoucherCodeFormat,
+  regenerateVoucherCode,
+  validateItemBatchExpiry,
+  validateItemMeasurement,
+  validateItemReferences,
+  validateAvailableQuantity,
+  validateVoucherDeletion,
+  validateStockInEditAvailability,
+  USE_VOUCHER_VCH_TYPE,
+  INTERNAL_DELIVERY_VCH_TYPE,
+  STOCK_IN_VCH_TYPE,
+  STOCK_VOUCHER_TYPES,
+} from "./_lib"
+
+// حد أقصى لمحاولات توليد رقم بديل عند تعارض (رقم مستخدم مسبقاً من سند أُدخِل بنفس اللحظة من
+// مستخدم آخر) — وقاية من حلقة لا نهائية في الحالة النادرة لفشل توليد رقم صالح باستمرار.
+const MAX_CODE_RETRY_ATTEMPTS = 5
+import { saveJournalRows, validateJournalAccountCurrencies } from "../receipts/_lib"
+import { validateLeafAccounts } from "@/lib/leaf-accounts"
+import { authorizeTransaction, transactionFamilyForVoucherType } from "@/lib/transaction-permissions"
+import { productionLinkError } from "@/lib/production-links"
+import { attachItemSerials, saveVoucherSerials, validateSerialsRemoval, validateSerialsRemovalOnUpdate, validateVoucherSerials } from "@/lib/item-serials"
+import { workingPeriodErrorMessage } from "@/lib/working-period"
+
+export async function GET(request: NextRequest) {
+  try {
+    await ensureTables()
+
+    const { searchParams } = new URL(request.url)
+    const vchType = Number(searchParams.get("vch_type") || STOCK_VOUCHER_TYPES[0])
+    const family = transactionFamilyForVoucherType(vchType)
+    if (!family) return NextResponse.json({ error: "نوع الحركة غير صالح" }, { status: 400 })
+    const authorization = await authorizeTransaction(request, family, "view", searchParams.get("branch_id"))
+    if (!authorization.ok) return authorization.response
+
+    const rows = await sql`
+      SELECT * FROM voucher_header_tbl
+      WHERE vch_type = ${vchType} AND status != 3 AND branch_id = ANY(${authorization.branchIds}::int[])
+      ORDER BY id DESC
+    `
+
+    return NextResponse.json(rows)
+  } catch (error) {
+    console.error("Error fetching stock vouchers:", error)
+    return NextResponse.json({ error: "Failed to fetch stock vouchers" }, { status: 500 })
+  }
+}
+
+async function postHandler(request: NextRequest) {
+  try {
+    await ensureTables()
+    const data = await request.json()
+    const family = transactionFamilyForVoucherType(Number(data.vch_type))
+    if (!family) return NextResponse.json({ error: "نوع الحركة غير صالح" }, { status: 400 })
+    const authorization = await authorizeTransaction(request, family, "create", data.branch_id)
+    if (!authorization.ok) return authorization.response
+    if (Number(data.status || 1) === 2) {
+      const posting = await authorizeTransaction(request, family, "post", authorization.branchId)
+      if (!posting.ok) return posting.response
+    }
+
+    const vchType = Number(data.vch_type)
+    if (!STOCK_VOUCHER_TYPES.includes(vchType as any) || !data.vch_code || !data.vch_date) {
+      return NextResponse.json({ error: "بيانات السند غير مكتملة" }, { status: 400 })
+    }
+    if (!(Number(data.rate) > 0)) {
+      return NextResponse.json({ error: "سعر الصرف يجب أن يكون أكبر من صفر" }, { status: 400 })
+    }
+
+    const codeFormatError = await validateVoucherCodeFormat(request.url, vchType, data.vch_book_id ?? null, data.vch_code, authorization.branchId)
+    if (codeFormatError) {
+      return NextResponse.json({ error: codeFormatError }, { status: 400 })
+    }
+
+    // تعارض الرقم (مستخدم مسبقاً) هنا غالباً ليس خطأ مستخدم بل أثر تزامن — سندان أُنشئا بنفس اللحظة
+    // من مستخدمين مختلفين على نفس الدفتر حصلا على نفس الرقم التالي عبر /generate-number (قراءة
+    // MAX+1 عادية بلا قفل). بدل رفض الحفظ، يُعاد توليد رقم بديل والمحاولة من جديد بضع مرات.
+    let vchCode = String(data.vch_code)
+    let existing = await sql`
+      SELECT id FROM voucher_header_tbl WHERE vch_type = ${vchType} AND vch_code = ${vchCode}
+    `
+    let regenerateAttempts = 0
+    while (existing.length > 0 && regenerateAttempts < MAX_CODE_RETRY_ATTEMPTS) {
+      const regenerated = await regenerateVoucherCode(request.url, vchType, data.vch_book_id ?? null, authorization.branchId)
+      if (!regenerated || regenerated === vchCode) break
+      vchCode = regenerated
+      existing = await sql`SELECT id FROM voucher_header_tbl WHERE vch_type = ${vchType} AND vch_code = ${vchCode}`
+      regenerateAttempts++
+    }
+    if (existing.length > 0) {
+      return NextResponse.json({ error: "رقم السند مستخدم مسبقاً" }, { status: 400 })
+    }
+
+    const items = Array.isArray(data.items) ? data.items.filter((i: any) => i?.product_id) : []
+    if (items.length === 0) {
+      return NextResponse.json({ error: "يجب إدخال صنف واحد على الأقل" }, { status: 400 })
+    }
+    if (items.some((i: any) => !(Number(i.store_id ?? i.warehouse_id) > 0))) {
+      return NextResponse.json({ error: "يجب اختيار المستودع لكل صنف" }, { status: 400 })
+    }
+    if (items.some((i: any) => !(Number(i.quantity || 0) > 0))) {
+      return NextResponse.json({ error: "يجب إدخال الكمية لكل صنف" }, { status: 400 })
+    }
+    const measurementError = await validateItemMeasurement(items)
+    if (measurementError) {
+      return NextResponse.json({ error: measurementError }, { status: 400 })
+    }
+    // المستودع/الوحدة موجودان ونشِطان فعلياً — بمعزل عمّا رآه العميل عند اختيارهما (قد يكونان حُذفا
+    // أو أُوقِفا منذ ذلك الحين)، ونفس فحص حسابَي المصروف/المشتريات لسند الاستعمال تحديداً.
+    const referencesError = await validateItemReferences(items, vchType === USE_VOUCHER_VCH_TYPE ? ["expense_account_id", "purchase_account_id"] : [])
+    const leafAccountsError = await validateLeafAccounts([data.account_id, ...items.flatMap((item: any) => [item.expense_account_id, item.purchase_account_id])])
+    if (leafAccountsError) return NextResponse.json({ error: leafAccountsError }, { status: 400 })
+    const stopError = await validateAccountStops([data.account_id, ...items.flatMap((item: any) => [item.expense_account_id, item.purchase_account_id])], vchType, data.vch_date)
+    if (stopError) return NextResponse.json({ error: stopError }, { status: 400 })
+    if (referencesError) {
+      return NextResponse.json({ error: referencesError }, { status: 400 })
+    }
+    if (vchType === STOCK_IN_VCH_TYPE) {
+      const batchExpiryError = await validateItemBatchExpiry(items)
+      if (batchExpiryError) {
+        return NextResponse.json({ error: batchExpiryError }, { status: 400 })
+      }
+    }
+    if (vchType === INTERNAL_DELIVERY_VCH_TYPE && (!data.from_store_id || !data.to_store_id)) {
+      return NextResponse.json({ error: "يجب اختيار المستودع المرسل والمستودع المستلم" }, { status: 400 })
+    }
+    if (vchType === INTERNAL_DELIVERY_VCH_TYPE && Number(data.from_store_id) === Number(data.to_store_id)) {
+      return NextResponse.json({ error: "لا يمكن عمل ارسالية لنفس المستودع" }, { status: 400 })
+    }
+    // فحص أخير من جهة الخادم (بمعزل تام عن أي فحص سابق بالواجهة) لتوفّر الكمية المطلوبة إخراجها —
+    // يلتقط تزامن مستخدمَين يُدخلان سندَين على نفس الدفعة/تاريخ الصلاحية بنفس اللحظة تقريباً.
+    const availabilityError = await validateAvailableQuantity(items, vchType, null)
+    if (availabilityError) {
+      return NextResponse.json({ error: availabilityError }, { status: 400 })
+    }
+    // منع الرصيد السالب (إن لم يكن مسموحاً بالإعدادات العامة للسندات)
+    const negativeStockError = await validateNegativeStock({ vchType, voucherId: null, items, fromStoreId: data.from_store_id, toStoreId: data.to_store_id })
+    if (negativeStockError) {
+      return NextResponse.json({ error: negativeStockError }, { status: 400 })
+    }
+    // أصناف لها رقم تسلسلي: العدد = الكمية + البونص، ومكان كل رقم (داخل/خارج المخزون، المستودع)
+    const serialError = await validateVoucherSerials({ vchType, voucherId: null, items, fromStoreId: data.from_store_id, toStoreId: data.to_store_id })
+    if (serialError) {
+      return NextResponse.json({ error: serialError }, { status: 400 })
+    }
+
+    const amount = items.reduce((sum: number, i: any) => sum + Number(i.total_price || 0), 0)
+
+    let journalRows: any[] = []
+    if (vchType === USE_VOUCHER_VCH_TYPE) {
+      journalRows = buildUseVoucherJournalRows(items, data.currency_id || null, Number(data.rate || 1))
+      const totalDebit = journalRows.filter((r) => r.credit_debit === 1).reduce((s, r) => s + r.amount, 0)
+      const totalCredit = journalRows.filter((r) => r.credit_debit === 2).reduce((s, r) => s + r.amount, 0)
+      if (Math.round((totalDebit - totalCredit) * 100) / 100 !== 0) {
+        const format = (value: number) => value.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+        return NextResponse.json({ error: `القيد غير متوازن: إجمالي المدين ${format(totalDebit)}، وإجمالي الدائن ${format(totalCredit)}. يجب أن يتساوى الطرفان قبل الترحيل.` }, { status: 400 })
+      }
+      const currencyError = await validateJournalAccountCurrencies(journalRows, data.currency_id ? Number(data.currency_id) : null)
+      if (currencyError) return NextResponse.json({ error: currencyError }, { status: 400 })
+    }
+
+    const status = Number(data.status || 1)
+    let result: any[] = []
+    for (let attempt = 0; attempt < MAX_CODE_RETRY_ATTEMPTS; attempt += 1) {
+      try {
+        result = await sql`
+      INSERT INTO voucher_header_tbl (
+        vch_type, vch_code, vch_date, vch_book_id, branch_id, currency_id, rate,
+        account_id, customer_name, to_store_id, from_store_id,
+        amount, manual_voucher, manual_date, note, status, vch_status, is_printed,
+        insert_user
+      ) VALUES (
+        ${vchType}, ${vchCode}, ${data.vch_date}, ${data.vch_book_id || null}, ${authorization.branchId}, ${data.currency_id || null}, ${Number(data.rate || 1)},
+        ${data.account_id || null}, ${data.customer_name || ""}, ${data.to_store_id || null}, ${data.from_store_id || null},
+        ${amount}, ${data.manual_voucher || ""}, ${data.manual_date || null}, ${data.note || ""}, ${status}, ${status === 2 ? 2 : 1}, ${Number(data.is_printed || 0)},
+        ${data.insert_user || null}
+      )
+      RETURNING *
+        `
+        break
+      } catch (error: any) {
+        if (String(error?.code || "") !== "23505") throw error
+        const regenerated = await regenerateVoucherCode(request.url, vchType, data.vch_book_id ?? null, authorization.branchId)
+        if (!regenerated || regenerated === vchCode) break
+        vchCode = regenerated
+      }
+    }
+    if (!result.length) return NextResponse.json({ error: "تعذر توليد رقم سند متاح من دفتر السندات" }, { status: 409 })
+
+    const voucher = result[0]
+    const savedItems = await saveVoucherItems(voucher.id, items)
+    await saveVoucherSerials(voucher.id, vchType, savedItems, data.to_store_id || null, data.from_store_id || null)
+    if (vchType === USE_VOUCHER_VCH_TYPE) {
+      await saveJournalRows(voucher.id, journalRows)
+    }
+    if (status === 2) {
+      await applyVoucherStockEffect(vchType, voucher.id, savedItems, data.from_store_id || null, data.to_store_id || null)
+    }
+
+    const savedItemsWithNames = await attachItemSerials(await fetchVoucherItems(voucher.id))
+    return NextResponse.json({ ...voucher, items: savedItemsWithNames }, { status: 201 })
+  } catch (error) {
+    console.error("Error creating stock voucher:", error)
+    return NextResponse.json({ error: workingPeriodErrorMessage(error) || "Failed to create stock voucher" }, { status: workingPeriodErrorMessage(error) ? 400 : 500 })
+  }
+}
+
+async function putHandler(request: NextRequest) {
+  try {
+    await ensureTables()
+    const data = await request.json()
+    const family = transactionFamilyForVoucherType(Number(data.vch_type))
+    if (!family) return NextResponse.json({ error: "نوع الحركة غير صالح" }, { status: 400 })
+    const action = Number(data.status) === 3 ? "delete" : "update"
+    const authorization = await authorizeTransaction(request, family, action, data.branch_id)
+    if (!authorization.ok) return authorization.response
+    if (Number(data.status) === 2) {
+      const posting = await authorizeTransaction(request, family, "post", authorization.branchId)
+      if (!posting.ok) return posting.response
+    }
+
+    if (!data.id) {
+      return NextResponse.json({ error: "معرف السند مطلوب" }, { status: 400 })
+    }
+
+    const vchType = Number(data.vch_type)
+    if (!STOCK_VOUCHER_TYPES.includes(vchType as any) || !data.vch_code || !data.vch_date) {
+      return NextResponse.json({ error: "بيانات السند غير مكتملة" }, { status: 400 })
+    }
+    if (!(Number(data.rate) > 0)) {
+      return NextResponse.json({ error: "سعر الصرف يجب أن يكون أكبر من صفر" }, { status: 400 })
+    }
+
+    const codeFormatError = await validateVoucherCodeFormat(request.url, vchType, data.vch_book_id ?? null, data.vch_code, authorization.branchId)
+    if (codeFormatError) {
+      return NextResponse.json({ error: codeFormatError }, { status: 400 })
+    }
+
+    const duplicate = await sql`
+      SELECT id FROM voucher_header_tbl WHERE vch_type = ${vchType} AND vch_code = ${data.vch_code} AND id != ${data.id}
+    `
+    if (duplicate.length > 0) {
+      return NextResponse.json({ error: "رقم السند مستخدم مسبقاً" }, { status: 400 })
+    }
+
+    const status = Number(data.status ?? 1)
+
+    // سند مُرحَّل (status=2) مقفل: التعديل العادي عليه ممنوع، والاستثناء الوحيد هو إلغاؤه
+    // منطقياً (status=3) — مطابق تماماً لقفل receipts/route.ts.
+    const currentRows = await sql`SELECT status FROM voucher_header_tbl WHERE id = ${data.id}`
+    if (currentRows.length === 0) {
+      return NextResponse.json({ error: "السند غير موجود" }, { status: 404 })
+    }
+    const linkError = await productionLinkError(Number(data.id))
+    if (linkError) return NextResponse.json({ error: linkError }, { status: 409 })
+    const previousStatus = Number(currentRows[0].status)
+    if (previousStatus === 2 && status !== 3) {
+      return NextResponse.json({ error: "السند معتمد ولا يمكن تعديله" }, { status: 400 })
+    }
+
+    let items: any[] = []
+    let journalRows: any[] = []
+    if (status !== 3) {
+      items = Array.isArray(data.items) ? data.items.filter((i: any) => i?.product_id) : []
+      if (items.length === 0) {
+        return NextResponse.json({ error: "يجب إدخال صنف واحد على الأقل" }, { status: 400 })
+      }
+      if (items.some((i: any) => !(Number(i.store_id ?? i.warehouse_id) > 0))) {
+        return NextResponse.json({ error: "يجب اختيار المستودع لكل صنف" }, { status: 400 })
+      }
+      if (items.some((i: any) => !(Number(i.quantity || 0) > 0))) {
+        return NextResponse.json({ error: "يجب إدخال الكمية لكل صنف" }, { status: 400 })
+      }
+      const measurementError = await validateItemMeasurement(items)
+      if (measurementError) {
+        return NextResponse.json({ error: measurementError }, { status: 400 })
+      }
+      const referencesError = await validateItemReferences(items, vchType === USE_VOUCHER_VCH_TYPE ? ["expense_account_id", "purchase_account_id"] : [])
+      const leafAccountsError = await validateLeafAccounts([data.account_id, ...items.flatMap((item: any) => [item.expense_account_id, item.purchase_account_id])])
+      if (leafAccountsError) return NextResponse.json({ error: leafAccountsError }, { status: 400 })
+      const stopError = await validateAccountStops([data.account_id, ...items.flatMap((item: any) => [item.expense_account_id, item.purchase_account_id])], vchType, data.vch_date)
+      if (stopError) return NextResponse.json({ error: stopError }, { status: 400 })
+      if (referencesError) {
+        return NextResponse.json({ error: referencesError }, { status: 400 })
+      }
+      if (vchType === STOCK_IN_VCH_TYPE) {
+        const batchExpiryError = await validateItemBatchExpiry(items)
+        if (batchExpiryError) {
+          return NextResponse.json({ error: batchExpiryError }, { status: 400 })
+        }
+        // فحص خاص بتعديل سند ادخال بضاعة موجود فقط (لا الإنشاء الجديد أعلاه في POST) — انظر شرح
+        // validateStockInEditAvailability: يمنع تغيير صنف/كمية/مستودع/وحدة سطر توفّر منه سند
+        // اخراج/استعمال/ارسالية داخلية لاحقاً بما يجعل "المتاح" لتلك الدفعة سالباً.
+        const stockInEditError = await validateStockInEditAvailability(Number(data.id), items)
+        if (stockInEditError) {
+          return NextResponse.json({ error: stockInEditError }, { status: 400 })
+        }
+      }
+      if (vchType === INTERNAL_DELIVERY_VCH_TYPE && (!data.from_store_id || !data.to_store_id)) {
+        return NextResponse.json({ error: "يجب اختيار المستودع المرسل والمستودع المستلم" }, { status: 400 })
+      }
+      if (vchType === INTERNAL_DELIVERY_VCH_TYPE && Number(data.from_store_id) === Number(data.to_store_id)) {
+        return NextResponse.json({ error: "لا يمكن عمل ارسالية لنفس المستودع" }, { status: 400 })
+      }
+      // نفس فحص التوفّر في POST — استبعاد هذا السند نفسه (data.id) من ledger "المتاح" يجعل الفحص
+      // يعيد الاحتساب من الصفر اعتماداً على قائمة الأصناف الجديدة فقط، فيتعامل تلقائياً مع أي تعديل
+      // (حذف صنف، تغيير تاريخ صلاحية/وحدة/مستودع/كمية) دون حاجة لمقارنة صريحة مع الأصناف القديمة.
+      const availabilityError = await validateAvailableQuantity(items, vchType, Number(data.id))
+      if (availabilityError) {
+        return NextResponse.json({ error: availabilityError }, { status: 400 })
+      }
+      // تعديل (تغيير كمية، حذف سطر، تغيير صنف/وحدة/مستودع) لا يجعل أي رصيد سالباً
+      const negativeStockError = await validateNegativeStock({ vchType, voucherId: Number(data.id), items, fromStoreId: data.from_store_id, toStoreId: data.to_store_id })
+      if (negativeStockError) {
+        return NextResponse.json({ error: negativeStockError }, { status: 400 })
+      }
+      const serialError = await validateVoucherSerials({ vchType, voucherId: Number(data.id), items, fromStoreId: data.from_store_id, toStoreId: data.to_store_id })
+      if (serialError) {
+        return NextResponse.json({ error: serialError }, { status: 400 })
+      }
+      // حذف سطر/رقم تسلسلي من سند محفوظ: مسموح فقط إن كان هذا السند آخر حركة على الرقم
+      const serialRemovalError = await validateSerialsRemovalOnUpdate(Number(data.id), items)
+      if (serialRemovalError) {
+        return NextResponse.json({ error: serialRemovalError }, { status: 400 })
+      }
+      if (vchType === USE_VOUCHER_VCH_TYPE) {
+        journalRows = buildUseVoucherJournalRows(items, data.currency_id || null, Number(data.rate || 1))
+        const totalDebit = journalRows.filter((r) => r.credit_debit === 1).reduce((s, r) => s + r.amount, 0)
+        const totalCredit = journalRows.filter((r) => r.credit_debit === 2).reduce((s, r) => s + r.amount, 0)
+        if (Math.round((totalDebit - totalCredit) * 100) / 100 !== 0) {
+          const format = (value: number) => value.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+          return NextResponse.json({ error: `القيد غير متوازن: إجمالي المدين ${format(totalDebit)}، وإجمالي الدائن ${format(totalCredit)}. يجب أن يتساوى الطرفان قبل الترحيل.` }, { status: 400 })
+        }
+        const currencyError = await validateJournalAccountCurrencies(journalRows, data.currency_id ? Number(data.currency_id) : null)
+        if (currencyError) return NextResponse.json({ error: currencyError }, { status: 400 })
+      }
+    } else {
+      // status === 3: إلغاء منطقي لسند مُرحَّل — يُعيد أثره على المخزون ويحذف سطوره أدناه (بعد
+      // تحديث الترويسة)، فيُفحَص هنا قبل أي تعديل فعلي أن إزالته آمنة (انظر شرح validateVoucherDeletion).
+      const deletionError = await validateVoucherDeletion(Number(data.id))
+      if (deletionError) {
+        return NextResponse.json({ error: deletionError }, { status: 400 })
+      }
+      const negativeStockError = await validateNegativeStock({ vchType, voucherId: Number(data.id), items: [], action: "delete" })
+      if (negativeStockError) {
+        return NextResponse.json({ error: negativeStockError }, { status: 400 })
+      }
+      const serialsRemovalError = await validateSerialsRemoval(Number(data.id))
+      if (serialsRemovalError) {
+        return NextResponse.json({ error: serialsRemovalError }, { status: 400 })
+      }
+    }
+
+    const amount = items.reduce((sum: number, i: any) => sum + Number(i.total_price || 0), 0)
+
+    const result = await sql`
+      UPDATE voucher_header_tbl
+      SET
+        vch_code = ${data.vch_code},
+        vch_date = ${data.vch_date},
+        vch_book_id = ${data.vch_book_id || null},
+        branch_id = ${authorization.branchId},
+        currency_id = ${data.currency_id || null},
+        rate = ${Number(data.rate || 1)},
+        account_id = ${data.account_id || null},
+        customer_name = ${data.customer_name || ""},
+        to_store_id = ${data.to_store_id || null},
+        from_store_id = ${data.from_store_id || null},
+        amount = ${amount},
+        manual_voucher = ${data.manual_voucher || ""},
+        manual_date = ${data.manual_date || null},
+        note = ${data.note || ""},
+        status = ${status},
+        vch_status = ${status === 2 ? 2 : 1},
+        is_printed = ${Number(data.is_printed || 0)},
+        last_update_date = CURRENT_TIMESTAMP
+      WHERE id = ${data.id}
+      RETURNING *
+    `
+
+    const voucher = result[0]
+
+    // إلغاء منطقي (status=3): تُعكَس حركة المخزون (إن وُجدت) وتُحذف أسطر الأصناف/القيد، دون حذف
+    // رأسية السند نفسها (تبقى مؤرشفة بحالة "محذوف" ضمن voucher_header_tbl، مطابقةً لسند القيد).
+    if (status === 3) {
+      await reverseStockMovement(voucher.id)
+      await sql`DELETE FROM voucher_journal_detail_tbl WHERE voucher_id = ${voucher.id}`
+      await sql`DELETE FROM voucher_items_tbl WHERE voucher_id = ${voucher.id}`
+      return NextResponse.json({ ...voucher, items: [] })
+    }
+
+    const savedItems = await saveVoucherItems(voucher.id, items)
+    await saveVoucherSerials(voucher.id, vchType, savedItems, data.to_store_id || null, data.from_store_id || null)
+    if (vchType === USE_VOUCHER_VCH_TYPE) {
+      await saveJournalRows(voucher.id, journalRows)
+    }
+    // تُطبَّق حركة المخزون فقط عند الانتقال الفعلي إلى status=2 (لم تكن مُرحَّلة سابقاً) — تعديل
+    // سند فعال يبقى فعالاً (draft → draft) لا يحرّك المخزون إطلاقاً.
+    if (status === 2 && previousStatus !== 2) {
+      await applyVoucherStockEffect(vchType, voucher.id, savedItems, data.from_store_id || null, data.to_store_id || null)
+    }
+
+    const savedItemsWithNames = await attachItemSerials(await fetchVoucherItems(voucher.id))
+    return NextResponse.json({ ...voucher, items: savedItemsWithNames })
+  } catch (error) {
+    console.error("Error updating stock voucher:", error)
+    return NextResponse.json({ error: workingPeriodErrorMessage(error) || "Failed to update stock voucher" }, { status: workingPeriodErrorMessage(error) ? 400 : 500 })
+  }
+}
+
+// أرشفة السندات (تقرير ارشفة السندات): نسخة قبل/بعد + نوع العملية والمستخدم
+export const POST = withVoucherAudit(postHandler, { source: "voucher", kind: "save" })
+export const PUT = withVoucherAudit(putHandler, { source: "voucher", kind: "save" })

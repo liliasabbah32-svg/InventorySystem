@@ -1,11 +1,30 @@
 "use client";
 
-import React, { useState, useEffect, useRef, useMemo, useCallback } from "react";
+import { tr, appDir } from "@/lib/i18n"
+import { pickRoleUnit, type UnitRole } from "@/lib/product-unit-roles";
+import React, { useState, useEffect, useRef, useMemo, useCallback, useDeferredValue } from "react";
+import { createPortal } from "react-dom";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import DataGridView from "../common/DataGridView";
-import * as wjGrid from "@grapecity/wijmo.grid";
+import { onProductsChanged } from "@/lib/products-changed";
+import { ReportMultiChoice, type ReportOption } from "@/components/reports/account-statement-report";
+
+const PRODUCT_TYPE_OPTIONS: ReportOption[] = [
+  { id: 1, name: "الأصناف" },
+  { id: 2, name: "الخدمات" },
+];
 import { useTranslation } from 'react-i18next';
+import { Boxes, Package, Plus, RotateCcw, ListFilter } from "lucide-react";
+import { normalizeArabicSearch } from "@/lib/arabic-search";
+import {
+  SearchDialogHeader,
+  SearchFilterField,
+  SearchResultsTable,
+  searchInputClassName,
+  useEnterAsTabFilters,
+  type SearchColumn,
+  type SearchResultsTableHandle,
+} from "@/components/common/search-dialog-kit";
 // -----------------------
 // Types
 // -----------------------
@@ -14,6 +33,11 @@ interface Unit {
   unit_name: string;
   price: number;
   barcode: string;
+  primary_barcode?: string;
+  to_main_qnty?: number;
+  /** كل باركودات الوحدة (لوحة الوحدات تعرض سطراً لكل وحدة + باركود) */
+  barcodes?: string[];
+  _row_key?: string;
 }
 
 interface Product {
@@ -23,34 +47,148 @@ interface Product {
   first_unit: string;
   first_price: number;
   first_barcode: string;
+  barcode?: string | null;
   units?: Unit[];
   selected?: boolean;
   selected_unit?: Unit;
+  product_image?: string | null;
+  image_url?: string | null;
+  display_image?: string | null;
+  attributes?: Array<{ name: string; values: string[]; value_images?: Record<string, string | null> }>;
+  selected_attributes?: Record<string, string>;
+  attribute_summary?: string;
+  attributes_display?: string;
+  _variant_key?: string;
+  last_purchase_price?: number | null;
+  // نصوص بحث مُجهّزة مسبقاً (مرة واحدة عند التحميل) — الفلترة لا تعيد تحويل كل صنف مع كل حرف
+  _code?: string;
+  _name?: string;
+  _barcodes?: string;
 }
 
 interface ProductSearchPopupProps {
-  visible: boolean;
+  visible?: boolean;
+  open?: boolean;
   onClose: () => void;
   onSelect: (products: Product[]) => void;
-  priceCategoryId: number;
-  ShowSelect: boolean;
-  searchText: string;
+  priceCategoryId?: number;
+  ShowSelect?: boolean;
+  searchText?: string;
+  productTypes?: number[];
+  title?: string;
+  selectBaseProduct?: boolean;
+  // من حركة: حساب العميل المختار وتاريخ الحركة — يُفعّل زر "من نموذج" (أصناف نماذج العملاء والأصناف)
+  customerAccountId?: number | null;
+  transactionDate?: string | null;
+  // "purchase": من حركات المشتريات — عمود السعر وأسعار الوحدات = آخر سعر شراء (بدل سعر البيع)
+  priceSource?: "sale" | "purchase";
+  /** الوحدة الافتراضية عند الاختيار بلا تحديد وحدة: وحدة الشراء/الجرد/التقارير من تعريف الصنف (وإلا أول وحدة) */
+  defaultUnitRole?: UnitRole;
+  /** نوع الرقم في عمود "الباركود" للسند (إعدادات السندات): رقم المصنع/الأصلي ⇐ فلتر النافذة يبدأ به، والمختار يحمل أول رقم من هذا النوع بدل الباركود */
+  voucherNumberType?: "barcode" | "factory" | "original";
 }
 
-const ProductSearchPopup: React.FC<ProductSearchPopupProps> = ({ visible, onClose, onSelect, priceCategoryId, ShowSelect, searchText }) => {
+// قائمة الأصناف المخففة (lite) لكل رابط — فتح النافذة مجدداً فوري من الذاكرة ثم تحديث بالخلفية
+const LIST_CACHE_MS = 20_000
+const productListCache = new Map<string, { at: number; data: any[] }>()
+
+const roundPrice = (value: number) => Math.round((Number(value) || 0) * 10000) / 10000
+
+const productThumb = (image?: string | null, alt = "") =>
+  image
+    ? <img src={image} alt={alt} className="mx-auto h-7 w-7 rounded-md border object-cover" />
+    : <div className="mx-auto flex h-7 w-7 items-center justify-center rounded-md bg-slate-100 text-slate-300"><Package className="h-3.5 w-3.5" /></div>
+
+const ProductSearchPopup: React.FC<ProductSearchPopupProps> = ({ visible: visibleProp, open, onClose, onSelect, priceCategoryId = 0, ShowSelect = true, searchText = "", productTypes, title, selectBaseProduct = false, customerAccountId = null, transactionDate = null, priceSource = "sale", defaultUnitRole, voucherNumberType = "barcode" }) => {
+  const visible = visibleProp ?? open ?? false;
   const [products, setProducts] = useState<Product[]>([]);
   const [searchCode, setSearchCode] = useState("");
   const [searchName, setSearchName] = useState("");
   const [searchPrice, setSearchPrice] = useState("");
   const [searchBarcode, setSearchBarcode] = useState("");
+  // نوع الرقم في فلتر/عمود الباركود: باركود (افتراضي) أو رقم المصنع (product_numbers.type 2) أو الرقم الأصلي (type 1)
+  const [numberType, setNumberType] = useState<"barcode" | "factory" | "original">("barcode");
+  const [productNumbers, setProductNumbers] = useState<Record<string, Record<number, string>>>({});
+  useEffect(() => {
+    if (numberType === "barcode" || productNumbers[numberType]) return;
+    let active = true;
+    fetch(`/api/products/numbers?type=${numberType === "original" ? 1 : 2}`, { cache: "no-store" })
+      .then((response) => (response.ok ? response.json() : { numbers: {} }))
+      .then((data) => { if (active) setProductNumbers((current) => ({ ...current, [numberType]: data.numbers || {} })) })
+      .catch(() => undefined);
+    return () => { active = false };
+  }, [numberType, productNumbers]);
+  useEffect(() => { if (visible) setNumberType(voucherNumberType) }, [visible, voucherNumberType]);
+  // أرقام الصنف لنوع معيّن (مخزّنة بعد أول تحميل) — لملء عمود الرقم في السند عند الاختيار
+  const productNumbersRef = useRef(productNumbers);
+  productNumbersRef.current = productNumbers;
+  const loadNumbers = useCallback(async (type: "factory" | "original"): Promise<Record<number, string>> => {
+    const cached = productNumbersRef.current[type];
+    if (cached) return cached;
+    const data = await fetch(`/api/products/numbers?type=${type === "original" ? 1 : 2}`, { cache: "no-store" }).then((response) => (response.ok ? response.json() : { numbers: {} })).catch(() => ({ numbers: {} }));
+    const numbers = data.numbers || {};
+    setProductNumbers((current) => ({ ...current, [type]: numbers }));
+    return numbers;
+  }, []);
+  const numberLabel = numberType === "factory" ? tr("رقم المصنع") : numberType === "original" ? tr("الرقم الأصلي") : tr("الباركود");
+  const numbersOf = useCallback((productId: unknown) => (numberType === "barcode" ? "" : productNumbers[numberType]?.[Number(productId)] || ""), [numberType, productNumbers]);
+  const [selectedTypes, setSelectedTypes] = useState<number[]>(() =>
+    Array.isArray(productTypes) && productTypes.length > 0
+      ? Array.from(new Set(productTypes))
+      : [1, 2]
+  );
+  // نوع ثابت مفروض (productTypes بعنصر واحد) يجب أن يبقى متزامناً حتى لو تغيّر بين فتحة وأخرى لنفس
+  // مثيل هذه النافذة (مثال: مكوّن واحد يُستدعى مرة لصنف ومرة لخدمة) — بلا هذا التزامن يبقى النوع
+  // القديم محفوظاً في الحالة (state) فيعرض نتائج من النوع الخطأ.
+  useEffect(() => {
+    if (Array.isArray(productTypes) && productTypes.length > 0) {
+      setSelectedTypes(Array.from(new Set(productTypes)));
+    }
+  }, [productTypes]);
   const searchCodeRef = useRef<HTMLInputElement>(null);
   const searchNameRef = useRef<HTMLInputElement>(null);
   const searchPriceRef = useRef<HTMLInputElement>(null);
   const searchBarcodeRef = useRef<HTMLInputElement>(null);
+  const filterContainerRef = useRef<HTMLDivElement>(null);
 
-  const gridProductsRef = useRef<wjGrid.FlexGrid | null>(null);
-  const gridUnitsRef = useRef<wjGrid.FlexGrid | null>(null);
+  const resultsRef = useRef<SearchResultsTableHandle | null>(null);
+  // عنصر النافذة نفسها — حاوية قائمة "النوع" المنسدلة (ReportMultiChoice) كي تظهر فوق اللوحة لا خلفها
+  const [dialogElement, setDialogElement] = useState<HTMLDivElement | null>(null);
+  const unitsTableRef = useRef<SearchResultsTableHandle | null>(null);
   const [selectedProduct, setSelectedProduct] = useState<Product | null>(null);
+  const [selectedAttributeKeysByProduct, setSelectedAttributeKeysByProduct] = useState<Record<string, Set<string>>>({});
+  const [refreshVersion, setRefreshVersion] = useState(0);
+  const forceRefreshRef = useRef(false);
+  const selectedProductRef = useRef<Product | null>(null);
+  selectedProductRef.current = selectedProduct;
+  const loadUnitsRef = useRef<(product: Product) => Promise<Unit[]>>(async () => []);
+  const [productsLoading, setProductsLoading] = useState(false);
+  // "من نموذج": قصر النتائج على أصناف نماذج العميل الفعّالة بتاريخ الحركة
+  const [templateFilter, setTemplateFilter] = useState<{ ids: Set<number>; label: string } | null>(null);
+  const [templateLoading, setTemplateLoading] = useState(false);
+  const [templateMessage, setTemplateMessage] = useState("");
+  const customerId = Number(customerAccountId) > 0 ? Number(customerAccountId) : null;
+  useEffect(() => { setTemplateFilter(null); setTemplateMessage(""); }, [visible, customerId]);
+  const toggleTemplateFilter = useCallback(async () => {
+    if (templateFilter) { setTemplateFilter(null); setTemplateMessage(""); return; }
+    if (!customerId) return;
+    setTemplateLoading(true);
+    setTemplateMessage("");
+    try {
+      const query = new URLSearchParams({ account_id: String(customerId), ...(transactionDate ? { date: String(transactionDate).slice(0, 10) } : {}) });
+      const response = await fetch(`/api/customer-product-templates/customer-products?${query}`, { cache: "no-store" });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || tr("تعذر تحميل أصناف النموذج"));
+      const ids: number[] = Array.isArray(data.product_ids) ? data.product_ids.map(Number) : [];
+      if (!ids.length) { setTemplateMessage(tr("لا توجد نماذج فعّالة لهذا العميل بتاريخ الحركة")); return; }
+      const names = (Array.isArray(data.templates) ? data.templates : []).map((row: any) => row.name || row.code).filter(Boolean);
+      setTemplateFilter({ ids: new Set(ids), label: names.join("، ") });
+    } catch (error) {
+      setTemplateMessage(error instanceof Error ? error.message : tr("تعذر تحميل أصناف النموذج"));
+    } finally {
+      setTemplateLoading(false);
+    }
+  }, [templateFilter, customerId, transactionDate]);
   const searchTextRef = useRef<HTMLInputElement>(null);
   const ws = useRef<WebSocket | null>(null);
   const { t, i18n } = useTranslation();
@@ -62,100 +200,220 @@ const ProductSearchPopup: React.FC<ProductSearchPopupProps> = ({ visible, onClos
 
     let cancelled = false;
 
+    const normalize = (data: any[]) => data.map((p: any) => ({
+      ...p,
+      attributes: (Array.isArray(p.attributes) ? p.attributes : []).filter((attribute: any) => attribute?.name && Array.isArray(attribute?.values) && attribute.values.length > 0),
+      attributes_display: "",
+      _variant_key: `${p.id}:default`,
+      selected: false,
+      selected_unit: p.selected_unit || null,
+      _code: String(p.product_code || "").toLowerCase(),
+      _name: normalizeArabicSearch(p.product_name),
+      _barcodes: [p.first_barcode, p.barcode].filter(Boolean).join(" ").toLowerCase(),
+    }));
+    // تحديث تلقائي (عودة من تبويب إضافة/تعديل صنف أو حفظ صنف في تبويب آخر): يتجاوز الذاكرة المؤقتة ويُبقي الفلاتر
+    const forceRefresh = forceRefreshRef.current;
+    forceRefreshRef.current = false;
     const fetchProducts = async () => {
+      // lite=1: حقول العرض والبحث فقط (~عُشر الحجم)؛ الصنف الكامل يُجلب عند الاختيار (hydrateSelection)
+      let url = `/api/inventory/products?priceCategoryId=${priceCategoryId}&activeOnly=true&lite=1`;
+      if (selectedTypes.length === 1) {
+        url += selectedTypes[0] === 2 ? `&type=services` : `&type=products`;
+      }
+      let cacheKey = url;
       try {
-        const res = await fetch(`/api/inventory/products?priceCategoryId=${priceCategoryId}`);
+        cacheKey = `${sessionStorage.getItem("active_company_id") || "default"}:${url}`;
+      } catch { /* use the URL key when storage is unavailable */ }
+      const cached = productListCache.get(cacheKey);
+      if (cached && !forceRefresh) {
+        setProducts(normalize(cached.data));
+        setSelectedProduct(null);
+        if (Date.now() - cached.at < LIST_CACHE_MS) return;
+      } else if (!cached) {
+        setProductsLoading(true);
+      }
+      try {
+        const res = await fetch(url, forceRefresh ? { cache: "no-store" } : undefined);
         const data = await res.json();
-        if (!cancelled) setProducts(data || []);
+        if (!Array.isArray(data)) throw new Error("invalid products response");
+        productListCache.set(cacheKey, { at: Date.now(), data });
+        if (!cancelled) {
+          setProducts((current) => {
+            // تحديث بالخلفية: يُحافَظ على التأشير الحالي
+            const selectedKeys = new Set(current.filter((item) => item.selected).map((item) => item._variant_key));
+            return normalize(data).map((item: Product) => selectedKeys.has(item._variant_key) ? { ...item, selected: true } : item);
+          });
+          if (!cached) setSelectedProduct(null);
+          // الصنف المحدد: بياناته ووحداته من جديد (مثلاً بعد إضافة وحدة له)
+          const current = selectedProductRef.current;
+          if (forceRefresh && current) {
+            const fresh = normalize(data).find((item: Product) => item._variant_key === current._variant_key || Number(item.id) === Number(current.id));
+            if (!fresh) setSelectedProduct(null);
+            else void loadUnitsRef.current(fresh).then((units) => { if (!cancelled && selectedProductRef.current?.id === current.id) setSelectedProduct({ ...fresh, units }); });
+          }
+        }
       } catch (err) {
         console.error("Failed to fetch products:", err);
-        if (!cancelled) setProducts([]);
+        if (!cancelled && !cached) setProducts([]);
+      } finally {
+        if (!cancelled) setProductsLoading(false);
       }
     };
 
     fetchProducts();
-    console.log("searchText ", searchText)
-    //setSearchTerm(searchText || "");
-    
-    setSearchCode("")
-    setSearchName("")
-    setSearchBarcode("")
-    setSearchPrice("")
-    setTimeout(() => searchNameRef.current?.focus(), 100);
-    ws.current = new WebSocket("ws://localhost:33333/ws");
-    ws.current.onopen = () => {
-      ws.current?.send(JSON.stringify({ type: "changeLang", language: "1" }));
-    };
+    if (!forceRefresh) {
+      setSearchCode("");
+      setSearchName(searchText || "");
+      setSearchBarcode("");
+      setSearchPrice("");
+    }
+    let focusAttemptCancelled = forceRefresh
+    const tryFocus = () => {
+      if (focusAttemptCancelled) return
+      if (window.matchMedia("(max-width: 639px)").matches) return
+      const targetRef = (searchText || !searchNameRef.current) ? searchNameRef : searchNameRef
+      if (targetRef.current) {
+        try {
+          targetRef.current.focus()
+        } catch {
+          // ignore
+        }
+        return
+      }
+      // retry a few times in case focus is blocked by other modal setup
+      window.setTimeout(tryFocus, 80)
+    }
+    tryFocus()
+    // WebSocket is useful in development (local i18n change server), but in production
+    // creating a socket to localhost can fail and produce unhandled exceptions in the
+    // client. Guard it: only attempt when running on localhost and wrap in try/catch.
+    try {
+      if (typeof window !== "undefined" && window.location?.hostname === "localhost") {
+        try {
+          ws.current = new WebSocket("ws://localhost:33333/ws");
+          ws.current.onopen = () => {
+            try {
+              ws.current?.send(JSON.stringify({ type: "changeLang", language: "1" }));
+            } catch (err) {
+              console.warn("ws send failed", err);
+            }
+          };
+          ws.current.onerror = (ev) => {
+            console.warn("ProductSearchPopup websocket error:", ev);
+          };
+        } catch (err) {
+          console.warn("Failed to initialize websocket in ProductSearchPopup:", err);
+          ws.current = null;
+        }
+      }
+    } catch (err) {
+      console.warn("WS guard failed:", err);
+    }
     return () => {
       cancelled = true;
+      focusAttemptCancelled = true
       if (ws.current) ws.current.close();
     };
+  }, [visible, priceCategoryId, selectedTypes, searchText, refreshVersion]);
+
+  useEffect(() => {
+    if (!visible) return;
+    const refreshAfterReturn = () => {
+      forceRefreshRef.current = true;
+      productListCache.clear();
+      unitsCacheRef.current.clear();
+      fullCacheRef.current.clear();
+      setRefreshVersion((value) => value + 1);
+    };
+    // حفظ صنف (إضافة/تعديل/وحدة جديدة) في أي تبويب ⇐ تحديث فوري، والعودة للتبويب ⇐ تحديث أيضاً
+    const unsubscribe = onProductsChanged(refreshAfterReturn);
+    window.addEventListener("focus", refreshAfterReturn);
+    return () => { unsubscribe(); window.removeEventListener("focus", refreshAfterReturn); };
   }, [visible]);
+
+  useEffect(() => {
+    if (!visible) return;
+    const nextTypes = Array.isArray(productTypes) && productTypes.length > 0
+      ? Array.from(new Set(productTypes))
+      : [1, 2]
+    setSelectedTypes((current) => current.length === nextTypes.length && current.every((value, index) => value === nextTypes[index]) ? current : nextTypes);
+  }, [visible, productTypes]);
 
   // -----------------------
   // Products grid scheme
   // -----------------------
-  const productScheme = useMemo(() => ({
-    name: "ProductsScheme",
-    columns: [
-      { header: "✅", name: "selected", width: 50, isReadOnly: false, visible: ShowSelect },
-      { header: "رقم الصنف", name: "product_code", width: 120, isReadOnly: true },
-      { header: "اسم الصنف", name: "product_name", width: "*", isReadOnly: true },
-      { header: "الوحدة", name: "first_unit", width: 80, isReadOnly: true },
-      { header: "السعر", name: "first_price", width: 80, isReadOnly: true },
-      { header: "باركود", name: "first_barcode", width: 150, isReadOnly: true },
-    ]
-  }), []);
-
-  // -----------------------
-  // Units grid scheme
-  // -----------------------
-  const unitScheme = useMemo(() => ({
-    columns: [
-      { header: "الوحدة", name: "unit_name", width: "*", isReadOnly: true },
-      { header: "سعر الوحدة", name: "price", width: 90, isReadOnly: true },
-      { header: "باركود", name: "barcode", width: 150, isReadOnly: true },
-    ]
-  }), []);
+  const selectedAttributeRows = useMemo(() => {
+    const attributes = Array.isArray(selectedProduct?.attributes) ? selectedProduct.attributes : []
+    const productKey = selectedProduct?._variant_key || (selectedProduct ? String(selectedProduct.id) : "")
+    const selectedAttributeKeys = selectedAttributeKeysByProduct[productKey] || new Set<string>()
+    return attributes.flatMap((attribute: any) => (Array.isArray(attribute.values) ? attribute.values : []).map((value: string) => ({
+      attribute_name: attribute.name,
+      value_name: value,
+      attribute_key: `${attribute.name}::${value}`,
+      barcode: selectedProduct?.first_barcode || (selectedProduct as any)?.barcode || "",
+      selected: selectedAttributeKeys.has(`${attribute.name}::${value}`),
+      image_url: attribute.value_images?.[value] || selectedProduct?.product_image || selectedProduct?.image_url || null,
+    })))
+  }, [selectedProduct, selectedAttributeKeysByProduct])
 
   // -----------------------
   // Filtered products
   // -----------------------
   const searchWordsMatch = (text: string, searchQuery: string) => {
-    const words = searchQuery
+    const words = normalizeArabicSearch(searchQuery)
       .trim()
-      .toLowerCase()
       .split(/\s+/);
 
-    const normalizedText = text.toLowerCase();
+    const normalizedText = normalizeArabicSearch(text);
     return words.every(word => normalizedText.includes(word));
   };
 
 
 
+  // السعر المعروض: حركات المشتريات ⇐ آخر سعر شراء، وإلا سعر البيع لفئة السعر
+  const displayPrice = useCallback((product: Product) =>
+    priceSource === "purchase" ? Number(product.last_purchase_price ?? 0) : Number(product.first_price ?? (product as any).price ?? 0), [priceSource]);
+
+  // الكتابة لا تنتظر الفلترة: الفلترة على قيم مؤجلة (useDeferredValue) ونصوص مُجهّزة مسبقاً
+  const deferredCode = useDeferredValue(searchCode);
+  const deferredName = useDeferredValue(searchName);
+  const deferredPrice = useDeferredValue(searchPrice);
+  const deferredBarcode = useDeferredValue(searchBarcode);
   const filteredProducts = useMemo(() => {
+    const code = deferredCode.trim().toLowerCase();
+    const nameWords = normalizeArabicSearch(deferredName).trim().split(/\s+/).filter(Boolean);
+    const price = deferredPrice.trim();
+    const barcode = deferredBarcode.trim().toLowerCase();
+    if (!code && !nameWords.length && !price && !barcode && !templateFilter) return products;
     return products.filter(p => {
-
-      const matchCode =
-        !searchCode ||
-        p.product_code?.toLowerCase().includes(searchCode.toLowerCase());
-
-      const matchName =
-        !searchName ||
-        searchWordsMatch(p.product_name || "", searchName);
-
-      const matchPrice =
-        !searchPrice ||
-        String(p.first_price).includes(searchPrice);
-
-      const matchBarcode =
-        !searchBarcode ||
-        p.first_barcode?.toLowerCase().includes(searchBarcode.toLowerCase());
-
-      return matchCode && matchName && matchPrice && matchBarcode;
-
+      if (templateFilter && !templateFilter.ids.has(Number(p.id))) return false;
+      if (code && !(p._code ?? String(p.product_code || "").toLowerCase()).includes(code)) return false;
+      if (nameWords.length) {
+        const name = p._name ?? normalizeArabicSearch(p.product_name);
+        if (!nameWords.every(word => name.includes(word))) return false;
+      }
+      if (price && !String(displayPrice(p)).includes(price)) return false;
+      if (barcode) {
+        if (numberType !== "barcode") {
+          if (!numbersOf(p.id).toLowerCase().includes(barcode)) return false;
+        } else {
+          const own = p._barcodes ?? "";
+          if (!own.includes(barcode) && !(p.units || []).some((unit: Unit) => (unit.barcodes?.length ? unit.barcodes : [unit.barcode]).some((code) => String(code || "").toLowerCase().includes(barcode)))) return false;
+        }
+      }
+      return true;
     });
-  }, [products, searchCode, searchName, searchPrice, searchBarcode]);
+  }, [products, deferredCode, deferredName, deferredPrice, deferredBarcode, templateFilter, displayPrice, numberType, numbersOf]);
+  const visibleProducts = useMemo(() => filteredProducts.slice(0, 200), [filteredProducts]);
+
+  const clearFilters = useCallback(() => {
+    setSearchCode("");
+    setSearchName("");
+    setSearchPrice("");
+    setSearchBarcode("");
+    setSelectedTypes(Array.isArray(productTypes) && productTypes.length > 0 ? Array.from(new Set(productTypes)) : [1, 2]);
+    searchNameRef.current?.focus();
+  }, [productTypes]);
 
   // -----------------------
   // Select product row
@@ -164,39 +422,200 @@ const ProductSearchPopup: React.FC<ProductSearchPopupProps> = ({ visible, onClos
     setSelectedProduct(product);
   }, []);
 
-  const handleProductDoubleClick = useCallback((product: Product) => {
+  const getProductSelectionKey = (product: Product) => product._variant_key || String(product.id);
+
+  // تأشير/إلغاء تأشير قيمة متغير للصنف المحدد (خانة الاختيار أو Space في جدول المتغيرات)
+  const toggleAttributeKey = useCallback((attributeKey: string) => {
+    if (!selectedProduct || !attributeKey) return;
+    const productKey = getProductSelectionKey(selectedProduct);
+    setSelectedAttributeKeysByProduct((current) => {
+      const next = new Set(current[productKey] || []);
+      if (next.has(attributeKey)) next.delete(attributeKey);
+      else next.add(attributeKey);
+      return { ...current, [productKey]: next };
+    });
+  }, [selectedProduct]);
+
+  const buildSelectedVariants = useCallback((product: Product, rows: typeof selectedAttributeRows) => {
+    const baseName = product.product_name.replace(/\s*\([^)]*\)\s*$/, "");
+    return rows.map((row) => ({
+      ...product,
+      product_name: `${baseName} (${row.attribute_name}: ${row.value_name})`,
+      selected_attributes: { ...(product.selected_attributes || {}), [row.attribute_name]: row.value_name },
+      attribute_summary: `${row.attribute_name}: ${row.value_name}`,
+      selected: true,
+    }));
+  }, []);
+
+  const finishOrConfigureProduct = useCallback((product: Product) => {
+    if (selectBaseProduct) {
+      const baseName = product.product_name.replace(/\s*\([^)]*\)\s*$/, "").trim();
+      void emitSelectRef.current([{ ...product, product_name: baseName, selected_attributes: undefined, attribute_summary: undefined }]);
+      return;
+    }
+    const attributes = Array.isArray(product.attributes) ? product.attributes.filter((attribute) => attribute.name && attribute.values?.length) : [];
+    if (attributes.length > 0 && !product.selected_attributes) {
+      setSelectedProduct(product);
+      setTimeout(() => unitsTableRef.current?.focusFirstRow(), 0);
+      return;
+    }
+    const name = product.attribute_summary ? `${product.product_name} (${product.attribute_summary})` : product.product_name
+    void emitSelectRef.current([{ ...product, product_name: name }]);
+  }, [onSelect, onClose, selectBaseProduct]);
+
+  // وحدات الصنف بأسعار مصدر السعر: الشراء ⇐ آخر سعر شراء × معامل الوحدة
+  const priceUnits = useCallback((product: Product, units: Unit[]) => priceSource !== "purchase" ? units
+    : units.map((unit) => ({ ...unit, price: roundPrice(Number(product.last_purchase_price ?? 0) * (Number(unit.to_main_qnty) || 1)) })), [priceSource]);
+  // ذاكرة لكل فتحة للنافذة: وحدات الصنف وبياناته الكاملة تُجلب مرة واحدة (وتبدأ عند تحديد السطر)، فيصبح
+  // الاختيار بنقر مزدوج فورياً تقريباً بدل انتظار طلبين متتاليين بعد النقر
+  const unitsCacheRef = useRef(new Map<string, Promise<Unit[]>>());
+  const fullCacheRef = useRef(new Map<string, Promise<any | null>>());
+  useEffect(() => { if (!visible) { unitsCacheRef.current.clear(); fullCacheRef.current.clear(); } }, [visible]);
+
+  const loadUnits = useCallback(async (product: Product): Promise<Unit[]> => {
+    const key = `${product.id}:${priceCategoryId}`;
+    let pending = unitsCacheRef.current.get(key);
+    if (!pending) {
+      pending = fetch(`/api/products/${product.id}/units?price_category_id=${priceCategoryId}`)
+        .then(async (response) => { const units = response.ok ? await response.json() : []; return Array.isArray(units) ? units as Unit[] : []; })
+        .catch((err) => { console.error("Error fetching units:", err); unitsCacheRef.current.delete(key); return [] as Unit[]; });
+      unitsCacheRef.current.set(key, pending);
+    }
+    return priceUnits(product, await pending);
+  }, [priceCategoryId, priceUnits]);
+  loadUnitsRef.current = loadUnits;
+
+  // البيانات الكاملة للأصناف (?ids=) — طلب واحد لكل الأصناف غير المخزّنة، ووعد لكل صنف في الذاكرة
+  const fetchFullProducts = useCallback((ids: number[]) => {
+    const cache = fullCacheRef.current;
+    const missing = ids.filter((id) => !cache.has(`${id}:${priceCategoryId}`));
+    if (missing.length) {
+      const batch = fetch(`/api/inventory/products?priceCategoryId=${priceCategoryId}&activeOnly=false&ids=${missing.join(",")}`, { cache: "no-store" })
+        .then(async (response) => { const rows = response.ok ? await response.json() : []; return new Map((Array.isArray(rows) ? rows : []).map((row: any) => [Number(row.id), row])); })
+        .catch((err) => { console.error("Failed to load selected products:", err); return new Map<number, any>(); });
+      for (const id of missing) {
+        const key = `${id}:${priceCategoryId}`;
+        cache.set(key, batch.then((rows) => { const row = rows.get(id) ?? null; if (!row) cache.delete(key); return row; }));
+      }
+    }
+    return Promise.all(ids.map((id) => cache.get(`${id}:${priceCategoryId}`)!));
+  }, [priceCategoryId]);
+
+  // الاختيار: القائمة مخففة ⇐ تُجلب بيانات الأصناف المختارة كاملة (?ids=) وتُدمج مع حالة الاختيار
+  // (الوحدة/المتغير/السعر) ثم onSelect ثم إغلاق النافذة — نفس الترتيب السابق للمستدعين.
+  const emitSelect = useCallback(async (items: Product[]) => {
+    let merged = items;
+    const ids = [...new Set(items.map((item) => Number(item.id)).filter((id) => id > 0))];
+    if (ids.length) {
+      const full = await fetchFullProducts(ids);
+      const byId = new Map(ids.map((id, index) => [id, full[index]]));
+      merged = items.map((item) => {
+        const { _code, _name, _barcodes, ...rest } = item;
+        return { ...(byId.get(Number(item.id)) || {}), ...rest } as Product;
+      });
+    }
+    if (priceSource === "purchase") {
+      merged = merged.map((item) => {
+        const units = priceUnits(item, item.units || []);
+        const selectedUnit = item.selected_unit ? priceUnits(item, [item.selected_unit])[0] : pickRoleUnit(units, defaultUnitRole);
+        return { ...item, units, selected_unit: selectedUnit, first_price: selectedUnit?.price ?? roundPrice(Number(item.last_purchase_price ?? 0)) };
+      });
+    }
+    if (voucherNumberType !== "barcode") {
+      // عمود الرقم في السند = رقم المصنع/الأصلي: أول رقم من هذا النوع على الصنف ووحداته (كما يُعرض الباركود الأول عادةً)
+      const numbers = await loadNumbers(voucherNumberType);
+      merged = merged.map((item) => {
+        const number = String(numbers[Number(item.id)] || "").split("، ")[0].trim();
+        return {
+          ...item, barcode: number, first_barcode: number,
+          units: (item.units || []).map((unit) => ({ ...unit, barcode: number })),
+          selected_unit: item.selected_unit ? { ...item.selected_unit, barcode: number } : item.selected_unit,
+        };
+      });
+    }
+    onSelect(merged);
+    onClose();
+  }, [fetchFullProducts, priceSource, priceUnits, onSelect, onClose, defaultUnitRole, voucherNumberType, loadNumbers]);
+  // المعالجات المحفوظة (useCallback) تستدعي آخر نسخة دائماً
+  const emitSelectRef = useRef(emitSelect);
+  emitSelectRef.current = emitSelect;
+
+  const handleProductDoubleClick = useCallback(async (product: Product) => {
     if (!product) return;
-    console.log("product ", product)
-    // Automatically select first unit if available
-    const selectedUnit = product.units?.[0];
-    const updatedProduct: Product = { ...product, selected_unit: selectedUnit, selected: true };
+    // النقر المزدوج/Enter على صنف بلا مرور بشبكة الوحدات (selectionChanged) لا يحمل units أصلاً —
+    // فتُجلَب هنا صراحة قبل onSelect، وإلا يصل المستدعي (unified-stock-voucher.tsx وغيره) بمصفوفة
+    // وحدات فارغة فيظهر بعدها "لا توجد وحدات" عند فتح نافذة بحث الوحدة بالسطر.
+    // البيانات الكاملة تُطلب بالتوازي مع الوحدات (لا بعدها) — emitSelect يجدها في الذاكرة
+    void fetchFullProducts([Number(product.id)]);
+    let units = product.units;
+    if (!units || units.length === 0) units = await loadUnits(product);
+    const selectedUnit = pickRoleUnit(units, defaultUnitRole);
+    const updatedProduct: Product = { ...product, units, selected_unit: selectedUnit, selected: true };
 
     setProducts(prev =>
-      prev.map(p => p.id === product.id ? updatedProduct : p)
+      prev.map(p => p._variant_key === product._variant_key ? updatedProduct : p)
     );
 
-    onSelect([updatedProduct]);
-    onClose();
-  }, [onSelect, onClose]);
+    if (selectBaseProduct) {
+      finishOrConfigureProduct(updatedProduct);
+      return;
+    }
+
+    const attributes = Array.isArray(updatedProduct.attributes)
+      ? updatedProduct.attributes.filter((attribute) => attribute.name && attribute.values?.length)
+      : [];
+    if (attributes.length > 0 && !updatedProduct.selected_attributes) {
+      const firstAttribute = attributes[0];
+      const firstValue = firstAttribute.values[0];
+      const [firstVariant] = buildSelectedVariants(updatedProduct, [{
+        attribute_name: firstAttribute.name,
+        value_name: firstValue,
+        attribute_key: `${firstAttribute.name}::${firstValue}`,
+        selected: true,
+        image_url: firstAttribute.value_images?.[firstValue] || updatedProduct.product_image || updatedProduct.image_url || null,
+      }]);
+      void emitSelectRef.current([firstVariant]);
+      return;
+    }
+
+    finishOrConfigureProduct(updatedProduct);
+  }, [finishOrConfigureProduct, priceCategoryId, buildSelectedVariants, onSelect, onClose, selectBaseProduct, fetchFullProducts, loadUnits, defaultUnitRole]);
   // -----------------------
   // Fetch units when product selected
   // -----------------------
-  const selectionChanged = useCallback(async (grid: wjGrid.FlexGrid) => {
-    if (!grid) return;
-    const rowIndex = grid.selection?.row ?? -1;
-    if (rowIndex < 0) return;
 
-    const item = grid.rows[rowIndex]?.dataItem as Product;
-    if (!item) return;
+  const handleMobileProductSelect = useCallback(async (product: Product) => {
+    setSelectedProduct(product);
+    if (product.units?.length) return;
+    setSelectedProduct({ ...product, units: await loadUnits(product) });
+  }, [loadUnits]);
 
-    try {
-      const response = await fetch(`/api/products/${item.id}/units`);
-      const units: Unit[] = await response.json();
-      setSelectedProduct({ ...item, units });
-    } catch (err) {
-      console.error("Error fetching units:", err);
-      setSelectedProduct({ ...item, units: [] });
-    }
+  const toggleProductChecked = useCallback((event: React.SyntheticEvent, product: Product) => {
+    event.stopPropagation();
+    setProducts((current) => current.map((item) => item._variant_key === product._variant_key ? { ...item, selected: !item.selected } : item));
+  }, []);
+
+  // السطر النشط في جدول النتائج (نقر/أسهم) ⇐ يُعرض الصنف ووحداته باللوحة الجانبية. الجلب مؤجَّل قليلاً
+  // كي لا يُطلَق طلب لكل سطر يُمَرّ عليه بالأسهم، ويُتجاهَل الرد إن انتقل المستخدم لسطر آخر.
+  const unitsLoadTimerRef = useRef<number | null>(null);
+  const activeProductKeyRef = useRef<string>("");
+  const handleActiveProductChange = useCallback((product: Product | null) => {
+    if (unitsLoadTimerRef.current) window.clearTimeout(unitsLoadTimerRef.current);
+    if (!product) return;
+    const key = getProductSelectionKey(product);
+    activeProductKeyRef.current = key;
+    setSelectedProduct((current) => (current && getProductSelectionKey(current) === key ? current : product));
+    unitsLoadTimerRef.current = window.setTimeout(async () => {
+      // تحميل مسبق للبيانات الكاملة للسطر المحدد — يجعل الاختيار التالي فورياً
+      void fetchFullProducts([Number(product.id)]);
+      if (product.units?.length) return;
+      const units = await loadUnits(product);
+      if (activeProductKeyRef.current === key) setSelectedProduct({ ...product, units });
+    }, 150);
+  }, [loadUnits, fetchFullProducts]);
+
+  useEffect(() => () => {
+    if (unitsLoadTimerRef.current) window.clearTimeout(unitsLoadTimerRef.current);
   }, []);
 
   // -----------------------
@@ -206,7 +625,7 @@ const ProductSearchPopup: React.FC<ProductSearchPopupProps> = ({ visible, onClos
     if (!selectedProduct) return;
 
     setProducts(prev =>
-      prev.map(p => p.id === selectedProduct.id ? { ...p, selected_unit: unit, selected: true } : p)
+      prev.map(p => p._variant_key === selectedProduct._variant_key ? { ...p, selected_unit: unit, selected: true } : p)
     );
     setSelectedProduct(prev => prev ? { ...prev, selected_unit: unit } : null);
   }, [selectedProduct]);
@@ -214,216 +633,366 @@ const ProductSearchPopup: React.FC<ProductSearchPopupProps> = ({ visible, onClos
   const handleUnitRowDoubleClick = useCallback((unit: Unit) => {
     if (!selectedProduct || !unit) return;
 
+    const attributeRow = unit as Unit & { attribute_key?: string; attribute_name?: string; value_name?: string };
+    if (attributeRow.attribute_key && attributeRow.attribute_name && attributeRow.value_name) {
+      const [variant] = buildSelectedVariants(selectedProduct, [attributeRow as typeof selectedAttributeRows[number]]);
+      void emitSelectRef.current([variant]);
+      return;
+    }
+
     // Combine product info + selected unit
     const productWithUnit = {
       ...selectedProduct,       // all product fields
       selected_unit: unit,      // attach the double-clicked unit
       unit_name: unit.unit_name,
       unit_id: unit.unit_id,
-      first_barcode: unit.barcode,  // override barcode
+      first_barcode: unit.primary_barcode || unit.barcode,  // use one barcode for transaction persistence
       first_price: unit.price,      // override price
     };
 
     // Pass it to parent and close popup
-    onSelect([productWithUnit]);
-    onClose();
-  }, [selectedProduct, onSelect, onClose]);
+    finishOrConfigureProduct(productWithUnit);
+  }, [selectedProduct, buildSelectedVariants, onSelect, onClose, finishOrConfigureProduct]);
+
+  const handleAttributeDoubleClick = useCallback((row: typeof selectedAttributeRows[number]) => {
+    if (!selectedProduct || !row) return;
+    const [variant] = buildSelectedVariants(selectedProduct, [row]);
+    if (!variant) return;
+    void emitSelectRef.current([variant]);
+  }, [selectedProduct, buildSelectedVariants, onSelect, onClose]);
   // -----------------------
   // Confirm selection
   // -----------------------
   const handleConfirm = () => {
-    let selectedItems = products.filter(p => p.selected);
-
-    // If no products are selected, pick the currently focused row in the grid
-    if (selectedItems.length === 0 && selectedProduct) {
-      selectedItems.push(selectedProduct);
-
+    const checkedProducts = products.filter((product) => product.selected);
+    const selectedProducts = checkedProducts.length > 0 ? checkedProducts : (selectedProduct ? [selectedProduct] : []);
+    const pendingAttributeProduct = !selectBaseProduct && selectedProducts.find((product) => {
+      if (!product || !Array.isArray(product.attributes) || product.attributes.length === 0) return false;
+      const selectedKeys = selectedAttributeKeysByProduct[getProductSelectionKey(product)] || new Set<string>();
+      return !product.selected_attributes && selectedKeys.size === 0;
+    });
+    if (pendingAttributeProduct) {
+      setSelectedProduct(pendingAttributeProduct);
+      setTimeout(() => unitsTableRef.current?.focusFirstRow(), 0);
+      return;
     }
 
-    if (selectedItems.length === 0) return; // nothing to select
+    if (selectedProducts.length === 0) return;
+
+    const selectedItems = selectBaseProduct ? selectedProducts.map((product) => ({
+      ...product,
+      product_name: product.product_name.replace(/\s*\([^)]*\)\s*$/, "").trim(),
+      selected_attributes: undefined,
+      attribute_summary: undefined,
+    })) : selectedProducts.flatMap((product) => {
+      const selectedKeys = selectedAttributeKeysByProduct[getProductSelectionKey(product)] || new Set<string>();
+      const attributes = Array.isArray(product.attributes) ? product.attributes.filter((attribute) => attribute.name && attribute.values?.length) : [];
+      if (attributes.length === 0 || product.selected_attributes) return [product];
+      const rows = attributes.flatMap((attribute) => attribute.values.map((value) => ({
+        attribute_name: attribute.name,
+        value_name: value,
+        attribute_key: `${attribute.name}::${value}`,
+        selected: selectedKeys.has(`${attribute.name}::${value}`),
+        image_url: attribute.value_images?.[value] || product.product_image || product.image_url || null,
+      }))).filter((row) => selectedKeys.has(row.attribute_key));
+      return buildSelectedVariants(product, rows);
+    });
+
+    if (selectedItems.length === 0) return;
 
     // Reset selection flags
     setProducts(prev => prev.map(p => ({ ...p, selected: false })));
 
-    // Pass selected items to parent and close popup
-    onSelect(selectedItems);
-    onClose();
+    void emitSelectRef.current(selectedItems);
   };
 
-  const focusFirstGridRow = () => {
-    const grid = gridProductsRef.current;
-    if (!grid) return;
+  // آخر فلتر (Enter) أو السهم للأسفل من أي فلتر ⇐ أول سطر في جدول النتائج
+  const focusFirstGridRow = useCallback(() => {
+    resultsRef.current?.focusFirstRow();
+  }, []);
 
-    grid?.focus();
-    grid.select(0, 0); // first row, first column
-  };
+  useEnterAsTabFilters(visible, filterContainerRef, focusFirstGridRow);
 
   useEffect(() => {
-  if (!visible) return;
-
-  const handleKeyDown = (e: KeyboardEvent) => {
-    const active = document.activeElement;
-
-    if (e.key === "Escape") {
+    if (!visible) return;
+    const handleEscape = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      // Escape داخل قائمة منسدلة مفتوحة يغلقها هي فقط
+      if ((e.target as HTMLElement | null)?.closest?.(".p-dropdown-panel, .p-multiselect-panel")) return;
       e.preventDefault();
+      e.stopImmediatePropagation();
       onClose();
-      return;
-    }
+    };
+    // window (التقاط) يسبق document: نافذة Radix الأم (مثل طلب بضاعة داخلي) تستمع لـESC على document
+    // فكانت تُغلق مع هذه النافذة. هنا يُستهلك ESC قبل وصوله إليها فتُغلق نافذة البحث وحدها.
+    window.addEventListener("keydown", handleEscape, true);
+    return () => window.removeEventListener("keydown", handleEscape, true);
+  }, [visible, onClose]);
 
-    if (e.key === "Enter") {
-      e.preventDefault();
+  const resultColumns = useMemo<SearchColumn<Product>[]>(() => [
+    ...(ShowSelect ? [{
+      key: "selected",
+      header: "",
+      width: "40px",
+      align: "center" as const,
+      render: (product: Product) => (
+        <input
+          type="checkbox"
+          checked={!!product.selected}
+          aria-label={tr("اختيار {0}", product.product_name)}
+          tabIndex={-1}
+          onClick={(event) => event.stopPropagation()}
+          onDoubleClick={(event) => event.stopPropagation()}
+          onChange={(event) => toggleProductChecked(event, product)}
+          className="h-4 w-4 cursor-pointer accent-emerald-600"
+        />
+      ),
+    }] : []),
+    { key: "image", header: "", width: "44px", align: "center", render: (product) => productThumb(product.display_image || product.product_image || product.image_url, product.product_name) },
+    { key: "product_code", header: tr("رقم الصنف"), width: "120px", className: "font-mono text-xs text-slate-600" },
+    { key: "product_name", header: tr("اسم الصنف"), className: "max-w-[340px] truncate font-semibold text-slate-800" },
+    { key: "first_unit", header: tr("الوحدة"), width: "80px", className: "text-slate-600" },
+    { key: "first_price", header: tr("السعر"), width: "90px", align: "end", className: "tabular-nums font-semibold", render: (product) => displayPrice(product).toLocaleString("en-US") },
+    numberType === "barcode"
+      ? { key: "first_barcode", header: tr("الباركود"), width: "140px", className: "font-mono text-xs text-slate-500" }
+      : { key: "first_barcode", header: numberLabel, width: "160px", className: "font-mono text-xs text-slate-600", render: (product: Product) => numbersOf(product.id) || "—" },
+  ], [ShowSelect, toggleProductChecked, displayPrice, numberType, numberLabel, numbersOf]);
 
-      if (active === searchCodeRef.current) {
-        searchNameRef.current?.focus();
-      } else if (active === searchNameRef.current) {
-        searchPriceRef.current?.focus();
-      } else if (active === searchPriceRef.current) {
-        searchBarcodeRef.current?.focus();
-      } else if (active === searchBarcodeRef.current) {
-        focusFirstGridRow(); // Focus first row of products grid
-      }
-    }
+  type AttributeRow = (typeof selectedAttributeRows)[number];
 
-    if (e.key === "ArrowDown") {
-      if (active === searchCodeRef.current ||
-          active === searchNameRef.current ||
-          active === searchPriceRef.current ||
-          active === searchBarcodeRef.current) {
-        focusFirstGridRow();
-        e.preventDefault();
-      }
-    }
-  };
+  const attributeColumns = useMemo<SearchColumn<AttributeRow>[]>(() => [
+    ...(ShowSelect ? [{
+      key: "selected",
+      header: "",
+      width: "36px",
+      align: "center" as const,
+      render: (row: AttributeRow) => (
+        <input
+          type="checkbox"
+          checked={row.selected}
+          aria-label={tr("اختيار القيمة")}
+          tabIndex={-1}
+          onClick={(event) => event.stopPropagation()}
+          onDoubleClick={(event) => event.stopPropagation()}
+          onChange={() => toggleAttributeKey(row.attribute_key)}
+          className="h-4 w-4 cursor-pointer accent-emerald-600"
+        />
+      ),
+    }] : []),
+    { key: "attribute_name", header: tr("المتغير"), className: "font-semibold text-slate-700" },
+    { key: "value_name", header: tr("القيمة") },
+    { key: "image_url", header: "", width: "40px", align: "center", render: (row) => productThumb(row.image_url) },
+  ], [ShowSelect, toggleAttributeKey]);
 
-  window.addEventListener("keydown", handleKeyDown, true);
+  // كل وحدة بعدد باركوداتها: وحدة لها 3 باركودات ⇐ 3 أسطر (الاختيار يُرجع الوحدة مع ذلك الباركود)
+  const unitBarcodeRows = (units: Unit[]): Unit[] => units.flatMap((unit) => {
+    const codes = (unit.barcodes && unit.barcodes.length ? unit.barcodes : String(unit.barcode || "").split(",").map((code) => code.trim())).filter(Boolean);
+    return codes.length
+      ? codes.map((code) => ({ ...unit, barcode: code, _row_key: `${unit.unit_id}:${code}` }))
+      : [{ ...unit, barcode: "", _row_key: `${unit.unit_id}:` }];
+  });
 
-  return () => {
-    window.removeEventListener("keydown", handleKeyDown, true);
-  };
-}, [visible, onClose]);
+  const unitColumns = useMemo<SearchColumn<Unit>[]>(() => [
+    { key: "unit_name", header: tr("الوحدة"), className: "font-semibold text-slate-700" },
+    { key: "price", header: tr("السعر"), width: "80px", align: "end", className: "tabular-nums", render: (unit) => Number(unit.price ?? 0).toLocaleString("en-US") },
+    { key: "barcode", header: tr("الباركود"), className: "font-mono text-xs text-slate-500", render: (unit) => unit.barcode || "—" },
+  ], []);
 
-
-  const onKeyDownGrid = async (grid: any, e: KeyboardEvent) => {
-    // Make sure grid and selection exist
-    if (!grid || !grid.selection) return;
-    const sel = grid.selection;
-    const row = sel.row;
-
-    if (e.keyCode === 13) {
-      const rowIndex = grid.selection?.row ?? -1;
-      if (rowIndex < 0) return;
-
-      const item = grid.rows[rowIndex]?.dataItem as Product;
-      console.log("item ", item)
-      try {
-        const response = await fetch(`/api/products/${item.id}/units`);
-        const units: Unit[] = await response.json();
-        setSelectedProduct({ ...item, units });
-        const selectedItem = item
-        handleProductDoubleClick(selectedItem)
-      } catch (err) {
-        console.error("Error fetching units:", err);
-      }
-      e.preventDefault();
-
-      return;
-    }
-  }
   if (!visible) return null;
 
-  const gridStyleUnits = {
-    maxHeight: '20vh',
-    minHeight: '20vh',
-  };
+  const checkedCount = products.reduce((count, product) => count + (product.selected ? 1 : 0), 0);
+  const showingAttributes = selectedAttributeRows.length > 0;
 
-  const gridStyleItems = {
-    maxHeight: '30vh',
-    minHeight: '30vh',
-  };
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
-      <div className="bg-white rounded-lg shadow-2xl border p-6 flex flex-col w-full max-w-4xl h-[800px]  w-[95vw] max-w-7xl" dir="rtl">
-        <h3 className="text-lg font-semibold mb-4 text-right">بحث الأصناف</h3>
+  return createPortal(
+    <div
+      // pointer-events-auto صريح ضروري: اللوحة تُركَّب عبر createPortal إلى document.body خارج طبقات
+      // Radix — أي Dialog مفتوح من Radix يضبط pointerEvents="none" على body فتُصبح اللوحة غير قابلة للنقر.
+      className="pointer-events-auto fixed inset-0 z-[100] flex items-center justify-center bg-slate-950/45 p-0 backdrop-blur-[2px] sm:p-4"
+    >
+      <div
+        ref={setDialogElement}
+        className="flex h-[100dvh] w-full flex-col overflow-hidden bg-slate-50 shadow-2xl sm:h-[min(84dvh,780px)] sm:max-w-[1320px] sm:rounded-2xl sm:ring-1 sm:ring-slate-900/10"
+        dir={appDir()}
+      >
+        <SearchDialogHeader
+          icon={<Boxes className="h-4 w-4" />}
+          title={title || tr("بحث الأصناف")}
+          subtitle={tr("Enter للتنقل بين الفلاتر ثم للنتائج • ↑↓ للتنقل • Enter للاختيار")}
+          count={filteredProducts.length}
+          onClose={onClose}
+          actions={
+            <>
+            <Button
+              type="button"
+              tabIndex={-1}
+              disabled={!customerId || templateLoading}
+              onClick={() => void toggleTemplateFilter()}
+              title={customerId ? tr("عرض أصناف نماذج هذا العميل فقط") : tr("متاح من الحركة بعد اختيار العميل")}
+              className={`h-8 gap-1.5 rounded-lg px-2.5 text-xs font-bold ${templateFilter ? "bg-amber-400 text-amber-950 hover:bg-amber-300" : "bg-white text-indigo-700 hover:bg-indigo-50"}`}
+            >
+              <ListFilter className="h-3.5 w-3.5" />
+              <span>{templateLoading ? tr("جاري التحميل...") : templateFilter ? tr("كل الأصناف") : tr("من نموذج")}</span>
+            </Button>
+            <Button
+              type="button"
+              tabIndex={-1}
+              onClick={() => window.open("/?section=products&new=1", "_blank", "noopener,noreferrer")}
+              className="h-8 gap-1.5 rounded-lg bg-white px-2.5 text-xs font-bold text-emerald-700 hover:bg-emerald-50"
+            >
+              <Plus className="h-3.5 w-3.5" />
+              <span className="hidden sm:inline">{tr("إضافة صنف")}</span>
+            </Button>
+            </>
+          }
+        />
 
-        <div className="grid grid-cols-8 gap-1 mb-4">
-
-
-            <Input
-              ref={searchCodeRef}
-              className="col-span-1"
-              placeholder="رقم الصنف"
-              value={searchCode}
-              onChange={(e) => setSearchCode(e.target.value)}
-            />
-
-            <Input
-              ref={searchNameRef}
-              className="col-span-5"
-              placeholder="اسم الصنف"
-              value={searchName}
-              onChange={(e) => setSearchName(e.target.value)}
-            />
-
-            <Input
-              ref={searchPriceRef} 
-              className="col-span-1"
-              placeholder="السعر"
-              value={searchPrice}
-              onChange={(e) => setSearchPrice(e.target.value)}
-            />
-
-            <Input
-              ref={searchBarcodeRef}
-              className="col-span-1"
-              placeholder="الباركود"
-              value={searchBarcode}
-              onChange={(e) => setSearchBarcode(e.target.value)}
-            />
-
-          </div>
-
-
-        <div className="flex-1 flex flex-col gap-4 overflow-hidden">
-          {/* Products DataGrid (2/3) */}
-          <div className="flex-[4] overflow-none border rounded shadow-sm p-2">
-            <DataGridView
-              style={gridStyleItems}
-              ref={gridProductsRef}
-              dataSource={filteredProducts}
-              scheme={productScheme}
-              onRowDoubleClick={handleProductDoubleClick}
-              selectionChanged={selectionChanged}
-              onKeyDown={(s: any, e: any) => onKeyDownGrid(s, e)}
-              keyActionEnter="None"
-            />
-          </div>
-
-          {/* Units DataGrid (1/3) */}
-          <div className="flex-[3] overflow-hidden border rounded shadow-sm p-2 mt-2">
-            <h4 className="font-medium mb-2 text-right">
-              وحدات الصنف: {selectedProduct?.product_name || "لا يوجد صنف محدد"}
-            </h4>
-            <DataGridView
-              //style={gridStyleUnits}
-              innerRef={gridUnitsRef}
-              dataSource={selectedProduct?.units || []}
-              scheme={unitScheme}
-              onRowDoubleClick={handleUnitRowDoubleClick}
-            />
+        {/* على الجوال: الفلاتر + النتائج + الوحدات صفحة واحدة قابلة للتمرير (لا تتسع الشاشة لها معاً)؛ على الشاشات الكبيرة كما هي */}
+        <div className="flex min-h-0 flex-1 flex-col overflow-y-auto overscroll-contain lg:overflow-hidden">
+        {/* الفلاتر */}
+        <div className="shrink-0 border-b border-slate-200 bg-white px-4 py-3">
+          <div className="flex flex-col gap-2 lg:flex-row lg:items-end">
+            <div ref={filterContainerRef} className="grid min-w-0 flex-1 grid-cols-2 items-end gap-2 sm:grid-cols-3 lg:grid-cols-[1fr_1.8fr_0.8fr_1.1fr_1.3fr]">
+              <SearchFilterField label={tr("رقم الصنف")}>
+                <Input ref={searchCodeRef} className={searchInputClassName} placeholder={tr("رقم الصنف")} value={searchCode} onChange={(e) => setSearchCode(e.target.value)} />
+              </SearchFilterField>
+              <SearchFilterField label={tr("اسم الصنف")} className="col-span-2 sm:col-span-1">
+                <Input ref={searchNameRef} className={searchInputClassName} placeholder={tr("يمكن كتابة أكثر من كلمة")} value={searchName} onChange={(e) => setSearchName(e.target.value)} />
+              </SearchFilterField>
+              <SearchFilterField label={tr("السعر")}>
+                <Input ref={searchPriceRef} className={searchInputClassName} placeholder={tr("السعر")} value={searchPrice} onChange={(e) => setSearchPrice(e.target.value)} />
+              </SearchFilterField>
+              <SearchFilterField label={
+                <span className="flex items-center justify-between gap-2">
+                  <span>{numberLabel}</span>
+                  <select
+                    tabIndex={-1}
+                    aria-label={tr("نوع الرقم")}
+                    value={numberType}
+                    onChange={(event) => setNumberType(event.target.value as "barcode" | "factory" | "original")}
+                    className="h-5 rounded-md border border-slate-200 bg-slate-50 px-1 text-[11px] font-semibold text-emerald-700 outline-none focus:border-emerald-400"
+                  >
+                    <option value="barcode">{tr("باركود")}</option>
+                    <option value="factory">{tr("رقم المصنع")}</option>
+                    <option value="original">{tr("الرقم الأصلي")}</option>
+                  </select>
+                </span>
+              }>
+                <Input ref={searchBarcodeRef} className={searchInputClassName} placeholder={numberLabel} value={searchBarcode} onChange={(e) => setSearchBarcode(e.target.value)} />
+              </SearchFilterField>
+              {Array.isArray(productTypes) && productTypes.length === 1 ? (
+                <SearchFilterField label={tr("النوع")}>
+                  {/* نوع ثابت مفروض من الشاشة المستدعية — لا منتقي قابل للتعديل كي لا تُخلَط الأصناف بالخدمات. */}
+                  <div className="flex h-9 items-center justify-center rounded-lg border border-slate-200 bg-slate-50 text-sm text-slate-600">
+                    {productTypes[0] === 2 ? tr("الخدمات") : tr("الأصناف")}
+                  </div>
+                </SearchFilterField>
+              ) : (
+                // نفس مكوّن الاختيار المتعدد المستخدم في التقارير؛ القائمة تُفتح داخل النافذة (portalContainer)
+                // وإلا تظهر خلف هذه اللوحة (z-[100]) لأن Popover يُركَّب افتراضياً على document.body.
+                <ReportMultiChoice
+                  label={tr("النوع")}
+                  options={PRODUCT_TYPE_OPTIONS}
+                  selected={selectedTypes}
+                  placeholder={tr("اختر النوع")}
+                  portalContainer={dialogElement}
+                  onChange={(ids) => setSelectedTypes(ids.length > 0 ? ids.map(Number) : [1, 2])}
+                />
+              )}
+            </div>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={clearFilters}
+              className="h-9 shrink-0 rounded-lg border-slate-200 px-3 text-xs text-slate-600 hover:border-emerald-200 hover:bg-emerald-50 hover:text-emerald-700"
+            >
+              <RotateCcw className="me-1.5 h-3.5 w-3.5" />
+              {tr("مسح الفلاتر")}
+            </Button>
           </div>
         </div>
 
+        {(templateFilter || templateMessage) && (
+          <div className={`shrink-0 border-b px-4 py-2 text-xs font-semibold ${templateFilter ? "border-amber-200 bg-amber-50 text-amber-900" : "border-rose-200 bg-rose-50 text-rose-700"}`}>
+            {templateFilter ? tr("أصناف من نموذج: {0} ({1} صنف)", templateFilter.label || "نماذج العميل", templateFilter.ids.size) : templateMessage}
+          </div>
+        )}
 
-        <div className="flex justify-center gap-2 mt-4">
-          <Button className="erp-btn-primary search-button" onClick={handleConfirm}>
-            موافق
-          </Button>
-          <Button variant="outline" onClick={onClose} className="search-button">
-            إغلاق
-          </Button>
+        {/* النتائج + لوحة الوحدات/المتغيرات */}
+        <div className="flex shrink-0 flex-col gap-3 p-3 lg:min-h-0 lg:flex-1 lg:flex-row lg:overflow-hidden">
+          <div className="flex h-[min(360px,55dvh)] min-w-0 flex-col gap-1.5 lg:h-auto lg:min-h-[200px] lg:flex-1">
+            <div className="flex items-center justify-between px-1 text-[11px] font-bold text-slate-500">
+              <span>{tr("نتائج البحث")}</span>
+              <span>
+                {filteredProducts.length > 200 ? tr("عرض أول 200 من {0}", filteredProducts.length.toLocaleString("en-US")) : tr("{0} صنف", filteredProducts.length.toLocaleString("en-US"))}
+                {checkedCount > 0 && <span className="ms-2 rounded-full bg-emerald-100 px-2 py-0.5 text-emerald-700">{tr("مؤشَّر ")}{checkedCount}</span>}
+              </span>
+            </div>
+            <SearchResultsTable<Product>
+              ref={resultsRef}
+              rows={visibleProducts}
+              columns={resultColumns}
+              getRowKey={(product) => product._variant_key || product.id}
+              onPick={(product) => void handleProductDoubleClick(product)}
+              onActiveChange={(product) => handleActiveProductChange(product)}
+              onToggle={ShowSelect ? (product) => setProducts((current) => current.map((item) => item._variant_key === product._variant_key ? { ...item, selected: !item.selected } : item)) : undefined}
+              isRowMarked={(product) => !!product.selected}
+              emptyText={productsLoading && products.length === 0 ? tr("جاري تحميل البيانات...") : tr("لا توجد أصناف مطابقة")}
+            />
+          </div>
+
+          <div className="flex h-[240px] min-w-0 flex-col gap-1.5 lg:h-auto lg:min-h-[160px] lg:w-[300px] lg:shrink-0">
+            <div className="flex items-center justify-between gap-2 px-1 text-[11px] font-bold text-slate-500">
+              <span>{showingAttributes ? tr("المتغيرات والخصائص") : tr("وحدات الصنف")}</span>
+              <span className="truncate text-slate-700">{selectedProduct?.product_name || ""}</span>
+            </div>
+            {!selectedProduct ? (
+              <div className="flex min-h-0 flex-1 items-center justify-center rounded-xl border border-dashed border-slate-200 bg-white px-4 text-center text-xs text-slate-400">
+                {tr("اختر صنفاً من النتائج لعرض وحداته")}
+              </div>
+            ) : showingAttributes ? (
+              <SearchResultsTable<AttributeRow>
+                ref={unitsTableRef}
+                rows={selectedAttributeRows}
+                columns={attributeColumns}
+                getRowKey={(row) => row.attribute_key}
+                onPick={(row) => handleAttributeDoubleClick(row)}
+                onToggle={ShowSelect ? (row) => toggleAttributeKey(row.attribute_key) : undefined}
+                isRowMarked={(row) => row.selected}
+                rowHeightClassName="h-9"
+              />
+            ) : (
+              <SearchResultsTable<Unit>
+                ref={unitsTableRef}
+                rows={unitBarcodeRows(selectedProduct.units || [])}
+                columns={unitColumns}
+                getRowKey={(unit) => unit._row_key || unit.unit_id}
+                onPick={(unit) => handleUnitRowDoubleClick(unit)}
+                onActiveChange={(unit) => { if (unit) handleSelectUnit(unit) }}
+                isRowMarked={(unit) => selectedProduct.selected_unit?.unit_id === unit.unit_id}
+                emptyText={tr("لا توجد وحدات")}
+                rowHeightClassName="h-9"
+              />
+            )}
+          </div>
+        </div>
+        </div>
+
+        <div className="flex shrink-0 items-center justify-between gap-2 border-t border-slate-200 bg-white px-4 py-2.5">
+          <span className="hidden text-[11px] text-slate-400 sm:block">
+            {ShowSelect ? tr("Space لتأشير أكثر من صنف ثم موافق") : tr("نقر مزدوج أو Enter للاختيار")}
+          </span>
+          <div className="flex flex-1 gap-2 sm:flex-none">
+            <Button onClick={handleConfirm} className="h-9 flex-1 rounded-lg bg-emerald-600 px-6 font-bold text-white hover:bg-emerald-700 sm:flex-none">
+              {tr("موافق")}
+            </Button>
+            <Button variant="outline" onClick={onClose} className="h-9 flex-1 rounded-lg border-slate-200 px-6 text-slate-600 sm:flex-none">
+              {tr("إغلاق")}
+            </Button>
+          </div>
         </div>
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 };
 

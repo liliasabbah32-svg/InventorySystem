@@ -1,8 +1,6 @@
 import { type NextRequest, NextResponse } from "next/server"
-import { neon } from "@neondatabase/serverless"
+import sql from "@/lib/database"
 import { createNotificationFromTemplate } from "@/lib/notifications"
-
-const sql = neon(process.env.DATABASE_URL!)
 
 export async function POST(request: NextRequest) {
   try {
@@ -46,7 +44,7 @@ export async function POST(request: NextRequest) {
           changed_by: changedBy,
           reason: reason || "لا يوجد سبب محدد",
           total_amount:
-            currentOrder.total_amount?.toLocaleString("ar-SA", {
+            currentOrder.total_amount?.toLocaleString("ar-SA-u-nu-latn", {
               style: "currency",
               currency: "SAR",
             }) || "غير محدد",
@@ -72,7 +70,8 @@ export async function POST(request: NextRequest) {
         if (notificationStatus) {
           await fetch(`${request.nextUrl.origin}/api/customer-notifications/send`, {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            // نفس الجلسة والشركة (مسارات /api محمية بجلسة في middleware.ts)
+            headers: { "Content-Type": "application/json", cookie: request.headers.get("cookie") || "", "x-tenant-db": request.headers.get("x-tenant-db") || "" },
             body: JSON.stringify({
               customer_id: currentOrder.customer_id,
               order_id: orderId,

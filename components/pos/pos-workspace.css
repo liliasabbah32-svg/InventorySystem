@@ -1,0 +1,420 @@
+/* ─────────────────────────────────────────────────────────────────────────────
+   Cashier — "Floating dock" (2026-10-20)
+   A soft-mint canvas holds the catalog; actions float in a glass command bar; the
+   sale lives in a frosted dock card that ends in one large pay pill. The number pad
+   appears only while a cart line is selected, so the dock stays calm.
+   Class names are shared with the dialogs and mobile bar — keep them stable.
+   ───────────────────────────────────────────────────────────────────────────── */
+.pos-workspace {
+  --pos-ink: #12302a;
+  --pos-muted: #5e7c74;
+  --pos-accent: #10a37f;
+  --pos-accent-strong: #0b7f63;
+  --pos-accent-soft: #d8f5ea;
+  --pos-surface: #ffffff;
+  --pos-soft: #f1faf6;
+  --pos-edge: #d9eee6;
+  --pos-glass: rgb(255 255 255 / 72%);
+  --pos-glass-edge: rgb(255 255 255 / 85%);
+  --pos-shadow: 0 24px 48px -28px rgb(16 92 72 / 45%);
+  /* عرض الفاتورة الحالية: نصف مساحة العمل تقريباً (نسبة من شبكة .pos-layout) بحد أدنى وأقصى */
+  --pos-dock-width: clamp(560px, 50%, 1000px);
+  container: cashier / inline-size;
+  box-sizing: border-box;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  height: 100%;
+  min-height: 720px;
+  padding: 14px;
+  color: var(--pos-ink);
+  background:
+    radial-gradient(1200px 520px at 100% -10%, #c9f2e3 0%, transparent 60%),
+    radial-gradient(900px 480px at -10% 110%, #dff5ff 0%, transparent 55%),
+    linear-gradient(180deg, #f3fbf8 0%, #eef8f4 100%);
+}
+.pos-workspace[data-mode=return] { --pos-accent: #e0763a; --pos-accent-strong: #b8561f; --pos-accent-soft: #fdebdc; }
+.pos-workspace[data-mode=gift] { --pos-accent: #9a62e0; --pos-accent-strong: #7a44c2; --pos-accent-soft: #efe4fd; }
+.pos-workspace button { cursor: pointer; }
+.pos-workspace button:disabled { opacity: .45; cursor: not-allowed; }
+.pos-workspace :is(button, input, select):focus-visible { outline: 3px solid color-mix(in srgb, var(--pos-accent) 45%, white); outline-offset: 2px; }
+.pos-workspace kbd { font: 600 10px/1.2 ui-monospace, monospace; padding: 2px 5px; border: 1px solid currentColor; border-radius: 6px; opacity: .6; }
+
+/* ── Floating command bar ─────────────────────────────────────────────────── */
+.pos-topbar {
+  display: flex; flex-shrink: 0; flex-wrap: wrap; align-items: center; gap: 8px 10px;
+  padding: 8px 10px; border: 1px solid color-mix(in srgb, var(--pos-accent) 22%, white); border-radius: 22px;
+  /* خلفية ملوّنة ناعمة بلون الوضع (بيع أخضر، مرتجع برتقالي، هدية بنفسجي) بدل الأبيض — الأزرار تبقى بيضاء فتبرز */
+  background:
+    radial-gradient(120% 140% at 100% 0%, color-mix(in srgb, var(--pos-accent) 20%, transparent), transparent 60%),
+    linear-gradient(135deg, color-mix(in srgb, var(--pos-accent) 13%, #ffffff), color-mix(in srgb, var(--pos-accent) 6%, #f4fbff));
+  backdrop-filter: blur(14px) saturate(140%); -webkit-backdrop-filter: blur(14px) saturate(140%);
+  box-shadow: var(--pos-shadow);
+}
+.dark .pos-topbar {
+  border-color: color-mix(in srgb, var(--pos-accent) 30%, #0f1d1a);
+  background: linear-gradient(135deg, color-mix(in srgb, var(--pos-accent) 22%, #0f1d1a), color-mix(in srgb, var(--pos-accent) 8%, #0f1d1a));
+}
+.pos-toolbar, .pos-overview { display: contents; }
+.pos-identity { order: 0; display: flex; flex-shrink: 0; align-items: center; gap: 10px; padding-inline-end: 6px; }
+.pos-brand { display: grid; place-items: center; width: 40px; height: 40px; border-radius: 14px; color: #fff; background: linear-gradient(140deg, #34d3a6, var(--pos-accent-strong)); box-shadow: 0 8px 18px -8px var(--pos-accent); }
+.pos-brand svg { width: 20px; height: 20px; }
+.pos-eyebrow { display: block; color: var(--pos-muted); font-size: 10px; font-weight: 700; letter-spacing: .02em; }
+.pos-identity h1 { color: var(--pos-ink); font-size: 17px; font-weight: 900; line-height: 1.15; }
+.pos-context { order: 2; flex: 0 1 210px; min-width: 150px; }
+.pos-context label { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+.pos-workspace .pos-point-dropdown { display: flex; width: 100%; min-height: 38px; align-items: center; border: 1px solid var(--pos-edge); border-radius: 999px; background: #fff; box-shadow: none; }
+.pos-workspace .pos-point-dropdown .p-dropdown-label { padding: 0 14px; color: var(--pos-ink); font-size: 12.5px; font-weight: 700; line-height: 36px; }
+.pos-workspace .pos-point-dropdown .p-dropdown-label.p-placeholder { color: var(--pos-muted); }
+.pos-workspace .pos-point-dropdown .p-dropdown-trigger { width: 32px; color: var(--pos-muted); }
+.pos-workspace .pos-point-dropdown:not(.p-disabled):hover,
+.pos-workspace .pos-point-dropdown.p-focus { border-color: color-mix(in srgb, var(--pos-accent) 40%, white); }
+.pos-workspace .pos-point-dropdown.p-disabled { opacity: .65; cursor: not-allowed; }
+.pos-point-panel { z-index: 1400 !important; }
+.pos-shift { order: 3; display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; min-width: 0; color: var(--pos-muted); font-size: 11.5px; }
+.pos-shift > div { display: flex; align-items: center; gap: 6px; white-space: nowrap; }
+.pos-shift b { color: var(--pos-ink); }
+.pos-shift time { font-variant-numeric: tabular-nums; opacity: .8; }
+.pos-shift-state { display: inline-flex; align-items: center; gap: 5px; padding: 2px 9px; border-radius: 999px; color: #0b7f63; background: #d8f5ea; font-weight: 700; }
+.pos-shift-state > span { width: 7px; height: 7px; border-radius: 50%; background: currentColor; box-shadow: 0 0 0 3px color-mix(in srgb, currentColor 22%, transparent); }
+.pos-shift-state.is-closed { color: #b7791f; background: #fdf1d8; }
+.pos-toolbar-actions { order: 4; display: flex; flex: 1 1 auto; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 6px; }
+.pos-toolbar-actions > button {
+  position: relative; display: inline-flex; align-items: center; justify-content: center; gap: 6px; height: 38px; padding: 0 13px;
+  border: 1px solid var(--pos-edge); border-radius: 999px; color: var(--pos-ink); background: #fff; font-size: 12px; font-weight: 700; white-space: nowrap;
+  transition: background-color .15s, border-color .15s, transform .15s, box-shadow .15s;
+}
+.pos-toolbar-actions > button svg { width: 16px; height: 16px; color: var(--pos-accent); }
+.pos-toolbar-actions > button kbd { padding: 0 4px; font-size: 9px; }
+.pos-toolbar-actions > button:hover:not(:disabled) { border-color: color-mix(in srgb, var(--pos-accent) 35%, white); box-shadow: 0 8px 16px -12px var(--pos-accent); transform: translateY(-1px); }
+.pos-toolbar-actions > .pos-primary-tool { border-color: transparent; color: #fff; background: linear-gradient(135deg, #2cc79a, var(--pos-accent-strong)); box-shadow: 0 10px 20px -12px var(--pos-accent); }
+.pos-toolbar-actions > .pos-primary-tool svg { color: #fff; }
+.pos-badge { display: grid; place-items: center; min-width: 18px; height: 18px; padding: 0 5px; border-radius: 999px; color: #fff; background: #f08b3e; font-size: 10px; font-weight: 800; }
+/* الصافي للدفع: كبسولة أعلى وأوضح (المبلغ أهم رقم في الشاشة) */
+.pos-net { order: 5; display: flex; flex-shrink: 0; align-items: center; gap: 12px; height: 60px; padding: 0 22px 0 8px; border-radius: 999px; color: #fff; background: linear-gradient(135deg, var(--pos-accent), var(--pos-accent-strong)); box-shadow: 0 16px 28px -16px var(--pos-accent); }
+.pos-net-icon { display: grid; flex-shrink: 0; place-items: center; width: 44px; height: 44px; border-radius: 50%; color: var(--pos-accent-strong); background: #fff; }
+.pos-net-icon svg { width: 22px; height: 22px; }
+.pos-net > div { display: flex; align-items: baseline; gap: 10px; min-width: 0; }
+.pos-net > div > span { color: rgb(255 255 255 / 85%); font-size: 13px; font-weight: 700; white-space: nowrap; }
+.pos-net strong { color: #fff; font-size: 30px; font-weight: 900; line-height: 1; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.pos-net small { color: rgb(255 255 255 / 82%); font-size: 12px; font-weight: 700; }
+.pos-connection { order: 1; display: inline-grid; flex-shrink: 0; place-items: center; width: 30px; height: 30px; padding: 0; border-radius: 50%; color: #0b7f63; background: #d8f5ea; font-size: 0; }
+.pos-connection svg { width: 14px; height: 14px; }
+.pos-connection.is-offline { color: #b7791f; background: #fdf1d8; animation: pos-pulse 1.8s ease-in-out infinite; }
+@keyframes pos-pulse { 50% { box-shadow: 0 0 0 6px rgb(183 121 31 / 15%); } }
+
+.pos-message { display: flex; flex-shrink: 0; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 16px; border: 1px solid #bfeedd; border-radius: 16px; color: #0b6b53; background: rgb(236 251 245 / 90%); font-size: 13px; box-shadow: var(--pos-shadow); }
+.pos-message.is-error { border-color: #fbd0d6; color: #a1283f; background: rgb(255 241 243 / 95%); }
+
+/* ── Canvas + dock ────────────────────────────────────────────────────────── */
+.pos-layout { display: grid; flex: 1; min-height: 0; gap: 16px; grid-template-columns: minmax(0, 1fr) var(--pos-dock-width); }
+.pos-catalog { display: flex; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden; }
+.pos-sale {
+  display: flex; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden;
+  border: 1px solid var(--pos-glass-edge); border-radius: 30px;
+  /* لون ثابت بدل backdrop-filter: الضباب يُعاد حسابه مع كل إطار تمرير فيُبطئ الأجهزة الضعيفة */
+  background: #fbfefd;
+  box-shadow: 0 30px 60px -34px rgb(16 92 72 / 55%), inset 0 1px 0 #fff;
+}
+
+/* إخفاء الأصناف (زر "إخفاء الأصناف" — يُحفظ على الجهاز): الفاتورة الحالية بعرض المساحة كاملة.
+   الجوال يبقى على مبدّل الأصناف/السلة السفلي. */
+@container cashier (min-width: 641px) {
+  .pos-layout[data-catalog=hidden] { grid-template-columns: minmax(0, 1fr); }
+  .pos-layout[data-catalog=hidden] .pos-catalog { display: none; }
+  .pos-layout[data-catalog=hidden] .pos-sale { width: min(100%, 1100px); justify-self: center; }
+}
+.pos-toolbar-actions > .pos-view-toggle[aria-pressed=false] { color: var(--pos-accent-strong); background: var(--pos-accent-soft); }
+.pos-categories-toggle { display: inline-flex; flex-shrink: 0; align-items: center; gap: 6px; height: 40px; padding: 0 14px; border: 1px solid var(--pos-glass-edge); border-radius: 999px; color: var(--pos-accent-strong); background: var(--pos-glass); font-size: 12px; font-weight: 800; white-space: nowrap; }
+.pos-categories-toggle[aria-pressed=false] { background: var(--pos-accent-soft); }
+@container cashier (max-width: 900px) { .pos-categories-toggle span { display: none; } .pos-categories-toggle { padding: 0 11px; } }
+
+/* ── Catalog canvas ───────────────────────────────────────────────────────── */
+.pos-catalog-head { display: flex; flex-shrink: 0; align-items: center; gap: 10px; padding: 2px 2px 10px; }
+.pos-search-field { position: relative; display: flex; flex: 1; align-items: center; gap: 9px; min-width: 0; height: 48px; padding: 0 8px 0 16px; border: 1px solid var(--pos-glass-edge); border-radius: 999px; color: var(--pos-muted); background: var(--pos-glass); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); box-shadow: 0 12px 26px -22px rgb(16 92 72 / 50%); transition: border-color .15s, box-shadow .15s, background-color .15s; }
+.pos-search-field:focus-within { border-color: color-mix(in srgb, var(--pos-accent) 45%, white); background: #fff; box-shadow: 0 0 0 5px color-mix(in srgb, var(--pos-accent) 14%, transparent); }
+.pos-search-field > svg { flex-shrink: 0; color: var(--pos-accent); }
+.pos-search-field input { flex: 1; width: 100%; min-width: 0; height: 100%; padding: 0; border: 0; outline: none; box-shadow: none; background: transparent; color: var(--pos-ink); font-size: 14.5px; }
+.pos-search-field input:focus-visible { outline: none; box-shadow: none; }
+/* زر بحث الأصناف داخل حقل الباركود وحقل البحث بالاسم — بديل F10 على الجوال واللمس */
+.pos-search-field .pos-item-search-btn { display: inline-flex; flex-shrink: 0; align-items: center; gap: 5px; height: 36px; padding: 0 14px; border: 0; border-radius: 999px; background: var(--pos-accent); color: #fff; font-size: 12px; font-weight: 800; cursor: pointer; transition: background-color .15s; }
+.pos-search-field .pos-item-search-btn:hover:not(:disabled) { background: var(--pos-accent-strong); }
+.pos-search-field .pos-item-search-btn:disabled { opacity: .5; cursor: not-allowed; }
+@media (max-width: 640px) { .pos-search-field .pos-item-search-btn span { display: none; } .pos-search-field .pos-item-search-btn { padding: 0 11px; } }
+.pos-search-field > button { display: grid; place-items: center; padding: 5px; border-radius: 50%; }
+.pos-count { flex-shrink: 0; padding: 8px 14px; border-radius: 999px; color: var(--pos-accent-strong); background: rgb(255 255 255 / 70%); font-size: 11.5px; font-weight: 800; }
+
+.pos-categories-bar { display: flex; flex-shrink: 0; align-items: center; gap: 6px; padding: 0 0 12px; }
+.pos-categories-arrow { display: grid; flex-shrink: 0; place-items: center; width: 36px; height: 36px; border: 1px solid var(--pos-glass-edge); border-radius: 50%; color: var(--pos-muted); background: var(--pos-glass); }
+.pos-categories-arrow:hover { color: var(--pos-accent-strong); }
+.pos-categories { display: flex; flex: 1; gap: 8px; min-width: 0; padding: 2px 2px 6px; overflow-x: auto; scroll-behavior: smooth; scrollbar-width: none; }
+.pos-categories::-webkit-scrollbar { display: none; }
+.pos-categories button { display: inline-flex; flex-shrink: 0; align-items: center; gap: 7px; height: 38px; padding: 0 16px; border: 1px solid var(--pos-glass-edge); border-radius: 999px; color: var(--pos-ink); background: var(--pos-glass); font-size: 13px; font-weight: 700; white-space: nowrap; transition: background-color .15s, color .15s, transform .15s; }
+.pos-categories button small { padding: 1px 8px; border-radius: 999px; color: var(--pos-accent-strong); background: var(--pos-accent-soft); font-size: 10.5px; font-weight: 800; }
+.pos-categories button:hover:not([aria-pressed=true]) { transform: translateY(-1px); }
+.pos-categories button[aria-pressed=true] { border-color: transparent; color: #fff; background: linear-gradient(135deg, var(--pos-accent), var(--pos-accent-strong)); box-shadow: 0 10px 18px -12px var(--pos-accent); }
+.pos-categories button[aria-pressed=true] small { color: #fff; background: rgb(255 255 255 / 22%); }
+
+.pos-products { display: grid; flex: 1 1 0; align-content: start; grid-template-columns: repeat(auto-fill, minmax(168px, 1fr)); grid-auto-rows: max-content; gap: 14px; min-height: 0; padding: 4px 4px 16px; overflow-y: auto; overscroll-behavior: contain; will-change: scroll-position; contain: layout paint; -webkit-overflow-scrolling: touch; scrollbar-width: thin; scrollbar-color: #b9e6d6 transparent; }
+.pos-product { position: relative; display: flex; flex-direction: column; min-width: 0; min-height: 224px; overflow: hidden; padding: 8px; border: 1px solid var(--pos-glass-edge); border-radius: 24px; background: #fff; text-align: start; white-space: normal; box-shadow: 0 6px 14px -12px rgb(16 92 72 / 45%); transition: transform .18s, box-shadow .18s; content-visibility: auto; contain-intrinsic-size: auto 224px; }
+.pos-product-visual { position: relative; display: grid; flex: 0 0 auto; place-items: center; height: 118px; overflow: hidden; border-radius: 18px; background: linear-gradient(160deg, #eefaf5, #e2f5ee); }
+.pos-product:nth-child(5n+2) .pos-product-visual { background: linear-gradient(160deg, #eef6ff, #e3effc); }
+.pos-product:nth-child(5n+3) .pos-product-visual { background: linear-gradient(160deg, #fff6ee, #fdeedf); }
+.pos-product:nth-child(5n+4) .pos-product-visual { background: linear-gradient(160deg, #f6f1ff, #ece4fd); }
+.pos-product:nth-child(5n) .pos-product-visual { background: linear-gradient(160deg, #f3fbe9, #e8f5d9); }
+.pos-product-icon { display: grid; place-items: center; color: color-mix(in srgb, var(--pos-accent) 55%, #9bb8b0); }
+.pos-product-icon.has-image { position: absolute; inset: 0; width: auto; height: auto; padding: 10px; }
+.pos-product-icon.has-image img { display: block; width: 100%; height: 100%; max-width: 100%; max-height: 100%; object-fit: contain; }
+.pos-stock { position: absolute; top: 8px; inset-inline-start: 8px; display: inline-flex; align-items: center; gap: 5px; max-width: calc(100% - 16px); padding: 3px 9px; overflow: hidden; border-radius: 999px; color: #0b7f63; background: rgb(255 255 255 / 92%); font-size: 10px; font-weight: 800; white-space: nowrap; text-overflow: ellipsis; }
+.pos-stock > span { width: 6px; height: 6px; flex-shrink: 0; border-radius: 50%; background: currentColor; }
+.pos-stock.is-unavailable { color: #c2334d; }
+.pos-product-add { position: absolute; bottom: 8px; inset-inline-end: 8px; display: grid; place-items: center; width: 34px; height: 34px; border-radius: 50%; color: #fff; background: var(--pos-accent); box-shadow: 0 8px 16px -8px var(--pos-accent); transform: scale(.85); opacity: .0; transition: opacity .15s, transform .15s; }
+.pos-product-details { display: flex; flex: 1 0 auto; flex-direction: column; gap: 3px; padding: 10px 6px 4px; }
+.pos-product-details > b { display: -webkit-box; overflow: hidden; -webkit-line-clamp: 2; -webkit-box-orient: vertical; font-size: 13.5px; font-weight: 800; line-height: 1.45; }
+.pos-product-code { color: var(--pos-muted); font: 10px ui-monospace, monospace; text-align: start; }
+.pos-product-details > strong { display: inline-flex; align-self: flex-start; align-items: baseline; gap: 4px; margin-top: auto; padding: 4px 11px; border-radius: 999px; color: var(--pos-accent-strong); background: var(--pos-accent-soft); font-size: 15.5px; font-weight: 900; font-variant-numeric: tabular-nums; }
+.pos-product-details > strong small { font-size: 10px; font-weight: 700; opacity: .8; }
+.pos-more { align-self: center; margin: 0 12px 12px; }
+
+/* ── Dock: heading · parties · scan ───────────────────────────────────────── */
+.pos-panel-heading { display: flex; flex-shrink: 0; align-items: center; justify-content: space-between; gap: 10px; padding: 16px 18px 10px; }
+.pos-panel-title { display: flex; align-items: center; gap: 11px; min-width: 0; }
+.pos-heading-icon { display: grid; place-items: center; width: 40px; height: 40px; flex-shrink: 0; border-radius: 14px; color: #fff; background: linear-gradient(140deg, color-mix(in srgb, var(--pos-accent) 75%, white), var(--pos-accent-strong)); }
+.pos-panel-heading h2 { font-size: 16px; font-weight: 900; line-height: 1.35; }
+.pos-panel-heading p { font-size: 11.5px; color: var(--pos-muted); }
+.pos-mode-badge { flex-shrink: 0; padding: 6px 12px; border-radius: 999px; color: var(--pos-accent-strong); background: var(--pos-accent-soft); font-size: 11px; font-weight: 900; }
+
+.pos-parties { display: grid; flex-shrink: 0; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; padding: 0 18px; }
+.pos-parties > div { height: 42px; overflow: hidden; border: 1px solid var(--pos-edge) !important; border-radius: 999px !important; background: #fff !important; }
+.pos-parties button { display: flex; align-items: center; gap: 7px; height: 100%; padding: 0 14px; color: var(--pos-ink); font-size: 12px; font-weight: 700; }
+.pos-parties button svg { flex-shrink: 0; color: var(--pos-accent); }
+.pos-parties button kbd { margin-inline-start: auto; }
+.pos-barcode-field { flex: 0 0 auto; margin: 10px 18px; height: 50px; border: 1.5px dashed color-mix(in srgb, var(--pos-accent) 40%, white); background: color-mix(in srgb, var(--pos-accent-soft) 45%, white); box-shadow: none; }
+.pos-barcode-field > svg { color: var(--pos-accent-strong); }
+
+/* ── Dock: cart lines ─────────────────────────────────────────────────────── */
+.pos-cart { flex: 1; min-height: 120px; padding: 2px 18px 10px; overflow-y: auto; overscroll-behavior: contain; scrollbar-width: thin; scrollbar-color: #b9e6d6 transparent; }
+/* سطر الفاتورة في صف واحد (الاسم + الكمية + الخصم + الإجمالي + الحذف) ليظهر أكبر عدد من الأصناف */
+.pos-cart-line { display: flex; align-items: center; margin-bottom: 6px; overflow: hidden; border: 1px solid var(--pos-edge); border-radius: 16px; scroll-margin: 6px; background: #fff; transition: border-color .15s, box-shadow .15s, transform .15s; animation: pos-line-in .22s ease-out; }
+@keyframes pos-line-in { from { opacity: 0; transform: translateY(6px); } }
+.pos-cart-line.is-selected { border-color: color-mix(in srgb, var(--pos-accent) 55%, white); box-shadow: 0 0 0 4px var(--pos-accent-soft); }
+.pos-cart-line.is-gift { border-style: dashed; border-color: #c5a3f2; }
+.pos-line-name { display: flex; flex: 1; align-items: center; gap: 9px; min-width: 0; padding: 7px 11px; text-align: start; }
+.pos-line-index { display: grid; place-items: center; width: 24px; height: 24px; flex-shrink: 0; border-radius: 50%; color: var(--pos-accent-strong); background: var(--pos-accent-soft); font-size: 11.5px; font-weight: 900; }
+.pos-cart-line.is-selected .pos-line-index { color: #fff; background: var(--pos-accent); }
+.pos-line-info { display: flex; flex: 1; flex-direction: column; gap: 1px; min-width: 0; }
+.pos-line-info b { overflow: hidden; font-size: 13px; font-weight: 800; text-overflow: ellipsis; white-space: nowrap; }
+.pos-line-info small { overflow: hidden; color: var(--pos-muted); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.pos-line-tags { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 1px; }
+.pos-line-tags i { padding: 1px 8px; border-radius: 999px; color: #b7651f; background: #fdf0de; font-size: 10px; font-style: normal; font-weight: 800; }
+.pos-line-tags i.is-gift { color: #7a44c2; background: #efe4fd; }
+.pos-line-tags i.is-campaign { color: #0b7f63; background: #d8f5ea; }
+.pos-line-total { flex-shrink: 0; min-width: 64px; text-align: end; font-size: 15px; font-weight: 900; font-variant-numeric: tabular-nums; }
+.pos-cart-line.is-history .pos-line-name { padding-block: 8px; }
+.pos-line-controls { display: flex; flex-shrink: 0; align-items: center; gap: 4px; padding-inline-end: 8px; }
+.pos-quantity { display: inline-flex; align-items: center; height: 32px; overflow: hidden; border-radius: 999px; background: var(--pos-soft); }
+.pos-quantity button { display: grid; place-items: center; width: 30px; height: 100%; color: var(--pos-accent-strong); }
+.pos-quantity button:hover { background: var(--pos-accent-soft); }
+.pos-quantity strong { min-width: 34px; text-align: center; font-size: 13.5px; font-variant-numeric: tabular-nums; }
+.pos-item-discount { display: inline-flex; align-items: center; gap: 4px; height: 32px; padding: 0 10px; border-radius: 999px; color: #b7651f; background: #fdf0de; font-size: 12px; font-weight: 800; }
+.pos-remove { display: grid; place-items: center; width: 32px; height: 32px; border-radius: 50%; color: #c2334d; }
+.pos-remove:hover { background: #ffe8ec; }
+
+.pos-history-view { display: flex; flex-direction: column; gap: 8px; }
+.pos-history-nav, .pos-history-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.pos-history-nav { justify-content: center; padding: 6px; border-radius: 999px; background: var(--pos-soft); }
+.pos-history-nav > span { min-width: 64px; text-align: center; font-size: 12px; font-weight: 800; font-variant-numeric: tabular-nums; }
+.pos-history-summary { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; padding: 12px; border: 1px solid var(--pos-edge); border-radius: 18px; background: #fff; font-size: 12px; }
+.pos-history-summary small { display: block; color: var(--pos-muted); font-size: 10px; }
+.pos-history-payments { display: flex; flex-wrap: wrap; gap: 6px; }
+.pos-history-payments span { padding: 5px 11px; border-radius: 999px; background: var(--pos-soft); font-size: 11px; }
+.pos-history-loading { padding: 32px 0; color: var(--pos-muted); font-size: 13px; text-align: center; }
+
+.pos-empty { grid-column: 1 / -1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; height: 100%; min-height: 200px; padding: 20px; color: var(--pos-muted); font-size: 12px; text-align: center; }
+.pos-empty h3 { color: var(--pos-ink); font-size: 15px; font-weight: 900; }
+.pos-empty-icon { position: relative; display: grid; place-items: center; width: 80px; height: 80px; margin-bottom: 6px; border-radius: 50%; color: var(--pos-accent); background: radial-gradient(circle at 30% 30%, #fff, var(--pos-accent-soft)); box-shadow: 0 16px 30px -20px var(--pos-accent); }
+.pos-empty-plus { position: absolute; bottom: -2px; inset-inline-end: -2px; display: grid; place-items: center; width: 28px; height: 28px; border: 3px solid #fff; border-radius: 50%; color: #fff; background: var(--pos-accent); }
+.pos-tool { display: inline-flex; align-items: center; justify-content: center; gap: 6px; height: 38px; padding: 0 16px; border: 1px solid var(--pos-edge); border-radius: 999px; color: var(--pos-ink); background: #fff; font-size: 12px; font-weight: 700; }
+
+/* ── Dock footer: totals · tools strip · keypad (on selection) · pay pill ─── */
+.pos-ticket-footer { display: flex; flex-shrink: 0; flex-direction: column; gap: 7px; padding: 9px 18px 12px; border-top: 1px solid var(--pos-edge); background: linear-gradient(180deg, rgb(241 250 246 / 60%), rgb(255 255 255 / 90%)); }
+.pos-totals { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 5px 18px; font-size: 13px; }
+.pos-totals > div { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; color: var(--pos-muted); font-weight: 700; }
+.pos-totals b { color: var(--pos-ink); font-size: 14.5px; font-weight: 900; font-variant-numeric: tabular-nums; }
+.pos-totals > .pos-totals-due { display: none; }
+.pos-control-row { display: flex; flex-direction: column; gap: 7px; }
+/* لوحة الأرقام في صف واحد: خانة الكمية + تطبيق + 12 مفتاحاً */
+.pos-keypad { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 6px; border-radius: 18px; background: var(--pos-soft); animation: pos-line-in .2s ease-out; }
+.pos-keypad-entry { display: flex; flex: 0 0 190px; gap: 5px; }
+.pos-keypad-entry input { height: 34px; min-width: 0; padding: 0 10px; border-radius: 999px; text-align: center; font-size: 15px; font-weight: 800; }
+.pos-keypad-entry button { height: 34px; padding: 0 12px; border-radius: 999px; font-size: 12px; }
+.pos-keypad-keys { display: grid; flex: 1 1 300px; grid-template-columns: repeat(12, minmax(0, 1fr)); gap: 4px; }
+.pos-keypad-keys button { height: 34px; border-radius: 11px; color: var(--pos-ink); background: #fff; font-size: 15px; font-weight: 800; transition: background-color .12s, transform .12s; }
+.pos-keypad-keys button:hover:not(:disabled) { background: var(--pos-accent-soft); }
+.pos-keypad-keys button:active:not(:disabled) { transform: scale(.94); }
+.pos-keypad-keys button:nth-child(10) { color: #c2334d; }
+.pos-actions { display: flex; gap: 6px; overflow-x: auto; scrollbar-width: none; }
+.pos-actions::-webkit-scrollbar { display: none; }
+.pos-actions > button { position: relative; display: inline-flex; flex: 1 0 auto; flex-direction: row; align-items: center; justify-content: center; gap: 5px; min-width: 62px; height: 40px; padding: 0 10px; border-radius: 14px; color: var(--pos-ink); background: #fff; font-size: 11px; font-weight: 800; text-align: center; line-height: 1.15; box-shadow: 0 8px 18px -16px rgb(16 92 72 / 50%); transition: background-color .15s, transform .15s; }
+.pos-actions > button svg { color: var(--pos-accent); }
+.pos-actions > button kbd { position: absolute; top: 1px; inset-inline-end: 5px; padding: 0 3px; border: 0; font-size: 8.5px; }
+.pos-actions > button:hover:not(:disabled) { background: var(--pos-accent-soft); transform: translateY(-1px); }
+.pos-actions > button:nth-child(1) svg { color: #d98a2b; }
+.pos-actions > button:nth-child(2) svg { color: #d4485f; }
+.pos-actions > button:nth-child(3) svg { color: #9a62e0; }
+.pos-actions > button:nth-child(4) svg { color: #3b8fd6; }
+.pos-actions > button:nth-child(5) svg { color: #5b6ee0; }
+.pos-actions > button:nth-child(6) svg { color: var(--pos-accent); }
+
+.pos-pay-button { position: relative; display: flex; align-items: center; justify-content: space-between; gap: 12px; width: 100%; min-height: 56px; padding: 0 8px 0 22px; overflow: hidden; border-radius: 999px; color: #fff; background: linear-gradient(120deg, color-mix(in srgb, var(--pos-accent) 80%, #5ee6b8), var(--pos-accent-strong)); box-shadow: 0 18px 30px -18px var(--pos-accent); transition: transform .14s, box-shadow .14s, filter .14s; }
+.pos-pay-button::after { content: ""; position: absolute; inset: 0; background: linear-gradient(100deg, transparent 30%, rgb(255 255 255 / 22%) 50%, transparent 70%); transform: translateX(-120%); transition: transform .6s; pointer-events: none; }
+.pos-pay-button:hover:not(:disabled)::after { transform: translateX(120%); }
+.pos-pay-button:hover:not(:disabled) { filter: brightness(1.04); transform: translateY(-1px); }
+.pos-pay-button:active:not(:disabled) { transform: translateY(1px); }
+.pos-pay-button:disabled { opacity: .5; box-shadow: none; }
+.pos-pay-label { display: inline-flex; align-items: center; gap: 9px; font-size: 17px; font-weight: 900; }
+.pos-pay-label kbd { border-color: rgb(255 255 255 / 55%); opacity: .8; }
+.pos-pay-button strong { display: inline-flex; align-items: baseline; gap: 6px; font-size: 26px; font-weight: 950; font-variant-numeric: tabular-nums; }
+.pos-pay-button strong small { font-size: 12px; font-weight: 700; opacity: .85; }
+.pos-pay-arrow { display: grid; place-items: center; width: 48px; height: 48px; flex-shrink: 0; border-radius: 50%; color: var(--pos-accent-strong); background: #fff; transition: transform .2s; }
+.pos-pay-button:hover:not(:disabled) .pos-pay-arrow { transform: translateX(-4px); }
+.pos-pay-amount { display: flex; align-items: center; gap: 12px; }
+.pos-ticket-note { display: flex; align-items: center; gap: 6px; color: var(--pos-muted); font-size: 11px; }
+
+@media (hover: hover) {
+  .pos-product:hover:not(:disabled) { box-shadow: 0 26px 40px -26px rgb(16 92 72 / 65%); transform: translateY(-4px); }
+  .pos-product:hover:not(:disabled) .pos-product-add { opacity: 1; transform: none; }
+}
+.pos-product:active:not(:disabled) { transform: scale(.97); }
+@media (hover: none) { .pos-product-add { opacity: 1; transform: none; } }
+
+/* ── Responsive (container = workspace width) ───────────────────────────── */
+@container cashier (min-width: 1500px) { .pos-layout { --pos-dock-width: clamp(640px, 52%, 1100px); } .pos-products { grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); } }
+@container cashier (max-width: 1250px) {
+  .pos-toolbar-actions { order: 7; flex-basis: 100%; justify-content: flex-start; }
+  .pos-layout { --pos-dock-width: clamp(460px, 46%, 720px); }
+  .pos-products { grid-template-columns: repeat(auto-fill, minmax(146px, 1fr)); }
+}
+@container cashier (max-width: 860px) {
+  .pos-layout { flex: none; grid-template-columns: 1fr; }
+  .pos-catalog { max-height: 560px; }
+  .pos-products { flex: none; max-height: 400px; }
+  .pos-cart { flex: none; max-height: 380px; }
+  .pos-shift { order: 8; flex-basis: 100%; }
+}
+@container cashier (max-width: 560px) {
+  .pos-totals { grid-template-columns: 1fr; }
+  .pos-parties { grid-template-columns: 1fr; }
+  .pos-products { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+  .pos-keypad-keys { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  .pos-cart-line { flex-wrap: wrap; }
+  .pos-line-controls { width: 100%; padding: 0 11px 7px; padding-inline-start: 44px; }
+  .pos-keypad-entry { flex-basis: 100%; }
+  .pos-context { flex-basis: 100%; order: 6; }
+  .pos-net { height: 52px; }
+  .pos-net strong { font-size: 24px; }
+  .pos-pay-button strong { font-size: 22px; }
+}
+@media (max-width: 900px) {
+  .pos-workspace { height: auto; min-height: 100%; }
+  /* الصفحة كلها تتمرّر هنا: قائمة الأصناف بلا ارتفاع محدد، فلو بقيت overflow:auto + overscroll-behavior:contain
+     يحتجز أندرويد (WebView) لمسة السحب داخلها ولا يمرّرها للصفحة — فلا يعمل التمرير إلا على حواف الشاشة. */
+  .pos-products { overflow: visible; overscroll-behavior: auto; contain: none; will-change: auto; }
+}
+@media (prefers-reduced-motion: reduce) { .pos-workspace *, .pos-workspace *::after { transition: none !important; animation: none !important; } .pos-workspace button:hover, .pos-workspace button:active { transform: none !important; } }
+
+/* ── Dark mode ──────────────────────────────────────────────────────────── */
+.dark .pos-workspace {
+  --pos-ink: #e3f3ed; --pos-muted: #93b3aa; --pos-surface: #0f1d1a; --pos-soft: #16292449; --pos-edge: #24413a;
+  --pos-glass: rgb(17 33 29 / 70%); --pos-glass-edge: rgb(56 98 87 / 45%); --pos-accent-soft: rgb(52 211 166 / 16%);
+  background: radial-gradient(1100px 500px at 100% -10%, #0f3a2f 0%, transparent 60%), linear-gradient(180deg, #0b1714, #08120f);
+}
+.dark .pos-workspace[data-mode=return] { --pos-accent-soft: rgb(240 140 80 / 16%); }
+.dark .pos-workspace[data-mode=gift] { --pos-accent-soft: rgb(180 130 240 / 16%); }
+.dark :is(.pos-sale) { background: rgb(15 29 26 / 82%); box-shadow: 0 30px 60px -34px #000; }
+.dark :is(.pos-product, .pos-cart-line, .pos-actions > button, .pos-keypad-keys button, .pos-parties > div, .pos-tool, .pos-toolbar-actions > button, .pos-history-summary) { background: #13241f !important; }
+.dark .pos-workspace .pos-point-dropdown { border-color: var(--pos-edge); background: #13241f; }
+.dark .pos-product-visual { background: linear-gradient(160deg, #173029, #12261f) !important; }
+.dark .pos-stock { background: rgb(15 29 26 / 88%); color: #34d3a6; }
+.dark .pos-stock.is-unavailable { color: #fb7185; }
+.dark .pos-ticket-footer { background: linear-gradient(180deg, rgb(22 41 36 / 50%), rgb(15 29 26 / 90%)); }
+.dark .pos-barcode-field { background: rgb(52 211 166 / 8%); }
+.dark .pos-item-discount, .dark .pos-line-tags i { color: #f6c27a; background: rgb(217 138 43 / 18%); }
+.dark .pos-message { border-color: #1f5b4b; color: #a7f0d8; background: rgb(16 70 56 / 45%); }
+.dark .pos-message.is-error { border-color: #7a2235; color: #fecdd3; background: rgb(122 34 53 / 35%); }
+.dark .pos-empty-icon { background: radial-gradient(circle at 30% 30%, #1d3a32, #10241f); }
+
+/* ─────────────────────────────────────────────────────────────────────────────
+   POS dialogs (shared with pos-payment-details / pos-discount / unsaved prompt)
+   ───────────────────────────────────────────────────────────────────────────── */
+.pos-unsaved-dialog { width: min(94vw, 560px); max-width: 560px; padding: 24px; border: 1px solid #d9eee6; border-radius: 26px; background: #fff; color: #12302a; box-shadow: 0 26px 60px rgb(16 92 72 / 22%); }
+.pos-unsaved-heading { display: flex; align-items: center; gap: 13px; text-align: start; }
+.pos-unsaved-icon { display: grid; place-items: center; width: 50px; height: 50px; flex-shrink: 0; border-radius: 50%; color: #b7651f; background: #fdf0de; }
+.pos-unsaved-heading h2 { font-size: 18px; font-weight: 900; }
+.pos-unsaved-heading p { margin-top: 7px; color: #5e7c74; font-size: 12px; line-height: 1.8; }
+.pos-unsaved-dialog .pos-unsaved-actions { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin-top: 8px; }
+.pos-unsaved-actions button { display: flex; align-items: center; justify-content: center; gap: 6px; min-width: 0; height: 46px; margin: 0; padding: 6px; border-radius: 999px; font-size: 12px; white-space: normal; }
+.pos-unsaved-actions button svg { width: 17px; height: 17px; flex-shrink: 0; }
+.pos-unsaved-actions .pos-save-continue { border: 0; color: #fff; background: linear-gradient(135deg, #2cc79a, #0b7f63); }
+.pos-unsaved-actions .pos-discard-continue { border-color: #f6d9b4; color: #b7651f; background: #fdf6ec; }
+@media (max-width: 440px) { .pos-unsaved-dialog { padding: 20px 12px; } .pos-unsaved-actions button { flex-direction: column; height: 62px; gap: 4px; font-size: 10px; border-radius: 18px; } }
+.dark .pos-unsaved-dialog { border-color: #24413a; color: #e3f3ed; background: #0f1d1a; }
+.dark .pos-unsaved-heading p { color: #93b3aa; }
+
+.pos-payment-dialog-footer { background: #f1faf6; }
+.pos-payment-dialog-footer button { min-width: 128px; min-height: 44px; border-radius: 999px; font-size: 14px; font-weight: 900; box-shadow: none; }
+.pos-payment-confirm { border: 0 !important; color: #fff !important; background: linear-gradient(135deg, #2cc79a, #0b7f63) !important; }
+.pos-payment-confirm:hover:not(:disabled) { filter: brightness(1.05); }
+.pos-payment-close { border: 1px solid #f7cdd5 !important; color: #c2334d !important; background: #fff4f6 !important; }
+.pos-payment-close:hover:not(:disabled) { background: #ffe8ec !important; }
+.dark .pos-payment-dialog-footer { background: #0f1d1a; }
+.dark .pos-payment-close { border-color: #7a2235 !important; color: #fecdd3 !important; background: rgb(122 34 53 / 30%) !important; }
+
+.pos-discount-dialog { border: 1px solid #bfeedd; border-radius: 24px; background: #fff; box-shadow: 0 26px 50px rgb(16 92 72 / 22%); }
+.pos-discount-dialog [data-slot="dialog-title"] { color: #12302a; font-size: 19px; font-weight: 900; }
+.pos-discount-dialog section { border-color: #bfeedd; border-radius: 18px; background: #f1faf6; }
+.pos-discount-dialog section h3 { color: #0b7f63; font-size: 18px; }
+.pos-discount-dialog section input { min-height: 40px; border-color: #d9eee6; border-radius: 999px; background: #fff; font-size: 14px; }
+.pos-discount-dialog section input:focus { border-color: #10a37f; background: #fff; box-shadow: 0 0 0 4px rgb(16 163 127 / 14%); }
+.pos-discount-dialog .pos-payment-dialog-footer { margin-top: 2px; padding-top: 13px; }
+.dark .pos-discount-dialog { border-color: #24413a; background: #0f1d1a; }
+.dark .pos-discount-dialog [data-slot="dialog-title"] { color: #e3f3ed; }
+.dark .pos-discount-dialog section { border-color: #1f5b4b; background: rgb(16 70 56 / 30%); }
+.dark .pos-discount-dialog section input { border-color: #24413a; color: #e3f3ed; background: #13241f; }
+
+/* ── معاينة طباعة الفاتورة على الجوال (نفس التبويب) ───────────────────── */
+.pos-print-preview { position: fixed; inset: 0; z-index: 2000; display: flex; flex-direction: column; background: #e6f4ef; }
+.pos-print-preview-bar { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 10px 12px; padding-top: max(10px, env(safe-area-inset-top)); color: #fff; background: linear-gradient(120deg, #10a37f, #0b7f63); box-shadow: 0 4px 14px rgb(16 92 72 / 30%); }
+.pos-print-preview-bar b { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 15px; }
+.pos-print-preview-bar button { display: inline-flex; align-items: center; gap: 6px; height: 42px; padding: 0 18px; border-radius: 999px; font-size: 15px; font-weight: 800; }
+.pos-print-preview-print { border: 0; color: #0b7f63; background: #fff; }
+.pos-print-preview-close { border: 1px solid rgb(255 255 255 / 45%); color: #fff; background: rgb(255 255 255 / 12%); }
+.pos-print-preview-frame { flex: 1; width: 100%; min-height: 0; border: 0; background: #fff; }
+
+/* ── واجهة الجوال: لوحة واحدة (الأصناف أو السلة) + شريط سفلي للتنقل والدفع ── */
+.pos-mobile-bar { display: none; }
+@container cashier (max-width: 640px) {
+  .pos-mobile-bar { position: sticky; bottom: 0; z-index: 30; display: grid; grid-template-columns: 1fr 1fr 1.6fr; gap: 6px; margin-top: 8px; padding: 8px; padding-bottom: max(8px, env(safe-area-inset-bottom)); border: 1px solid var(--pos-glass-edge); border-radius: 26px; background: var(--pos-glass); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); box-shadow: 0 -10px 24px -16px rgb(16 92 72 / 45%); }
+  .pos-mobile-bar > button { position: relative; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; min-height: 54px; border-radius: 20px; color: var(--pos-muted); background: #fff; font-size: 12px; font-weight: 800; }
+  .pos-mobile-bar > button.is-active { color: var(--pos-accent-strong); background: var(--pos-accent-soft); }
+  .pos-mobile-bar > button .pos-badge { position: absolute; top: 4px; inset-inline-end: 10px; }
+  .pos-mobile-bar > .pos-mobile-pay { flex-direction: row; gap: 8px; color: #fff; background: linear-gradient(120deg, var(--pos-accent), var(--pos-accent-strong)); font-size: 16px; }
+  .pos-mobile-bar > .pos-mobile-pay:disabled { opacity: .55; }
+  .pos-mobile-bar > .pos-mobile-pay small { font-size: 11px; opacity: .85; }
+  .pos-layout[data-mobile-pane="cart"] .pos-catalog { display: none; }
+  .pos-layout[data-mobile-pane="catalog"] .pos-sale { display: none; }
+  .pos-catalog, .pos-products, .pos-cart { max-height: none; }
+  /* نفس السبب على الجوال: القوائم بلا ارتفاع محدد ⇐ لا تحتجز السحب؛ التمرير للصفحة */
+  .pos-catalog, .pos-products, .pos-cart { overflow: visible; overscroll-behavior: auto; contain: none; will-change: auto; }
+  .pos-cart { min-height: 220px; }
+  .pos-toolbar-actions { flex-wrap: nowrap; justify-content: flex-start; overflow-x: auto; scrollbar-width: none; -webkit-overflow-scrolling: touch; padding-bottom: 2px; }
+  .pos-toolbar-actions::-webkit-scrollbar { display: none; }
+  .pos-toolbar-actions > button { flex-shrink: 0; height: 40px; padding: 0 14px; font-size: 13px; }
+  .pos-topbar { padding: 8px 10px; border-radius: 20px; }
+  .pos-eyebrow { display: none; }
+  .pos-net { flex: 1 1 auto; }
+  .pos-sale { border-radius: 24px; }
+}
+/* لمس بلا لوحة مفاتيح: لا داعي لعرض اختصارات F2/F3… */
+@media (hover: none) and (pointer: coarse) { .pos-workspace kbd { display: none; } }

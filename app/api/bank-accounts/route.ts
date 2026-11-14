@@ -1,0 +1,240 @@
+import { type NextRequest, NextResponse } from "next/server"
+import sql, { withTenantTransaction } from "@/lib/database"
+import { BankAutoGenerateError, createBankAccountAccounts } from "@/lib/bank-account-autogen"
+import { authorizeFile, authorizeFileRead, projectFileLookup } from "@/lib/file-permissions"
+import { runSchemaOnce } from "@/lib/schema-once"
+import { validateLeafAccountFields } from "@/lib/leaf-accounts"
+
+const ensureTable = async () => { return runSchemaOnce("app/api/bank-accounts/route.ts#ensureTable", async () => {
+  await sql`
+    CREATE TABLE IF NOT EXISTS bank_accounts (
+      id SERIAL PRIMARY KEY,
+      branch_id INTEGER,
+      order_no INTEGER,
+      code VARCHAR(20) UNIQUE NOT NULL,
+      actual_bank_code VARCHAR(20),
+      currency_id INTEGER,
+      name VARCHAR(100) NOT NULL,
+      name_lang2 VARCHAR(100),
+      jary_account_id INTEGER,
+      tahsil_account_id INTEGER,
+      tahsil_commission_account_id INTEGER,
+      payed_checks_account_id INTEGER,
+      returned_checks_account_id INTEGER,
+      returned_checks_commission DOUBLE PRECISION,
+      add_returned_check_commision_on_customer BOOLEAN DEFAULT false,
+      tahsil_checks_commission DOUBLE PRECISION,
+      returned_checks_commission_currency_id INTEGER,
+      tahsil_checks_commission_currency_id INTEGER,
+      check_value_period INTEGER,
+      checks_deposit_period INTEGER,
+      notes VARCHAR(70),
+      status INTEGER DEFAULT 1,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `
+  // رقم الآيبان (IBAN) للحوالات البنكية
+  await sql`ALTER TABLE bank_accounts ADD COLUMN IF NOT EXISTS iban VARCHAR(34)`
+}) }
+
+// IBAN: رمز الدولة (حرفان) + رقمان للتحقق + حتى 30 حرفاً/رقماً، ويُتحقق منه بخوارزمية mod 97 (ISO 13616)
+function normalizeIban(value: unknown): { iban: string | null; error?: string } {
+  const iban = String(value ?? "").toUpperCase().replace(/\s+/g, "")
+  if (!iban) return { iban: null }
+  if (!/^[A-Z]{2}\d{2}[A-Z0-9]{11,30}$/.test(iban)) return { iban: null, error: "رقم الآيبان (IBAN) غير صحيح — يبدأ برمز الدولة ثم رقمين ثم رقم الحساب" }
+  const digits = (iban.slice(4) + iban.slice(0, 4)).replace(/[A-Z]/g, (letter) => String(letter.charCodeAt(0) - 55))
+  let remainder = 0
+  for (const digit of digits) remainder = (remainder * 10 + Number(digit)) % 97
+  return remainder === 1 ? { iban } : { iban: null, error: "رقم الآيبان (IBAN) غير صحيح — أرقام التحقق لا تطابق" }
+}
+
+export async function GET(request: NextRequest) {
+  try {
+    const authorization = await authorizeFileRead(request, ["bank-accounts", "credit-cards"])
+    if (!authorization.ok) return authorization.response
+    await ensureTable()
+
+    const { searchParams } = new URL(request.url)
+    const branchIdParam = searchParams.get("branch_id")
+    const branchId = branchIdParam ? Number(branchIdParam) : undefined
+
+    const bankAccounts = branchId !== undefined && !Number.isNaN(branchId)
+      ? await sql`SELECT * FROM bank_accounts WHERE status != 3 AND branch_id = ${branchId} ORDER BY id`
+      : await sql`SELECT * FROM bank_accounts WHERE status != 3 ORDER BY id`
+
+    return NextResponse.json(authorization.lookupOnly ? projectFileLookup("bank-accounts", bankAccounts) : bankAccounts)
+  } catch (error) {
+    console.error("Error fetching bank accounts:", error)
+    return NextResponse.json({ error: "Failed to fetch bank accounts" }, { status: 500 })
+  }
+}
+
+export async function POST(request: NextRequest) {
+  try {
+    const authorization = await authorizeFile(request, "bank-accounts", "create")
+    if (!authorization.ok) return authorization.response
+    await ensureTable()
+    const data = await request.json()
+    const autoGenerate = data.auto_generate === true
+    if (!autoGenerate) {
+      const leafAccountsError = await validateLeafAccountFields({ "الحساب الجاري": data.jary_account_id, "حساب التحصيل": data.tahsil_account_id, "حساب عمولة التحصيل": data.tahsil_commission_account_id, "حساب الشيكات المدفوعة": data.payed_checks_account_id, "حساب الشيكات المرتجعة": data.returned_checks_account_id })
+      if (leafAccountsError) return NextResponse.json({ error: leafAccountsError }, { status: 400 })
+    }
+
+    if (!data.code || !data.name) {
+      return NextResponse.json({ error: "رقم الحساب واسم الحساب مطلوبان" }, { status: 400 })
+    }
+
+    const existing = await sql`SELECT id FROM bank_accounts WHERE code = ${data.code}`
+    if (existing.length > 0) {
+      return NextResponse.json({ error: "رقم الحساب موجود مسبقاً" }, { status: 400 })
+    }
+    const ibanCheck = normalizeIban(data.iban)
+    if (ibanCheck.error) return NextResponse.json({ error: ibanCheck.error }, { status: 400 })
+
+    if (autoGenerate) {
+      // انشاء آلي: الحسابات المحاسبية تُنشأ مع الحساب البنكي في معاملة واحدة — فشل أي خطوة لا يترك حسابات يتيمة
+      const accountsPermission = await authorizeFile(request, "accounts", "create")
+      if (!accountsPermission.ok) return accountsPermission.response
+      if (!data.branch_id || !data.currency_id) return NextResponse.json({ error: "يجب اختيار البنك والفرع والعملة" }, { status: 400 })
+      try {
+        const created = await withTenantTransaction(async () => {
+          const ids = await createBankAccountAccounts({ branchId: Number(data.branch_id), currencyId: Number(data.currency_id), actualCode: String(data.actual_bank_code || "") })
+          return insertBankAccount({ ...data, ...ids })
+        })
+        return NextResponse.json(created, { status: 201 })
+      } catch (error) {
+        if (error instanceof BankAutoGenerateError) return NextResponse.json({ error: error.message }, { status: 400 })
+        throw error
+      }
+    }
+
+    return NextResponse.json(await insertBankAccount(data), { status: 201 })
+  } catch (error) {
+    console.error("Error creating bank account:", error)
+    return NextResponse.json({ error: "Failed to create bank account" }, { status: 500 })
+  }
+}
+
+// يُستدعى داخل معاملة الإنشاء الآلي أو مباشرة
+async function insertBankAccount(data: any) {
+    const lastOrder = await sql`SELECT COALESCE(MAX(order_no), 0) AS max_order FROM bank_accounts`
+    const nextOrder = Number(lastOrder[0]?.max_order || 0) + 1
+
+    const result = await sql`
+      INSERT INTO bank_accounts (
+        branch_id, order_no, code, actual_bank_code, currency_id, name, name_lang2,
+        jary_account_id, tahsil_account_id, tahsil_commission_account_id, payed_checks_account_id,
+        returned_checks_account_id, returned_checks_commission, add_returned_check_commision_on_customer,
+        tahsil_checks_commission, returned_checks_commission_currency_id, tahsil_checks_commission_currency_id,
+        check_value_period, checks_deposit_period, notes, status, iban
+      )
+      VALUES (
+        ${data.branch_id || null}, ${nextOrder}, ${data.code}, ${data.actual_bank_code || ""},
+        ${data.currency_id || null}, ${data.name}, ${data.name_lang2 || ""},
+        ${data.jary_account_id || null}, ${data.tahsil_account_id || null}, ${data.tahsil_commission_account_id || null},
+        ${data.payed_checks_account_id || null}, ${data.returned_checks_account_id || null},
+        ${data.returned_checks_commission ?? null}, ${Boolean(data.add_returned_check_commision_on_customer)},
+        ${data.tahsil_checks_commission ?? null}, ${data.returned_checks_commission_currency_id || null},
+        ${data.tahsil_checks_commission_currency_id || null}, ${data.check_value_period ?? null},
+        ${data.checks_deposit_period ?? null}, ${data.notes || ""}, ${Number(data.status || 1)}, ${normalizeIban(data.iban).iban}
+      )
+      RETURNING *
+    `
+
+    return result[0]
+}
+
+export async function PUT(request: NextRequest) {
+  try {
+    const data = await request.json()
+    const leafAccountsError = await validateLeafAccountFields({ "الحساب الجاري": data.jary_account_id, "حساب التحصيل": data.tahsil_account_id, "حساب عمولة التحصيل": data.tahsil_commission_account_id, "حساب الشيكات المدفوعة": data.payed_checks_account_id, "حساب الشيكات المرتجعة": data.returned_checks_account_id })
+    if (leafAccountsError) return NextResponse.json({ error: leafAccountsError }, { status: 400 })
+    const authorization = await authorizeFile(request, "bank-accounts", Number(data.status) === 3 ? "delete" : "update")
+    if (!authorization.ok) return authorization.response
+    await ensureTable()
+
+    if (!data.id) {
+      return NextResponse.json({ error: "معرف حساب البنك مطلوب" }, { status: 400 })
+    }
+
+    if (!data.code || !data.name) {
+      return NextResponse.json({ error: "رقم الحساب واسم الحساب مطلوبان" }, { status: 400 })
+    }
+
+    const duplicate = await sql`SELECT id FROM bank_accounts WHERE code = ${data.code} AND id != ${data.id}`
+    if (duplicate.length > 0) {
+      return NextResponse.json({ error: "رقم الحساب مستخدم مسبقاً" }, { status: 400 })
+    }
+
+    const status = Number(data.status ?? 1)
+    const iban = normalizeIban(data.iban)
+    if (iban.error) return NextResponse.json({ error: iban.error }, { status: 400 })
+
+    const result = await sql`
+      UPDATE bank_accounts
+      SET
+        branch_id = ${data.branch_id || null},
+        code = ${data.code},
+        actual_bank_code = ${data.actual_bank_code || ""},
+        currency_id = ${data.currency_id || null},
+        name = ${data.name},
+        name_lang2 = ${data.name_lang2 || ""},
+        jary_account_id = ${data.jary_account_id || null},
+        tahsil_account_id = ${data.tahsil_account_id || null},
+        tahsil_commission_account_id = ${data.tahsil_commission_account_id || null},
+        payed_checks_account_id = ${data.payed_checks_account_id || null},
+        returned_checks_account_id = ${data.returned_checks_account_id || null},
+        returned_checks_commission = ${data.returned_checks_commission ?? null},
+        add_returned_check_commision_on_customer = ${Boolean(data.add_returned_check_commision_on_customer)},
+        tahsil_checks_commission = ${data.tahsil_checks_commission ?? null},
+        returned_checks_commission_currency_id = ${data.returned_checks_commission_currency_id || null},
+        tahsil_checks_commission_currency_id = ${data.tahsil_checks_commission_currency_id || null},
+        check_value_period = ${data.check_value_period ?? null},
+        checks_deposit_period = ${data.checks_deposit_period ?? null},
+        notes = ${data.notes || ""},
+        status = ${status},
+        iban = CASE WHEN ${"iban" in data}::boolean THEN ${iban.iban} ELSE iban END,
+        updated_at = CURRENT_TIMESTAMP
+      WHERE id = ${data.id}
+      RETURNING *
+    `
+
+    if (result.length === 0) {
+      return NextResponse.json({ error: "حساب البنك غير موجود" }, { status: 404 })
+    }
+
+    return NextResponse.json(result[0])
+  } catch (error) {
+    console.error("Error updating bank account:", error)
+    return NextResponse.json({ error: "Failed to update bank account" }, { status: 500 })
+  }
+}
+
+export async function DELETE(request: NextRequest) {
+  try {
+    const authorization = await authorizeFile(request, "bank-accounts", "delete")
+    if (!authorization.ok) return authorization.response
+    const data = await request.json()
+
+    if (!data.id) {
+      return NextResponse.json({ error: "معرف حساب البنك مطلوب" }, { status: 400 })
+    }
+
+    const result = await sql`
+      DELETE FROM bank_accounts
+      WHERE id = ${data.id}
+      RETURNING id
+    `
+
+    if (result.length === 0) {
+      return NextResponse.json({ error: "حساب البنك غير موجود" }, { status: 404 })
+    }
+
+    return NextResponse.json({ success: true })
+  } catch (error) {
+    console.error("Error deleting bank account:", error)
+    return NextResponse.json({ error: "Failed to delete bank account" }, { status: 500 })
+  }
+}

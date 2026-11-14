@@ -1,0 +1,303 @@
+"use client"
+
+import { tr, appDir } from "@/lib/i18n"
+import { useRef, useState, type CSSProperties } from "react"
+import Link from "next/link"
+import { AlertCircle, ArrowLeft, Building2, CheckCircle2, Eye, EyeOff, LockKeyhole, Mail, Phone, ShieldCheck, Sparkles, UserPlus, UserRound, Zap } from "lucide-react"
+import { NoonLogo } from "@/components/brand/noon-logo"
+import { PoweredBy } from "@/components/brand/powered-by"
+
+// The app sets `[dir="rtl"] input { direction: rtl }` globally; inline direction wins so Latin email/password
+// typing keeps the caret after the last character (same fix as components/auth/management-login.tsx).
+const ltrStyle: CSSProperties = { direction: "ltr", unicodeBidi: "plaintext", textAlign: "left" }
+
+// نفس هوية شاشة الدخول (management-login.tsx): شفق متحرك، نقاط، بطاقة زجاجية بحدّ متدرّج دوّار، ميل خفيف مع الماوس.
+const css = `
+@property --su-angle{syntax:"<angle>";inherits:false;initial-value:0deg}
+.su-root{--mx:0;--my:0;position:relative;isolation:isolate;overflow:hidden;background:#f8f4ec;color:#0f172a}
+.su-aurora{position:absolute;inset:0;z-index:-2;background:
+  radial-gradient(60% 50% at 85% 10%,rgba(217,186,140,.28),transparent 70%),
+  radial-gradient(50% 45% at 10% 20%,rgba(16,185,129,.07),transparent 70%),
+  radial-gradient(55% 55% at 20% 95%,rgba(232,213,180,.35),transparent 70%),
+  radial-gradient(45% 45% at 90% 90%,rgba(20,184,166,.06),transparent 70%),linear-gradient(180deg,#fbf8f2,#f5efe4)}
+.su-blob{position:absolute;border-radius:9999px;filter:blur(70px);z-index:-1;opacity:.35;animation:su-drift 16s ease-in-out infinite}
+@keyframes su-drift{0%,100%{transform:translate3d(0,0,0) scale(1)}50%{transform:translate3d(-40px,-50px,0) scale(1.12)}}
+.su-dots{position:absolute;inset:0;z-index:-1;opacity:.5;background-image:radial-gradient(rgba(120,90,50,.16) 1px,transparent 1.2px);background-size:26px 26px;
+  mask-image:radial-gradient(70% 70% at 50% 45%,#000,transparent);-webkit-mask-image:radial-gradient(70% 70% at 50% 45%,#000,transparent)}
+.su-wrap{perspective:1400px;width:100%;max-width:480px}
+.su-card{position:relative;border-radius:30px;padding:2px;transform-style:preserve-3d;
+  transform:rotateX(calc(var(--my)*-4deg)) rotateY(calc(var(--mx)*5deg));transition:transform .2s ease-out;
+  background:conic-gradient(from var(--su-angle),rgba(16,185,129,0),#10b981,#38bdf8,#a78bfa,rgba(16,185,129,0) 60%);animation:su-spin 7s linear infinite;
+  box-shadow:0 40px 80px -40px rgba(120,90,50,.35),0 0 60px -30px rgba(16,185,129,.35)}
+@keyframes su-spin{to{--su-angle:360deg}}
+.su-card-in{border-radius:28px;background:#fffdf9;box-shadow:0 1px 0 rgba(255,255,255,.9) inset}
+.su-field{height:3.1rem;width:100%;border-radius:14px;border:1px solid #e7dccb;background:#fff;font-size:15px;color:#0f172a;outline:none;
+  box-shadow:inset 0 1px 2px rgba(120,90,50,.08);transition:border-color .2s,background .2s,box-shadow .2s}
+.su-field::placeholder{color:#a8a29e}
+.su-field:focus{border-color:#10b981;background:#fff;box-shadow:0 0 0 4px rgba(16,185,129,.15)}
+.su-field:-webkit-autofill{-webkit-text-fill-color:#0f172a;box-shadow:0 0 0 40px #fff inset}
+.su-btn{position:relative;overflow:hidden;border-radius:14px;background:linear-gradient(100deg,#10b981,#06b6d4);border-bottom:4px solid #0a6a63;
+  box-shadow:0 18px 30px -14px rgba(16,185,129,.8);transition:transform .12s,border-bottom-width .12s,box-shadow .2s,filter .2s}
+.su-btn::after{content:"";position:absolute;inset:0;background:linear-gradient(105deg,transparent 35%,rgba(255,255,255,.45) 50%,transparent 65%);transform:translateX(-120%);transition:transform .7s}
+.su-btn:hover:not(:disabled){filter:brightness(1.08);transform:translateY(-2px)}
+.su-btn:hover:not(:disabled)::after{transform:translateX(120%)}
+.su-btn:active:not(:disabled){transform:translateY(3px);border-bottom-width:1px}
+@keyframes su-rise{from{opacity:0;transform:translateY(18px)}to{opacity:1;transform:none}}
+.su-rise{animation:su-rise .7s cubic-bezier(.2,.8,.2,1) both}
+@keyframes su-pop{0%{transform:scale(.6);opacity:0}70%{transform:scale(1.08)}100%{transform:scale(1);opacity:1}}
+.su-pop{animation:su-pop .55s cubic-bezier(.2,.8,.2,1) both}
+@media (prefers-reduced-motion:reduce){.su-root *{animation:none!important;transition:none!important}}
+@media (max-width:1023px){.su-card{transform:none}}
+`
+
+function Wordmark() {
+  return <NoonLogo size="lg" />
+}
+
+// قوة كلمة المرور (للعرض فقط — الحد الأدنى المفروض يبقى 6 أحرف كما في الخادم)
+function passwordStrength(password: string) {
+  if (!password) return { score: 0, label: "", color: "" }
+  let score = 0
+  if (password.length >= 6) score++
+  if (password.length >= 10) score++
+  if (/[A-Z]/.test(password) && /[a-z]/.test(password)) score++
+  if (/\d/.test(password)) score++
+  if (/[^A-Za-z0-9]/.test(password)) score++
+  const level = Math.min(4, Math.max(1, score))
+  return [
+    { score: 1, label: tr("ضعيفة"), color: "bg-rose-400" },
+    { score: 2, label: tr("مقبولة"), color: "bg-amber-300" },
+    { score: 3, label: tr("جيدة"), color: "bg-cyan-300" },
+    { score: 4, label: tr("قوية"), color: "bg-emerald-400" },
+  ][level - 1]
+}
+
+export default function ManagementSignupPage() {
+  const [form, setForm] = useState({ fullName: "", email: "", mobile: "", password: "", confirmPassword: "" })
+  const [showPassword, setShowPassword] = useState(false)
+  const [error, setError] = useState("")
+  const [success, setSuccess] = useState(false)
+  const [loading, setLoading] = useState(false)
+  const rootRef = useRef<HTMLElement | null>(null)
+
+  const strength = passwordStrength(form.password)
+  const confirmMismatch = form.confirmPassword.length > 0 && form.confirmPassword !== form.password
+
+  const onPointerMove = (event: React.PointerEvent<HTMLElement>) => {
+    const root = rootRef.current
+    if (!root) return
+    root.style.setProperty("--mx", String((event.clientX / window.innerWidth - 0.5) * 2))
+    root.style.setProperty("--my", String((event.clientY / window.innerHeight - 0.5) * 2))
+  }
+  const onPointerLeave = () => {
+    rootRef.current?.style.setProperty("--mx", "0")
+    rootRef.current?.style.setProperty("--my", "0")
+  }
+
+  const handleSubmit = async (event: React.FormEvent) => {
+    event.preventDefault()
+    setError("")
+    if (form.password !== form.confirmPassword) {
+      setError(tr("كلمة المرور وتأكيد كلمة المرور غير متطابقتين"))
+      return
+    }
+    if (!/^\+?\d{9,15}$/.test(form.mobile.replace(/[\s-]/g, ""))) {
+      setError(tr("رقم الجوال غير صحيح"))
+      return
+    }
+    if (form.password.length < 6) {
+      setError(tr("كلمة المرور يجب أن تكون 6 أحرف على الأقل"))
+      return
+    }
+
+    setLoading(true)
+    try {
+      const response = await fetch("/api/management/auth/signup", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ fullName: form.fullName, email: form.email, mobile: form.mobile, password: form.password }),
+      })
+      const data = await response.json()
+      if (!response.ok) {
+        setError(data.error || tr("حدث خطأ أثناء إنشاء الحساب"))
+        return
+      }
+      setSuccess(true)
+    } catch {
+      setError(tr("تعذّر الاتصال بالخادم"))
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  return (
+    <main ref={rootRef} dir={appDir()} onPointerMove={onPointerMove} onPointerLeave={onPointerLeave} className="su-root grid min-h-screen lg:grid-cols-[1fr_1.1fr]">
+      <style dangerouslySetInnerHTML={{ __html: css }} />
+      <div className="su-aurora" aria-hidden="true" />
+      <div className="su-dots" aria-hidden="true" />
+      <div className="su-blob -end-24 top-0 h-80 w-80 bg-amber-200/60" aria-hidden="true" />
+      <div className="su-blob -start-24 bottom-0 h-96 w-96 bg-emerald-200/50 [animation-delay:-6s]" aria-hidden="true" />
+
+      <section className="relative flex min-h-screen flex-col items-center justify-center px-5 py-10 sm:px-8">
+        <div className="mb-8 lg:hidden"><Wordmark /></div>
+        <div className="su-wrap su-rise [animation-delay:.15s]">
+          <div className="su-card">
+            <div className="su-card-in p-7 sm:p-9">
+              {success ? (
+                <div className="py-4 text-center">
+                  <span className="su-pop mx-auto grid h-20 w-20 place-items-center rounded-3xl bg-gradient-to-br from-emerald-400 to-cyan-500 shadow-[0_18px_40px_-12px_rgba(16,185,129,.9)] ring-1 ring-white/30">
+                    <CheckCircle2 className="h-10 w-10 text-white" />
+                  </span>
+                  <h2 className="mt-6 text-[1.75rem] font-black">{tr("تم إنشاء الحساب بنجاح! 🎉")}</h2>
+                  <p className="mx-auto mt-2 max-w-sm text-sm leading-7 text-stone-500">{tr("يمكنك الآن تسجيل الدخول إلى بوابة الإدارة وإضافة شركتك الأولى.")}</p>
+                  <Link href="/management/login" className="su-btn group mt-7 inline-flex h-12 w-full items-center justify-center gap-2 text-sm font-black text-white">
+                    {tr("الذهاب لتسجيل الدخول")}<ArrowLeft className="h-4 w-4 transition-transform group-hover:-translate-x-1" />
+                  </Link>
+                </div>
+              ) : (
+                <>
+                  <div className="mb-7">
+                    <span className="mb-4 inline-flex items-center gap-1.5 rounded-full bg-emerald-50 px-3 py-1 text-[11px] font-bold text-emerald-700 ring-1 ring-emerald-200"><UserPlus className="h-3.5 w-3.5" />{tr("حساب إدارة جديد")}</span>
+                    <h1 className="text-[1.75rem] font-black leading-tight">{tr("أنشئ حسابك ✨")}</h1>
+                    <p className="mt-1.5 text-sm text-stone-500">{tr("دقيقة واحدة وتبدأ بإدارة شركاتك من بوابة واحدة")}</p>
+                  </div>
+
+                  <form onSubmit={handleSubmit} className="space-y-5">
+                    {error && (
+                      <div role="alert" className="flex items-start gap-2 rounded-xl border border-rose-200 bg-rose-50 px-3.5 py-3 text-sm font-medium text-rose-700">
+                        <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />{error}
+                      </div>
+                    )}
+
+                    <div className="space-y-2">
+                      <label htmlFor="signup-name" className="text-sm font-bold text-slate-700">{tr("الاسم الكامل")}</label>
+                      <div className="relative">
+                        <UserRound className="pointer-events-none absolute start-4 top-1/2 h-[18px] w-[18px] -translate-y-1/2 text-stone-500" />
+                        <input id="signup-name" autoComplete="name" autoFocus required placeholder={tr("أدخل الاسم الكامل")} className="su-field pe-4 ps-11 text-start"
+                          value={form.fullName} onChange={(event) => setForm((current) => ({ ...current, fullName: event.target.value }))} />
+                      </div>
+                    </div>
+
+                    <div className="space-y-2">
+                      <label htmlFor="signup-email" className="text-sm font-bold text-slate-700">{tr("البريد الإلكتروني")}</label>
+                      <div className="relative" dir="ltr">
+                        <Mail className="pointer-events-none absolute end-4 top-1/2 h-[18px] w-[18px] -translate-y-1/2 text-stone-500" />
+                        <input id="signup-email" type="email" inputMode="email" autoComplete="email" required dir="ltr" style={ltrStyle} spellCheck={false} autoCapitalize="none"
+                          placeholder="name@company.com" className="su-field pe-11 ps-4" value={form.email} onChange={(event) => setForm((current) => ({ ...current, email: event.target.value }))} />
+                      </div>
+                    </div>
+
+                    <div className="space-y-2">
+                      <label htmlFor="signup-mobile" className="text-sm font-bold text-slate-700">{tr("رقم الجوال")}</label>
+                      <div className="relative" dir="ltr">
+                        <Phone className="pointer-events-none absolute end-4 top-1/2 h-[18px] w-[18px] -translate-y-1/2 text-stone-500" />
+                        <input id="signup-mobile" type="tel" inputMode="tel" autoComplete="tel" required dir="ltr" style={ltrStyle}
+                          placeholder="05XXXXXXXX" className="su-field pe-11 ps-4" value={form.mobile} onChange={(event) => setForm((current) => ({ ...current, mobile: event.target.value }))} />
+                      </div>
+                    </div>
+
+                    <div className="grid gap-4 sm:grid-cols-2">
+                      <div className="space-y-2">
+                        <label htmlFor="signup-password" className="text-sm font-bold text-slate-700">{tr("كلمة المرور")}</label>
+                        <div className="relative" dir="ltr">
+                          <LockKeyhole className="pointer-events-none absolute end-4 top-1/2 h-[18px] w-[18px] -translate-y-1/2 text-stone-500" />
+                          <input id="signup-password" type={showPassword ? "text" : "password"} autoComplete="new-password" required dir="ltr" style={ltrStyle}
+                            placeholder={tr("6 أحرف على الأقل")} className="su-field pe-11 ps-12" value={form.password} onChange={(event) => setForm((current) => ({ ...current, password: event.target.value }))} />
+                          <button type="button" onClick={() => setShowPassword((current) => !current)} aria-label={showPassword ? tr("إخفاء كلمة المرور") : tr("إظهار كلمة المرور")}
+                            className="absolute start-1.5 top-1/2 grid h-9 w-9 -translate-y-1/2 place-items-center rounded-lg text-stone-500 transition hover:bg-stone-100 hover:text-slate-900">
+                            {showPassword ? <EyeOff className="h-[18px] w-[18px]" /> : <Eye className="h-[18px] w-[18px]" />}
+                          </button>
+                        </div>
+                      </div>
+
+                      <div className="space-y-2">
+                        <label htmlFor="signup-confirm-password" className="text-sm font-bold text-slate-700">{tr("تأكيد كلمة المرور")}</label>
+                        <div className="relative" dir="ltr">
+                          <LockKeyhole className="pointer-events-none absolute end-4 top-1/2 h-[18px] w-[18px] -translate-y-1/2 text-stone-500" />
+                          <input id="signup-confirm-password" type={showPassword ? "text" : "password"} autoComplete="new-password" required dir="ltr" style={ltrStyle}
+                            placeholder={tr("أعد كتابتها")} className={`su-field pe-11 ps-4 ${confirmMismatch ? "!border-rose-400/70" : ""}`}
+                            value={form.confirmPassword} onChange={(event) => setForm((current) => ({ ...current, confirmPassword: event.target.value }))} />
+                        </div>
+                      </div>
+                    </div>
+
+                    {(form.password || form.confirmPassword) && (
+                      <div className="space-y-2">
+                        {form.password && (
+                          <div className="flex items-center gap-3">
+                            <div className="grid flex-1 grid-cols-4 gap-1.5" dir="ltr">
+                              {[1, 2, 3, 4].map((step) => <span key={step} className={`h-1.5 rounded-full transition-colors ${step <= strength.score ? strength.color : "bg-stone-200"}`} />)}
+                            </div>
+                            <span className="w-14 text-end text-xs font-bold text-slate-600">{strength.label}</span>
+                          </div>
+                        )}
+                        {form.confirmPassword && (
+                          <p className={`flex items-center gap-1.5 text-xs font-semibold ${confirmMismatch ? "text-rose-600" : "text-emerald-700"}`}>
+                            {confirmMismatch ? <AlertCircle className="h-3.5 w-3.5" /> : <CheckCircle2 className="h-3.5 w-3.5" />}
+                            {confirmMismatch ? tr("كلمتا المرور غير متطابقتين") : tr("كلمتا المرور متطابقتان")}
+                          </p>
+                        )}
+                      </div>
+                    )}
+
+                    <button type="submit" disabled={loading} className="su-btn group flex h-12 w-full items-center justify-center gap-2 text-sm font-black text-white disabled:cursor-not-allowed disabled:opacity-70">
+                      {loading ? <><span className="h-4 w-4 animate-spin rounded-full border-2 border-white/35 border-t-white" />{tr("جاري إنشاء الحساب…")}</> : <>{tr("إنشاء الحساب")}<ArrowLeft className="h-4 w-4 transition-transform group-hover:-translate-x-1" /></>}
+                    </button>
+                  </form>
+                </>
+              )}
+
+              <div className="mt-6 border-t border-[#ece3d3] pt-5 text-center text-sm text-stone-500">
+                {tr("لديك حساب بالفعل؟ ")}<Link href="/management/login" className="font-semibold text-emerald-700 transition-colors hover:text-emerald-800">{tr("تسجيل الدخول")}</Link>
+              </div>
+            </div>
+          </div>
+        </div>
+        <p className="mt-6 flex items-center gap-1.5 text-xs text-stone-500"><ShieldCheck className="h-3.5 w-3.5 text-emerald-400" />{tr("اتصال مشفّر · ")}<span dir="ltr">Noon ERP</span></p>
+        <PoweredBy className="mt-2" />
+      </section>
+
+      <aside className="relative hidden lg:flex lg:flex-col lg:justify-between lg:p-12 xl:p-16">
+        <div className="su-rise flex justify-end"><Wordmark /></div>
+
+        <div className="su-rise max-w-xl [animation-delay:.1s]">
+          <p className="mb-5 inline-flex items-center gap-2 rounded-full border border-[#ece3d3] bg-white/80 px-3.5 py-1.5 text-xs font-semibold text-emerald-700 backdrop-blur">
+            <Sparkles className="h-3.5 w-3.5" />{tr("ابدأ مجاناً")}
+          </p>
+          <h2 className="text-4xl font-black leading-[1.3] xl:text-[3.25rem]">
+            {tr("ابدأ إدارة شركتك")}<br />
+            <span className="bg-gradient-to-l from-emerald-600 via-teal-600 to-cyan-600 bg-clip-text text-transparent">{tr("في دقائق")}</span>
+          </h2>
+          <p className="mt-5 max-w-md text-[15px] leading-8 text-slate-600">{tr("أنشئ حساب إدارة، أضف شركتك أو جرّب شركة تجريبية لمدة 10 أيام، وادخل إلى المخزون والمبيعات والحسابات والتقارير من مكان واحد.")}</p>
+        </div>
+
+        <ol className="su-rise relative max-w-md space-y-3 [animation-delay:.2s]">
+          {[
+            { title: tr("أنشئ حسابك"), text: tr("الاسم والبريد وكلمة المرور") },
+            { title: tr("أضف شركتك"), text: tr("أو ابدأ بشركة تجريبية فوراً") },
+            { title: tr("ادخل إلى النظام"), text: tr("كل شركة بقاعدة بيانات معزولة") },
+          ].map((step, index) => (
+            <li key={step.title} className="flex items-center gap-4 rounded-2xl border border-[#ece3d3] bg-white/80 p-3.5 backdrop-blur-xl">
+              <span className="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-gradient-to-br from-emerald-400/30 to-cyan-400/10 text-base font-black text-emerald-700 ring-1 ring-emerald-200/60">{index + 1}</span>
+              <span><b className="block text-sm">{step.title}</b><span className="text-xs text-stone-500">{step.text}</span></span>
+            </li>
+          ))}
+        </ol>
+
+        <div className="su-rise grid grid-cols-3 gap-3 [animation-delay:.3s]">
+          {[
+            { icon: Building2, title: tr("عدة شركات"), text: tr("من حساب واحد") },
+            { icon: ShieldCheck, title: tr("حماية البيانات"), text: tr("تشفير وصلاحيات") },
+            { icon: Zap, title: tr("بداية سريعة"), text: tr("إعداد بسيط") },
+          ].map((item) => (
+            <div key={item.title} className="rounded-2xl border border-[#ece3d3] bg-white/80 p-3.5 backdrop-blur-xl transition duration-300 hover:-translate-y-1.5 hover:border-emerald-300/30 hover:bg-white">
+              <span className="mb-2 grid h-9 w-9 place-items-center rounded-xl bg-gradient-to-br from-emerald-400/25 to-cyan-400/10 text-emerald-700 ring-1 ring-emerald-200/60"><item.icon className="h-[18px] w-[18px]" /></span>
+              <b className="block text-[13px]">{item.title}</b>
+              <span className="text-xs leading-5 text-stone-500">{item.text}</span>
+            </div>
+          ))}
+        </div>
+      </aside>
+    </main>
+  )
+}

@@ -3,61 +3,115 @@
  * All numbers are 8 characters: PREFIX + 7 digits (padded with zeros)
  */
 
-import { neon } from "@neondatabase/serverless"
-
-
-import { Pool } from "pg"
-
-let sql: any = null
-
-try {
-  if (!process.env.DATABASE_URL) {
-    console.error("[v0] DATABASE_URL environment variable is not set")
-  } else {
-    const dbUrl = process.env.DATABASE_URL
-
-    if (dbUrl.includes("localhost") || dbUrl.includes("127.0.0.1")) {
-      console.log("[v0] Using local PostgreSQL with pg Pool")
-      const pool = new Pool({ connectionString: dbUrl })
-      sql = async (strings: TemplateStringsArray, ...values: any[]) => {
-        const client = await pool.connect()
-        try {
-          const query =
-            strings.reduce(
-              (prev, curr, i) =>
-                prev + curr + (i < values.length ? `$${i + 1}` : ""),
-              ""
-            )
-          const result = await client.query(query, values)
-          return result.rows
-        } finally {
-          client.release()
-        }
-      }
-    } else {
-      console.log("[v0] Using Neon serverless client")
-      sql = neon(dbUrl)
-    }
-
-    console.log("[v0] Database client initialized successfully")
-  }
-} catch (error) {
-  console.error("[v0] Failed to initialize DB client:", error)
-  sql = null
-}
+import sql, { memoInTransaction } from "./database"
+import { buildVoucherCode } from "./voucher-code"
+import { withBranchSymbol, resolveBranchSymbol } from "./branch-symbol"
 
 export default sql
 
-async function getPrefixFromSettings(type: "customer" | "supplier" | "item_group"): Promise<string> {
+// إعدادات ترقيم الطلبيات (بادئة النظام + بداية الترقيم) — نفس نمط getStockVoucherNumberSettings
+// بـapp/api/stock-vouchers/_lib.ts، لكن قراءة مباشرة من system_settings (بنفس أسلوب
+// getPrefixFromSettings أدناه) بدل استدعاء HTTP ذاتي، لأن هذا الملف يُستدعى من الخادم مباشرة (كـ
+// lib/orders.ts) بلا سياق طلب دوماً. order_prefix/order_start لطلبات المبيعات، purchase_prefix/
+// purchase_start لطلبات الشراء — نفس المفاتيح التي تعرضها شاشة الإعدادات العامة (system-settings.tsx).
+async function getOrderNumberSettings(vchType: number): Promise<{ prefix: string; startNumber: number }> {
+  const isPurchase = vchType === 2
+  const defaultPrefix = isPurchase ? "PO" : "SO"
+  const prefixKey = isPurchase ? "purchase_prefix" : "order_prefix"
+  const startKey = isPurchase ? "purchase_start" : "order_start"
+  try {
+    const result = await sql`
+      SELECT id, value FROM system_settings WHERE id IN (${[prefixKey, startKey]})
+    `
+    const map = Object.fromEntries(result.map((row: any) => [row.id, row.value]))
+    const prefixRaw = String(map[prefixKey] || defaultPrefix).trim().toUpperCase()
+    const prefix = /^[A-Z]{1,3}$/.test(prefixRaw) ? prefixRaw : defaultPrefix
+    const startNumber = Number(map[startKey]) || 1
+    return { prefix, startNumber }
+  } catch (error) {
+    console.error("[v0] Error fetching order number settings:", error)
+    return { prefix: defaultPrefix, startNumber: 1 }
+  }
+}
+
+// دفتر السندات من رقم طلبية محفوظة (لا عمود للدفتر في orders): رقم الطلبية = بادئة الطلبية + [رمز الفرع] + رمز الدفتر +
+// تسلسل. كانت الواجهة تأخذ الحرف الثاني من الرقم (order_number[1]) — وهو جزء من البادئة "SO" (أي "O") لا الدفتر،
+// فتُنسَخ الطلبية/يُعاد ترقيمها على دفتر خاطئ. يُعاد null إن لم يطابق الحرف دفتراً معرَّفاً.
+export async function orderBookFromNumber(orderNumber: string, vchType: number, branchId?: number | null): Promise<string | null> {
+  const code = String(orderNumber || "").trim().toUpperCase()
+  const { prefix } = await getOrderNumberSettings(vchType)
+  if (!code.startsWith(prefix)) return null
+  const rest = code.slice(prefix.length)
+  const symbol = await resolveBranchSymbol(branchId)
+  const candidates = symbol && rest.startsWith(symbol) && rest.length > 2 ? [rest[1], rest[0]] : [rest[0]]
+  const rows = await memoInTransaction("voucher-book-names", () => sql`SELECT name FROM voucher_books_tbl` as Promise<any[]>)
+  const names = new Set(rows.map((row: any) => String(row.name || "").trim().toUpperCase()))
+  return candidates.find((candidate) => candidate && names.has(candidate)) ?? null
+}
+
+// دفتر السندات الافتراضي لمستخدم معيَّن على نوع سند معيَّن (voucher_book_user_permissions_tbl،
+// is_default=1) — نفس منطق app/api/receipts/voucher-books/route.ts تماماً (بما فيه حلّ المعرّف
+// النصي user_settings.user_id إلى المفتاح الرقمي user_settings.id أولاً)، لكن استعلام مباشر هنا
+// بدل HTTP لأن هذا يُستدعى من الخادم مباشرة (lib/orders.ts createOrder) بلا سياق طلب. تُستخدَم عند
+// حفظ طلبية دون رقم طلبية جاهز من الواجهة (كالنافذة السريعة QuickSalesOrder التي لا تعرف شيئاً عن
+// دفاتر السندات) بدل الرجوع لحرف ثابت غير مرتبط بصلاحيات المستخدم فعلياً.
+export async function resolveDefaultVoucherBookName(userId: string, voucherTypeId: number): Promise<string | null> {
+  if (!userId || !voucherTypeId) return null
+  try {
+    const userRows = await sql`SELECT id FROM user_settings WHERE user_id = ${userId}`
+    const resolvedUserId: number | null = userRows[0]?.id ?? null
+    if (!resolvedUserId) return null
+
+    const permissionRows = await sql`
+      SELECT vch_book_id FROM voucher_book_user_permissions_tbl
+      WHERE user_id = ${resolvedUserId} AND voucher_type_id = ${voucherTypeId} AND is_default = 1
+      LIMIT 1
+    `
+    const bookId = permissionRows[0]?.vch_book_id ?? null
+    if (!bookId) return null
+
+    const bookRows = await memoInTransaction(`voucher-book-name:${bookId}`, () => sql`SELECT name FROM voucher_books_tbl WHERE id = ${bookId}` as Promise<any[]>)
+    return bookRows[0]?.name ?? null
+  } catch (error) {
+    console.error("[v0] Error resolving default voucher book:", error)
+    return null
+  }
+}
+
+// التسلسل التالي ضمن orders.order_number لبادئة (بادئة الطلبية + رمز الدفتر) معيَّنة — نفس منطق
+// nextVoucherSequence بـapp/api/stock-vouchers/_lib.ts، لكن على جدول orders بدل voucher_header_tbl.
+async function nextOrderSequence(codePrefix: string, startNumber: number): Promise<number> {
+  const rows = await sql`
+    SELECT order_number FROM orders WHERE order_number LIKE ${codePrefix + "%"}
+  `
+  let maxNumber = 0
+  for (const row of rows as any[]) {
+    const suffix = String(row.order_number || "").slice(codePrefix.length)
+    const match = suffix.match(/^[A-Za-z]?([0-9]+)$/)
+    const value = Number(match?.[1] ?? suffix)
+    if (Number.isFinite(value) && value > maxNumber) maxNumber = value
+  }
+  return maxNumber >= startNumber ? maxNumber + 1 : startNumber
+}
+
+export async function getPrefixFromSettings(type: "customer" | "supplier" | "salesman" | "subscriber" | "item_group"): Promise<string> {
   try {
     if (!process.env.DATABASE_URL) {
-      return type === "customer" ? "C" : type === "supplier" ? "S" : "G"
+      return type === "customer"
+        ? "C"
+        : type === "supplier"
+          ? "S"
+          : type === "salesman"
+            ? "C"
+            : type === "subscriber"
+              ? "G"
+              : "G"
     }
 
     const result = await sql`
       SELECT id, value
       FROM system_settings
-      WHERE id IN (${["customer_prefix", "supplier_prefix", "item_group_prefix"]})
+      WHERE id IN (${["customer_prefix", "supplier_prefix", "salesman_prefix", "subscriber_prefix", "item_group_prefix"]})
       ORDER BY id ASC
     `
 
@@ -67,22 +121,34 @@ async function getPrefixFromSettings(type: "customer" | "supplier" | "item_group
         ? prefixMap.customer_prefix
         : type === "supplier"
           ? prefixMap.supplier_prefix
-          : prefixMap.item_group_prefix
+          : type === "salesman"
+            ? prefixMap.salesman_prefix ?? prefixMap.customer_prefix
+            : type === "subscriber"
+              ? prefixMap.subscriber_prefix ?? prefixMap.customer_prefix
+              : prefixMap.item_group_prefix
 
-    return String(prefix || (type === "customer" ? "C" : type === "supplier" ? "S" : "G"))
+    return String(prefix || (type === "customer" ? "C" : type === "supplier" ? "S" : type === "salesman" ? "C" : type === "subscriber" ? "G" : "G"))
   } catch (error) {
     console.error("[v0] Error fetching prefix from settings:", error)
-    return type === "customer" ? "C" : type === "supplier" ? "S" : "G"
+    return type === "customer" ? "C" : type === "supplier" ? "S" : type === "salesman" ? "C" : type === "subscriber" ? "G" : "G"
   }
 }
 
-export async function generateCustomerNumber(isSupplier: boolean = false): Promise<string> {
-  // Use different prefixes based on type
-  const typeKey = isSupplier ? "supplier" : "customer";
-  const prefix = await getPrefixFromSettings(typeKey);
+export async function generateCustomerNumber(entityTypeOrSupplier: boolean | number = false, isSalesman: boolean = false, isSubscriber: boolean = false): Promise<string> {
+  const entityType = typeof entityTypeOrSupplier === "number"
+    ? entityTypeOrSupplier
+    : isSubscriber
+      ? 4
+      : isSalesman
+        ? 3
+        : entityTypeOrSupplier
+          ? 2
+          : 1
 
-  // Table is still "customers", column is "customer_code"
-  return await getNextSequentialNumber(prefix, "customers", "customer_code",isSupplier ? 2:1);
+  const typeKey = entityType === 2 ? "supplier" : entityType === 3 ? "salesman" : entityType === 4 ? "subscriber" : "customer"
+  const prefix = await getPrefixFromSettings(typeKey)
+
+  return await getNextSequentialNumber(prefix, "customers", "customer_code", entityType)
 }
 
 
@@ -91,16 +157,24 @@ export async function generateSupplierNumber(): Promise<string> {
   return await getNextSequentialNumber(prefix, "suppliers", "supplier_code")
 }
 
-export async function generateSalesOrderNumber(
-  vchBook: string
-): Promise<string> {
-  return await getNextSequentialNumber("O"+vchBook, "orders", "order_number");
+// رقم الطلبية = بادئة الطلبية (إعدادات النظام) + رمز دفتر السندات + رقم تسلسلي مبطّن بأصفار،
+// بمجموع 10 خانات كحد أقصى (lib/voucher-code.ts buildVoucherCode) — نفس منطق ترقيم السندات
+// الموحَّد (سند قبض/صرف/قيد، سندات المخزون...) بدل الصيغة القديمة "O"/"T" + دفتر + 8 أرقام ثابتة
+// التي لم تكن لها أي علاقة ببادئة الطلبية الفعلية بإعدادات النظام.
+export async function generateSalesOrderNumber(vchBook: string, branchId?: number | null): Promise<string> {
+  const bookName = (await withBranchSymbol(String(vchBook || "").trim().toUpperCase(), branchId)) || ""
+  const { prefix, startNumber } = await getOrderNumberSettings(1)
+  const codePrefix = `${prefix}${bookName}`
+  const sequence = await nextOrderSequence(codePrefix, startNumber)
+  return buildVoucherCode(prefix, bookName, sequence)
 }
 
-export async function generatePurchaseOrderNumber(
-  vchBook: string
-): Promise<string> {
-  return await getNextSequentialNumber("T"+vchBook, "orders", "order_number");
+export async function generatePurchaseOrderNumber(vchBook?: string, branchId?: number | null): Promise<string> {
+  const bookName = (await withBranchSymbol(String(vchBook || "").trim().toUpperCase(), branchId)) || (await resolveBranchSymbol(branchId))
+  const { prefix, startNumber } = await getOrderNumberSettings(2)
+  const codePrefix = `${prefix}${bookName}`
+  const sequence = await nextOrderSequence(codePrefix, startNumber)
+  return buildVoucherCode(prefix, bookName, sequence)
 }
 
 
@@ -111,7 +185,7 @@ export async function generateItemGroupNumber(): Promise<string> {
 
 // Helper function to validate number format
 export function validateNumberFormat(number: string, prefix: string): boolean {
-  const regex = new RegExp(`^${prefix}\\d{7}$`)
+  const regex = new RegExp(`^${prefix}\\d{9}$`)
   return regex.test(number)
 }
 
@@ -133,10 +207,8 @@ async function getNextSequentialNumber(prefix: string, tableName: string, column
       result = await sql`
         SELECT customer_code as code 
         FROM customers 
-        WHERE customer_code LIKE ${prefix + "%"} 
-        AND TYPE= ${type}
-        ORDER BY customer_code DESC 
-        LIMIT 1
+        WHERE customer_code LIKE ${prefix + "%"}
+        ORDER BY customer_code ASC
       `
       console.log("[v0] Customers query completed")
     } else if (tableName === "suppliers") {
@@ -174,37 +246,45 @@ async function getNextSequentialNumber(prefix: string, tableName: string, column
         SELECT group_code as code 
         FROM item_groups 
         WHERE group_code LIKE ${prefix + "%"} 
-        ORDER BY group_code DESC 
-        LIMIT 1
+        ORDER BY group_code ASC
       `
     }
 
 
-    let nextNumber = 1
-    let nextCode = "0000001";
-    if(tableName === "orders")
-      nextCode = "000001";
-    if (result.length > 0 && result[0].code) {
-      // Extract the numeric part and increment
-      const currentCode = result[0].code as string
-      console.log(`[v0] Found existing code: ${currentCode}`)
-      let numericPart = currentCode.substring(1) // Remove prefix
-      if(tableName === "orders")
-        numericPart = currentCode.substring(2)
-      console.log(`[v0] Numeric part: ${numericPart}`)
-      nextCode = getNextCode(numericPart);
-
-      console.log(`[v0] Next number will be: ${nextNumber}`)
-    } else {
-      console.log("[v0] No existing codes found, starting with 1")
-      if (tableName === "sales_orders") {
-        nextNumber = 1
-      }
+    let nextCode = "000000001";
+    if (tableName === "orders") {
+      nextCode = "00000001";
     }
 
-    // Format as 7-digit padded number with prefix
-    //const paddedNumber = nextNumber.toString().padStart(7, "0")
-    const finalNumber = `${prefix}${nextCode}`
+    if (result.length > 0) {
+      const matchingCodes = result
+        .map((row: any) => String(row?.code || ""))
+        .filter((code: string) => code && code.startsWith(prefix))
+
+      if (matchingCodes.length > 0) {
+        const parsedNumbers = matchingCodes
+          .map((code: string) => {
+            const match = code.match(/^([^\d]*)(\d+)$/)
+            return match ? { code, value: Number(match[2]), width: match[2].length } : null
+          })
+          .filter(Boolean) as Array<{ code: string; value: number; width: number }>
+
+        if (parsedNumbers.length > 0) {
+          const maxEntry = parsedNumbers.reduce((best, current) => {
+            if (current.value > best.value) return current
+            if (current.value === best.value && current.width > best.width) return current
+            return best
+          }, parsedNumbers[0])
+
+          nextCode = adjustCodePlusOne(maxEntry.code, 10)
+          console.log(`[v0] Highest matching code: ${maxEntry.code}`)
+        }
+      }
+    } else {
+      console.log("[v0] No existing codes found, starting with 1")
+    }
+
+    const finalNumber = nextCode.startsWith(prefix) ? nextCode : `${prefix}${nextCode}`
     console.log(`[v0] Generated final number: ${finalNumber}`)
     console.log(`[v0] ========== END getNextSequentialNumber (SUCCESS) ==========`)
 
@@ -233,17 +313,22 @@ async function getNextSequentialNumber(prefix: string, tableName: string, column
 }
 
 function getNextCode(currentCode: string) {
-  // Separate prefix (non-digits) and numeric part
-  const match = currentCode.match(/^([^\d]*)(\d+)$/);
-  if (!match) return currentCode; // fallback if no number found
+  return currentCode
+}
 
-  const prefix = match[1];       // e.g., "RB"
-  const numberPart = match[2];   // e.g., "010"
+function adjustCodePlusOne(code: string, codeLen = 10): string {
+  if (!code || !code.trim()) return ""
 
-  // Increment number and preserve leading zeros
-  const nextNumber = (parseInt(numberPart, 10) + 1).toString().padStart(numberPart.length, "0");
+  const normalizedCode = String(code).trim().toUpperCase()
+  const match = normalizedCode.match(/^([^\d]*)(\d+)$/)
+  if (!match) return normalizedCode
 
-  return prefix + nextNumber;     // e.g., "RB011"
+  const prefix = match[1] || ""
+  const numericPart = match[2]
+  const nextValue = (Number(numericPart) + 1).toString()
+  const digitsLength = Math.max(1, codeLen - prefix.length)
+
+  return `${prefix}${nextValue.padStart(digitsLength, "0")}`.slice(0, codeLen)
 }
 
 

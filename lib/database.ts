@@ -1,43 +1,412 @@
-import { neon } from "@neondatabase/serverless"
-import { Pool } from "pg"
+import { neon, types as neonTypes } from "@neondatabase/serverless"
+import { Pool, types } from "pg"
+import { cookies, headers } from "next/headers"
+import { AsyncLocalStorage } from "node:async_hooks"
+import { withDatabaseName, getDatabaseNameFromUrl, isNeonDatabaseUrl } from "./db-url"
+import { getPool, isWorkersRuntime } from "./db-pool"
 
-let sql: any = null
+// node-postgres يحوّل أعمدة DATE افتراضياً إلى كائن JS Date مربوط بمنتصف الليل بالتوقيت المحلي
+// لخادم Node (لا UTC ولا أي علاقة بالقيمة المخزَّنة فعلياً) — فتاريخ مثل "1990-01-01" على خادم
+// بتوقيت +02:00 (Africa/Cairo هنا) يصبح "1989-12-31T22:00:00.000Z"، ويظهر بعدها كيوم سابق خاطئ في
+// أي مكان يعرضه (تأكَّد تجريبياً: القيمة المخزَّنة فعلياً في القاعدة صحيحة، والعطل فقط في تحويل
+// pg لها لجافاسكربت). التسجيل هنا (OID 1082 = date) يُعيدها كنص "YYYY-MM-DD" خام بلا تحويل، وهو
+// الإصلاح المعياري الموصى به لِهذه المشكلة المعروفة في node-postgres. لا يؤثر على مسار Neon
+// (neon() أدناه) لأنه لا يستخدم سجل الأنواع هذا التابع لحزمة pg.
+types.setTypeParser(1082, (value: string) => value)
+// Accounting dates and timestamps without a zone are local wall-clock values.
+// Serializing a JS Date here shifts midnight into the previous UTC day.
+types.setTypeParser(1114, (value: string) => value.replace(" ", "T"))
+neonTypes.setTypeParser(1082, (value: string) => value)
+neonTypes.setTypeParser(1114, (value: string) => value.replace(" ", "T"))
 
-try {
-  if (!process.env.DATABASE_URL) {
-    console.error("[v0] DATABASE_URL environment variable is not set")
-  } else {
-    const dbUrl = process.env.DATABASE_URL
-
-    if (dbUrl.includes("localhost") || dbUrl.includes("127.0.0.1")) {
-      console.log("[v0] Using local PostgreSQL with pg Pool")
-      const pool = new Pool({ connectionString: dbUrl })
-      sql = async (strings: TemplateStringsArray, ...values: any[]) => {
-        const client = await pool.connect()
-        try {
-          const query =
-            strings.reduce(
-              (prev, curr, i) =>
-                prev + curr + (i < values.length ? `$${i + 1}` : ""),
-              ""
-            )
-          const result = await client.query(query, values)
-          return result.rows
-        } finally {
-          client.release()
-        }
-      }
-    } else {
-      console.log("[v0] Using Neon serverless client")
-      sql = neon(dbUrl)
-    }
-
-    console.log("[v0] Database client initialized successfully")
-  }
-} catch (error) {
-  console.error("[v0] Failed to initialize DB client:", error)
-  sql = null
+// تنفيذ استعلام خام (نص + معاملات موضعية $1,$2...) على قاعدة بعينها — واجهة موحَّدة تُخفي الفرق بين
+// pg.Pool محلياً و.unsafe() الخاصة بعميل Neon، حتى يبقى منطق تركيب الاستعلامات (أدناه) مستقلاً تماماً
+// عن الخلفيّة الفعلية.
+interface TenantClient {
+  query: (text: string, params: any[]) => Promise<any[]>
 }
+
+// DATABASE_URL connects only to management and supplies the shared PostgreSQL server credentials.
+// Company database names always come from management.companies.db_name after user selection.
+const baseUrl = (process.env.DATABASE_URL || "").trim()
+const defaultDbName = baseUrl ? getDatabaseNameFromUrl(baseUrl) : ""
+
+function buildNoopClient(): TenantClient {
+  return { query: async () => [] }
+}
+
+function buildClientForUrl(url: string): TenantClient {
+  if (!url) return buildNoopClient()
+
+  if (!isNeonDatabaseUrl(url) || isWorkersRuntime) {
+    // Pool لكل طلب على Workers / لكل عملية على Node (lib/db-pool.ts)
+    return { query: async (text, params) => (await getPool(url).query(text, params)).rows }
+  }
+  const neonClient = neon(url) as any
+  return { query: (text, params) => neonClient.query(text, params) }
+}
+
+// عميل واحد لكل قاعدة (مُخزَّن مؤقتاً بالذاكرة) — لا نفتح اتصالاً/Pool جديداً بكل استعلام، ولا حتى
+// بكل طلب HTTP، بل مرة واحدة لكل db_name طيلة عمر العملية (Node process).
+const clientCache = new Map<string, TenantClient>()
+
+// دوال ensure* في المسارات تُنفّذ عشرات/مئات أوامر DDL "IF NOT EXISTS" مع كل طلب (ensureTables في سندات
+// القبض وحدها ~150 أمراً متتالياً). محلياً لا تُلاحَظ، لكن مع قاعدة بعيدة (Neon) كل أمر رحلة شبكة كاملة ←
+// ثوانٍ لكل طلب. الأمر الذي لا يُغيّر شيئاً عند تكراره يُنفَّذ مرة واحدة لكل قاعدة طيلة عمر العملية/الـ
+// isolate ثم يُتخطّى. لا يُخزَّن ما قد يكون لتكراره أثر (DROP/RENAME/ADD CONSTRAINT/عدة أوامر/معاملات).
+const completedDdl = new Set<string>()
+const inFlightDdl = new Map<string, Promise<any[]>>()
+
+function isRepeatSafeDdl(text: string, params: any[]): boolean {
+  if (params.length) return false
+  const statement = text.trim().replace(/;\s*$/, "").replace(/\s+/g, " ")
+  if (statement.includes(";")) return false
+  if (/^CREATE (UNIQUE )?INDEX (CONCURRENTLY )?IF NOT EXISTS /i.test(statement)) return true
+  if (/^CREATE (TABLE|SEQUENCE|SCHEMA|EXTENSION) IF NOT EXISTS /i.test(statement)) return true
+  if (/^ALTER TABLE /i.test(statement)) {
+    const adds = statement.match(/\bADD\b/gi)?.length ?? 0
+    const safeAdds = statement.match(/\bADD COLUMN IF NOT EXISTS\b/gi)?.length ?? 0
+    return adds > 0 && adds === safeAdds && !/\b(DROP|RENAME|ALTER COLUMN|OWNER|ENABLE|DISABLE)\b/i.test(statement)
+  }
+  return false
+}
+
+// "ALTER TABLE … ADD COLUMN IF NOT EXISTS" يطلب قفلاً حصرياً كاملاً على الجدول (ACCESS EXCLUSIVE) حتى لو كان
+// العمود موجوداً، و"CREATE INDEX IF NOT EXISTS" يقفل الجدول قبل أن يكتشف وجود الفهرس. فإن كانت معاملة أخرى
+// تستخدم الجدول (حفظ فاتورة كاشير يقرأ user_settings مثلاً) ينتظر الأمر انتهاءها، وكل استعلام لاحق على نفس
+// الجدول يصطف خلفه ← يتجمّد النظام كله (أو حفظ ينتظر نفسه إن صدر الأمر من اتصال آخر أثناء معاملة الحفظ).
+// لذلك يُفحص الفهرس/الجدول/الأعمدة في الكتالوج أولاً (بلا أقفال على الجدول) ولا يُنفَّذ الأمر إلا إن نقص شيء.
+const IDENT = String.raw`("(?:[^"]|"")+"|[A-Za-z_][\w$]*(?:\.(?:"(?:[^"]|"")+"|[A-Za-z_][\w$]*))?)`
+const unquoteIdent = (name: string) => (name.startsWith('"') ? name.slice(1, -1).replace(/""/g, '"') : name.toLowerCase())
+
+async function ddlAlreadySatisfied(client: TenantClient, text: string): Promise<boolean> {
+  const statement = text.trim().replace(/;\s*$/, "").replace(/\s+/g, " ")
+  const relation =
+    statement.match(new RegExp(String.raw`^CREATE (?:TABLE|SEQUENCE) IF NOT EXISTS ${IDENT}`, "i"))?.[1] ??
+    statement.match(new RegExp(String.raw`^CREATE (?:UNIQUE )?INDEX (?:CONCURRENTLY )?IF NOT EXISTS ${IDENT}`, "i"))?.[1]
+  if (relation) {
+    const [row] = await client.query(`SELECT to_regclass($1) IS NOT NULL AS ok`, [relation])
+    return Boolean(row?.ok)
+  }
+  const table = statement.match(new RegExp(String.raw`^ALTER TABLE (?:IF EXISTS )?(?:ONLY )?${IDENT}`, "i"))?.[1]
+  if (!table) return false
+  const columns = [...statement.matchAll(new RegExp(String.raw`\bADD COLUMN IF NOT EXISTS ${IDENT}`, "gi"))].map((match) => unquoteIdent(match[1]))
+  if (!columns.length) return false
+  const [row] = await client.query(
+    `SELECT COUNT(*)::int AS n FROM pg_attribute WHERE attrelid = to_regclass($1) AND attname = ANY($2::text[]) AND NOT attisdropped`,
+    [table, columns],
+  )
+  return Number(row?.n) === new Set(columns).size
+}
+
+/** يُنفّذ أمر DDL آمن التكرار فقط إن كان ينقصه شيء فعلاً (انظر ddlAlreadySatisfied). */
+async function runRepeatSafeDdl(client: TenantClient, text: string, params: any[]): Promise<any[]> {
+  if (await ddlAlreadySatisfied(client, text)) return []
+  return client.query(text, params)
+}
+
+function withDdlMemo(dbName: string, client: TenantClient): TenantClient {
+  return {
+    query: (text, params) => {
+      if (!isRepeatSafeDdl(text, params)) return client.query(text, params)
+      const key = `${dbName}\u0000${text}`
+      if (completedDdl.has(key)) return Promise.resolve([])
+      let pending = inFlightDdl.get(key)
+      if (!pending) {
+        pending = runRepeatSafeDdl(client, text, params).then(
+          (rows) => {
+            completedDdl.add(key)
+            inFlightDdl.delete(key)
+            return rows
+          },
+          (error) => {
+            inFlightDdl.delete(key)
+            throw error
+          },
+        )
+        inFlightDdl.set(key, pending)
+      }
+      return pending
+    },
+  }
+}
+
+function getClientForDbName(dbName: string): TenantClient {
+  let client = clientCache.get(dbName)
+  if (!client) {
+    const url = dbName === defaultDbName ? baseUrl : withDatabaseName(baseUrl, dbName)
+    client = withDdlMemo(dbName, buildClientForUrl(url))
+    clientCache.set(dbName, client)
+  }
+  return client
+}
+
+// وصول مباشر لقاعدة شركة بعينها بصرف النظر عن كوكي tenant_db للطلب الحالي — يُستخدَم فقط من كود
+// التزويد (lib/provisioning.ts) الذي يجب أن يكتب لقاعدة الشركة المُنشأة حديثاً تحديداً، لا لقاعدة
+// الشركة التي يتصفّحها المسؤول (Qais) حالياً أثناء الموافقة.
+export function getPoolForDb(dbName: string): TenantClient {
+  return getClientForDbName(dbName)
+}
+
+// pg.Pool حقيقي (وليس دالة tagged-template) للكود الذي يحتاج معاملات (BEGIN/COMMIT/ROLLBACK) عبر
+// عدة استعلامات على نفس الاتصال — مثل lib/orders.ts's createOrder. يعمل مع Neon أيضاً (بروتوكول
+// Postgres السلكي القياسي مدعوم من Neon، لا يقتصر الاتصال به على عميل neon() المبني على HTTP فقط).
+// مُخصَّص لقاعدة الشركة الحالية (نفس كوكي tenant_db)، ومُخزَّن مؤقتاً بالذاكرة لكل قاعدة كذلك.
+const transactionClientStorage = new AsyncLocalStorage<TenantClient>()
+
+export async function getTenantPool(): Promise<Pool> {
+  const dbName = await resolveCurrentDbName()
+  return getPool(dbName === defaultDbName ? baseUrl : withDatabaseName(baseUrl, dbName))
+}
+
+// ذاكرة قراءات لمدة معاملة واحدة: حفظ فاتورة الكاشير (معاملة واحدة) يمرّ بمسار الكاشير ثم مسار فاتورة المبيعات ثم
+// سند القبض، وكل منها يقرأ نفس الإعدادات والجلسة وفرع المستخدم واسم دفتر السندات... بشكل مستقل. داخل المعاملة
+// تُقرأ مرة واحدة؛ خارجها تُنفَّذ كالمعتاد دون أي ذاكرة.
+const transactionMemos = new WeakMap<TenantClient, Map<string, Promise<unknown>>>()
+
+export function memoInTransaction<T>(key: string, load: () => Promise<T>): Promise<T> {
+  const store = transactionClientStorage.getStore()
+  if (!store) return load()
+  let memo = transactionMemos.get(store)
+  if (!memo) {
+    memo = new Map()
+    transactionMemos.set(store, memo)
+  }
+  let pending = memo.get(key) as Promise<T> | undefined
+  if (!pending) {
+    // Promise حقيقي يُنفَّذ مرة واحدة: sql`...` يُعيد كائناً يُعيد تنفيذ الاستعلام مع كل await (then مخصص)،
+    // فتخزينه مباشرة كان يُعيد الاستعلام عند كل استخدام بدل قراءته مرة واحدة.
+    pending = Promise.resolve().then(load)
+    pending.catch(() => memo!.delete(key))
+    memo.set(key, pending)
+  }
+  return pending
+}
+
+/** True while inside withTenantTransaction (its work may still be rolled back). */
+export function inTenantTransaction(): boolean {
+  return Boolean(transactionClientStorage.getStore())
+}
+
+/** Run all sql tagged-template calls in fn on one PostgreSQL connection. */
+export async function withTenantTransaction<T>(fn: () => Promise<T>): Promise<T> {
+  if (transactionClientStorage.getStore()) return fn()
+
+  const dbName = await resolveCurrentDbName()
+  const pool = await getTenantPool()
+  const client = await pool.connect()
+  const rawTransactionClient: TenantClient = {
+    query: async (text, params) => (await client.query(text, params)).rows,
+  }
+  // نفس الفحص داخل المعاملة: أمر DDL لا يُغيّر شيئاً لا يُنفَّذ فلا يحجز قفلاً حصرياً حتى نهاية المعاملة.
+  // يُعلَّم الأمر "مكتملاً" (فلا يُعاد فحصه بالكتالوج مع كل حفظ لاحق) فقط بعد نجاح COMMIT — لو عُلِّم فوراً
+  // ثم أُلغيت المعاملة لبقي مُعلَّماً والجدول/العمود غير موجود فعلاً.
+  const ddlDoneOnCommit = new Set<string>()
+  const transactionClient: TenantClient = {
+    query: async (text, params) => {
+      if (!isRepeatSafeDdl(text, params)) return rawTransactionClient.query(text, params)
+      const key = `${dbName}\u0000${text}`
+      if (completedDdl.has(key)) return []
+      ddlDoneOnCommit.add(key)
+      if (await ddlAlreadySatisfied(rawTransactionClient, text)) return []
+      return rawTransactionClient.query(text, params)
+    },
+  }
+
+  try {
+    await client.query("BEGIN")
+    const result = await transactionClientStorage.run(transactionClient, fn)
+    await client.query("COMMIT")
+    for (const key of ddlDoneOnCommit) completedDdl.add(key)
+    return result
+  } catch (error) {
+    try {
+      await client.query("ROLLBACK")
+    } catch (rollbackError) {
+      console.error("[database] Transaction rollback failed:", rollbackError)
+    }
+    throw error
+  } finally {
+    client.release()
+  }
+}
+
+// قائمة أسماء قواعد الشركات المعتمَدة (status='approved') — مخزَّنة مؤقتاً دقيقة واحدة، حتى لا
+// نستعلم قاعدة الإدارة (management) في كل استعلام لكل طلب HTTP في التطبيق كله.
+let approvedDbNamesCache: { names: Set<string>; loadedAt: number } | null = null
+const APPROVED_NAMES_TTL_MS = 60_000
+const UNKNOWN_NAME_REFRESH_MS = 5_000
+let approvedRefreshPromise: Promise<void> | null = null
+let lastUnknownNameRefreshAt = 0
+
+// تحديث واحد مشترك لكل الطلبات المتزامنة (لوحة الرئيسية تطلق عشرات الطلبات معاً — كان كل منها يفتح
+// استعلاماً على قاعدة الإدارة لحظة انتهاء صلاحية الذاكرة المؤقتة). عند فشل التحديث تبقى القائمة السابقة
+// صالحة: سابقاً كان الفشل العابر يُرجع "غير معتمدة" فيُحوَّل الطلب بصمت للقاعدة الافتراضية حيث لا توجد
+// جلسة المستخدم ← "يجب تسجيل الدخول" بشكل متقطع.
+function refreshApprovedDbNames(): Promise<void> {
+  if (!approvedRefreshPromise) {
+    approvedRefreshPromise = (async () => {
+      try {
+        const managementSql = (await import("./management-db")).default
+        // تُستثنى الشركات المنتهي اشتراكها هنا أيضاً (لا فقط عند اختيار الشركة في select-company) —
+        // حاجز دفاعي إضافي يقطع كل استعلامات هذه القاعدة فوراً حتى لو بقيت كوكي tenant_db قديمة سارية
+        // من قبل تاريخ الانتهاء (المستخدم لم يُعِد اختيار الشركة، فلا مسار آخر كان سيرفض طلباته).
+        const rows = await managementSql`
+          SELECT db_name FROM companies
+          WHERE status = 'approved' AND db_name IS NOT NULL AND (expiry_date IS NULL OR expiry_date > CURRENT_TIMESTAMP)
+        `
+        approvedDbNamesCache = { names: new Set(rows.map((r: any) => r.db_name)), loadedAt: Date.now() }
+      } catch (error) {
+        console.error("[database] Failed to refresh approved tenant db list (keeping previous list):", error)
+      } finally {
+        approvedRefreshPromise = null
+      }
+    })()
+  }
+  return approvedRefreshPromise
+}
+
+async function isApprovedTenantDb(dbName: string): Promise<boolean> {
+  if (!approvedDbNamesCache) {
+    await refreshApprovedDbNames()
+  } else if (Date.now() - approvedDbNamesCache.loadedAt > APPROVED_NAMES_TTL_MS) {
+    // قائمة قديمة: تُستخدم فوراً ويُحدَّث في الخلفية (لا ينتظر أي طلب قاعدة الإدارة)
+    void refreshApprovedDbNames()
+  }
+  if (approvedDbNamesCache?.names.has(dbName)) return true
+  // اسم غير معروف — غالباً شركة اعتُمدت للتو (قبل التحديث الدوري): تحديث فوري واحد قبل الرفض
+  if (Date.now() - lastUnknownNameRefreshAt > UNKNOWN_NAME_REFRESH_MS) {
+    lastUnknownNameRefreshAt = Date.now()
+    await refreshApprovedDbNames()
+    return Boolean(approvedDbNamesCache?.names.has(dbName))
+  }
+  return false
+}
+
+// بوابة العملاء العامة (بلا جلسة مستخدم): الرابط يحمل اسم قاعدة الشركة — تُقبل فقط القاعدة الافتراضية أو شركة معتمدة
+export async function isPortalTenantDb(dbName: string): Promise<boolean> {
+  if (!/^[a-zA-Z0-9_]+$/.test(dbName)) return false
+  return dbName === defaultDbName || isApprovedTenantDb(dbName)
+}
+
+// نفس ترتيب resolveCurrentDbName لكن من قيم صريحة (middleware لا يملك headers()/cookies() الخاصة بـRoute Handlers):
+// null = التبويب حدّد شركة غير متاحة (منتهية/غير معتمدة) فيُرفض الطلب.
+export async function resolveTenantDbFromValues(headerDb: string | null, cookieDb: string | null): Promise<string | null> {
+  if (headerDb && /^[a-zA-Z0-9_]+$/.test(headerDb)) return (await isApprovedTenantDb(headerDb)) ? headerDb : null
+  if (cookieDb && /^[a-zA-Z0-9_]+$/.test(cookieDb) && (await isApprovedTenantDb(cookieDb))) return cookieDb
+  return defaultDbName
+}
+
+export class TenantUnavailableError extends Error {
+  constructor() {
+    super("الشركة المفتوحة في هذا التبويب غير متاحة حالياً (منتهية الاشتراك أو غير معتمدة) — أعد اختيار الشركة")
+    this.name = "TenantUnavailableError"
+  }
+}
+
+// تجاوز صريح (وليس عبر كوكي/هيدر) لقاعدة الشركة الحالية ضمن نطاق دالة واحدة — يُستخدَم من
+// /api/management/select-company لتنفيذ تسجيل الدخول التلقائي على قاعدة الشركة المُختارة للتو
+// ضمن نفس الطلب، دون اعتماد على قراءة الكوكي الذي ضُبط للتو (توقيت الكتابة/القراءة داخل نفس
+// الطلب في Route Handlers غير مضمون بنفس درجة تجاوز صريح كهذا).
+const tenantOverrideStorage = new AsyncLocalStorage<string>()
+
+export function withTenantDb<T>(dbName: string, fn: () => Promise<T>): Promise<T> {
+  return tenantOverrideStorage.run(dbName, fn)
+}
+
+// كوكي tenant_db يُضبط فقط بواسطة /api/management/select-company بعد التحقق من ملكية المستخدم
+// لتلك الشركة وأنها معتمَدة — بلا هذا الكوكي (أو حين لا يمكن قراءة الكوكيز أصلاً، كسكربتات CLI/
+// اختبارات مباشرة) يبقى التطبيق يعمل على القاعدة الافتراضية (DATABASE_URL) تماماً كسلوكه الحالي،
+// حفاظاً على التوافق التام مع الاستخدام أحادي الشركة القائم.
+//
+// ترتيب الأولوية: تجاوز صريح (withTenantDb) > هيدر x-tenant-db (لكل تبويب متصفح على حدة — يُضبط
+// من تصحيح fetch في auth-context.tsx حتى تتمكّن عدة تبويبات من فتح شركات مختلفة في آنٍ واحد رغم
+// أن الكوكي مشتركة بين كل تبويبات نفس المتصفح) > كوكي tenant_db (المسار الأقدم/تبويب واحد).
+export async function resolveCurrentDbName(): Promise<string> {
+  const override = tenantOverrideStorage.getStore()
+  if (override) return override
+
+  let headerDb: string | null = null
+  try {
+    const headerStore = await headers()
+    headerDb = headerStore.get("x-tenant-db")
+  } catch {
+    // headers() غير متاحة خارج سياق طلب فعلي.
+  }
+  if (headerDb && /^[a-zA-Z0-9_]+$/.test(headerDb)) {
+    if (await isApprovedTenantDb(headerDb)) return headerDb
+    // التبويب حدّد شركته صراحة لكنها غير متاحة (منتهية الاشتراك/غير معتمدة): يُرفض الطلب. سابقاً كان
+    // يُكمل بصمت على كوكي tenant_db (آخر شركة اختيرت في أي تبويب) أو القاعدة الافتراضية — فيقرأ/يكتب
+    // بيانات شركة أخرى (ظهور اسم شركة فارغ أو اسم شركة أخرى بإعدادات النظام، وحفظه فوقها).
+    throw new TenantUnavailableError()
+  }
+
+  try {
+    const cookieStore = await cookies()
+    const tenantDb = cookieStore.get("tenant_db")?.value
+    if (tenantDb && /^[a-zA-Z0-9_]+$/.test(tenantDb) && (await isApprovedTenantDb(tenantDb))) {
+      return tenantDb
+    }
+  } catch {
+    // cookies() غير متاحة خارج سياق طلب فعلي — استخدم القاعدة الافتراضية بصمت.
+  }
+  return defaultDbName
+}
+
+// يدعم الاستخدامين اللذين يعتمد عليهما الكود القائم بكل مكان في المشروع (على غرار عميل Neon
+// الحقيقي): استدعاء sql`...` مباشرة كنص قالب مع معاملات مربوطة $1,$2...، و sql.unsafe(text, params)
+// لاستعلام نصّي خام — وكلاهما قابل لأن يُضمَّن كـ"جزء" (fragment) داخل استدعاء آخر (مثل
+// `WHERE ${sql.unsafe(whereClause)}`) بدل أن يُعامَل كقيمة مربوطة عادية، لأسماء أعمدة/جداول ديناميكية
+// أو شروط WHERE مبنية سلفاً. بناء النص فوري ومتزامن (لا يحتاج معرفة "أي شركة" أصلاً)؛ التنفيذ الفعلي
+// وحده (عند await) يحلّ الشركة الحالية عبر كوكي tenant_db وينفّذ الاستعلام النهائي عليها.
+class SqlFragment {
+  constructor(
+    public text: string,
+    public params: any[],
+  ) {}
+}
+
+function isFragment(value: any): value is SqlFragment {
+  return value instanceof SqlFragment
+}
+
+function buildTaggedQuery(strings: readonly string[], values: any[]): { text: string; params: any[] } {
+  let text = strings[0] ?? ""
+  const params: any[] = []
+  for (let i = 0; i < values.length; i++) {
+    const value = values[i]
+    if (isFragment(value)) {
+      text += value.text
+      params.push(...value.params)
+    } else {
+      params.push(value)
+      text += `$${params.length}`
+    }
+    text += strings[i + 1] ?? ""
+  }
+  return { text, params }
+}
+
+function makeAwaitableFragment(text: string, params: any[]): any {
+  const fragment: any = new SqlFragment(text, params)
+  fragment.then = (resolve: any, reject: any) => {
+    ;(async () => {
+      const transactionClient = transactionClientStorage.getStore()
+      if (transactionClient) return transactionClient.query(text, params)
+      const dbName = await resolveCurrentDbName()
+      const client = getClientForDbName(dbName)
+      return client.query(text, params)
+    })().then(resolve, reject)
+  }
+  fragment.catch = (onReject: any) => Promise.resolve(fragment).catch(onReject)
+  return fragment
+}
+
+const sql: any = (strings: TemplateStringsArray, ...values: any[]) => {
+  const { text, params } = buildTaggedQuery(strings, values)
+  return makeAwaitableFragment(text, params)
+}
+sql.unsafe = (text: string, params: any[] = []) => makeAwaitableFragment(text, params)
 
 export default sql
 
@@ -149,7 +518,7 @@ export async function getProducts() {
     const result = await sql`
       SELECT p.*, ig.group_name as category_name, s.supplier_name as supplier_name
       FROM products p
-      LEFT JOIN item_groups ig ON p.category = ig.group_name
+      LEFT JOIN item_groups ig ON p.category_id = ig.id
       LEFT JOIN suppliers s ON p.product_code = s.supplier_code
       ORDER BY p.created_at DESC
     `
@@ -164,7 +533,7 @@ export async function createProduct(productData: any) {
   const query = `
     INSERT INTO products (
       product_code, product_name, description, barcode, original_number,
-      manufacturer_number, category, main_unit, secondary_unit,
+      manufacturer_number, category_id, main_unit, secondary_unit,
       conversion_factor, currency, last_purchase_price, 
       order_quantity, max_quantity, has_expiry, has_batch_number, 
       has_colors, status, product_type, entry_date, product_image
@@ -178,7 +547,7 @@ export async function createProduct(productData: any) {
     productData.barcode,
     productData.original_number,
     productData.manufacturer_number,
-    productData.category,
+    productData.category_id ?? productData.category ?? null,
     productData.main_unit,
     productData.secondary_unit,
     productData.conversion_factor || 1,
@@ -313,6 +682,9 @@ export async function getCurrenciesWithLatestRate() {
         c.id AS currency_id,
         c.currency_code,
         c.currency_name,
+        to_jsonb(c)->>'currency_symbol' AS currency_symbol,
+        to_jsonb(c)->>'sub_currency_name' AS sub_currency_name,
+        (to_jsonb(c)->>'fraction_digits')::int AS fraction_digits,
         c.is_active AS is_active,
         c.created_at AS currency_created,
         c.updated_at AS currency_updated,
@@ -320,7 +692,7 @@ export async function getCurrenciesWithLatestRate() {
         er.buy_rate,
         er.sell_rate,
         er.exchange_rate,
-        er.rate_date,
+        to_char(er.rate_date, 'YYYY-MM-DD') AS rate_date,
         er.is_active AS rate_active,
         er.created_at AS rate_created,
         er.updated_at AS rate_updated
@@ -341,6 +713,64 @@ export async function getCurrenciesWithLatestRate() {
     return { success: false, error: error.message }
   }
 }
+
+// أسعار الصرف "كما كانت" بتاريخ مُعيَّن — لكل عملة نشطة (عدا الرئيسية، الثابتة دوماً عند 1): إن وُجد
+// سعر مسجَّل لهذا التاريخ تحديداً يُعاد كما هو، وإلا يُنسَخ آخر سعر معروف قبل هذا التاريخ (أو 0 إن لم
+// يوجد أي سعر سابق إطلاقاً) ويُحفَظ تلقائياً كسعر هذا اليوم — حتى لا تُفتَح شاشة الإدخال بلا أي قيمة
+// افتراضية معقولة لأي عملة.
+export async function getOrCreateRatesForDate(date: string) {
+  try {
+    const rows = await sql`
+      SELECT
+        c.id AS currency_id, c.currency_code, c.currency_name, c.is_active,
+        er.id, er.buy_rate, er.sell_rate, er.exchange_rate, to_char(er.rate_date, 'YYYY-MM-DD') AS rate_date,
+        (er.entered_at IS NOT NULL) AS entered
+      FROM currency c
+      LEFT JOIN LATERAL (
+        SELECT *
+        FROM exchange_rates er
+        WHERE er.currency_id = c.id AND er.rate_date <= ${date}
+        ORDER BY er.rate_date DESC, er.created_at DESC
+        LIMIT 1
+      ) er ON true
+      ORDER BY c.id
+    `
+
+    const baseId = rows.length > 0 ? Math.min(...rows.map((r: any) => Number(r.currency_id))) : null
+
+    const result = []
+    for (const row of rows as any[]) {
+      const currencyId = Number(row.currency_id)
+
+      if (currencyId === baseId) {
+        result.push({ ...row, buy_rate: 1, sell_rate: 1, exchange_rate: 1, rate_date: date })
+        continue
+      }
+
+      const existingDate = row.rate_date ? String(row.rate_date).slice(0, 10) : null
+      if (existingDate === date || row.is_active === false) {
+        result.push(row)
+        continue
+      }
+
+      // بلا أي سعر سابق مسجَّل إطلاقاً لهذه العملة (لا صف أصلاً عبر LEFT JOIN LATERAL، فـrow.buy_rate
+      // وأخواتها null) — القيمة الافتراضية المعقولة هي 1 (لا فرق صرف بعد) وليس 0 (سعر صرف صفري
+      // يُفسَد به أي حساب لاحق يعتمد القسمة على سعر الصرف).
+      const carried = await sql`
+        INSERT INTO exchange_rates (currency_id, buy_rate, sell_rate, exchange_rate, is_active, rate_date)
+        VALUES (${currencyId}, ${row.buy_rate ?? 1}, ${row.sell_rate ?? 1}, ${row.exchange_rate ?? 1}, true, ${date})
+        RETURNING id, buy_rate, sell_rate, exchange_rate, rate_date
+      `
+      result.push({ ...row, ...carried[0], entered: false })
+    }
+
+    return { success: true, data: result }
+  } catch (error: any) {
+    console.error("Database query error:", error)
+    return { success: false, error: error.message }
+  }
+}
+
 export async function getExchangeRate(
   currency_id: number,
   rate_date?: string | null
@@ -376,61 +806,62 @@ export async function getExchangeRate(
     };
   }
 }
+// ملاحظة: كانت هذه الدالة تبني نصوص SQL عبر قوالب حرفية (template literals) وتُمرّرها لـ executeQuery
+// بلا معاملات مربوطة إطلاقاً — أي أن buy_rate/sell_rate/exchange_rate/currency_id (قيم من جسم طلب
+// المستخدم مباشرة) كانت تُدرَج خاماً داخل نص الاستعلام، وهي ثغرة حقن SQL كلاسيكية. استُبدلت هنا
+// بالقوالب الموسومة (tagged templates) لـ sql التي تربط كل قيمة كمعامل $n حقيقي.
 export async function updateExchangeRate(id: number, rates: any) {
-  if (rates.type === 1) {
-    const existing = await executeQuery(`
-  SELECT * FROM exchange_rates 
-  WHERE currency_id = ${rates.currency_id} 
-  AND rate_date = CURRENT_DATE
-  LIMIT 1
-`);
+  try {
+    if (rates.type === 1) {
+      // rate_date اختياري — بلا تمريره (الاستخدام القديم) يبقى السلوك كما كان دوماً (يوم اليوم)؛
+      // نافذة أسعار الصرف اليومية الجديدة تُمرِّره صراحةً لتحديث/إدخال سعر تاريخ مُختار بعينه.
+      const rateDate = rates.rate_date || new Date().toISOString().slice(0, 10)
+      const existing = await sql`
+        SELECT id FROM exchange_rates
+        WHERE currency_id = ${rates.currency_id}
+        AND rate_date = ${rateDate}
+        LIMIT 1
+      `
 
-    if (existing.success && existing.data.length > 0) {
-      const query = `
-    UPDATE exchange_rates
-    SET 
-      buy_rate = ${rates.buy_rate},
-      sell_rate = ${rates.sell_rate},
-      exchange_rate = ${rates.exchange_rate},
-      updated_at = CURRENT_TIMESTAMP
-    WHERE id = ${existing.data[0].id}
-    RETURNING *
-  `;
-      return executeQuery(query);
+      if (existing.length > 0) {
+        const result = await sql`
+          UPDATE exchange_rates
+          SET
+            buy_rate = ${rates.buy_rate},
+            sell_rate = ${rates.sell_rate},
+            exchange_rate = ${rates.exchange_rate},
+            updated_at = CURRENT_TIMESTAMP
+          WHERE id = ${existing[0].id}
+          RETURNING *
+        `
+        return { success: true, data: result }
+      } else {
+        const result = await sql`
+          INSERT INTO exchange_rates (
+            currency_id, buy_rate, sell_rate, exchange_rate, is_active, rate_date
+          ) VALUES (
+            ${rates.currency_id}, ${rates.buy_rate}, ${rates.sell_rate}, ${rates.exchange_rate},
+            ${rates.is_active ?? true}, ${rateDate}
+          ) RETURNING *
+        `
+        return { success: true, data: result }
+      }
     } else {
-      // insert new
-      const query = `
-    INSERT INTO exchange_rates (
-      currency_id,
-      buy_rate,
-      sell_rate,
-      exchange_rate,
-      is_active,
-      rate_date
-    ) VALUES (
-      ${rates.currency_id},
-      ${rates.buy_rate},
-      ${rates.sell_rate},
-      ${rates.exchange_rate},
-      ${rates.is_active ?? true},
-      CURRENT_DATE
-    ) RETURNING *
-  `;
-      return executeQuery(query);
-
+      const result = await sql`
+        UPDATE exchange_rates
+        SET
+          buy_rate = ${rates.buy_rate},
+          sell_rate = ${rates.sell_rate},
+          exchange_rate = ${rates.exchange_rate},
+          updated_at = CURRENT_TIMESTAMP
+        WHERE id = ${id}
+        RETURNING *
+      `
+      return { success: true, data: result }
     }
-  } else {
-    const query = `
-      UPDATE exchange_rates 
-      SET 
-        buy_rate = ${rates.buy_rate},
-        sell_rate = ${rates.sell_rate},
-        exchange_rate = ${rates.exchange_rate},
-        updated_at = CURRENT_TIMESTAMP
-      WHERE id = ${id}
-      RETURNING *
-    `;
-    return executeQuery(query);
+  } catch (error: any) {
+    console.error("Database query error:", error)
+    return { success: false, error: error.message }
   }
 }
 

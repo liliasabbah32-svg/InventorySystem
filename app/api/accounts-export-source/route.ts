@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server"
 import fs from "fs"
 import path from "path"
+import { authorizeFile } from "@/lib/file-permissions"
 
 const SOURCE_FILE_PATH = path.join(process.cwd(), "data", "accounts.json")
 
@@ -13,6 +14,8 @@ const typeMap: Record<string, string | null> = {
 
 export async function GET(request: NextRequest) {
   try {
+    const permission = await authorizeFile(request, "accounts", "create")
+    if (!permission.ok) return permission.response
     const typeId = request.nextUrl.searchParams.get("type") || "none"
     const selectedType = typeMap[typeId] ?? null
 
@@ -20,7 +23,9 @@ export async function GET(request: NextRequest) {
       return NextResponse.json({ error: "accounts.json not found" }, { status: 404 })
     }
 
-    const rawContent = fs.readFileSync(SOURCE_FILE_PATH, "utf8")
+    // ملف accounts.json يُحفَظ أحياناً بترميز UTF-8 مع BOM (مثلاً بعد تعديله من Excel/Windows)،
+    // وJSON.parse يرفض BOM في بداية النص فيفشل التحميل بالكامل — نزيله دفاعياً هنا.
+    const rawContent = fs.readFileSync(SOURCE_FILE_PATH, "utf8").replace(/^﻿/, "")
     const parsed = JSON.parse(rawContent)
     const rows = Array.isArray(parsed?.Sheet1) ? parsed.Sheet1 : []
 

@@ -1,7 +1,11 @@
 "use client"
 
-import { createContext, useContext, useState, useEffect, type ReactNode } from "react"
+import { createContext, useCallback, useContext, useState, useEffect, type ReactNode } from "react"
 import { ThemeLoader } from "@/components/theme-loader"
+import { beginSaving, isVoucherSaveRequest } from "@/lib/saving-lock"
+import { isEnglish, translatePayload, tr } from "@/lib/i18n"
+import { POS_RESUME_KEY, shouldResumePos } from "@/lib/pos-offline"
+import { rememberOfflinePassword } from "@/lib/offline-unlock"
 interface ModulePermissions {
   add?: boolean
   edit?: boolean
@@ -22,17 +26,25 @@ interface User {
   isActive: boolean
   lastLogin?: Date
   defaultScreen?: string
+  branchId?: number
+  branchName?: string
 }
 
 interface AuthContextType {
   user: User | null
   isAuthenticated: boolean
   isLoading: boolean
+  activeBranchId: number | null
+  activeBranchName: string | null
+  activeDepartment: string | null
+  permissionVersion: number
   login: (credentials: { username: string; password: string; rememberMe: boolean }) => Promise<void>
   logout: () => void
   hasPermission: (permission: string) => boolean
   refreshUser: () => Promise<void>
   getDefaultScreen: () => string
+  setActiveBranchContext: (branch: { id: number; name: string } | null) => void
+  setActiveDepartmentContext: (department: string | null) => void
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined)
@@ -49,12 +61,122 @@ interface AuthProviderProps {
   children: ReactNode
 }
 
+// يُثبَّت عند تحميل الوحدة في المتصفح (لا داخل useEffect فقط): تأثيرات المكوّنات الأبناء (كلوحة الرئيسية)
+// تعمل قبل تأثير AuthProvider نفسه، فكانت أول طلباتها تخرج بلا x-tenant-db وتعتمد على كوكي tenant_db
+// المشتركة بين التبويبات — إن كانت لشركة أخرى تُرفض بـ"يجب تسجيل الدخول" بشكل متقطع.
+function installTenantFetchPatch() {
+  // يُلحق كل طلب fetch من هذا التبويب بهيدر x-tenant-db (إن وُجدت شركة مُختارة له في
+  // sessionStorage، غير المشتركة بين تبويبات المتصفح) — هذا هو ما يجعل بالإمكان فتح شركات
+  // مختلفة في تبويبات مختلفة في آنٍ واحد رغم أن كوكي tenant_db وحدها مشتركة بينها جميعاً.
+  // localStorage احتياط فقط لتبويب جديد لم يختر شركته الخاصة بعد (انظر شرح tenant-client.ts).
+  // مُطبَّق مرة واحدة فقط عبر علم على window لتفادي لف fetch عدة مرات مع إعادة تركيب المكوّن.
+  if (typeof window !== "undefined" && !(window as any).__tenantFetchPatched) {
+    const originalFetch = window.fetch.bind(window)
+    window.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+      const tenantDb = sessionStorage.getItem("active_tenant_db") || localStorage.getItem("active_tenant_db")
+      // نفس فكرة x-tenant-db أعلاه بالضبط، لكن للفرع النشط (erp_active_branch: JSON {id,name} —
+      // انظر persistBranchContext أدناه) — يحتاجه الخادم لتصفية نتائج بحث الأصناف/العملاء/الحسابات
+      // حسب صلاحيات الفرع (سجل مقيَّد بفروع معيّنة لا يظهر إلا لمستخدم فرعه أحدها؛ سجل بلا أي فرع
+      // مُحدَّد يبقى ظاهراً للجميع). كان هذا السياق عميل-فقط سابقاً (React state) بلا أي وسيلة
+      // لوصوله للخادم إطلاقاً.
+      const branchRaw = sessionStorage.getItem("erp_active_branch") || localStorage.getItem("erp_active_branch")
+      let branchId: number | null = null
+      if (branchRaw) {
+        try {
+          branchId = JSON.parse(branchRaw)?.id ?? null
+        } catch {
+          branchId = null
+        }
+      }
+      // x-user-id: يتيح لمسارات API التحقق الفعلي من صلاحيات المستخدم عبر hasEffectivePermission/
+      // getGrantedBranchIds (lib/permissions.ts) بدل الاكتفاء بقراءة Util.checkUserAccess المخزَّنة
+      // بـlocalStorage بالواجهة فقط (لا يمنع طلب fetch فعلياً، فقط يُخفي العرض). نفس مصدر المعرِّف
+      // الذي تستخدمه Util.checkUserAccess نفسها (savedUser?.id ?? savedUser?.user_id) للاتساق.
+      let userId: string | null = null
+      const userRaw = sessionStorage.getItem("erp_user") || localStorage.getItem("erp_user")
+      if (userRaw) {
+        try {
+          const savedUser = JSON.parse(userRaw)
+          userId = savedUser?.id ?? savedUser?.user_id ?? null
+        } catch {
+          userId = null
+        }
+      }
+      if (tenantDb || branchId != null || userId) {
+        const headers = new Headers(init?.headers)
+        if (tenantDb) headers.set("x-tenant-db", tenantDb)
+        if (branchId != null) headers.set("x-branch-id", String(branchId))
+        if (userId) headers.set("x-user-id", userId)
+        init = { ...init, headers }
+      }
+      // حفظ/تعديل/حذف سند: يُقفل المنيو الجانبي حتى انتهاء الطلب (lib/saving-lock.ts)
+      if (isVoucherSaveRequest(input, init)) {
+        const endSaving = beginSaving()
+        return originalFetch(input, init).then(handleSessionEnded).then((response) => translateApiResponse(input, response)).finally(endSaving)
+      }
+      return originalFetch(input, init).then(handleSessionEnded).then((response) => translateApiResponse(input, response))
+    }) as typeof window.fetch
+    ;(window as any).__tenantFetchPatched = true
+  }
+}
+
+// جلسة أنهاها الخادم (middleware ⇐ x-session-ended): دخول نفس الحساب من جهاز آخر، أو إيقاف المستخدم.
+// يُمسح دخول هذا المتصفح ويُفتح «شركاتي» برسالة السبب — مرة واحدة حتى لو رُفضت طلبات كثيرة معاً.
+let sessionEndedHandled = false
+function handleSessionEnded(response: Response): Response {
+  const reason = response.status === 401 ? response.headers.get("x-session-ended") : null
+  if (!reason || sessionEndedHandled) return response
+  // صفحات الإدارة (شركاتي/الدخول) هي الوجهة نفسها: طلب شركة بالجلسة المنتهية من هناك كان يعيد التوجيه إليها بلا نهاية
+  if (window.location.pathname.startsWith("/management")) return response
+  sessionEndedHandled = true
+  try {
+    for (const key of ["erp_user", "erp_token", "erp_session", "active_tenant_db", "active_company_id"]) {
+      sessionStorage.removeItem(key)
+      localStorage.removeItem(key)
+    }
+  } catch {
+    // التخزين غير متاح: التحويل أدناه يكفي
+  }
+  window.location.replace(`/management/companies?reason=${encodeURIComponent(reason)}`)
+  return response
+}
+
+// الواجهة بالإنجليزية: رسائل الخادم (error/message...) عربية دائماً، تُترجم هنا بالقاموس قبل وصولها للشاشات.
+// الردود الكبيرة (تقارير، قوائم) تمر كما هي دون قراءة إضافية — رسائلها في الردود الصغيرة.
+const TRANSLATE_MAX_BYTES = 64 * 1024
+async function translateApiResponse(input: RequestInfo | URL, response: Response): Promise<Response> {
+  if (!isEnglish()) return response
+  const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url
+  if (!/^(\/api\/|https?:\/\/[^/]+\/api\/)/.test(url) || !(response.headers.get("content-type") || "").includes("application/json")) return response
+  const length = Number(response.headers.get("content-length") || 0)
+  if (length > TRANSLATE_MAX_BYTES) return response
+  try {
+    const text = await response.clone().text()
+    if (text.length > TRANSLATE_MAX_BYTES || !/[؀-ۿ]/.test(text)) return response
+    const translated = JSON.stringify(translatePayload(JSON.parse(text)))
+    if (translated === text) return response
+    const headers = new Headers(response.headers)
+    headers.delete("content-length")
+    return new Response(translated, { status: response.status, statusText: response.statusText, headers })
+  } catch {
+    return response
+  }
+}
+
+installTenantFetchPatch()
+
 export function AuthProvider({ children }: AuthProviderProps) {
   const [user, setUser] = useState<User | null>(null)
   const [isAuthenticated, setIsAuthenticated] = useState(false)
   const [isLoading, setIsLoading] = useState(true)
+  const [activeBranchId, setActiveBranchId] = useState<number | null>(null)
+  const [activeBranchName, setActiveBranchName] = useState<string | null>(null)
+  const [activeDepartment, setActiveDepartment] = useState<string | null>(null)
+  const [permissionVersion, setPermissionVersion] = useState(0)
 
   useEffect(() => {
+    installTenantFetchPatch()
+
     console.log("[v0] useEffect triggered!")
 
     if (typeof window === "undefined") {
@@ -67,10 +189,13 @@ export function AuthProvider({ children }: AuthProviderProps) {
       console.log("[v0] Starting auth initialization...")
 
       try {
-        const savedUser = localStorage.getItem("erp_user") || sessionStorage.getItem("erp_user")
-        const savedToken = localStorage.getItem("erp_token") || sessionStorage.getItem("erp_token")
-        let savedSession = localStorage.getItem("erp_session") || sessionStorage.getItem("erp_session")
-
+        // The current tab's session wins over a remembered session. Otherwise an
+        // old localStorage login can immediately replace a successful LAN login.
+        const savedUser = sessionStorage.getItem("erp_user") || localStorage.getItem("erp_user")
+        const savedToken = sessionStorage.getItem("erp_token") || localStorage.getItem("erp_token")
+        let savedSession = sessionStorage.getItem("erp_session") || localStorage.getItem("erp_session")
+        const savedBranch = sessionStorage.getItem("erp_active_branch") || localStorage.getItem("erp_active_branch")
+        const savedDepartment = sessionStorage.getItem("erp_active_department") || localStorage.getItem("erp_active_department")
 
         if (savedUser && savedToken) {
 
@@ -84,17 +209,56 @@ export function AuthProvider({ children }: AuthProviderProps) {
           const sessionData = JSON.parse(savedSession)
           const now = new Date().getTime()
 
-          // Check if session is still valid (24 hours)
-          if (now - sessionData.timestamp < 24 * 60 * 60 * 1000) {
+          // Check if session is still valid (24 hours) — الكاشير المتروك مفتوحاً (أُغلق المتصفح/الجهاز أثناءه، POS_RESUME_KEY)
+          // يُقبل حتى 7 أيام = مدة جلسة الخادم، فيعود للعمل بعد إعادة التشغيل حتى دون اتصال
+          const maxAgeMs = shouldResumePos() ? 7 * 24 * 60 * 60 * 1000 : 24 * 60 * 60 * 1000
+          if (now - sessionData.timestamp < maxAgeMs) {
             const userData = JSON.parse(savedUser)
+            sessionStorage.setItem("erp_user", savedUser)
+            sessionStorage.setItem("erp_token", savedToken)
+            sessionStorage.setItem("erp_session", JSON.stringify(sessionData))
+
+            let permissionBranchId: number | null = userData?.branchId ?? null
+            if (savedBranch) {
+              try {
+                const parsedBranch = JSON.parse(savedBranch)
+                setActiveBranchId(parsedBranch?.id ?? null)
+                setActiveBranchName(parsedBranch?.name ?? null)
+                permissionBranchId = parsedBranch?.id ?? permissionBranchId
+              } catch {
+                setActiveBranchId(null)
+                setActiveBranchName(null)
+              }
+            }
+
+            if (savedDepartment) {
+              setActiveDepartment(savedDepartment)
+            } else if (userData?.department) {
+              setActiveDepartment(userData.department)
+            }
+
+            // مزامنة تعريفات الصلاحيات الجديدة (أنواع/أدوار وظيفية) من قاعدة الإدارة لهذه الشركة —
+            // قبل تحديث صلاحيات المستخدم مباشرة (السطر التالي) حتى يظهر أي تعريف جديد أُضيف هناك
+            // فوراً بنفس هذا التحميل، بلا أي سكربت يدوي لكل شركة. فشلها لا يمنع تسجيل الدخول (best
+            // effort — انظر lib/permissions.ts).
+            window.setTimeout(() => {
+              // دون اتصال (كاشير يعمل بعد إعادة تشغيل الجهاز): لا مزامنة — تُعاد عند التحميل التالي متصلاً
+              if (!navigator.onLine) return
+              void fetch("/api/settings/permissions/sync", { method: "POST" })
+                .then((response) => {
+                  if (response.ok) return refreshUserPermissions(userData.id, permissionBranchId)
+                })
+                .catch((syncError) => console.error("[v0] Failed to sync permission definitions on init:", syncError))
+            }, 1500)
+
+            // إعادة جلب صلاحيات المستخدم من قاعدة الشركة الحالية دوماً عند تحميل الصفحة — لا يكفي
+            // الاكتفاء بما كان مخزَّناً في localStorage من آخر مرة، فهذا الاستدعاء نفسه هو ما يُشغَّل
+            // بعد التبديل بين الشركات (activateCompany يُتبَع دوماً بإعادة تحميل/تنقّل كامل يُعيد
+            // تركيب AuthProvider)، وبلا هذا التحديث تبقى صلاحيات الشركة السابقة معروضة خطأً هنا.
             setUser(userData)
             setIsAuthenticated(true)
-
-            // Refresh user permissions from database
-            try {
-
-            } catch (permError) {
-            }
+            void refreshUserPermissions(userData.id, permissionBranchId)
+              .catch((permError) => console.error("[v0] Failed to refresh permissions on init:", permError))
           } else {
             clearAuthData()
           }
@@ -112,18 +276,39 @@ export function AuthProvider({ children }: AuthProviderProps) {
     initializeAuth()
   }, [])
 
-  const clearAuthData = () => {
+  const clearAuthData = (currentUserId?: string) => {
     if (typeof window === "undefined") return
 
-    localStorage.removeItem("erp_user")
-    localStorage.removeItem("erp_token")
-    localStorage.removeItem("erp_session")
+    let shouldClearRemembered = !currentUserId
+    if (currentUserId) {
+      try {
+        const rememberedUser = JSON.parse(localStorage.getItem("erp_user") || "null")
+        const rememberedUserId = rememberedUser?.id ?? rememberedUser?.user_id
+        shouldClearRemembered = String(rememberedUserId) === String(currentUserId)
+      } catch {
+        shouldClearRemembered = false
+      }
+    }
+    if (shouldClearRemembered) {
+      localStorage.removeItem("erp_user")
+      localStorage.removeItem("erp_token")
+      localStorage.removeItem("erp_session")
+      // تسجيل الخروج ينهي استئناف الكاشير التلقائي أيضاً
+      localStorage.removeItem(POS_RESUME_KEY)
+    }
     sessionStorage.removeItem("erp_user")
     sessionStorage.removeItem("erp_token")
     sessionStorage.removeItem("erp_session")
+    sessionStorage.removeItem("erp_active_branch")
+    sessionStorage.removeItem("erp_active_department")
     sessionStorage.removeItem("default_screen_opened");
+    localStorage.removeItem("erp_active_branch")
+    localStorage.removeItem("erp_active_department")
     setUser(null)
     setIsAuthenticated(false)
+    setActiveBranchId(null)
+    setActiveBranchName(null)
+    setActiveDepartment(null)
   }
 
   interface AccessItem {
@@ -134,11 +319,42 @@ export function AuthProvider({ children }: AuthProviderProps) {
     is_granted?: boolean,
     access_id: number
   }
-  const refreshUserPermissions = async (userId: string) => {
+
+  const persistBranchContext = useCallback((branch: { id: number; name: string } | null, department: string | null) => {
+    if (typeof window === "undefined") return
+
+    if (branch) {
+      const branchValue = JSON.stringify(branch)
+      localStorage.setItem("erp_active_branch", branchValue)
+      sessionStorage.setItem("erp_active_branch", branchValue)
+    } else {
+      localStorage.removeItem("erp_active_branch")
+      sessionStorage.removeItem("erp_active_branch")
+    }
+
+    if (department) {
+      localStorage.setItem("erp_active_department", department)
+      sessionStorage.setItem("erp_active_department", department)
+    } else {
+      localStorage.removeItem("erp_active_department")
+      sessionStorage.removeItem("erp_active_department")
+    }
+  }, [])
+
+  const refreshUserPermissions = useCallback(async (userId: string, branchId?: number | null) => {
     try {
-      localStorage.removeItem('user_Access_List');
-      const res = await fetch(`/api/settings/user/user-access?userId=${userId}`)
+      let resolvedBranchId = Number(branchId) || null
+      if (!resolvedBranchId) {
+        const storedBranch = sessionStorage.getItem("erp_active_branch") || localStorage.getItem("erp_active_branch")
+        if (storedBranch) {
+          try { resolvedBranchId = Number(JSON.parse(storedBranch)?.id) || null } catch { resolvedBranchId = null }
+        }
+      }
+      const branchQuery = resolvedBranchId ? `&branchId=${resolvedBranchId}` : ""
+      const res = await fetch(`/api/settings/user/user-access?userId=${encodeURIComponent(userId)}${branchQuery}`)
+      if (!res.ok) throw new Error(`Failed to load permissions (${res.status})`)
       const data: AccessItem[] = await res.json()
+      if (!Array.isArray(data)) throw new Error("Invalid permissions response")
       console.log("[v0] Fetched user permissions:", data)
       const ua: Record<string, Record<string, boolean>> = {}
       data.forEach(item => {
@@ -146,11 +362,46 @@ export function AuthProvider({ children }: AuthProviderProps) {
         ua[key] = { view: !!item.is_granted } // extend for more actions if needed
       })
       localStorage.setItem('user_Access_List', JSON.stringify(data))
+      localStorage.setItem(`user_Access_List:${userId}:${resolvedBranchId || "default"}`, JSON.stringify(data))
+      setPermissionVersion((current) => current + 1)
+      window.dispatchEvent(new CustomEvent("user-permissions-updated", { detail: { userId, branchId: resolvedBranchId } }))
     } catch (error) {
-      console.error("[v0] Failed to refresh permissions:", error)
+      console.warn("[auth] Unable to refresh permissions; keeping the cached permissions", error)
       throw error
     }
-  }
+  }, [])
+
+  const currentUserId = user?.id
+  const setActiveBranchContext = useCallback((branch: { id: number; name: string } | null) => {
+    setActiveBranchId(branch?.id ?? null)
+    setActiveBranchName(branch?.name ?? null)
+    persistBranchContext(branch, activeDepartment)
+
+    if (branch && currentUserId) {
+      void refreshUserPermissions(currentUserId, branch.id)
+        .catch(() => {
+          // A temporary API/network failure must not keep selecting the same
+          // default branch and start another render/fetch cycle.
+        })
+    }
+  }, [activeDepartment, currentUserId, persistBranchContext, refreshUserPermissions])
+
+  const setActiveDepartmentContext = useCallback((department: string | null) => {
+    setActiveDepartment(department)
+    persistBranchContext(activeBranchId ? { id: activeBranchId, name: activeBranchName || "" } : null, department)
+  }, [activeBranchId, activeBranchName, persistBranchContext])
+
+  useEffect(() => {
+    const handlePermissionsChanged = (event: Event) => {
+      const detail = (event as CustomEvent<{ userId?: string; branchId?: number }>).detail
+      if (!user?.id || String(detail?.userId) !== String(user.id)) return
+      if (detail?.branchId && activeBranchId && Number(detail.branchId) !== Number(activeBranchId)) return
+      void refreshUserPermissions(user.id, detail?.branchId || activeBranchId)
+    }
+
+    window.addEventListener("user-permissions-changed", handlePermissionsChanged)
+    return () => window.removeEventListener("user-permissions-changed", handlePermissionsChanged)
+  }, [user?.id, activeBranchId])
 
 
 
@@ -164,30 +415,80 @@ export function AuthProvider({ children }: AuthProviderProps) {
         body: JSON.stringify(credentials),
       })
 
+      if (!response.ok) {
+        const errorText = await response.text().catch(() => "")
+        let message = errorText
+        try { message = JSON.parse(errorText)?.error || errorText } catch { /* نص غير JSON */ }
+        throw new Error(message || `Login failed (${response.status})`)
+      }
+
       const result = await response.json()
 
       if (result.success && result.user) {
-        setUser(result.user)
-        setIsAuthenticated(true)
-
+        void rememberOfflinePassword(credentials.username, credentials.password)
         const sessionData = {
           timestamp: new Date().getTime(),
           rememberMe: credentials.rememberMe,
         }
-
         try {
+          const serializedUser = JSON.stringify(result.user)
+          const serializedSession = JSON.stringify(sessionData)
+          sessionStorage.setItem("erp_user", serializedUser)
+          sessionStorage.setItem("erp_token", result.token)
+          sessionStorage.setItem("erp_session", serializedSession)
           if (credentials.rememberMe) {
-            localStorage.setItem("erp_user", JSON.stringify(result.user))
+            localStorage.setItem("erp_user", serializedUser)
             localStorage.setItem("erp_token", result.token)
-            localStorage.setItem("erp_session", JSON.stringify(sessionData))
+            localStorage.setItem("erp_session", serializedSession)
           } else {
-            sessionStorage.setItem("erp_user", JSON.stringify(result.user))
-            sessionStorage.setItem("erp_token", result.token)
-            sessionStorage.setItem("erp_session", JSON.stringify(sessionData))
+            try {
+              const rememberedUser = JSON.parse(localStorage.getItem("erp_user") || "null")
+              const rememberedUserId = rememberedUser?.id ?? rememberedUser?.user_id
+              if (String(rememberedUserId) === String(result.user.id)) {
+                localStorage.removeItem("erp_user")
+                localStorage.removeItem("erp_token")
+                localStorage.removeItem("erp_session")
+              }
+            } catch {
+              // Ignore malformed optional remembered-login data.
+            }
           }
         } catch (storageError) {
           console.error("[v0] Failed to save session data:", storageError)
         }
+
+        // تُجلَب الصلاحيات وتُخزَّن في user_Access_List قبل تعليم المستخدم كـ"مُوثَّق" — بلا هذا
+        // الترتيب يُعيد ProtectedRoute عرض الصفحة المحمية فوراً بمجرد setIsAuthenticated(true) بينما
+        // localStorage لا يزال فارغاً (تحديثه لاحق وغير متزامن معه)، فتفشل شاشات مثل "الاصناف" التي
+        // تتحقق من الصلاحية عند أول عرض (Util.checkUserAccess) رغم أن الصلاحية فعلاً ممنوحة في القاعدة.
+        let loginBranchId: number | null = null
+        try {
+          loginBranchId = Number(result.user.branchId) || null
+          if (loginBranchId) {
+            const loginBranch = { id: loginBranchId, name: result.user.branchName || "" }
+            setActiveBranchId(loginBranch.id)
+            setActiveBranchName(loginBranch.name)
+            persistBranchContext(loginBranch, result.user.department || null)
+          }
+          await refreshUserPermissions(result.user.id, loginBranchId)
+        } catch (permError) {
+          console.error("[v0] Failed to refresh permissions on login:", permError)
+        }
+
+        setUser(result.user)
+        setIsAuthenticated(true)
+        window.setTimeout(() => {
+          void fetch("/api/settings/permissions/sync", { method: "POST" })
+            .then((response) => {
+              if (response.ok) return refreshUserPermissions(result.user.id, loginBranchId)
+            })
+            .catch((syncError) => console.error("[v0] Failed to sync permission definitions on login:", syncError))
+        }, 1500)
+
+        if (result.user.department) {
+          setActiveDepartment(result.user.department)
+        }
+
         console.log("result result result login ", result)
         // Navigate to dashboard_layout after login
         /*setTimeout(() => {
@@ -197,9 +498,8 @@ export function AuthProvider({ children }: AuthProviderProps) {
           window.dispatchEvent(new CustomEvent("OPEN_DEFAULT_SCREEN"));
         }, 100);
         fetchSettings();
-        await refreshUserPermissions(result.user.id)
       } else {
-        throw new Error(result.error || "فشل في تسجيل الدخول")
+        throw new Error(result.error || tr("فشل في تسجيل الدخول"))
       }
     } catch (error) {
       console.error("[v0] Login error:", error)
@@ -209,12 +509,10 @@ export function AuthProvider({ children }: AuthProviderProps) {
 
   const fetchSettings = async () => {
     try {
-      const screenRes = await fetch(
-        `/api/voucher-settings?target=screen`
-      );
-      const printRes = await fetch(
-        `/api/voucher-settings?&target=print`
-      );
+      const [screenRes, printRes] = await Promise.all([
+        fetch(`/api/voucher-settings?target=screen`),
+        fetch(`/api/voucher-settings?target=print`),
+      ]);
 
       const screenData = await screenRes.json();
       const printData = await printRes.json();
@@ -236,9 +534,18 @@ export function AuthProvider({ children }: AuthProviderProps) {
     } catch (error) {
       console.error("Logout API error:", error)
     } finally {
-      clearAuthData()
+      clearAuthData(user?.id)
       if (typeof window !== "undefined") {
         sessionStorage.clear()
+        // active_tenant_db بـlocalStorage (قيمة افتراضية مشتركة لتبويبات جديدة — انظر tenant-
+        // client.ts) لا يمسحها sessionStorage.clear() أعلاه؛ بقاؤها يجعل ProtectedRoute يظن أن
+        // شركة ما زالت "مُختارة" فيومض بنموذج الدخول المحلي للحظة قبل أن يكتمل التحويل لتسجيل دخول
+        // الإدارة بالسطر التالي. مسحها هنا يمنع ذلك الوميض تماماً.
+        localStorage.removeItem("active_tenant_db")
+        localStorage.removeItem("active_company_id")
+        // تسجيل الخروج من تطبيق شركة بعينها يعود دوماً لتسجيل الدخول بنظام إدارة الشركات، لا لصفحة
+        // الدخول المحلية لهذا التطبيق — فهذا التطبيق أصبح يُفتح فقط عبر اختيار شركة من هناك.
+        window.location.href = "/management/login"
       }
     }
   }
@@ -247,7 +554,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
     if (!user) return
 
     try {
-      await refreshUserPermissions(user.id)
+      await refreshUserPermissions(user.id, activeBranchId)
     } catch (error) {
       console.error("Failed to refresh user:", error)
     }
@@ -256,8 +563,6 @@ export function AuthProvider({ children }: AuthProviderProps) {
   const hasPermission = (modulePermission: string): boolean => {
     if (!user || !user.permissions) return false;
 
-    // "جميع الصلاحيات" bypass
-    if (user.permissions["all"] || user.permissions["جميع الصلاحيات"]) return true;
 
     const [module, act] = modulePermission.split("-"); // e.g., "customers-view"
     const permModule = user.permissions[module];
@@ -290,11 +595,17 @@ export function AuthProvider({ children }: AuthProviderProps) {
         user,
         isAuthenticated,
         isLoading,
+        activeBranchId,
+        activeBranchName,
+        activeDepartment,
+        permissionVersion,
         login,
         logout,
         hasPermission,
         refreshUser,
         getDefaultScreen,
+        setActiveBranchContext,
+        setActiveDepartmentContext,
       }}
     >
       {isAuthenticated && user && <ThemeLoader userId={user.id} />}

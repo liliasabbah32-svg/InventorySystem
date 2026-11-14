@@ -1,9 +1,13 @@
+import { authorizeStoredProduct } from "@/app/api/inventory/products/_permissions"
+import { withDerivedUnitPrices } from "@/lib/unit-prices"
+import { projectFileLookup } from "@/lib/file-permissions"
 
 import { type NextRequest, NextResponse } from "next/server"
-import { Pool } from 'pg';
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-});
+import { getTenantPool } from "@/lib/database"
+import { pickRoleUnit, type UnitRole } from "@/lib/product-unit-roles"
+import { ensureProductUnitRoleColumns } from "@/lib/product-unit-roles-schema"
+
+const searchSchemaByPool = new WeakMap<object, Promise<boolean>>()
 
 async function ensureProductCostCentersTable(client: any) {
   await client.query(`
@@ -41,13 +45,36 @@ export async function GET(request: NextRequest) {
     const { searchParams } = new URL(request.url);
     const query = searchParams.get("query") || searchParams.get("code");
     const priceCategoryId = Number(searchParams.get("priceCategoryId") || 1);
+    const unitRoleParam = searchParams.get("unitRole");
+    const unitRole: UnitRole | null = unitRoleParam === "purchase" || unitRoleParam === "stock_count" || unitRoleParam === "report" ? unitRoleParam : null;
+    // numberType=factory|original: عمود الرقم في السند يعرض/يبحث برقم المصنع (product_numbers.type 2) أو الأصلي (1)
+    const numberTypeParam = searchParams.get("numberType");
+    const numberType = numberTypeParam === "factory" ? 2 : numberTypeParam === "original" ? 1 : 0;
+    let matchedNumber = "";
+    await ensureProductUnitRoleColumns();
     if (!query) {
       return NextResponse.json({ error: "Query is required" }, { status: 400 });
     }
 
+    // كانت متصلة مباشرة بـprocess.env.DATABASE_URL (قاعدة مرجعية) بدل قاعدة الشركة الحالية —
+    // فيفشل بحث الصنف دوماً على أي قاعدة شركة فعلية. انظر نفس الشرح في ProductsNavigations/
+    // [navigationType]/route.ts.
+    const pool = await getTenantPool();
     const client = await pool.connect();
-    await ensureProductCostCentersTable(client)
-    const canJoinDefaultStore = await hasDefaultStoreColumn(client)
+    let schemaReady = searchSchemaByPool.get(pool as object)
+    if (!schemaReady) {
+      schemaReady = (async () => {
+        await client.query("ALTER TABLE products ADD COLUMN IF NOT EXISTS transaction_notes VARCHAR(100)")
+        await ensureProductCostCentersTable(client)
+        // These lookups normalize stored strings with TRIM; ordinary indexes on
+        // the raw columns cannot accelerate those equality checks.
+        await client.query("CREATE INDEX IF NOT EXISTS idx_product_unit_barcodes_trimmed_barcode ON product_unit_barcodes (TRIM(barcode))")
+        return hasDefaultStoreColumn(client)
+      })()
+      searchSchemaByPool.set(pool as object, schemaReady)
+      void schemaReady.catch(() => searchSchemaByPool.delete(pool as object))
+    }
+    const canJoinDefaultStore = await schemaReady
 
     // 1️⃣ Get product by product_code OR first barcode (from product_unit_barcodes)
     const productQuery = canJoinDefaultStore
@@ -55,25 +82,48 @@ export async function GET(request: NextRequest) {
       SELECT p.*, COALESCE(w.warehouse_name, 'بلا تحديد') AS default_store_name
       FROM products p
       LEFT JOIN warehouses w ON w.id = p.default_store
-      WHERE p.product_code = $1 
+      WHERE p.product_code = TRIM($1::text)
       LIMIT 1
     `
       : `
       SELECT p.*, 'بلا تحديد' AS default_store_name
       FROM products p
-      WHERE p.product_code = $1 
+      WHERE p.product_code = TRIM($1::text)
       LIMIT 1
     `;
     let productResult = await client.query(productQuery, [query]);
 
+    // Product codes have a regular btree index. Keep a trimmed fallback for
+    // older records that were stored with surrounding whitespace, so normal
+    // scans stay index-backed without changing legacy matching behavior.
+    if (!productResult.rows.length) {
+      const legacyProductQuery = canJoinDefaultStore
+        ? `SELECT p.*, COALESCE(w.warehouse_name, 'بلا تحديد') AS default_store_name
+           FROM products p
+           LEFT JOIN warehouses w ON w.id = p.default_store
+           WHERE TRIM(p.product_code) = TRIM($1::text)
+           LIMIT 1`
+        : `SELECT p.*, 'بلا تحديد' AS default_store_name
+           FROM products p
+           WHERE TRIM(p.product_code) = TRIM($1::text)
+           LIMIT 1`
+      productResult = await client.query(legacyProductQuery, [query])
+    }
+
     if (!productResult.rows.length) {
 
-      const productQuery = `
+      // عمود الرقم في السند = رقم المصنع/الرقم الأصلي (إعدادات السندات) ⇐ البحث في أرقام الصنف بدل الباركود
+      const productQuery = numberType
+        ? `SELECT product_id FROM product_numbers WHERE type = $2 AND TRIM(number) = TRIM($1::text) ORDER BY id LIMIT 1`
+        : `
       SELECT p.* FROM product_unit_barcodes p
-      WHERE p.barcode = $1
+      WHERE TRIM(p.barcode) = TRIM($1::text)
       LIMIT 1
     `;
-      const barcodeResult = await client.query(productQuery, [query]);
+      const barcodeResult = numberType
+        ? await client.query(productQuery, [query, numberType]).catch(() => ({ rows: [] as any[] }))
+        : await client.query(productQuery, [query]);
+      if (numberType && barcodeResult.rows.length) matchedNumber = String(query).trim();
 
       if (!barcodeResult.rows.length) {
         client.release();
@@ -93,11 +143,14 @@ export async function GET(request: NextRequest) {
         LIMIT 1`}
       `;
         productResult = await client.query(productQuery, [barcodeResult.rows[0].product_id]);
-        is_barcode = true;
+        // بالرقم (مصنع/أصلي): الوحدة الافتراضية كالبحث بالكود — الرقم لا يحدد وحدة
+        is_barcode = !numberType;
       }
     }
 
     const product = productResult.rows[0];
+    const permission = await authorizeStoredProduct(request, product?.id, "lookup")
+    if (!permission.ok) { client.release(); return permission.response }
 
     if (product.deleted) {
       client.release();
@@ -106,29 +159,36 @@ export async function GET(request: NextRequest) {
 
     // 2️⃣ Get units for this product
     const unitsQuery = `
-  SELECT u.id AS unit_id, u.unit_name, pu.to_main_qnty,
+  SELECT u.id AS unit_id, u.unit_name, pu.to_main_qnty, pu.is_stock_count_unit, pu.is_purchase_unit, pu.is_report_unit,
          pub.barcode,
-         COALESCE(pp.price, 0) AS unit_price
+         COALESCE(pp_selected.price, pp_fallback.price, 0) AS unit_price
   FROM product_units pu
   LEFT JOIN units u ON pu.unit_id = u.id
   LEFT JOIN product_unit_barcodes pub
     ON pu.product_id = pub.product_id AND pu.id = pub.unit_id
-  LEFT JOIN product_prices pp
-    ON pu.product_id = pp.product_id
-    AND pu.unit_id = pp.unit_id
-    AND pp.price_category_id = $2
+  LEFT JOIN product_prices pp_selected
+    ON pu.product_id = pp_selected.product_id
+    AND pu.unit_id = pp_selected.unit_id
+    AND pp_selected.price_category_id = $2
+  LEFT JOIN product_prices pp_fallback
+    ON pu.product_id = pp_fallback.product_id
+    AND pu.unit_id = pp_fallback.unit_id
+    AND pp_fallback.price_category_id = 1
   WHERE pu.product_id = $1
   ORDER BY pu.id
 `;
     const unitsResult = await client.query(unitsQuery, [product.id, priceCategoryId]);
-    product.units = unitsResult.rows;
+    // وحدة بلا سعر ⇐ سعر الوحدة الأولى × العلاقة بالرئيسية (lib/unit-prices.ts)
+    product.units = withDerivedUnitPrices(unitsResult.rows.map((row: any) => ({ ...row, unit_price: Number(row.unit_price) || 0 })), "unit_price", "to_main_qnty");
     product.price = 0;
     if (!is_barcode) {
-      product.unit_id = product.units[0].unit_id;
-      product.unit_name = product.units[0].unit_name;
-      product.price = product.units[0].unit_price;
-      product.to_main_unit_qty = product.units[0].to_main_qty?? 1
-      product.barcode = product.units[0].barcode
+      // ?unitRole=purchase|stock_count|report: الوحدة المؤشَّرة لهذا الدور في تعريف الصنف (وإلا أول وحدة)
+      const defaultUnit = pickRoleUnit(product.units, unitRole) ?? product.units[0];
+      product.unit_id = defaultUnit.unit_id;
+      product.unit_name = defaultUnit.unit_name;
+      product.price = defaultUnit.unit_price;
+      product.to_main_unit_qty = Number(defaultUnit.to_main_qnty) || 1
+      product.barcode = defaultUnit.barcode
     }
     else {
       const barcodeUnit = product.units.find(
@@ -139,11 +199,20 @@ export async function GET(request: NextRequest) {
         product.unit_id = barcodeUnit.unit_id;
         product.unit_name = barcodeUnit.unit_name;
         product.price = barcodeUnit.unit_price ?? 0;
-        if(product.price <= 0)
-          product.price = product.units[0].unit_price * barcodeUnit.to_main_qnty || 0;
         product.to_main_unit_qty = barcodeUnit.to_main_qnty?? 1
         product.barcode = query
       }
+    }
+    // عمود الرقم = رقم المصنع/الأصلي: يُعرض الرقم المطابق (بحث بالرقم) أو أول رقم من هذا النوع (بحث بالكود) بدل الباركود،
+    // وعلى كل وحدات الصنف حتى لا يستبدله تغيير الوحدة بباركود الوحدة
+    if (numberType) {
+      const number = matchedNumber || String((await client.query(
+        `SELECT TRIM(number) AS number FROM product_numbers WHERE product_id = $1 AND type = $2 AND TRIM(COALESCE(number, '')) <> '' ORDER BY id LIMIT 1`,
+        [product.id, numberType],
+      ).catch(() => ({ rows: [] as any[] }))).rows[0]?.number || "")
+      product.barcode = number
+      product.first_barcode = number
+      product.units = product.units.map((unit: any) => ({ ...unit, barcode: number }))
     }
     const costCentersResult = await client.query(
       `SELECT id, product_id, cost_center_type_id, required_in_transactions, default_cost_center_id
@@ -157,7 +226,7 @@ export async function GET(request: NextRequest) {
     product.store_id = product.default_store ?? null;
     product.store_name = product.default_store_name || "بلا تحديد";
     client.release();
-    return NextResponse.json(product);
+    return NextResponse.json(permission.lookupOnly ? projectFileLookup(Number(product.type) === 2 ? "services" : "items", [product])[0] : product);
 
   } catch (error) {
     console.error("Error searching product:", error);

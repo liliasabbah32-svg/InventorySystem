@@ -1,0 +1,148 @@
+"use client"
+
+import { tr, appDir } from "@/lib/i18n"
+import { useEffect, useRef, useState } from "react"
+import { Columns2 } from "lucide-react"
+import { Button } from "@/components/ui/button"
+import { Label } from "@/components/ui/label"
+import { Switch } from "@/components/ui/switch"
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
+import { useWorkspace } from "@/contexts/workspace-context"
+
+interface DisplayModeMenuProps {
+  userId?: string
+}
+
+// يقرأ/يحفظ تفضيل "الشاشة المقسمة"/"التبويبات" الشخصي — بنفس عمود dashboard_layout المُستخدَم
+// أصلاً لـdefault_screen (انظر components/settings/user-settings.tsx)، مع تحميل طازج من قاعدة
+// البيانات عند الإقلاع (لا الاعتماد على erp_user المخزَّن محلياً، الذي لا يتحدَّث بعد أي PUT هنا —
+// نفس نمط components/theme-loader.tsx لـtheme_preference).
+export function DisplayModeMenu({ userId }: DisplayModeMenuProps) {
+  const { splitEnabled, tabsEnabled, fullscreenEnabled, setSplitEnabled, setTabsEnabled, setFullscreenEnabled, hydrateModes } = useWorkspace()
+  const dashboardLayoutRef = useRef<Record<string, any>>({})
+  const [saving, setSaving] = useState(false)
+
+  useEffect(() => {
+    if (!userId) return
+    let cancelled = false
+
+    fetch(`/api/settings/user?user_id=${userId}`)
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => {
+        if (cancelled || !data) return
+        const dashboardLayout = data.dashboard_layout || {}
+        dashboardLayoutRef.current = dashboardLayout
+        const displayMode = dashboardLayout.display_mode || { split: false, tabs: false }
+        hydrateModes({
+          split: !!displayMode.split,
+          tabs: !!displayMode.tabs,
+          fullscreen: !!dashboardLayout.open_screens_fullscreen,
+        })
+      })
+      .catch(() => {
+        // تجاهل — يبقى الوضع الافتراضي (بلا شاشة مقسمة/تبويبات) كما لو لم يُحفَظ تفضيل من قبل
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [userId, hydrateModes])
+
+  const persist = async (
+    next: { split: boolean; tabs: boolean },
+    fullscreen = fullscreenEnabled,
+  ) => {
+    if (!userId) return
+    const nextDashboardLayout = {
+      ...dashboardLayoutRef.current,
+      display_mode: next,
+      open_screens_fullscreen: fullscreen,
+    }
+    dashboardLayoutRef.current = nextDashboardLayout
+    setSaving(true)
+    try {
+      await fetch("/api/settings/user", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ user_id: userId, dashboard_layout: nextDashboardLayout }),
+      })
+      // يُبقي erp_user المخزَّن محلياً متزامناً فوراً بلا انتظار إعادة تسجيل دخول — أياً كانت مساحة
+      // التخزين التي استُخدمت عند الدخول (تذكرني مفعّل أم لا، انظر auth-context.tsx login()).
+      for (const storage of [localStorage, sessionStorage]) {
+        const raw = storage.getItem("erp_user")
+        if (!raw) continue
+        try {
+          const parsed = JSON.parse(raw)
+          storage.setItem("erp_user", JSON.stringify({ ...parsed, dashboard_layout: nextDashboardLayout }))
+        } catch {
+          // تجاهل — قيمة مخزَّنة غير متوقعة، لا تستحق فشل الحفظ الأساسي
+        }
+      }
+      window.dispatchEvent(new CustomEvent("user-fullscreen-setting-changed", { detail: fullscreen }))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <Popover>
+      <PopoverTrigger asChild>
+        <Button variant="ghost" size="icon" className="h-8 w-8 rounded-full text-slate-500 hover:bg-white hover:text-emerald-600 hover:shadow-sm dark:text-slate-400 dark:hover:bg-white/10 dark:hover:text-emerald-300" title={tr("طريقة عرض الصفحات")}>
+          <Columns2 className="h-[18px] w-[18px]" />
+        </Button>
+      </PopoverTrigger>
+      <PopoverContent align="end" className="w-72" dir={appDir()}>
+        <div className="space-y-4">
+          <div className="flex items-center justify-between gap-4">
+            <div>
+              <Label htmlFor="split-screen-toggle">{tr("الشاشة المقسمة")}</Label>
+              <p className="text-xs text-muted-foreground">{tr("تقسيم منطقة العرض لجزأين مستقلَّين")}</p>
+            </div>
+            <Switch
+              id="split-screen-toggle"
+              checked={splitEnabled}
+              disabled={saving}
+              onCheckedChange={(checked) => {
+                setSplitEnabled(checked)
+                void persist({ split: checked, tabs: tabsEnabled })
+              }}
+            />
+          </div>
+          <div className="flex items-center justify-between gap-4">
+            <div>
+              <Label htmlFor="tabs-toggle">{tr("فتح الصفحات كتبويبات")}</Label>
+              <p className="text-xs text-muted-foreground">{tr("إبقاء الصفحات المفتوحة كتبويبات بدل استبدالها")}</p>
+            </div>
+            <Switch
+              id="tabs-toggle"
+              checked={tabsEnabled}
+              disabled={saving}
+              onCheckedChange={(checked) => {
+                setTabsEnabled(checked)
+                void persist({ split: splitEnabled, tabs: checked })
+              }}
+            />
+          </div>
+          <div className="flex items-center justify-between gap-4">
+            <div>
+              <Label htmlFor="fullscreen-screens-toggle">{tr("فتح الشاشات بصورة كاملة")}</Label>
+              <p className="text-xs text-muted-foreground">{tr("فتح شاشات السندات والحسابات والعملاء والأصناف والخدمات كصفحة كاملة")}</p>
+            </div>
+            <Switch
+              id="fullscreen-screens-toggle"
+              checked={fullscreenEnabled}
+              disabled={saving}
+              onCheckedChange={(checked) => {
+                setFullscreenEnabled(checked)
+                void persist(
+                  { split: splitEnabled, tabs: tabsEnabled },
+                  checked,
+                )
+              }}
+            />
+          </div>
+        </div>
+      </PopoverContent>
+    </Popover>
+  )
+}

@@ -1,0 +1,886 @@
+"use client"
+
+import { tr, appDir } from "@/lib/i18n"
+import { useVoucherDeepLink } from "@/hooks/use-voucher-deep-link"
+import { VoucherListHero, VoucherStats } from "@/components/common/voucher-list-shell"
+import { FileMinus } from "lucide-react"
+import { creditNoteSnapshot } from "@/lib/credit-note-changes"
+
+import { useEffect, useMemo, useRef, useState } from "react"
+import { Button } from "@/components/ui/button"
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
+import { Input } from "@/components/ui/input"
+import { Label } from "@/components/ui/label"
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
+import { useAuth } from "@/components/auth/auth-context"
+import UnifiedCreditNote, { type VoucherRecord } from "./unified-credit-note"
+import { Edit, Plus, Search } from "lucide-react"
+import { VoucherListTable, VoucherSearchButton, searchOnEnter, useVoucherListSearch } from "@/components/common/voucher-list-table"
+import type { PostVoucherAction } from "@/components/common/post-voucher-dialog"
+import VoucherPrintLayout, { type VoucherPrintData } from "@/components/common/voucher-print-layout"
+import { logVoucherAudit } from "@/lib/audit-client"
+import { useAnnounceTransactionSaved } from "@/lib/transaction-success"
+
+interface CurrencyOption {
+  currency_id?: number
+  id?: number
+  currency_name?: string
+  currency_code?: string
+}
+
+interface LookupOption {
+  id: number
+  name: string
+}
+
+// vch_type per credit-notes/_lib.ts: 10 = اشعار دائن, 11 = اشعار مدين.
+interface CreditNoteProps {
+  voucherType: 6 | 7
+}
+
+const TYPE_LABELS: Record<6 | 7, { title: string; listTitle: string; addLabel: string }> = {
+  6: { title: tr("اشعار دائن"), listTitle: tr("الاشعارات الدائنة"), addLabel: tr("إضافة اشعار دائن") },
+  7: { title: tr("اشعار مدين"), listTitle: tr("الاشعارات المدينة"), addLabel: tr("إضافة اشعار مدين") },
+}
+
+const buildInitialForm = (voucherType: 6 | 7): VoucherRecord => ({
+  id: 0,
+  vch_type: voucherType,
+  vch_code: "",
+  vch_date: new Date().toISOString().slice(0, 10),
+  vch_book_id: null,
+  branch_id: null,
+  currency_id: null,
+  rate: 1,
+  account_id: null,
+  customer_name: "",
+  account_cost_centers: [],
+  debit_account_id: null,
+  debit_account_cost_centers: [],
+  vat_account_id: null,
+  vat_account_cost_centers: [],
+  amount_journal_type_8: null,
+  vat_percent: 0,
+  vat: null,
+  amount: 0,
+  payment_classification_id: null,
+  salesman_id: null,
+  manual_voucher: "",
+  manual_date: new Date().toISOString().slice(0, 10),
+  note: "",
+  status: 1,
+  is_printed: 0,
+})
+
+const normalizeVoucher = (record: Partial<VoucherRecord>, voucherType: 6 | 7): VoucherRecord => ({
+  ...buildInitialForm(voucherType),
+  ...record,
+  manual_date: record.manual_date || record.vch_date || buildInitialForm(voucherType).manual_date,
+})
+
+export default function CreditNote({ voucherType }: CreditNoteProps) {
+  const labels = TYPE_LABELS[voucherType]
+  const { user, activeBranchId } = useAuth()
+
+  const [vouchers, setVouchers] = useState<VoucherRecord[]>([])
+  const [currencies, setCurrencies] = useState<CurrencyOption[]>([])
+  const [voucherBooks, setVoucherBooks] = useState<LookupOption[]>([])
+  const [defaultBookId, setDefaultBookId] = useState<number | null>(null)
+  const [salesmen, setSalesmen] = useState<LookupOption[]>([])
+  const [paymentClassifications, setPaymentClassifications] = useState<LookupOption[]>([])
+
+  const [dialogOpen, setDialogOpen] = useState(false)
+  const [isNewMode, setIsNewMode] = useState(false)
+  const [form, setFormState] = useState<VoucherRecord>(buildInitialForm(voucherType))
+  const formRef = useRef(form)
+  const cleanFormRef = useRef(form)
+  const cleanSnapshotRef = useRef(creditNoteSnapshot(form))
+  const copiedVoucherRef = useRef(false)
+  const bookChangeRequestRef = useRef(0)
+  const pendingBookChangeRef = useRef<Promise<void> | null>(null)
+  const saveInFlightRef = useRef(false)
+  const editForm = (update: VoucherRecord | ((current: VoucherRecord) => VoucherRecord)) => {
+    const next = typeof update === "function" ? update(formRef.current) : update
+    formRef.current = next
+    setFormState(next)
+  }
+  // Only opening, loading, and successfully saving a voucher establish a clean baseline.
+  const setForm = (update: VoucherRecord | ((current: VoucherRecord) => VoucherRecord)) => {
+    bookChangeRequestRef.current++
+    pendingBookChangeRef.current = null
+    editForm(update)
+    cleanFormRef.current = structuredClone(formRef.current)
+    cleanSnapshotRef.current = creditNoteSnapshot(formRef.current)
+    copiedVoucherRef.current = false
+  }
+  const hasUnsavedChanges = () => copiedVoucherRef.current ||
+    creditNoteSnapshot(formRef.current) !== cleanSnapshotRef.current
+  const handleFormChange = (field: string, value: any) => {
+    const isInitialBranch = field === "branch_id" && formRef.current.branch_id == null &&
+      cleanFormRef.current.branch_id == null && Number(value) > 0
+    editForm((current) => ({ ...current, [field]: value }))
+    if (isInitialBranch) {
+      cleanFormRef.current = { ...cleanFormRef.current, branch_id: Number(value) }
+      cleanSnapshotRef.current = creditNoteSnapshot(cleanFormRef.current)
+    }
+  }
+  const [isSaving, setIsSaving] = useState(false)
+  const [currentIndex, setCurrentIndex] = useState(0)
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false)
+  const [errorMessages, setErrorMessages] = useState<string[]>([])
+  const [printData, setPrintData] = useState<VoucherPrintData | null>(null)
+  // "تمت العملية بنجاح" في نافذة السند بعد نجاح الحفظ (lib/transaction-success.ts)
+  const announceSaved = useAnnounceTransactionSaved()
+
+
+  const listSearch = useVoucherListSearch({ code: "", name: "", currencyId: "__all__", dateFrom: "", dateTo: "" })
+  const { draft: searchDraft, setDraft: setSearchDraft, filters: searchFilters } = listSearch
+  const runSearch = () => void listSearch.load(fetchVouchers, searchDraft)
+  const [currentPage, setCurrentPage] = useState(1)
+  const [pageSize, setPageSize] = useState(10)
+
+  const totalVouchers = vouchers.length
+  const totalAmount = useMemo(() => vouchers.reduce((sum, v) => sum + Number(v.amount || 0), 0), [vouchers])
+  const thisMonthCount = useMemo(() => {
+    const now = new Date()
+    return vouchers.filter((v) => {
+      const d = new Date(v.vch_date)
+      return d.getFullYear() === now.getFullYear() && d.getMonth() === now.getMonth()
+    }).length
+  }, [vouchers])
+  const averageAmount = totalVouchers > 0 ? totalAmount / totalVouchers : 0
+
+  const currencyName = (currencyId: number | null) => {
+    const currency = currencies.find((c) => Number(c.currency_id ?? c.id) === currencyId)
+    return currency?.currency_name || currency?.currency_code || ""
+  }
+
+  const firstCurrencyId = (): number | null =>
+    currencies.reduce<number | null>((min, c) => {
+      const id = Number(c.currency_id ?? c.id)
+      if (!Number.isFinite(id)) return min
+      return min === null || id < min ? id : min
+    }, null)
+
+  const filteredVouchers = useMemo(() => {
+    const codeQuery = searchFilters.code.trim().toLowerCase()
+    const nameQuery = searchFilters.name.trim().toLowerCase()
+    return vouchers.filter((voucher) => {
+      if (codeQuery && !voucher.vch_code.toLowerCase().includes(codeQuery)) return false
+      if (nameQuery && !(voucher.customer_name || "").toLowerCase().includes(nameQuery)) return false
+      if (searchFilters.currencyId !== "__all__" && String(voucher.currency_id ?? "") !== searchFilters.currencyId) return false
+      if (searchFilters.dateFrom && voucher.vch_date?.slice(0, 10) < searchFilters.dateFrom) return false
+      if (searchFilters.dateTo && voucher.vch_date?.slice(0, 10) > searchFilters.dateTo) return false
+      return true
+    })
+  }, [vouchers, searchFilters])
+
+  useEffect(() => {
+    setCurrentPage(1)
+  }, [searchFilters, voucherType])
+
+  const totalPages = Math.max(1, Math.ceil(filteredVouchers.length / pageSize))
+  const pageStart = filteredVouchers.length === 0 ? 0 : (currentPage - 1) * pageSize + 1
+  const pageEnd = Math.min(currentPage * pageSize, filteredVouchers.length)
+  const pagedVouchers = useMemo(
+    () => filteredVouchers.slice((currentPage - 1) * pageSize, currentPage * pageSize),
+    [filteredVouchers, currentPage, pageSize],
+  )
+
+  useEffect(() => {
+    void listSearch.load(fetchVouchers)
+    fetchLookups()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [voucherType, user?.id])
+
+  const fetchVouchers = async () => {
+    try {
+      const response = await fetch(`/api/credit-notes?vch_type=${voucherType}`)
+      const data = await response.json()
+      setVouchers(Array.isArray(data) ? data : [])
+    } catch (error) {
+      console.error("Failed to fetch vouchers", error)
+      setVouchers([])
+    }
+  }
+
+  const fetchLookups = async () => {
+    try {
+      const booksUrl = `/api/receipts/voucher-books?vch_type=${voucherType}${
+        user?.id ? `&user_id=${encodeURIComponent(user.id)}` : ""
+      }`
+      const [currenciesRes, booksRes, salesmenRes, classificationsRes] = await Promise.all([
+        fetch("/api/exchange-rates").catch(() => null),
+        fetch(booksUrl).catch(() => null),
+        fetch("/api/salesmen").catch(() => null),
+        fetch("/api/payment-classifications").catch(() => null),
+      ])
+
+      if (currenciesRes?.ok) {
+        const data = await currenciesRes.json()
+        setCurrencies(Array.isArray(data?.rates) ? data.rates : [])
+      }
+      if (booksRes?.ok) {
+        const data = await booksRes.json()
+        setVoucherBooks(Array.isArray(data?.books) ? data.books : [])
+        setDefaultBookId(data?.default_book_id ?? null)
+      }
+      if (salesmenRes?.ok) {
+        const data = await salesmenRes.json()
+        setSalesmen(Array.isArray(data?.data) ? data.data : [])
+      }
+      if (classificationsRes?.ok) {
+        const data = await classificationsRes.json()
+        setPaymentClassifications(Array.isArray(data) ? data : [])
+      }
+    } catch (error) {
+      console.error("Failed to fetch lookups", error)
+    }
+  }
+
+  const generateCode = async (bookId: number | null, fallbackCode = "", branchId: number | null = null) => {
+    if (!bookId) return fallbackCode
+    try {
+      const response = await fetch(`/api/credit-notes/generate-number?vch_type=${voucherType}&vch_book_id=${bookId}${branchId ? `&branch_id=${branchId}` : ""}`)
+      if (!response.ok) return fallbackCode
+      const data = await response.json()
+      return data.code || fallbackCode
+    } catch (error) {
+      console.error("Failed to generate voucher number", error)
+      return fallbackCode
+    }
+  }
+
+  const fetchVoucherDetails = async (id: number): Promise<VoucherRecord | null> => {
+    try {
+      const response = await fetch(`/api/credit-notes/${id}`)
+      if (!response.ok) return null
+      return await response.json()
+    } catch (error) {
+      console.error("Failed to fetch voucher details", error)
+      return null
+    }
+  }
+
+  const fetchDefaults = async (): Promise<{ bookId: number | null; currencyId: number | null }> => {
+    try {
+      const booksUrl = `/api/receipts/voucher-books?vch_type=${voucherType}${
+        user?.id ? `&user_id=${encodeURIComponent(user.id)}` : ""
+      }`
+      const [booksRes, currenciesRes] = await Promise.all([
+        fetch(booksUrl).catch(() => null),
+        fetch("/api/exchange-rates").catch(() => null),
+      ])
+
+      let bookId: number | null = null
+      if (booksRes?.ok) {
+        const data = await booksRes.json()
+        setVoucherBooks(Array.isArray(data?.books) ? data.books : [])
+        bookId = data?.default_book_id ?? null
+        setDefaultBookId(bookId)
+      }
+
+      let currencyId: number | null = null
+      if (currenciesRes?.ok) {
+        const data = await currenciesRes.json()
+        const rates = Array.isArray(data?.rates) ? data.rates : []
+        setCurrencies(rates)
+        currencyId = rates.reduce((min: number | null, c: CurrencyOption) => {
+          const id = Number(c.currency_id ?? c.id)
+          if (!Number.isFinite(id)) return min
+          return min === null || id < min ? id : min
+        }, null)
+      }
+
+      return { bookId, currencyId }
+    } catch (error) {
+      console.error("Failed to fetch voucher defaults", error)
+      return { bookId: defaultBookId, currencyId: firstCurrencyId() }
+    }
+  }
+
+  // حسابات الضريبة والحساب المدين/الدائن الافتراضيان يُحضَران من إعدادات النظام (شاشة الحسابات
+  // الافتراضية): اشعار دائن (10) يستخدم "حساب الضريبة على المبيعات" و"حساب خصم مسموح به"،
+  // واشعار مدين (11) يستخدم "حساب الضريبة على المشتريات" و"حساب الخصم المكتسب".
+  const fetchAccountDefaults = async (): Promise<{ vatAccountId: number | null; debitAccountId: number | null }> => {
+    const empty = { vatAccountId: null, debitAccountId: null }
+    try {
+      const response = await fetch("/api/settings/system")
+      if (!response.ok) return empty
+      const data = await response.json()
+      const settings = data?.settings ?? data
+      const isCredit = voucherType === 6
+      const vatAccountId = Number(settings?.[isCredit ? "default_sales_tax_account" : "default_purchase_tax_account"]) || null
+      const debitAccountId = Number(settings?.[isCredit ? "default_allowed_discount_account" : "default_earned_discount_account"]) || null
+      return { vatAccountId, debitAccountId }
+    } catch (error) {
+      console.error("Failed to fetch default vat/debit accounts", error)
+      return empty
+    }
+  }
+
+  const openNewDialog = async () => {
+    const requestId = ++bookChangeRequestRef.current
+    pendingBookChangeRef.current = null
+    const defaults = await fetchDefaults()
+    const accountDefaults = await fetchAccountDefaults()
+    const code = await generateCode(defaults.bookId)
+    if (requestId !== bookChangeRequestRef.current) return
+    setForm({
+      ...buildInitialForm(voucherType),
+      vch_code: code,
+      vch_book_id: defaults.bookId,
+      currency_id: defaults.currencyId,
+      vat_account_id: accountDefaults.vatAccountId,
+      debit_account_id: accountDefaults.debitAccountId,
+    })
+    setIsNewMode(true)
+    setErrorMessages([])
+    setDialogOpen(true)
+  }
+
+  const cloneVoucher = async () => {
+    await pendingBookChangeRef.current
+    const source = formRef.current
+    if (!source.id) return
+    logVoucherAudit({ action: "clone", voucher_id: Number(source.id) })
+    const requestId = ++bookChangeRequestRef.current
+    const code = await generateCode(source.vch_book_id, "", source.branch_id)
+    if (requestId !== bookChangeRequestRef.current || formRef.current.id !== source.id) return
+    const today = new Date().toISOString().slice(0, 10)
+    editForm((f) => ({
+      ...f,
+      id: 0,
+      vch_code: code,
+      vch_date: today,
+      manual_date: today,
+      status: 1,
+      is_printed: 0,
+    }))
+    copiedVoucherRef.current = true
+    setIsNewMode(true)
+    setErrorMessages([])
+  }
+
+  // تغيير الفرع لسند جديد لم يُحفظ بعد يعيد توليد الرقم (بادئة السند + رمز الفرع + رمز الدفتر + التسلسل).
+  // initialSelection: اختيار الفرع الافتراضي تلقائياً عند فتح سند جديد — لا يُعدّ تعديلاً من المستخدم.
+  const regenerateCodeForBranch = async (branchId: number, initialSelection: boolean) => {
+    const current = formRef.current
+    if (current.id > 0 || !current.vch_book_id || !(branchId > 0)) return
+    const requestId = ++bookChangeRequestRef.current
+    const pending = (async () => {
+      const generated = await generateCode(current.vch_book_id, current.vch_code || "", branchId)
+      if (requestId !== bookChangeRequestRef.current || formRef.current.branch_id !== branchId) return
+      editForm((f) => ({ ...f, vch_code: generated || f.vch_code }))
+      if (initialSelection) {
+        cleanFormRef.current = { ...cleanFormRef.current, vch_code: generated || cleanFormRef.current.vch_code }
+        cleanSnapshotRef.current = creditNoteSnapshot(cleanFormRef.current)
+      }
+    })()
+    pendingBookChangeRef.current = pending
+    await pending
+    if (requestId === bookChangeRequestRef.current) pendingBookChangeRef.current = null
+  }
+
+  const handleBookChange = async (bookId: number | null) => {
+    const requestId = ++bookChangeRequestRef.current
+    pendingBookChangeRef.current = null
+    const current = { ...formRef.current, vch_book_id: bookId }
+    editForm(current)
+    if (current.id > 0 || !bookId) return
+    const pending = (async () => {
+      const generated = await generateCode(bookId, current.vch_code || "", current.branch_id)
+      if (requestId !== bookChangeRequestRef.current) return
+      editForm((f) => ({ ...f, vch_code: generated || current.vch_code }))
+    })()
+    pendingBookChangeRef.current = pending
+    await pending
+    if (requestId === bookChangeRequestRef.current) pendingBookChangeRef.current = null
+  }
+
+  const openEditDialog = async (record: VoucherRecord, index: number) => {
+    const requestId = ++bookChangeRequestRef.current
+    pendingBookChangeRef.current = null
+    const details = await fetchVoucherDetails(record.id)
+    if (requestId !== bookChangeRequestRef.current) return
+    setForm(normalizeVoucher(details || record, voucherType))
+    setCurrentIndex(index)
+    setIsNewMode(false)
+    setErrorMessages([])
+    setDialogOpen(true)
+  }
+
+  const handleCodeResolved = async (id: number) => {
+    const requestId = ++bookChangeRequestRef.current
+    pendingBookChangeRef.current = null
+    const details = await fetchVoucherDetails(id)
+    if (requestId !== bookChangeRequestRef.current) return
+    if (!details) return
+    const index = vouchers.findIndex((v) => v.id === id)
+    setForm(normalizeVoucher(details, voucherType))
+    setCurrentIndex(index >= 0 ? index : 0)
+    setIsNewMode(false)
+    setErrorMessages([])
+    return true
+  }
+
+  useVoucherDeepLink(async id => {
+    if (await handleCodeResolved(id)) setDialogOpen(true)
+  }, Boolean(user?.id), voucherType)
+
+  const handleCodeNotFound = (code: string) => {
+    setForm((f) => ({
+      ...buildInitialForm(voucherType),
+      vch_code: code,
+      vch_book_id: f.vch_book_id,
+      currency_id: f.currency_id,
+    }))
+    setIsNewMode(true)
+    setErrorMessages([])
+  }
+
+  const validateVoucher = (data: VoucherRecord): string | null => {
+    const code = data.vch_code.trim()
+    if (!code) return tr("رقم السند مطلوب")
+    if (!/^[A-Z0-9-]+$/.test(code)) return tr("رقم السند يجب أن يحتوي على أحرف إنجليزية كبيرة وأرقام و - فقط")
+
+    if (!data.vch_date) return tr("تاريخ السند مطلوب")
+    if (voucherBooks.length > 0 && !data.vch_book_id) return tr("يجب اختيار دفتر السندات")
+    if (!data.currency_id || !currencies.some((c) => Number(c.currency_id ?? c.id) === data.currency_id)) {
+      return tr("يجب اختيار العملة")
+    }
+    if (!(Number(data.rate) > 0)) return tr("سعر الصرف يجب أن يكون أكبر من صفر")
+
+    if (!data.account_id) return tr("يجب اختيار العميل")
+    if (!data.debit_account_id) return tr("يجب اختيار {0}", voucherType === 6 ? "الحساب المدين" : "الحساب الدائن")
+    if (
+      (Number(data.vat_percent) > 0 || Number(data.vat) > 0) &&
+      (!Number.isSafeInteger(Number(data.vat_account_id)) || Number(data.vat_account_id) <= 0)
+    ) return tr("يجب اختيار حساب الضريبة")
+
+    if (!data.amount_journal_type_8 || Number(data.amount_journal_type_8) <= 0) return tr("يجب إدخال المبلغ")
+    if (!data.amount || Number(data.amount) <= 0) return tr("يجب إدخال المجموع")
+    if (Number(data.vat_percent) < 0) return tr("نسبة الضريبة غير صحيحة")
+    if (Number(data.vat) < 0) return tr("الضريبة غير صحيحة")
+
+    return null
+  }
+
+  const saveVoucher = async (action: PostVoucherAction = "save", keepSavedVoucher = false): Promise<boolean> => {
+    if (saveInFlightRef.current) return false
+    saveInFlightRef.current = true
+    setIsSaving(true)
+    try {
+      await pendingBookChangeRef.current
+      const currentForm = formRef.current
+      const error = validateVoucher(currentForm)
+      if (error) {
+        setErrorMessages([error])
+        return false
+      }
+      setErrorMessages([])
+      const method = currentForm.id > 0 ? "PUT" : "POST"
+      const status = action === "save" || action === "save_print" ? currentForm.status : 2
+      const isPrinted = action === "post_print" ? 1 : currentForm.is_printed || 0
+      const dataToSave: VoucherRecord = { ...currentForm, status, is_printed: isPrinted }
+      const response = await fetch("/api/credit-notes", {
+        method,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ...dataToSave, insert_user: user?.id || null }),
+      })
+      if (!response.ok) {
+        const responseError = await response.json()
+        setErrorMessages([responseError.error || tr("فشل في حفظ السند")])
+        return false
+      }
+      const saved = await response.json()
+      announceSaved()
+      setForm(normalizeVoucher(saved, voucherType))
+      setIsNewMode(false)
+
+      if (action === "post_print" || action === "save_print") {
+        setPrintData({
+          title: labels.title,
+          copyLabel: action === "post_print" ? tr("نسخة اصلية") : tr("نسخة للتدقيق"),
+          vch_code: saved.vch_code,
+          vch_date: saved.vch_date,
+          currency_name: currencies.find((c) => Number(c.currency_id ?? c.id) === saved.currency_id)?.currency_name,
+          amount: Number(saved.amount || 0),
+          manual_voucher: saved.manual_voucher,
+          note: saved.note,
+          rows: [
+            { account_code: saved.vat_account_code, account_name: saved.vat_account_name, debit: saved.vat > 0 ? saved.vat : null, credit: null, note: "" },
+            {
+              account_code: saved.debit_account_code,
+              account_name: saved.debit_account_name,
+              debit: saved.amount_journal_type_8,
+              credit: null,
+              note: "",
+            },
+            { account_code: saved.account_code, account_name: saved.account_name, debit: null, credit: saved.amount, note: "" },
+          ],
+        })
+      }
+
+      await fetchVouchers()
+      if (keepSavedVoucher) return true
+      const defaults = await fetchDefaults()
+      const accountDefaults = await fetchAccountDefaults()
+      const bookId = currentForm.vch_book_id ?? defaults.bookId
+      const code = await generateCode(bookId)
+      setForm({
+        ...buildInitialForm(voucherType),
+        vch_code: code,
+        vch_book_id: bookId,
+        currency_id: defaults.currencyId,
+        vat_account_id: accountDefaults.vatAccountId,
+        debit_account_id: accountDefaults.debitAccountId,
+      })
+      setIsNewMode(true)
+      setDialogOpen(true)
+      return true
+    } catch (error) {
+      console.error(error)
+      setErrorMessages([tr("فشل في حفظ السند")])
+      return false
+    } finally {
+      saveInFlightRef.current = false
+      setIsSaving(false)
+    }
+  }
+
+  const handlePrint = async () => {
+    if (!(form.id > 0) || form.status === 3) return
+
+    let isPrinted = form.is_printed || 0
+    const copyLabel = form.status !== 2 ? tr("نسخة للتدقيق") : isPrinted === 1 ? tr("نسخة") : tr("نسخة اصلية")
+
+    if (form.status === 2 && isPrinted !== 1) {
+      try {
+        const response = await fetch(`/api/credit-notes/${form.id}`, { method: "PATCH" })
+        if (response.ok) {
+          isPrinted = 1
+          editForm((f) => ({ ...f, is_printed: 1 }))
+        }
+      } catch (error) {
+        console.error("Failed to mark voucher as printed", error)
+      }
+    }
+
+    setPrintData({
+      title: labels.title,
+      copyLabel,
+      vch_code: form.vch_code,
+      vch_date: form.vch_date,
+      currency_name: currencyName(form.currency_id),
+      amount: Number(form.amount || 0),
+      manual_voucher: form.manual_voucher,
+      note: form.note,
+      rows: [
+        { account_code: form.vat_account_code, account_name: form.vat_account_name, debit: (form.vat || 0) > 0 ? form.vat : null, credit: null, note: "" },
+        {
+          account_code: form.debit_account_code,
+          account_name: form.debit_account_name,
+          debit: form.amount_journal_type_8,
+          credit: null,
+          note: "",
+        },
+        { account_code: form.account_code, account_name: form.account_name, debit: null, credit: form.amount, note: "" },
+      ],
+    })
+  }
+
+  const advanceAfterDelete = async () => {
+    await fetchVouchers()
+    setShowDeleteConfirm(false)
+
+    const nextList = vouchers.filter((v) => v.id !== form.id)
+    if (nextList.length > 0) {
+      const targetIndex = Math.min(Math.max(0, currentIndex), nextList.length - 1)
+      const next = nextList[targetIndex]
+      if (next) {
+        const details = await fetchVoucherDetails(next.id)
+        setForm(normalizeVoucher(details || next, voucherType))
+        setCurrentIndex(targetIndex)
+        setIsNewMode(false)
+        setDialogOpen(true)
+        return
+      }
+    }
+
+    const defaults = await fetchDefaults()
+    const accountDefaults = await fetchAccountDefaults()
+    const code = await generateCode(defaults.bookId)
+    setForm({
+      ...buildInitialForm(voucherType),
+      vch_code: code,
+      vch_book_id: defaults.bookId,
+      currency_id: defaults.currencyId,
+      vat_account_id: accountDefaults.vatAccountId,
+      debit_account_id: accountDefaults.debitAccountId,
+    })
+    setCurrentIndex(0)
+    setIsNewMode(true)
+    setDialogOpen(true)
+  }
+
+  const logicalCancelVoucher = async () => {
+    if (!form.id) return
+    setIsSaving(true)
+    try {
+      const response = await fetch("/api/credit-notes", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ...form, status: 3 }),
+      })
+      if (!response.ok) {
+        const error = await response.json()
+        throw new Error(error.error || tr("فشل في إلغاء السند"))
+      }
+      const saved = await response.json()
+      await fetchVouchers()
+      setShowDeleteConfirm(false)
+      setForm(normalizeVoucher(saved, voucherType))
+      setIsNewMode(false)
+      setDialogOpen(true)
+    } catch (error) {
+      console.error(error)
+    } finally {
+      setIsSaving(false)
+    }
+  }
+
+  const physicalDeleteVoucher = async () => {
+    if (!form.id) return
+    setIsSaving(true)
+    try {
+      const response = await fetch(`/api/credit-notes/${form.id}`, { method: "DELETE" })
+      if (!response.ok) {
+        const error = await response.json()
+        throw new Error(error.error || tr("فشل في حذف السند"))
+      }
+      await advanceAfterDelete()
+    } catch (error) {
+      console.error(error)
+    } finally {
+      setIsSaving(false)
+    }
+  }
+
+  const handleConfirmDelete = () => (form.status === 2 ? logicalCancelVoucher() : physicalDeleteVoucher())
+
+  const handleDialogOpenChange = (open: boolean) => {
+    if (!open && showDeleteConfirm) return
+    if (!open) {
+      bookChangeRequestRef.current++
+      pendingBookChangeRef.current = null
+    }
+    setDialogOpen(open)
+  }
+
+  const handleNavigateRecord = (record: VoucherRecord) => {
+    setForm(normalizeVoucher(record, voucherType))
+    const targetIndex = vouchers.findIndex((v) => v.id === record.id)
+    setCurrentIndex(targetIndex >= 0 ? targetIndex : 0)
+    setShowDeleteConfirm(false)
+    setIsNewMode(false)
+    setErrorMessages([])
+    setDialogOpen(true)
+  }
+
+  // موقع السند بترتيب التنقل (id تصاعدياً) — القائمة مرتبة تنازلياً، فكان "الأخير" يُحسب كأول سجل ويُعطّل الأول/السابق
+  const listIndex = form.id > 0 ? vouchers.findIndex((v) => v.id === form.id) : -1
+  const navigationIndex = listIndex >= 0 ? vouchers.length - 1 - listIndex : vouchers.length
+
+  const openRow = (voucher: VoucherRecord) => {
+    const index = vouchers.findIndex((v) => v.id === voucher.id)
+    openEditDialog(voucher, index >= 0 ? index : 0)
+  }
+
+  return (
+    <div className="voucher-list-page w-full max-w-full space-y-5" dir={appDir()}>
+      <VoucherListHero icon={FileMinus} title={<>{labels.listTitle}</>} addLabel={<>{labels.addLabel}</>} onNew={openNewDialog} />
+
+      <VoucherStats stats={[{ label: <>{tr("إجمالي {0}", labels.listTitle)}</>, value: <>{totalVouchers}</> }, { label: <>{tr("سندات هذا الشهر")}</>, value: <>{thisMonthCount}</> }, { label: <>{tr("إجمالي المبالغ")}</>, value: <>{totalAmount.toLocaleString("en-US")}</> }, { label: <>{tr("متوسط قيمة السند")}</>, value: <>{averageAmount.toLocaleString("en-US", { maximumFractionDigits: 2 })}</> }]} />
+
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <Search className="h-5 w-5" />
+            {tr("البحث المتقدم")}
+          </CardTitle>
+        </CardHeader>
+        <CardContent>
+          <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-4" onKeyDown={searchOnEnter(runSearch)}>
+            <div>
+              <Label htmlFor="search-code">{tr("رقم السند")}</Label>
+              <Input
+                id="search-code"
+                value={searchDraft.code}
+                onChange={(e) => setSearchDraft((prev) => ({ ...prev, code: e.target.value }))}
+                className="text-start"
+                placeholder={tr("ابحث برقم السند...")}
+              />
+            </div>
+            <div>
+              <Label htmlFor="search-name">{tr("العميل")}</Label>
+              <Input
+                id="search-name"
+                value={searchDraft.name}
+                onChange={(e) => setSearchDraft((prev) => ({ ...prev, name: e.target.value }))}
+                className="text-start"
+                placeholder={tr("ابحث بالاسم...")}
+              />
+            </div>
+            <div>
+              <Label htmlFor="search-currency">{tr("العملة")}</Label>
+              <Select
+                value={searchDraft.currencyId}
+                onValueChange={(value) => setSearchDraft((prev) => ({ ...prev, currencyId: value }))}
+              >
+                <SelectTrigger className="text-start">
+                  <SelectValue placeholder={tr("اختر العملة")} />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="__all__">{tr("جميع العملات")}</SelectItem>
+                  {currencies.map((c) => (
+                    <SelectItem key={c.currency_id ?? c.id} value={String(c.currency_id ?? c.id)}>
+                      {c.currency_name || c.currency_code}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="grid grid-cols-2 gap-2">
+              <div>
+                <Label htmlFor="search-date-from">{tr("من تاريخ")}</Label>
+                <Input
+                  id="search-date-from"
+                  type="date"
+                  value={searchDraft.dateFrom}
+                  onChange={(e) => setSearchDraft((prev) => ({ ...prev, dateFrom: e.target.value }))}
+                />
+              </div>
+              <div>
+                <Label htmlFor="search-date-to">{tr("إلى تاريخ")}</Label>
+                <Input
+                  id="search-date-to"
+                  type="date"
+                  value={searchDraft.dateTo}
+                  onChange={(e) => setSearchDraft((prev) => ({ ...prev, dateTo: e.target.value }))}
+                />
+              </div>
+            </div>
+          </div>
+          <div className="mt-4 flex justify-end">
+            <VoucherSearchButton onClick={runSearch} loading={listSearch.loading} />
+          </div>
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>{`${labels.listTitle} (${filteredVouchers.length})`}</CardTitle>
+        </CardHeader>
+        <CardContent>
+          <div className="min-h-0">
+            <VoucherListTable
+              loading={listSearch.loading}
+              rows={pagedVouchers.map((voucher) => ({ ...voucher, display_date: voucher.vch_date?.slice(0, 10), display_currency: currencyName(voucher.currency_id), display_amount: Number(voucher.amount || 0).toLocaleString("en-US") }))}
+              columns={[
+                { header: tr("رقم السند"), name: "vch_code", width: 150, isReadOnly: true },
+                { header: tr("التاريخ"), name: "display_date", width: 130, isReadOnly: true },
+                { header: tr("العميل"), name: "customer_name", width: "*", isReadOnly: true },
+                { header: tr("العملة"), name: "display_currency", width: 120, isReadOnly: true },
+                { header: tr("المجموع"), name: "display_amount", width: 130, isReadOnly: true },
+              ]}
+              onOpen={(row: any) => openRow(row.item || row)}
+            />
+          </div>
+            <div className="mt-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+              <div className="text-sm text-muted-foreground">
+                {tr("عرض ")}{pageStart}{tr(" إلى ")}{pageEnd}{tr(" من ")}{filteredVouchers.length}
+              </div>
+              <div className="flex items-center gap-2">
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={currentPage === 1}
+                  onClick={() => setCurrentPage((prev) => Math.max(prev - 1, 1))}
+                >
+                  {tr("السابق")}
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={currentPage === totalPages}
+                  onClick={() => setCurrentPage((prev) => Math.min(prev + 1, totalPages))}
+                >
+                  {tr("التالي")}
+                </Button>
+                <Select value={String(pageSize)} onValueChange={(value) => setPageSize(Number(value))}>
+                  <SelectTrigger className="h-10 w-24">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {[10, 20, 50, 100].map((size) => (
+                      <SelectItem key={size} value={String(size)}>
+                        {size}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+            </div>
+        </CardContent>
+      </Card>
+
+      <UnifiedCreditNote
+        title={labels.title}
+        dialogOpen={dialogOpen}
+        currentIndex={navigationIndex}
+        totalRecords={vouchers.length}
+        currencies={currencies}
+        voucherBooks={voucherBooks}
+        salesmen={salesmen}
+        paymentClassifications={paymentClassifications}
+        form={form}
+        hasUnsavedChanges={hasUnsavedChanges}
+        isSaving={isSaving}
+        showDeleteConfirm={showDeleteConfirm}
+        onOpenChange={handleDialogOpenChange}
+        onNew={openNewDialog}
+        onSave={saveVoucher}
+        onValidateSave={async () => {
+          await pendingBookChangeRef.current
+          return validateVoucher(formRef.current)
+        }}
+        onDelete={() => form.id && setShowDeleteConfirm(true)}
+        onClone={cloneVoucher}
+        onPrint={handlePrint}
+        onNavigateRecord={handleNavigateRecord}
+        onFormChange={(field, value) => {
+          const initialSelection = field === "branch_id" && formRef.current.branch_id == null && cleanFormRef.current.branch_id == null
+          handleFormChange(field, value)
+          if (field === "branch_id") void regenerateCodeForBranch(Number(value), initialSelection)
+        }}
+        onBookChange={handleBookChange}
+        onCodeResolved={handleCodeResolved}
+        onCodeNotFound={handleCodeNotFound}
+        onConfirmDelete={handleConfirmDelete}
+        onCancelDelete={() => setShowDeleteConfirm(false)}
+        canSave={
+          !!form.vch_code.trim() &&
+          !!form.vch_date &&
+          !!form.currency_id &&
+          currencies.some((c) => Number(c.currency_id ?? c.id) === form.currency_id)
+        }
+        isFirstRecord={navigationIndex <= 0}
+        isLastRecord={vouchers.length === 0 ? true : navigationIndex >= vouchers.length - 1}
+        isNewMode={isNewMode}
+        errorMessages={errorMessages}
+      />
+      <VoucherPrintLayout data={printData} voucherTypeId={voucherType} />
+    </div>
+  )
+}

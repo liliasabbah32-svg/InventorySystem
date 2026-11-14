@@ -260,7 +260,8 @@ export default class FlexGridContextMenu {
                   let dateStr = date + ' ' + time;
                   fName = fileName + '_' + dateStr;
                 }
-                saveFile(csv, fName);
+                // Keep Arabic text readable when Excel opens the CSV on Windows.
+                saveFile(new Blob(["\uFEFF", csv], { type: 'text/csv;charset=utf-8' }), fName);
               }
               break;
             case 'X_XLSX':
@@ -291,7 +292,7 @@ export default class FlexGridContextMenu {
             case 'X_PDF': {
               let fName = 'FlexGrid.pdf';
               if (fileName && fileName.length > 0) {
-                fName = fileName + '_' + new Date().toLocaleDateString();
+                fName = fileName + '_' + new Date().toLocaleDateString("en-GB-u-nu-latn");
               }
               FlexGridPdfConverter.export(grid, fName, {
                 maxPages: 10,
@@ -354,8 +355,8 @@ export default class FlexGridContextMenu {
         },
         executeCommand:async (cmd) => {
           switch (cmd) {
-            case 'copyStoreToDownRow': {
-              grid.finishEditing();
+                case 'copyStoreToDownRow': {
+              if (grid && typeof grid.finishEditing === 'function') grid.finishEditing();
               setTimeout(async() => {
               let view = grid.collectionView,
                 cols = grid.columns,

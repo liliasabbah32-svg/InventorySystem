@@ -1,0 +1,128 @@
+export interface PosQueuedSale {
+  id: string
+  tenantKey: string
+  createdAt: string
+  payload: Record<string, unknown>
+  attempts: number
+  lastError?: string
+}
+
+/**
+ * localStorage: الكاشير كان مفتوحاً بوردية عند إغلاق المتصفح/الجهاز ⇐ يُفتح تلقائياً عند بدء النظام، وتُقبل جلسة الواجهة
+ * حتى 7 أيام (نفس جلسة الخادم) بدل 24 ساعة. يُمسح عند مغادرة الكاشير داخل النظام وعند تسجيل الخروج.
+ */
+export const POS_RESUME_KEY = "pos:resume"
+
+// العلَم مرتبط بالمستخدم والشركة اللذين تركا الكاشير مفتوحاً — مستخدم آخر (أو شركة أخرى) على نفس المتصفح لا يُفتح له الكاشير
+function posResumeOwner() {
+  try {
+    const user = JSON.parse(sessionStorage.getItem("erp_user") || localStorage.getItem("erp_user") || "{}")
+    const tenant = sessionStorage.getItem("active_tenant_db") || localStorage.getItem("active_tenant_db") || ""
+    return user?.id ? `${user.id}@${tenant}` : ""
+  } catch {
+    return ""
+  }
+}
+
+export function markPosResume() {
+  const owner = posResumeOwner()
+  try { if (owner) localStorage.setItem(POS_RESUME_KEY, owner) } catch {}
+}
+
+/** هل يُستأنف الكاشير لهذا المستخدم في هذه الشركة؟ */
+export function shouldResumePos() {
+  try {
+    const value = localStorage.getItem(POS_RESUME_KEY)
+    return Boolean(value) && value === posResumeOwner()
+  } catch {
+    return false
+  }
+}
+
+const DB_NAME = "shamel-pos-offline"
+const DB_VERSION = 1
+const CATALOG_STORE = "catalog"
+const QUEUE_STORE = "salesQueue"
+
+function openDb(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(DB_NAME, DB_VERSION)
+    request.onupgradeneeded = () => {
+      const db = request.result
+      if (!db.objectStoreNames.contains(CATALOG_STORE)) db.createObjectStore(CATALOG_STORE)
+      if (!db.objectStoreNames.contains(QUEUE_STORE)) {
+        const store = db.createObjectStore(QUEUE_STORE, { keyPath: "id" })
+        store.createIndex("tenantKey", "tenantKey", { unique: false })
+      }
+    }
+    request.onsuccess = () => resolve(request.result)
+    request.onerror = () => reject(request.error)
+  })
+}
+
+function requestValue<T>(request: IDBRequest<T>): Promise<T> {
+  return new Promise((resolve, reject) => {
+    request.onsuccess = () => resolve(request.result)
+    request.onerror = () => reject(request.error)
+  })
+}
+
+export function currentPosTenantKey(userId?: string | null) {
+  if (typeof window === "undefined") return "server"
+  const tenant = sessionStorage.getItem("active_tenant_db") || localStorage.getItem("active_tenant_db") || "default"
+  return `${tenant}:${userId || "anonymous"}`
+}
+
+export async function savePosCatalog(tenantKey: string, catalog: unknown) {
+  const db = await openDb()
+  const tx = db.transaction(CATALOG_STORE, "readwrite")
+  tx.objectStore(CATALOG_STORE).put({ catalog, savedAt: new Date().toISOString() }, tenantKey)
+  await new Promise<void>((resolve, reject) => {
+    tx.oncomplete = () => resolve()
+    tx.onerror = () => reject(tx.error)
+  })
+  db.close()
+}
+
+export async function loadPosCatalog<T>(tenantKey: string): Promise<{ catalog: T; savedAt: string } | null> {
+  const db = await openDb()
+  const tx = db.transaction(CATALOG_STORE, "readonly")
+  const value = await requestValue<any>(tx.objectStore(CATALOG_STORE).get(tenantKey))
+  db.close()
+  return value || null
+}
+
+export async function queuePosSale(sale: PosQueuedSale) {
+  const db = await openDb()
+  const tx = db.transaction(QUEUE_STORE, "readwrite")
+  tx.objectStore(QUEUE_STORE).put(sale)
+  await new Promise<void>((resolve, reject) => {
+    tx.oncomplete = () => resolve()
+    tx.onerror = () => reject(tx.error)
+  })
+  db.close()
+}
+
+export async function listPosSales(tenantKey: string): Promise<PosQueuedSale[]> {
+  const db = await openDb()
+  const tx = db.transaction(QUEUE_STORE, "readonly")
+  const index = tx.objectStore(QUEUE_STORE).index("tenantKey")
+  const rows = await requestValue<PosQueuedSale[]>(index.getAll(tenantKey))
+  db.close()
+  return rows.sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+}
+
+export async function removePosSale(id: string) {
+  const db = await openDb()
+  const tx = db.transaction(QUEUE_STORE, "readwrite")
+  tx.objectStore(QUEUE_STORE).delete(id)
+  await new Promise<void>((resolve, reject) => {
+    tx.oncomplete = () => resolve()
+    tx.onerror = () => reject(tx.error)
+  })
+  db.close()
+}
+
+export async function markPosSaleFailed(sale: PosQueuedSale, error: string) {
+  return queuePosSale({ ...sale, attempts: sale.attempts + 1, lastError: error })
+}

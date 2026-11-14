@@ -1,6 +1,17 @@
 "use client"
 
+import { tr, appDir } from "@/lib/i18n"
+import { showAlert } from "@/components/ui/confirm-host"
 import { useState, useEffect, useMemo, useRef } from "react"
+import { useCustomerDefaultSalesman } from "@/lib/use-customer-default-salesman"
+import {
+  applyItemAmountAction,
+  finiteItemNumber,
+  guardItemAmountInput,
+  handleItemAmountKeyDown,
+  parseItemAmount,
+  type AppliedItemAmountAction,
+} from "@/lib/item-amount"
 import { Button } from "@/components/ui/button"
 import { Dialog, DialogContent } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
@@ -17,7 +28,7 @@ import { ReportGenerator } from "@/components/ui/report-generator"
 import { useRecordNavigation } from "@/hooks/use-record-navigation"
 import * as wjcCore from '@grapecity/wijmo';
 import { Toast } from 'primereact/toast';
-import * as XLSX from "xlsx";
+import { VoucherLinesImportDialog } from "@/components/import/voucher-lines-import";
 import { FlexGrid } from '@grapecity/wijmo.react.grid';
 import {
   Plus,
@@ -34,8 +45,9 @@ import {
 } from "lucide-react"
 import { useDocumentSettings } from "@/hooks/use-document-settings"
 import { LotSelector } from "@/components/inventory/lot-selector"
-import { Dropdown as PrimeDropdown } from "primereact/dropdown"
+import PrimeDropdown from "@/components/common/FocusDropdown"
 import ProductSearchPopup from "../products/ProductSearchPopup"
+import { requestProductVariant } from "@/components/products/product-variant-service"
 import * as wjGrid from "@grapecity/wijmo.grid";
 import DataGridView from "../common/DataGridView"
 import Messages from "../common/Messages"
@@ -52,7 +64,12 @@ import { stat } from "fs"
 import { set } from "date-fns"
 import React from "react"
 import AutoCompleteAccount from "@/components/customer/auto-complete-account"
+import AccountBalanceField from "@/components/common/account-balance-field"
 import type { AccountItem } from "@/components/customer/account-search-dialog"
+import { useWorkspaceTabActive } from "@/contexts/workspace-tab-context"
+import { screenHotkeysAllowed } from "@/lib/hotkeys"
+import { useNavigationGuard } from "@/lib/navigation-guard"
+import { keepDialogOpenOnEscape } from "@/lib/dialog-escape"
 
 // Inject CSS styles for dropdown visibility fix
 if (typeof document !== 'undefined') {
@@ -175,34 +192,34 @@ const InlineProductSearch = ({ onSelect, onClose, products }: any) => {
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-50">
       <div className="bg-white p-4 rounded-lg shadow-lg max-w-md w-full">
-        <h3 className="text-lg font-semibold mb-4">بحث المنتجات</h3>
+        <h3 className="text-lg font-semibold mb-4">{tr("بحث المنتجات")}</h3>
         <input
           type="text"
-          placeholder="ابحث عن منتج..."
-          className="mb-4 p-2 border rounded w-full text-right"
+          placeholder={tr("ابحث عن منتج...")}
+          className="mb-4 p-2 border rounded w-full text-start"
           value={searchTerm}
           onChange={(e) => setSearchTerm(e.target.value)}
-          dir="rtl"
+          dir={appDir()}
         />
         <div className="space-y-2 max-h-60 overflow-y-auto">
           {filteredProducts.map((product: any) => (
             <button
               key={product.id}
               onClick={() => onSelect(product)}
-              className="block w-full text-right p-2 hover:bg-gray-100 rounded"
+              className="block w-full text-start p-2 hover:bg-gray-100 rounded"
             >
               <div className="font-medium">{product.product_name}</div>
               <div className="text-sm text-gray-500">
                 {product.product_code} - {product.main_unit} - {product.selling_price || product.last_purchase_price}
-                ر.س
+                {tr("ر.س")}
               </div>
             </button>
           ))}
-          {filteredProducts.length === 0 && <div className="text-center text-gray-500 py-4">لا توجد نتائج</div>}
+          {filteredProducts.length === 0 && <div className="text-center text-gray-500 py-4">{tr("لا توجد نتائج")}</div>}
         </div>
         <div className="flex justify-end mt-4">
           <Button variant="outline" onClick={onClose}>
-            إغلاق
+            {tr("إغلاق")}
           </Button>
         </div>
       </div>
@@ -300,6 +317,10 @@ interface OrderItem {
   // New fields for lot selection
   lot_id?: number | null
   lotAllocations?: any[] // To store detailed lot allocations
+  source_voucher_id?: number | null
+  source_voucher_type?: number | null
+  source_voucher_code?: string | null
+  delivery_item_id?: number | null
 }
 
 interface OrderFormData {
@@ -411,6 +432,24 @@ const initialFormData: OrderFormData = {
   invoice_source_type: "normal",
 }
 
+const invoiceLineFingerprint = (items: any[]) => JSON.stringify(
+  [...items].sort((a, b) => Number(a.ser || 0) - Number(b.ser || 0)).map((item) => ({
+    product_id: item.product_id ?? item.item_id ?? item.id ?? null,
+    product_name: item.product_name ?? item.name ?? "",
+    quantity: item.qnty ?? item.quantity ?? 0,
+    bonus: item.bonus ?? item.bonus_quantity ?? 0,
+    unit_id: item.unit_id ?? null,
+    unit: item.unit_name ?? item.unit ?? "",
+    price: item.price ?? item.unit_price ?? 0,
+    discount: item.discount ?? item.discount_amount ?? 0,
+    store_id: item.store_id ?? item.warehouse_id ?? null,
+    expiry_date: item.expiry_date ?? null,
+    batch_number: item.batch ?? item.batch_number ?? "",
+    notes: item.notes ?? item.note ?? "",
+    delivery_item_id: item.delivery_item_id ?? null,
+  })),
+)
+
 
 function UnifiedSaleInvoices({
   order,
@@ -423,6 +462,7 @@ function UnifiedSaleInvoices({
   vch_type,
   fromSearch = false,
 }: UnifiedSalesOrderProps) {
+  const workspaceTabActive = useWorkspaceTabActive()
   const {
     settings,
     loading: settingsLoading,
@@ -457,9 +497,15 @@ function UnifiedSaleInvoices({
   })
   const isSaving = useRef(false)
   const isHandlingSave = useRef(false)
+  const saveSucceededRef = useRef(false)
   const isDeleting = useRef(false)
   const lastVchBook = useRef<string | null>(null)
   const doHotKeys = useRef(true)
+  const amountEditSnapshotRef = useRef<{ grid: any; row: number; value: any } | null>(null)
+  const amountVatAdjustmentRef = useRef(new Map<number, AppliedItemAmountAction>())
+  useEffect(() => {
+    amountVatAdjustmentRef.current.clear()
+  }, [state.formData.id, state.formData.vch_code])
   const toast = useRef<Toast | null>(null);
   const message = useRef(Messages);
   const [loading, setLoading] = useState(false);
@@ -526,34 +572,34 @@ function UnifiedSaleInvoices({
   )
   const taxClassificationOptions = useMemo(
     () => [
-      { label: "ضريبية", value: 1 },
-      { label: "معفاه", value: 2 },
-      { label: "صفرية", value: 3 },
+      { label: tr("ضريبية"), value: 1 },
+      { label: tr("معفاه"), value: 2 },
+      { label: tr("صفرية"), value: 3 },
     ],
     [],
   )
   const invoiceTypeOptions = useMemo(
     () => [
-      { label: "للتجارة", value: 1 },
-      { label: "خدمات", value: 2 },
-      { label: "أصول", value: 3 },
+      { label: tr("للتجارة"), value: 1 },
+      { label: tr("خدمات"), value: 2 },
+      { label: tr("أصول"), value: 3 },
     ],
     [],
   )
   const offsetCodeOptions = useMemo(
     () => [
-      { label: "تجارية", value: 1 },
-      { label: "أصول", value: 2 },
-      { label: "خدمات", value: 3 },
+      { label: tr("تجارية"), value: 1 },
+      { label: tr("أصول"), value: 2 },
+      { label: tr("خدمات"), value: 3 },
     ],
     [],
   )
   const voucherTypeOptions = useMemo(
     () => [
-      { label: "عادية", value: "normal" },
-      { label: "من طلبية", value: "from_order" },
-      { label: "من ارسالية", value: "from_delivery" },
-      { label: "من عرض سعر", value: "from_quotation" },
+      { label: tr("عادية"), value: "normal" },
+      { label: tr("من طلبية"), value: "from_order" },
+      { label: tr("من ارسالية"), value: "from_delivery" },
+      { label: tr("من عرض سعر"), value: "from_quotation" },
     ],
     [],
   )
@@ -562,6 +608,7 @@ function UnifiedSaleInvoices({
     [],
   )
   const [showUnsaved, setShowUnsaved] = useState(false);
+  const pendingInvoiceSourceTypeRef = useRef<string | null>(null);
   const [showConfirm, setShowConfirm] = useState(false);
   const [showAlert, setShowAlert] = useState(false);
   const [alertMessage, setAlertMessage] = useState("");
@@ -577,6 +624,13 @@ function UnifiedSaleInvoices({
     barcode: '', id: 0, code: '', price: 0, qnty: 0, bonus: 0, amount: 0, to_main_unit_qty: 0, store_id: 0, store_name: ''
   }]);
   const [CollectionView] = useState(() => new wjcCore.CollectionView(data));
+  const invoiceLineBaselineRef = useRef(invoiceLineFingerprint(CollectionView.items as any[]));
+  const sourceDeliveryNumbers = Array.from(new Set(
+    ((CollectionView?.items as any[]) ?? [])
+      .filter((item) => Number(item.source_voucher_type) === 13 && item.source_voucher_code)
+      .map((item) => String(item.source_voucher_code).trim())
+      .filter(Boolean),
+  )).join(", ");
   const CollectionViewBackupRef = useRef(null as any);
   const createNewOrder = (): SalesOrder => ({
     id: 0,
@@ -714,7 +768,8 @@ function UnifiedSaleInvoices({
           { id: 2, name: 'جاهز' },
           { id: 3, name: 'مرسلة جزئيا' },
           { id: 4, name: 'مرسلة كليا' },
-          { id: 5, name: 'ملغي' }
+          { id: 5, name: 'ملغي' },
+          { id: 6, name: 'مغلق' }
         ]);
 
         // Initialize new record
@@ -780,23 +835,13 @@ function UnifiedSaleInvoices({
     }
   }
   useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
+    const handleKeyDown = (e: KeyboardEvent) => { if (!workspaceTabActive.current) return;
       // F2 for customer search
-      if (e.key === "F2" && !e.ctrlKey && !e.altKey) {
+      if (e.key === "F2" && !e.ctrlKey && !e.altKey && screenHotkeysAllowed()) {
         e.preventDefault()
         setState((prev) => ({ ...prev, showCustomerSearch: true }))
       }
-      // F3 for product search in focused row
-      if (e.key === "F3" && !e.ctrlKey && !e.altKey) {
-        e.preventDefault()
-        const activeElement = document.activeElement as HTMLElement
-        if (activeElement?.closest("[data-product-row]")) {
-          const rowId = activeElement.closest("[data-product-row]")?.getAttribute("data-product-row")
-          if (rowId) {
-            setState((prev) => ({ ...prev, showProductSearch: true, activeItemId: rowId }))
-          }
-        }
-      }
+      // F3/Ctrl+S حفظ، F9 حذف، F4 نسخ، F5 جديد، Ctrl+P طباعة: UniversalToolbar (lib/hotkeys.ts)
       // Escape to close search
       if (e.key === "Escape") {
         setState((prev) => ({
@@ -806,11 +851,6 @@ function UnifiedSaleInvoices({
           activeItemId: null,
           showLotSelector: false,
         }))
-      }
-      // Ctrl+S for save
-      if (e.key === "s" && e.ctrlKey) {
-        e.preventDefault()
-        handleSave()
       }
     }
 
@@ -900,7 +940,7 @@ function UnifiedSaleInvoices({
   };
 
 
-  const adjustCode = (code: string, codeLen: number = 8): string => {
+  const adjustCode = (code: string, codeLen: number = 10): string => {
     if (!code || !code.trim()) return '';
 
     code = code.trim().toUpperCase();
@@ -988,7 +1028,7 @@ function UnifiedSaleInvoices({
         if (!data) reset_order()
         else {
           if (data.deleted === true) {
-            Util.showErrorMessage(message, 'الفاتورة محذوفة لا يمكن عرضها')
+            Util.showErrorMessage(message, tr("الفاتورة محذوفة لا يمكن عرضها"))
             reset_order();
             return
           }
@@ -1067,6 +1107,23 @@ function UnifiedSaleInvoices({
     const grid = gridRef.current?.flex;
     if (!grid) return;
 
+    try {
+      await FillItemInner(items, grid);
+    } catch (error: any) {
+      // استثناء غير معالَج هنا سابقاً (كخطأ شبكة عند جلب وحدات الصنف) كان يهرب كـ unhandled promise
+      // rejection بعد إغلاق نافذة البحث أصلاً — يظهر للمستخدم كأن التطبيق "تعطّل" رغم أن الإضافة قد
+      // تكون جزئية. الآن يُلتَقط ويُعرَض كتنبيه بدل ذلك.
+      console.error("Error adding product to invoice:", error);
+      toast.current?.show({
+        severity: "error",
+        summary: tr("تعذّرت إضافة الصنف"),
+        detail: error?.message || tr("حدث خطأ غير متوقع أثناء إضافة الصنف"),
+        life: 4000,
+      });
+    }
+  };
+
+  const FillItemInner = async (items: any[], grid: wjGrid.FlexGrid) => {
     let selectedIndexL = grid?.selection?.row;
     const lastRowIndex = CollectionView.items.length - 1;
     if (setFromExcelRef.current) {
@@ -1199,7 +1256,7 @@ function UnifiedSaleInvoices({
       const itemValid = item?.id;
       console.log("itemValid itemValid ", itemValid)
       if (!itemValid || (itemValid + '').trim() === '' || (itemValid + '').trim() === '0') {
-        Util.showErrorToast(toast.current, 'يجب ادخال رقم الصنف');
+        Util.showErrorToast(toast.current, tr("يجب ادخال رقم الصنف"));
         grid.focus();
         grid.select(currentRow, 'code');
         return false;
@@ -1232,12 +1289,12 @@ function UnifiedSaleInvoices({
     try {
       console.log("priceCategoryId priceCategoryId ", priceCategoryIdRef.current)
       const res = await fetch(
-        `/api/inventory/products/search?query=${encodeURIComponent(value)}&priceCategoryId=${priceCategoryIdRef.current}`
+        `/api/inventory/products/search?query=${encodeURIComponent(value)}&priceCategoryId=${priceCategoryIdRef.current}${Util.getVoucherBarcodeMode(vch_type) === "barcode" ? "" : `&numberType=${Util.getVoucherBarcodeMode(vch_type)}`}`
       );
       console.log("res res res res res ", res)
       if (!res.ok) throw new Error('Failed to fetch product');
       const product: Product | null = await res.json();
-      return product;
+      return product ? await requestProductVariant(product as any) as Product | null : null;
     } catch (err) {
       console.error('Error fetching product:', err);
       return null;
@@ -1250,10 +1307,10 @@ function UnifiedSaleInvoices({
     const colName = grid.columns[col].binding;
     const editedValue = grid.getCellData(row, col, false);
     const oldValue = e.data;
-    const price = grid.getCellData(row, 'price', false) ?? 0;
-    const discount = grid.getCellData(row, 'discount', false) ?? 0;
-    const qnty = grid.getCellData(row, 'qnty', false) ?? 0;
-    const amount = grid.getCellData(row, 'amount', false) ?? 0;
+    const price = finiteItemNumber(grid.getCellData(row, 'price', false)) ?? 0;
+    const discount = finiteItemNumber(grid.getCellData(row, 'discount', false)) ?? 0;
+    const qnty = finiteItemNumber(grid.getCellData(row, 'qnty', false)) ?? 0;
+    const amount = finiteItemNumber(grid.getCellData(row, 'amount', false)) ?? 0;
     console.log(" row  row ", row)
     setSelectedIndex(row)
     if (colName === 'code' || colName === 'barcode') {
@@ -1262,14 +1319,14 @@ function UnifiedSaleInvoices({
 
       if (colName === "code") {
         code = String(editedValue);
-        code = Util.adjustCode(code, 8).toUpperCase();
+        code = Util.adjustCode(code, 10).toUpperCase();
       }
       const product = await fetchProductByCodeOrBarcode(code);
 
       if (product) {
         FillItem([product])
       } else {
-        Util.showErrorToast(toast.current, `لا يوجد صنف بهذا الرقم أو الباركود: ${editedValue}`);
+        Util.showErrorToast(toast.current, tr("لا يوجد صنف بهذا الرقم أو الباركود: {0}", editedValue));
         if (grid.activeEditor) grid.activeEditor.value = '';
         const ColIndex = grid.columns.findIndex((coll: { binding: string }) => coll.binding === 'code');
         grid.setCellData(row, ColIndex, oldValue, false);
@@ -1280,12 +1337,12 @@ function UnifiedSaleInvoices({
     }
     if (colName === 'qnty' || colName === 'bonus') {
       if (isNaN(editedValue)) {
-        Util.showErrorToast(toast.current, `يجب ادخال ارقام فقط `);
+        Util.showErrorToast(toast.current, tr("يجب ادخال ارقام فقط "));
         if (grid.activeEditor) grid.activeEditor.value = '';
         return;
       }
       if (parseFloat(editedValue) <= 0.0001) {
-        Util.showErrorToast(toast.current, `يجب ادخال ارقام فقط `);
+        Util.showErrorToast(toast.current, tr("يجب ادخال ارقام فقط "));
         if (grid.activeEditor) grid.activeEditor.value = '';
         return;
       }
@@ -1299,48 +1356,91 @@ function UnifiedSaleInvoices({
         return;
       }*/
       //await recalculate_invoice(false/*, discountAmountRef.current*/);
-      const amount = parseFloat(editedValue) * parseFloat(price) - parseFloat(discount)
+      const amount = Number(editedValue) * price - discount
       const ColIndex = grid.columns.findIndex((coll: { binding: string }) => coll.binding === 'amount');
-      grid.setCellData(row, ColIndex, amount);
+      grid.setCellData(row, ColIndex, Number.isFinite(amount) ? amount : 0);
       grid.refresh(true);
     }
     if (colName === 'price') {
       if (isNaN(editedValue)) {
-        Util.showErrorToast(toast.current, `يجب ادخال ارقام فقط `);
+        Util.showErrorToast(toast.current, tr("يجب ادخال ارقام فقط "));
         if (grid.activeEditor) grid.activeEditor.value = '';
         return;
       }
-      const amount = parseFloat(editedValue) * parseFloat(qnty) - parseFloat(discount)
+      const amount = Number(editedValue) * qnty - discount
       const ColIndex = grid.columns.findIndex((coll: { binding: string }) => coll.binding === 'amount');
-      grid.setCellData(row, ColIndex, amount);
+      grid.setCellData(row, ColIndex, Number.isFinite(amount) ? amount : 0);
       grid.refresh(true);
     }
     if (colName === 'discount') {
       if (isNaN(editedValue)) {
-        Util.showErrorToast(toast.current, `يجب ادخال ارقام فقط `);
+        Util.showErrorToast(toast.current, tr("يجب ادخال ارقام فقط "));
         if (grid.activeEditor) grid.activeEditor.value = '';
         return;
       }
-      if (parseFloat(editedValue) > parseFloat(amount)) {
-        Util.showErrorToast(toast.current, `لا يمكن ادخال خصم اكبر من المبلغ `);
+      if (Number(editedValue) > amount) {
+        Util.showErrorToast(toast.current, tr("لا يمكن ادخال خصم اكبر من المبلغ "));
         if (grid.activeEditor) grid.activeEditor.value = '';
         const ColIndex = grid.columns.findIndex((coll: { binding: string }) => coll.binding === 'discount');
         grid.setCellData(row, ColIndex, oldValue, false);
         return;
       }
-      const amountVal = parseFloat(price) * parseFloat(qnty) - parseFloat(editedValue)
+      const amountVal = price * qnty - Number(editedValue)
       const ColIndex = grid.columns.findIndex((coll: { binding: string }) => coll.binding === 'amount');
-      grid.setCellData(row, ColIndex, amountVal, false);
+      grid.setCellData(row, ColIndex, Number.isFinite(amountVal) ? amountVal : amount, false);
       //grid.refresh(true);
     }
     if (colName === 'amount') {
+      const parsedAmount = parseItemAmount(editedValue)
+      const snapshot = amountEditSnapshotRef.current
+      const oldAmount = snapshot && snapshot.grid === grid && snapshot.row === row
+        ? snapshot.value
+        : grid.rows?.[row]?.dataItem?.amount ?? grid.getCellData(row, col, false)
+      const amountIndex = grid.columns.findIndex((column: { binding: string }) => column.binding === 'amount')
+      const restoreAmount = () => {
+        const safeOldAmount = oldAmount == null ? oldAmount : finiteItemNumber(oldAmount) ?? 0
+        if (amountIndex >= 0) grid.setCellData(row, amountIndex, safeOldAmount, false)
+        grid.refresh(true)
+      }
+      const quantity = finiteItemNumber(grid.getCellData(row, 'qnty', false))
+      const lineDiscount = finiteItemNumber(grid.getCellData(row, 'discount', false)) ?? 0
+      if (!parsedAmount) {
+        Util.showErrorToast(toast.current, tr("ظٹط¬ط¨ ط§ط¯ط®ط§ظ„ ط§ط±ظ‚ط§ظ… ظپظ‚ط· "))
+        restoreAmount()
+        return
+      }
+      if (quantity === null || quantity <= 0) {
+        restoreAmount()
+        return
+      }
+      const vatRate = finiteItemNumber(state.formData.vat_percent) ?? 0
+      const item = grid.rows?.[row]?.dataItem ?? CollectionView.items[row]
+      const productId = Number(item?.product_id ?? item?.id) || null
+      const previousAdjustment = amountVatAdjustmentRef.current.get(row)
+      const amountAction = applyItemAmountAction(parsedAmount.amount, parsedAmount.vatAction, vatRate, productId, previousAdjustment)
+      const { netAmount, displayAmount } = amountAction
+      if (amountAction.adjustment) amountVatAdjustmentRef.current.set(row, amountAction.adjustment)
+      else amountVatAdjustmentRef.current.delete(row)
+      const nextPrice = (netAmount + lineDiscount) / quantity
+      if (!Number.isFinite(nextPrice)) {
+        restoreAmount()
+        return
+      }
+      const priceIndex = grid.columns.findIndex((column: { binding: string }) => column.binding === 'price')
+      if (priceIndex >= 0) grid.setCellData(row, priceIndex, nextPrice, false)
+      if (amountIndex >= 0) grid.setCellData(row, amountIndex, displayAmount, false)
+      grid.refresh(true)
+      return
+    }
+
+    if (colName === 'amount') {
       if (isNaN(editedValue)) {
-        Util.showErrorToast(toast.current, `يجب ادخال ارقام فقط `);
+        Util.showErrorToast(toast.current, tr("يجب ادخال ارقام فقط "));
         if (grid.activeEditor) grid.activeEditor.value = '';
         return;
       }
-      if (parseFloat(qnty) > 0) {
-        const price = parseFloat(editedValue) / parseFloat(qnty) - parseFloat(discount)
+      if (qnty > 0) {
+        const price = Number(editedValue) / qnty - discount
         const ColIndex = grid.columns.findIndex((coll: { binding: string }) => coll.binding === 'price');
         grid.setCellData(row, ColIndex, price);
         grid.refresh(true);
@@ -1349,9 +1449,19 @@ function UnifiedSaleInvoices({
 
   }
 
+  const onBeginningEdit = (grid: any, e: any) => {
+    if (grid?.columns?.[e.col]?.binding === "amount") {
+      amountEditSnapshotRef.current = { grid, row: e.row, value: grid.getCellData(e.row, e.col, false) }
+      guardItemAmountInput(grid, e.row, e.col, true)
+    }
+  }
+
   const onKeyDownGrid = (grid: any, e: KeyboardEvent) => {
     // Make sure grid and selection exist
-    if (!grid || !grid.selection) return;
+    // يُستدعى مرتين لكل ضغطة مفتاح فعلياً: مرة بمعطيات Wijmo الصحيحة، ومرة أخرى بمعطيات غير مكتملة
+    // (onKeyDown ليس حدثاً مُوثَّقاً بـFlexGridInputs) — بلا هذا الحارس، قراءة e.keyCode على undefined
+    // بالاستدعاء الثاني تُطلِق استثناءً غير مُلتقَط يمنع Wijmo من بدء تحرير الخلية بعد أول ضغطة مفتاح.
+    if (!grid || !grid.selection || !e || typeof e.keyCode === "undefined") return;
     if (doHotKeys.current === false) return;
     if (e.keyCode === 113) {
       e.preventDefault(); // Prevent FlexGrid from opening the editor
@@ -1366,6 +1476,8 @@ function UnifiedSaleInvoices({
     const colName = grid.columns[col]?.binding;
     const activeEditor = grid.activeEditor;
     const value = activeEditor ? activeEditor.value : '';
+
+    if (handleItemAmountKeyDown(grid, e, true)) return
 
     const item = grid.collectionView?.items?.[row];
     const item_id = item?.id;
@@ -1389,22 +1501,19 @@ function UnifiedSaleInvoices({
       if (!item_id || item_id + '' === '0') {
         toast.current?.show({
           severity: 'error',
-          summary: 'خطأ',
-          detail: 'يجب ادخال رقم الصنف',
+          summary: tr("خطأ"),
+          detail: tr("يجب ادخال رقم الصنف"),
           life: 1500
         });
         grid.focus();
         e.preventDefault();
       }
     }
-    if (['qnty', 'bonus', 'amount', 'price', 'discount'].includes(colName)) {
+    if (['qnty', 'bonus', 'price', 'discount'].includes(colName)) {
       if (e.key.length === 1 && !/[0-9.]/.test(e.key)) {
         e.preventDefault();
         return;
       }
-    }
-    if (colName === 'amount' && parseFloat(item?.qnty) === 0) {
-      e.preventDefault();
     }
     switch (e.keyCode) {
       case 121: // F10
@@ -1435,7 +1544,7 @@ function UnifiedSaleInvoices({
           if (validateAddNewRow(row, grid)/* && this.state.dataObject.vch_status_id + '' !== '2' && this.state.dataObject.status !== 3*/) {
             grid.collectionView.addNew({});
             grid.collectionView.commitNew();
-            grid.finishEditing(true);
+            grid?.finishEditing?.(true);
             CollectionView.items[grid.rows.length - 1].ser = grid.rows.length;
             //setData(newData);
 
@@ -1523,13 +1632,13 @@ function UnifiedSaleInvoices({
         },
 
         {
-          header: "الحالة", name: "item_status", width: 100, visible: false,
+          header: tr("الحالة"), name: "item_status", width: 100, visible: false,
         },
         {
-          header: "الباركود", name: "barcode", width: 120, visible: Util.getVoucherSettingScreenData(vch_type, 'barcode')
+          header: Util.getVoucherBarcodeHeader(vch_type), name: "barcode", width: 120, visible: Util.getVoucherSettingScreenData(vch_type, 'barcode')
         },
         {
-          header: "رقم الصنف", name: "code", width: 120, maxLength: 8, visible: Util.getVoucherSettingScreenData(vch_type, 'code')
+          header: tr("رقم الصنف"), name: "code", width: 120, maxLength: 8, visible: Util.getVoucherSettingScreenData(vch_type, 'code')
         },
 
         { header: "id", name: "id", width: 150, visible: false },
@@ -1553,10 +1662,10 @@ function UnifiedSaleInvoices({
         },
 
         {
-          header: "اسم الصنف", name: "name", width: "*", minWidth: 150, maxLength: 100
+          header: tr("اسم الصنف"), name: "name", width: "*", minWidth: 150, maxLength: 100
         },
-        { header: "رقم المستودع", name: "store_id", width: 150, visible: false },
-        { header: "المستودع", name: "store_name", width: 100, visible: Util.getVoucherSettingScreenData(vch_type, 'store') },
+        { header: tr("رقم المستودع"), name: "store_id", width: 150, visible: false },
+        { header: tr("المستودع"), name: "store_name", width: 100, visible: Util.getVoucherSettingScreenData(vch_type, 'store') },
         {
           name: 'btnSearchStores',
           header: ' ',
@@ -1577,13 +1686,13 @@ function UnifiedSaleInvoices({
           visible: Util.getVoucherSettingScreenData(vch_type, 'store'),
           visibleInColumnChooser: true
         },
-        { header: "الكمية", name: "qnty", width: 80, visible: true, maxLength: 10 },
-        { header: "البونص", name: "bonus", width: 80, maxLength: 10, visible: Util.getVoucherSettingScreenData(vch_type, 'bonus') },
-        { header: "الرقم التشغيلي", name: "batch", width: 150, maxLength: 30, visible: Util.getVoucherSettingScreenData(vch_type, 'batch') },
-        { header: "رقم الوحدة", name: "unit_id", width: 150, visible: false },
-        { header: "الوحدة", name: "unit_name", width: 80, visible: Util.getVoucherSettingScreenData(vch_type, 'unit') },
-        { header: "وحدات الصنف", name: "units", width: 150, visible: false },
-        { header: "العلاقة", name: "to_main_unit_qty", width: 150, visible: false },
+        { header: tr("الكمية"), name: "qnty", width: 80, visible: true, maxLength: 10 },
+        { header: tr("البونص"), name: "bonus", width: 80, maxLength: 10, visible: Util.getVoucherSettingScreenData(vch_type, 'bonus') },
+        { header: tr("الرقم التشغيلي"), name: "batch", width: 150, maxLength: 30, visible: Util.getVoucherSettingScreenData(vch_type, 'batch') },
+        { header: tr("رقم الوحدة"), name: "unit_id", width: 150, visible: false },
+        { header: tr("الوحدة"), name: "unit_name", width: 80, visible: Util.getVoucherSettingScreenData(vch_type, 'unit') },
+        { header: tr("وحدات الصنف"), name: "units", width: 150, visible: false },
+        { header: tr("العلاقة"), name: "to_main_unit_qty", width: 150, visible: false },
 
         {
           name: 'btnSearchUnits',
@@ -1607,10 +1716,10 @@ function UnifiedSaleInvoices({
           visible: true,
           visibleInColumnChooser: true
         },
-        { header: "السعر", name: "price", width: 80, maxLength: 10, visible: Util.getVoucherSettingScreenData(vch_type, 'price') },
-        { header: "الخصم", name: "discount", width: 80, maxLength: 10, visible: Util.getVoucherSettingScreenData(vch_type, 'discount') },
-        { header: "المبلغ", name: "amount", width: 80, visible: true, maxLength: 15 },
-        { header: "تاريخ الصلاحية", name: "expiry_date", width: 120, visible: false },
+        { header: tr("السعر"), name: "price", width: 80, maxLength: 10, visible: Util.getVoucherSettingScreenData(vch_type, 'price') },
+        { header: tr("الخصم"), name: "discount", width: 80, maxLength: 10, visible: Util.getVoucherSettingScreenData(vch_type, 'discount') },
+        { header: tr("المبلغ"), name: "amount", width: 80, dataType: wjcCore.DataType.String, visible: true, maxLength: 15 },
+        { header: tr("تاريخ الصلاحية"), name: "expiry_date", width: 120, visible: false },
         { header: "has_batch_number", name: "has_batch_number", width: 150, visible: false },
         {
           name: 'btnDelete',
@@ -1684,7 +1793,9 @@ function UnifiedSaleInvoices({
     }))
   }
 
-  const handleProductSelect = (product: any, itemId: string) => {
+  const handleProductSelect = async (product: any, itemId: string) => {
+    product = await requestProductVariant(product)
+    if (!product) return
     updateOrderItem(itemId, "product_id", product.id)
     updateOrderItem(itemId, "product_code", product.product_code)
     updateOrderItem(itemId, "product_name", product.product_name)
@@ -1693,6 +1804,13 @@ function UnifiedSaleInvoices({
     updateOrderItem(itemId, "unit_price", product.selling_price || product.last_purchase_price)
     setState((prev) => ({ ...prev, showProductSearch: false, activeItemId: null }))
   }
+
+  // مندوب العميل يُعبّأ تلقائياً عند اختيار العميل (إن كان له مندوب، وإلا يبقى كما هو)
+  useCustomerDefaultSalesman({
+    recordId: state.formData.id,
+    accountId: state.formData.customer_id,
+    onSalesman: (salesmanId) => setState((prev) => ({ ...prev, formData: { ...prev.formData, salesman: String(salesmanId) } })),
+  })
 
   const selectCustomer = (customer: Customer) => {
     const allowedVoucherBooks = ["L", "P", "M", "R"]
@@ -1806,32 +1924,32 @@ function UnifiedSaleInvoices({
     message.current?.clear()
     console.log("state.formData ", state.formData)
     if (!state.formData.order_number) {
-      Util.showErrorMessage(message, 'رقم الفاتورة فارغ لا يمكن الاستمرار')
+      Util.showErrorMessage(message, tr("رقم الفاتورة فارغ لا يمكن الاستمرار"))
       return false
     }
     if (state.formData.currency_id === 0) {
-      Util.showErrorMessage(message, 'يجب تحديد العملة')
+      Util.showErrorMessage(message, tr("يجب تحديد العملة"))
       return false
     }
     if (state.formData.exchange_rate <= 0) {
-      Util.showErrorMessage(message, 'يجب ادخال سعر الصرف')
+      Util.showErrorMessage(message, tr("يجب ادخال سعر الصرف"))
       return false
     }
 
     if (state.formData.customer_id === 0) {
-      Util.showErrorMessage(message, 'يجب ادخال الزبون')
+      Util.showErrorMessage(message, tr("يجب ادخال العميل"))
       return false
     }
     if (!state.formData.customer_name.trim()) {
-      Util.showErrorMessage(message, 'يجب ادخال اسم الزبون')
+      Util.showErrorMessage(message, tr("يجب ادخال اسم العميل"))
       return false
     }
     if (CollectionView.items.length === 0 || !CollectionView?.items[0]?.id) {
-      Util.showErrorMessage(message, 'يجب ادخال صنف واحد على الأقل')
+      Util.showErrorMessage(message, tr("يجب ادخال صنف واحد على الأقل"))
       return false
     }
     if (Number(totals.total) < 0) {
-      Util.showErrorMessage(message, 'مجموع الفاتورة غير منطقي يرجى التأكد من المدخلات')
+      Util.showErrorMessage(message, tr("مجموع الفاتورة غير منطقي يرجى التأكد من المدخلات"))
       return false
     }
     // Assuming collectionView is your CollectionView instance
@@ -1848,7 +1966,7 @@ function UnifiedSaleInvoices({
       const qty = Number(item.qnty) || 0;
       const bonus = Number(item.bonus) || 0;
       if (qty <= 0 && bonus <= 0) {
-        Util.showErrorMessage(message, 'يوجد اصناف لم يتم ادخال الكمية او البونص لها')
+        Util.showErrorMessage(message, tr("يوجد اصناف لم يتم ادخال الكمية او البونص لها"))
         return false
       }
 
@@ -1856,11 +1974,11 @@ function UnifiedSaleInvoices({
       const amount = Number(item.amount) || 0;
       const discount = Number(item.discount) || 0;
       if (discount > amount) {
-        Util.showErrorMessage(message, 'مبلغ الخصم اكبر من مبلغ الصنف ' + item.name)
+        Util.showErrorMessage(message, tr("مبلغ الخصم اكبر من مبلغ الصنف ") + item.name)
         return false
       }
       if (item.has_batch_number && (!item.batch || item.batch === '') && vch_type === 2) {
-        Util.showErrorMessage(message, 'يجب ادخال الرقم التشغيلي للصنف ' + item.name)
+        Util.showErrorMessage(message, tr("يجب ادخال الرقم التشغيلي للصنف ") + item.name)
         return false
       }
 
@@ -1870,7 +1988,7 @@ function UnifiedSaleInvoices({
         if (usedBatches.has(batchNo)) {
           Util.showErrorMessage(
             message,
-            'يوجد رقم تشغيلي مكرر مع اكثر من صنف : ' + batchNo
+            tr("يوجد رقم تشغيلي مكرر مع اكثر من صنف : ") + batchNo
           );
           return false;
         }
@@ -2023,7 +2141,7 @@ function UnifiedSaleInvoices({
   `;
 
     // Get saved user
-    const savedUser = localStorage.getItem("erp_user") || sessionStorage.getItem("erp_user");
+    const savedUser = sessionStorage.getItem("erp_user") || localStorage.getItem("erp_user");
     if (!savedUser) return;
     const user = JSON.parse(savedUser);
     if (!user?.id) return;
@@ -2067,6 +2185,7 @@ function UnifiedSaleInvoices({
   async function handleSaveOrder(orderToSave: any, isNewRecord: boolean): Promise<void> {
 
     // ✅ HARD LOCK FIRST
+    saveSucceededRef.current = false;
     if (isSaving.current) return;
     isSaving.current = true;
 
@@ -2076,18 +2195,18 @@ function UnifiedSaleInvoices({
       if (!validateOrder()) return;
 
       const savedUser =
-        localStorage.getItem("erp_user") ||
-        sessionStorage.getItem("erp_user");
+        sessionStorage.getItem("erp_user") ||
+        localStorage.getItem("erp_user");
 
       if (!savedUser) {
-        Util.showErrorMessage(message, "المستخدم غير معرف يرجى تسجيل الدخول من جديد");
+        Util.showErrorMessage(message, tr("المستخدم غير معرف يرجى تسجيل الدخول من جديد"));
         return;
       }
 
       const user = JSON.parse(savedUser);
 
       if (!user?.id) {
-        Util.showErrorMessage(message, "المستخدم غير معرف يرجى تسجيل الدخول من جديد");
+        Util.showErrorMessage(message, tr("المستخدم غير معرف يرجى تسجيل الدخول من جديد"));
         return;
       }
 
@@ -2172,12 +2291,13 @@ function UnifiedSaleInvoices({
 
         Util.showErrorMessage(
           message,
-          errorData.error || "فشل في حفظ فاتورة المبيعات"
+          errorData.error || tr("فشل في حفظ فاتورة المبيعات")
         );
         return;
       }
 
       const result = await response.json();
+      saveSucceededRef.current = true;
 
       const id = result.id;
 
@@ -2191,7 +2311,7 @@ function UnifiedSaleInvoices({
       Util.showSuccessMessage(message);
       lastVchBook.current = state.formData.vch_book;
       popupHasCalled();
-      setAlertMessage("هل تريد طباعة الفاتورة؟");
+      setAlertMessage(tr("هل تريد طباعة الفاتورة؟"));
 
       setState((prev) => ({
         ...prev,
@@ -2208,6 +2328,13 @@ function UnifiedSaleInvoices({
       isSaving.current = false;
     }
   }
+
+  // تبديل الشاشة من القائمة/إغلاق التبويب/رجوع المتصفح/تحديث الصفحة مع تغييرات غير محفوظة ⇐ نفس نافذة
+  // التحقق من التغييرات — كما في كاشير نقطة البيع (lib/navigation-guard.ts)
+  useNavigationGuard(
+    () => Boolean(open && initialHash.current != 0 && getFormDataHash({ order_date: state.formData.order_date, customer_id: state.formData.customer_id, customer_name: state.formData.customer_name, delivery_date: state.formData.delivery_date, currency_id: state.formData.currency_id, exchange_rate: state.formData.exchange_rate }) !== initialHash.current),
+    (continueNavigation) => { setNextFunction(() => continueNavigation); setShowUnsaved(true) },
+  )
 
   const handleDeleteClick = (checkUnsaved: any) => {
     let newFormData = {
@@ -2228,15 +2355,15 @@ function UnifiedSaleInvoices({
     if (!state.formData.id) {
       toast.current?.show({
         severity: 'warn',
-        summary: 'تنبيه',
-        detail: 'لا توجد فاتورة لحذفها',
+        summary: tr("تنبيه"),
+        detail: tr("لا توجد فاتورة لحذفها"),
         life: 3000
       });
       return;
     }
     message.current?.clear();
     if (state.formData.is_exported) {
-      Util.showErrorMessage(message, "الفاتورة مرحلة الى النظام المحاسبي لن تتم عملية الحذف");
+      Util.showErrorMessage(message, tr("الفاتورة معتمدة الى النظام المحاسبي لن تتم عملية الحذف"));
 
       //Util.showInfoToast(toast.current, "الطلبية مرحلة الى النظام المحاسبي لن تتم عملية الحفظ");
       return;
@@ -2262,16 +2389,16 @@ function UnifiedSaleInvoices({
   }, [state.formData]);
   async function handleDeleteOrder(orderToDelete: SalesOrder): Promise<void> {
     if (!state.formData || !state.formData.id) {
-      throw new Error("لا توجد فاتورة محددة للحذف")
+      throw new Error(tr("لا توجد فاتورة محددة للحذف"))
     }
-    const savedUser = localStorage.getItem("erp_user") || sessionStorage.getItem("erp_user")
+    const savedUser = sessionStorage.getItem("erp_user") || localStorage.getItem("erp_user")
     if (!savedUser) {
-      Util.showErrorMessage(message, 'المستخدم غير معرف يرجى تسجيل الدخول من جديد')
+      Util.showErrorMessage(message, tr("المستخدم غير معرف يرجى تسجيل الدخول من جديد"))
       return
     }
     const user = JSON.parse(savedUser)
     if (!user || !user.id) {
-      Util.showErrorMessage(message, 'المستخدم غير معرف يرجى تسجيل الدخول من جديد')
+      Util.showErrorMessage(message, tr("المستخدم غير معرف يرجى تسجيل الدخول من جديد"))
       return
     }
     setLoading(true)
@@ -2285,7 +2412,7 @@ function UnifiedSaleInvoices({
     });
     if (!response.ok) {
       setLoading(false)
-      throw new Error("فشل في حذف الفاتورة")
+      throw new Error(tr("فشل في حذف الفاتورة"))
     }
     Util.showSuccessMessage(message, 'تم حذف الفاتورة بنجاح ✅')
     reset_order()
@@ -2316,15 +2443,16 @@ function UnifiedSaleInvoices({
 
 
   const handleSave = async () => {
-    if (isHandlingSave.current) return;
+    if (isHandlingSave.current) return false;
     isHandlingSave.current = true;
     message.current?.clear();
 
     if (state.formData.is_exported) {
-      Util.showErrorMessage(message, "الفاتورة مرحلة الى النظام المحاسبي لن تتم عملية الحفظ");
+      Util.showErrorMessage(message, tr("الفاتورة معتمدة الى النظام المحاسبي لن تتم عملية الحفظ"));
+      isHandlingSave.current = false;
 
       //Util.showInfoToast(toast.current, "الطلبية مرحلة الى النظام المحاسبي لن تتم عملية الحفظ");
-      return;
+      return false;
     }
     setState((prev) => ({ ...prev, isSaving: true }))
     try {
@@ -2353,6 +2481,7 @@ function UnifiedSaleInvoices({
       }
 
       await handleSaveOrder(currentOrderForNavigation, isNewRecord)
+      return saveSucceededRef.current;
       //alert("تم حفظ الطلبية بنجاح")
 
       // After successful save, update the state with the latest data if it was a new record
@@ -2373,7 +2502,8 @@ function UnifiedSaleInvoices({
       }*/
     } catch (err: any) {
       console.error("Error saving sales order:", err)
-      alert(err.message || "حدث خطأ أثناء حفظ البيانات")
+      showAlert(err.message || tr("حدث خطأ أثناء حفظ البيانات"))
+      return false;
     } finally {
       setState((prev) => ({ ...prev, isSaving: false }))
       isHandlingSave.current = false;
@@ -2384,7 +2514,7 @@ function UnifiedSaleInvoices({
   const handleDelete = async () => {
     message.current?.clear();
     if (state.formData.is_exported) {
-      Util.showErrorMessage(message, "الفاتورة مرحلة الى النظام المحاسبي لن تتم عملية الحذف");
+      Util.showErrorMessage(message, tr("الفاتورة معتمدة الى النظام المحاسبي لن تتم عملية الحذف"));
 
       //Util.showInfoToast(toast.current, "الطلبية مرحلة الى النظام المحاسبي لن تتم عملية الحفظ");
       return;
@@ -2394,7 +2524,7 @@ function UnifiedSaleInvoices({
       // The deleteRecord from useRecordNavigation hook handles the deletion logic
       // It expects the currentRecord to be passed or it uses the internally tracked current record.
       await deleteRecord()
-      alert("تم حذف الفاتورة بنجاح")
+      showAlert(tr("تم حذف الفاتورة بنجاح"))
 
       // Close the dialog after deletion
       if (onOpenChange) {
@@ -2404,7 +2534,7 @@ function UnifiedSaleInvoices({
       }
     } catch (err: any) {
       console.error("Error deleting sales order:", err)
-      alert(err.message || "حدث خطأ أثناء حذف البيانات")
+      showAlert(err.message || tr("حدث خطأ أثناء حذف البيانات"))
     } finally {
       setState((prev) => ({ ...prev, isDeleting: false }))
     }
@@ -2459,9 +2589,7 @@ function UnifiedSaleInvoices({
     const grid: any = gridRef.current;
 
     try {
-      if (grid?.finishEditing) {
-        grid.finishEditing(false);
-      }
+      grid?.finishEditing?.(false);
     } catch (error) {
       console.error("Failed to finish grid editing before closing customer search:", error);
     }
@@ -2486,12 +2614,6 @@ function UnifiedSaleInvoices({
     setShowCustomerSearch(true)
   }
 
-  const selectedCustomerBalance = useMemo(() => {
-    const selectedCustomer = state.customers.find((customer) =>
-      Number(customer.id) === Number(state.formData.customer_id),
-    )
-    return Number(selectedCustomer?.credit_limit ?? 0)
-  }, [state.customers, state.formData.customer_id])
 
   const refocusDropdownInput = (inputId: string) => {
     setTimeout(() => {
@@ -2526,7 +2648,7 @@ function UnifiedSaleInvoices({
   }
 
   useEffect(() => {
-    const handler = (e: KeyboardEvent) => {
+    const handler = (e: KeyboardEvent) => { if (!workspaceTabActive.current) return;
       if (!doHotKeys.current) return;
 
       if (e.key === "Enter" && skipNextEnterRef.current) {
@@ -2565,21 +2687,7 @@ function UnifiedSaleInvoices({
         }
         return;
       }
-      if (e.key === "F3") {
-        e.preventDefault();
-
-        // Blur the active element to commit any input changes
-        (document.activeElement as HTMLElement)?.blur();
-
-        // Now state has the latest values from all inputs
-        handleSave();
-      }
-
-      if (e.key === "F4") {
-        e.preventDefault();
-        handleDelete();
-      }
-
+      // F3 حفظ / F9 حذف / F4 نسخ: UniversalToolbar (lib/hotkeys.ts)
       if (e.key === "ESC") {
         e.preventDefault();
         onCancel();
@@ -2618,71 +2726,13 @@ function UnifiedSaleInvoices({
       return;
     }
     reset_order();
-    const input = document.createElement("input");
-    input.type = "file";
-    input.accept = ".xlsx,.xls"; // Only Excel files
-    input.onchange = (event: Event) => {
-      const target = event.target as HTMLInputElement;
-      if (target.files && target.files.length > 0) {
-        const file = target.files[0];
-        handleImportExcel(file); // Your function to read Excel and populate collectionView
-      }
-    };
-    input.click();
+    setExcelLinesOpen(true);
   }
-  const handleImportExcel = async (file: File) => {
-    try {
-      setLoading(true);
-      setFromExcelRef.current = true
-      const data = await file.arrayBuffer();
-      const workbook = XLSX.read(data, { type: "array" });
-      const firstSheetName = workbook.SheetNames[0];
-      const sheet = workbook.Sheets[firstSheetName];
-      const rows: any[] = XLSX.utils.sheet_to_json(sheet, { defval: "" });
-
-      if (!rows || rows.length === 0) {
-        alert("الملف فارغ أو لا يحتوي على بيانات صالحة");
-        return;
-      }
-
-      const importedProducts = await Promise.all(
-        rows.map(async (row) => {
-          const codeOrBarcode = row["رقم الصنف"] || row["barcode"] || row["code"];
-          if (!codeOrBarcode) return null;
-
-          const product = await fetchProductByCodeOrBarcode(codeOrBarcode);
-          if (!product) {
-            console.warn(`المنتج غير موجود: ${codeOrBarcode}`);
-            return null;
-          }
-
-          // Update fields from Excel
-          product.price = row["السعر"] || row["price"] || row["Price"] || product.price;
-          product.qnty = row["الكمية"] || row["quantity"] || row["qnty"] || 1;
-          product.bonus = row["البونص"] || row["بونص"] || row["bonus"] || 0;
-          product.batch = row["الرقم التشغيلي"] || row["batch"] || '';
-          return product;
-        })
-      );
-
-      // Filter out nulls (products not found)
-      const validProducts = importedProducts.filter((p): p is Product => p !== null);
-      // Fill items into CollectionView
-      if (validProducts.length > 0) {
-        FillItem(validProducts);
-
-      }
-      // Update CollectionView
-      //collectionView.sourceCollection = products;
-
-    } catch (err) {
-      console.error("خطأ أثناء استيراد Excel:", err);
-      alert("حدث خطأ أثناء قراءة ملف Excel.");
-    }
-    finally {
-      setLoading(false);
-
-    }
+  // استيراد الأسطر من Excel بالمحرك الموحّد: مطابقة الأعمدة ومراجعة الأصناف غير الموجودة قبل إضافتها للشبكة
+  const [excelLinesOpen, setExcelLinesOpen] = useState(false);
+  const importExcelLines = async (products: Product[]) => {
+    setFromExcelRef.current = true
+    await FillItem(products);
   };
   const filteredCustomers = state.customers.filter(
     (customer) =>
@@ -2760,8 +2810,8 @@ function UnifiedSaleInvoices({
       const order = await res.json();
       if (!order?.id || order.id === currentOrderId) {
         const isStartBoundary = navigationType === "previous" || navigationType === "first"
-        const boundaryText = isStartBoundary ? "بداية السجلات" : "نهاية السجلات"
-        const boundaryHint = isStartBoundary ? "لا توجد فواتير أقدم" : "لا توجد فواتير أحدث"
+        const boundaryText = isStartBoundary ? tr("بداية السجلات") : tr("نهاية السجلات")
+        const boundaryHint = isStartBoundary ? tr("لا توجد فواتير أقدم") : tr("لا توجد فواتير أحدث")
 
         toast.current?.show({
           severity: "warn",
@@ -2838,6 +2888,7 @@ function UnifiedSaleInvoices({
         CollectionView.sourceCollection = updatedItems;
         CollectionView.refresh();
       }
+      invoiceLineBaselineRef.current = invoiceLineFingerprint(CollectionView.items as any[]);
 
 
       let newFormData = {
@@ -2889,11 +2940,11 @@ function UnifiedSaleInvoices({
     reset_order()
   }
 
-  const reset_order = () => {
+  const reset_order = (invoiceSourceType = "normal") => {
     setLoading(true)
     setState((prev) => ({
       ...prev, // Keep existing states like customers, products etc.
-      formData: { ...initialFormData, vch_book: lastVchBook.current || initialFormData.vch_book },
+      formData: { ...initialFormData, invoice_source_type: invoiceSourceType, vch_book: lastVchBook.current || initialFormData.vch_book },
       customerSearch: "",
       activeTab: "basic", // Reset to basic tab
       showCustomerSearch: false,
@@ -2908,6 +2959,7 @@ function UnifiedSaleInvoices({
     const newRow = { ser: 1 };
     CollectionView.sourceCollection.push(newRow);
     CollectionView.refresh();
+    invoiceLineBaselineRef.current = invoiceLineFingerprint(CollectionView.items as any[]);
     setTimeout(() => {
       focusGrid()
     }, 10)
@@ -2945,6 +2997,36 @@ function UnifiedSaleInvoices({
         grid.select(new wjGrid.CellRange(lastRowIndex, itemNoColIndex));
       }
     }, 100);
+  }
+  const isInvoiceDirty = () => Boolean(open && (
+    (initialHash.current != 0 && getFormDataHash({ order_date: state.formData.order_date, customer_id: state.formData.customer_id, customer_name: state.formData.customer_name, delivery_date: state.formData.delivery_date, currency_id: state.formData.currency_id, exchange_rate: state.formData.exchange_rate }) !== initialHash.current)
+    || invoiceLineFingerprint(CollectionView.items as any[]) !== invoiceLineBaselineRef.current
+  ))
+  const handleInvoiceSourceTypeChange = (nextType: string) => {
+    if (nextType === (state.formData.invoice_source_type || "normal")) return
+
+    const startNewInvoice = () => {
+      setEditingOrder?.(null)
+      reset_order(nextType)
+    }
+    const hasDisplayedInvoice = Number(state.formData.id || currentOrderId) > 0
+    if (hasDisplayedInvoice && isInvoiceDirty()) {
+      pendingInvoiceSourceTypeRef.current = nextType
+      setNextFunction(() => startNewInvoice)
+      setShowUnsaved(true)
+      return
+    }
+    if (hasDisplayedInvoice) {
+      startNewInvoice()
+      return
+    }
+    setState((prev) => ({ ...prev, formData: { ...prev.formData, invoice_source_type: nextType } }))
+  }
+  const requestCloseWithCheck = () => {
+    const close = () => (onOpenChange ? onOpenChange(false) : handleCancel())
+    if (!isInvoiceDirty()) { close(); return }
+    setNextFunction(() => close)
+    setShowUnsaved(true)
   }
   const handleCancel = () => {
     // Reset form state
@@ -3022,19 +3104,20 @@ function UnifiedSaleInvoices({
   }
 
   const reportColumns = [
-    { key: "order_number", label: "رقم الفاتورة", width: "120px" },
-    { key: "order_date", label: "التاريخ", width: "100px" },
-    { key: "customer_name", label: "اسم الزبون", width: "200px" },
+    { key: "order_number", label: tr("رقم الفاتورة"), width: "120px" },
+    { key: "order_date", label: tr("التاريخ"), width: "100px" },
+    { key: "customer_name", label: tr("اسم العميل"), width: "200px" },
 
-    { key: "total_amount", label: "المبلغ", width: "100px" },
-    { key: "salesman", label: "المندوب", width: "120px" },
-    { key: "delivery_date", label: "تاريخ التسليم", width: "120px" },
+    { key: "total_amount", label: tr("المبلغ"), width: "100px" },
+    { key: "salesman", label: tr("المندوب"), width: "120px" },
+    { key: "delivery_date", label: tr("تاريخ التسليم"), width: "120px" },
   ]
 
 
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange || handleCancel}>
+    // الإغلاق (ESC أو زر X) يمر بالتحقق من التغييرات
+    <Dialog open={open} onOpenChange={(next) => { if (next) return; requestCloseWithCheck() }}>
       <DialogContent className="
           invoice-inline-labels
           w-full
@@ -3050,7 +3133,7 @@ function UnifiedSaleInvoices({
           flex-col
         "
         onPointerDownOutside={(event) => event.preventDefault()}
-        onEscapeKeyDown={(event) => { if (!doHotKeys.current) event.preventDefault() }}
+        onEscapeKeyDown={(event) => { if (!doHotKeys.current || showUnsaved) event.preventDefault(); else keepDialogOpenOnEscape(event) }}
 
       >
 
@@ -3085,6 +3168,7 @@ function UnifiedSaleInvoices({
 
           <div className="p-6 space-y-6">
             <Toast ref={toast} position={'top-left'} className="erp-toast-host" style={{ top: 100, whiteSpace: 'pre-line' }} />
+            <VoucherLinesImportDialog<Product> open={excelLinesOpen} onOpenChange={setExcelLinesOpen} priceCategoryId={priceCategoryIdRef.current} resolveProduct={fetchProductByCodeOrBarcode} onLines={importExcelLines} />
             <ProgressSpinner loading={loading} />
 
             <ProductSearchPopup
@@ -3094,10 +3178,12 @@ function UnifiedSaleInvoices({
               priceCategoryId={priceCategoryIdRef.current}
               ShowSelect={true}
               searchText={searchTextRef.current}
+              voucherNumberType={Util.getVoucherBarcodeMode(vch_type) as "barcode" | "factory" | "original"}
             />
             <UnitsSearchPopup
               visible={showUnitsSearch}
               product={selectedProductForUnits!}      // selected row from your main grid
+              priceCategoryId={priceCategoryIdRef.current}
               units={selectedProductForUnits?.units ?? []} // units from that row
               onClose={() => {
                 setUnitsSearch(false)
@@ -3167,7 +3253,22 @@ function UnifiedSaleInvoices({
             />
             <ConfirmDialogYesNo
               visible={showUnsaved}
-              onConfirm={() => { setShowUnsaved(false); handleSave() }}
+              onConfirm={async () => {
+                const pendingAction = nextFunction
+                setShowUnsaved(false)
+                const saved = await handleSave()
+                if (saved && pendingAction) {
+                  const pendingSourceType = pendingInvoiceSourceTypeRef.current
+                  if (pendingSourceType) {
+                    setState((prev) => ({ ...prev, formData: { ...prev.formData, invoice_source_type: pendingSourceType } }))
+                    setEditingOrder?.(null)
+                    pendingInvoiceSourceTypeRef.current = null
+                  } else {
+                    pendingAction()
+                  }
+                  setNextFunction(null)
+                }
+              }}
               onCancel={async () => {
                 setShowUnsaved(false); popupHasClosed();
                 if (nextFunction) {
@@ -3175,16 +3276,17 @@ function UnifiedSaleInvoices({
                   setNextFunction(null);
 
                 }
+                pendingInvoiceSourceTypeRef.current = null
               }}
-              message="تم تعديل السجل هل تريد الحفظ؟"
-              onBack={() => { setShowUnsaved(false); popupHasClosed(); setLoading(false) }}
+              message={tr("تم تعديل السجل هل تريد الحفظ؟")}
+              onBack={() => { setShowUnsaved(false); popupHasClosed(); setLoading(false); setNextFunction(null); pendingInvoiceSourceTypeRef.current = null }}
               showBack={true}
             />
             <ConfirmDialogYesNo
               visible={showConfirm}
               onConfirm={confirmDelete}
               onCancel={() => { setShowConfirm(false); popupHasClosed() }}
-              message="هل أنت متأكد من حذف السجل؟"
+              message={tr("هل أنت متأكد من حذف السجل؟")}
             />
             <ConfirmDialogYesNo
               visible={showAlert}
@@ -3199,7 +3301,7 @@ function UnifiedSaleInvoices({
               visible={showPrintRefConfirm}
               onConfirm={() => { setShowPrintRefConfirm(false); popupHasClosed(); handlePrint(false); setTimeout(() => referenceNumberRef.current?.focus(), 50) }}
               onCancel={() => { setShowPrintRefConfirm(false); popupHasClosed(); setTimeout(() => referenceNumberRef.current?.focus(), 50) }}
-              message="تمت طباعة السند مسبقا هل تريد الطباعة مرة أخرى؟"
+              message={tr("تمت طباعة السند مسبقا هل تريد الطباعة مرة أخرى؟")}
             />
             <ConfirmDialogYesNo
               visible={showDuplicateRefConfirm}
@@ -3231,7 +3333,7 @@ function UnifiedSaleInvoices({
                   popupHasClosed()
                 }, 220)
               }}
-              message="رقم السند اليدوي مستخدم مسبقا، هل تريد المتابعة؟"
+              message={tr("رقم السند اليدوي مستخدم مسبقا، هل تريد المتابعة؟")}
             />
             <OrderSearchPopup
               visible={showOrderSearch}
@@ -3287,31 +3389,31 @@ function UnifiedSaleInvoices({
                 <div className="flex flex-wrap items-center justify-between gap-4">
                   <div className="flex items-center gap-2">
                     <TrendingUp className="h-5 w-5 text-primary" />
-                    <span className="text-sm font-medium">ملخص الفاتورة</span>
+                    <span className="text-sm font-medium">{tr("ملخص الفاتورة")}</span>
                   </div>
                   <div className="flex flex-wrap items-center gap-6 text-sm">
                     <div className="flex flex-col items-end">
-                      <span className="text-xs text-muted-foreground">المجموع الفرعي</span>
+                      <span className="text-xs text-muted-foreground">{tr("المجموع الفرعي")}</span>
                       <span className="font-semibold">{totals.subtotal.toFixed(2)} </span>
                     </div>
                     <div className="flex flex-col items-end">
-                      <span className="text-xs text-muted-foreground">الخصم</span>
+                      <span className="text-xs text-muted-foreground">{tr("الخصم")}</span>
                       <span className="font-semibold text-red-600">-{totals.discount.toFixed(2)} </span>
                     </div>
                     <div className="flex flex-col items-end">
-                      <span className="text-xs text-muted-foreground">الضريبة</span>
+                      <span className="text-xs text-muted-foreground">{tr("الضريبة")}</span>
                       <span className="font-semibold">{totals.tax.toFixed(2)} </span>
                     </div>
                     <Separator orientation="vertical" className="h-10 hidden md:block" />
                     <div className="flex flex-col items-end">
-                      <span className="text-xs text-muted-foreground">الإجمالي</span>
+                      <span className="text-xs text-muted-foreground">{tr("الإجمالي")}</span>
                       <span className="text-lg font-bold text-primary">{totals.total.toFixed(2)}</span>
                     </div>
                   </div>
                 </div>
               </CardContent>
             </Card>
-            <div className="grid grid-cols-1 gap-6" dir="rtl">
+            <div className="grid grid-cols-1 gap-6" dir={appDir()}>
 
               {/* ===================== */}
               {/* معلومات الفاتورة (يمين) */}
@@ -3320,17 +3422,17 @@ function UnifiedSaleInvoices({
                 <CardHeader className="pb-4">
                   <CardTitle className="text-lg flex items-center gap-2">
                     <FileText className="h-5 w-5 text-primary" />
-                    معلومات الفاتورة الأساسية
+                    {tr("معلومات الفاتورة الأساسية")}
                   </CardTitle>
                 </CardHeader>
 
                 <CardContent className="space-y-10">
 
                   {/* الصف الأول */}
-                  <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+                  <div className={`grid grid-cols-1 md:grid-cols-4 gap-4 ${state.formData.invoice_source_type === "from_delivery" ? "xl:grid-cols-5" : ""}`}>
                     {/* دفتر السندات */}
                     <div className="invoice-currency-dropdown-wrap">
-                      <Label>دفتر السندات</Label>
+                      <Label>{tr("دفتر السندات")}</Label>
                       <PrimeDropdown
                         inputId="vch_book"
                         value={String(state.formData.vch_book ?? "R")}
@@ -3360,7 +3462,7 @@ function UnifiedSaleInvoices({
                     {/* رقم الفاتورة */}
                     <div className="space-y-2">
                       <Label className="text-sm font-medium">
-                        {"رقم الفاتورة"} <span className="text-red-500 mr-1">*</span>
+                        {tr("رقم الفاتورة")} <span className="text-red-500 ms-1">*</span>
                       </Label>
 
                       <div className="flex flex-row-reverse gap-2 items-center">
@@ -3384,8 +3486,8 @@ function UnifiedSaleInvoices({
                               formData: { ...prev.formData, order_number: e.target.value },
                             }))
                           }
-                          className="text-right font-medium text-sm h-9"
-                          dir="rtl"
+                          className="text-start font-medium text-sm h-9"
+                          dir={appDir()}
                           placeholder={""}
                           onBlur={handleOrderCodeBlur}
                           maxLength={9}
@@ -3395,7 +3497,7 @@ function UnifiedSaleInvoices({
 
                     {/* تاريخ الفاتورة */}
                     <div>
-                      <Label>تاريخ الفاتورة</Label>
+                      <Label>{tr("تاريخ الفاتورة")}</Label>
                       <Input
                         type="date"
                         value={state.formData.order_date ?? ""}
@@ -3418,7 +3520,7 @@ function UnifiedSaleInvoices({
                     </div>
 
                     <div className="invoice-currency-dropdown-wrap">
-                      <Label>نوع الفاتورة</Label>
+                      <Label>{tr("نوع الفاتورة")}</Label>
                       <PrimeDropdown
                         inputId="invoice_source_type"
                         value={state.formData.invoice_source_type || "normal"}
@@ -3430,15 +3532,16 @@ function UnifiedSaleInvoices({
                         appendTo="self"
                         baseZIndex={10000}
                         panelStyle={{ zIndex: 10000 }}
-                        onChange={(e: any) =>
-                          setState((prev) => ({
-                            ...prev,
-                            formData: { ...prev.formData, invoice_source_type: e.value || "normal" },
-                          }))
-                        }
+                        onChange={(e: any) => handleInvoiceSourceTypeChange(String(e.value || "normal"))}
                         onHide={() => refocusDropdownInput("invoice_source_type")}
                       />
                     </div>
+                    {state.formData.invoice_source_type === "from_delivery" && (
+                      <div className="space-y-2">
+                        <Label>{"\u0631\u0642\u0645 \u0627\u0644\u0625\u0631\u0633\u0627\u0644\u064a\u0629"}</Label>
+                        <Input value={sourceDeliveryNumbers} readOnly placeholder="—" className="h-11 bg-slate-50 text-start" dir={appDir()} />
+                      </div>
+                    )}
 
                   </div>
 
@@ -3447,7 +3550,7 @@ function UnifiedSaleInvoices({
 
                     {/* العملة */}
                     <div className="invoice-currency-dropdown-wrap">
-                      <Label>العملة</Label>
+                      <Label>{tr("العملة")}</Label>
                       <PrimeDropdown
                         id="currency_id"
                         inputId="currency_id"
@@ -3455,7 +3558,7 @@ function UnifiedSaleInvoices({
                         options={normalizedCurrencies}
                         optionLabel="currency_name"
                         optionValue="currency_id"
-                        placeholder="اختر العملة"
+                        placeholder={tr("اختر العملة")}
                         filter={true}
                         className="invoice-currency-dropdown"
                         panelClassName="invoice-currency-dropdown-panel"
@@ -3511,7 +3614,7 @@ function UnifiedSaleInvoices({
 
                     {/* سعر الصرف */}
                     <div>
-                      <Label>سعر الصرف</Label>
+                      <Label>{tr("سعر الصرف")}</Label>
                       <Input
                         value={state.formData.exchange_rate ?? 1}
                         disabled={state.formData.currency_id === 1}
@@ -3520,7 +3623,7 @@ function UnifiedSaleInvoices({
                     </div>
 
                     <div>
-                      <Label className="text-sm font-medium">{"السند اليدوي"}</Label>
+                      <Label className="text-sm font-medium">{tr("السند اليدوي")}</Label>
                       <Input
                         ref={referenceNumberRef}
                         value={state.formData.reference_number ?? ""}
@@ -3533,14 +3636,14 @@ function UnifiedSaleInvoices({
                           }))
                         }}
                         onBlur={handleReferenceNumberBlur}
-                        className="text-right h-11"
-                        dir="rtl"
+                        className="text-start h-11"
+                        dir={appDir()}
                         maxLength={7}
                       />
                     </div>
 
                     <div>
-                      <Label className="text-sm font-medium">{"تاريخ السند اليدوي"}</Label>
+                      <Label className="text-sm font-medium">{tr("تاريخ السند اليدوي")}</Label>
                       <Input
                         type="date"
                         value={state.formData.reference_number_date ?? state.formData.order_date ?? ""}
@@ -3550,8 +3653,8 @@ function UnifiedSaleInvoices({
                             formData: { ...prev.formData, reference_number_date: e.target.value },
                           }))
                         }
-                        className="text-right h-11"
-                        dir="rtl"
+                        className="text-start h-11"
+                        dir={appDir()}
                       />
                     </div>
 
@@ -3560,11 +3663,11 @@ function UnifiedSaleInvoices({
                 </CardContent>
               </Card>
 
-              <Card className="h-full" dir="rtl">
+              <Card className="h-full" dir={appDir()}>
                 <CardHeader className="pb-4">
                   <CardTitle className="text-lg flex items-center gap-2">
                     <User className="h-5 w-5 text-primary" />
-                    تفاصيل الزبون ومعلومات الضريبة
+                    {tr("تفاصيل العميل ومعلومات الضريبة")}
                   </CardTitle>
                 </CardHeader>
                 <CardContent>
@@ -3574,22 +3677,22 @@ function UnifiedSaleInvoices({
                         value="customer"
                         className="rounded-xl px-4 py-2.5 text-sm font-medium transition-colors duration-200 data-[state=inactive]:text-slate-600 data-[state=inactive]:hover:bg-white data-[state=inactive]:hover:text-slate-900 data-[state=active]:bg-white data-[state=active]:text-blue-700 data-[state=active]:shadow-sm"
                       >
-                        تفاصيل الزبون
+                        {tr("تفاصيل العميل")}
                       </TabsTrigger>
                       <TabsTrigger
                         value="tax"
                         className="rounded-xl px-4 py-2.5 text-sm font-medium transition-colors duration-200 data-[state=inactive]:text-slate-600 data-[state=inactive]:hover:bg-white data-[state=inactive]:hover:text-slate-900 data-[state=active]:bg-white data-[state=active]:text-blue-700 data-[state=active]:shadow-sm"
                       >
-                        معلومات الضريبة
+                        {tr("معلومات الضريبة")}
                       </TabsTrigger>
                     </TabsList>
 
                     <TabsContent value="customer" className="space-y-4 mt-0">
                       <div className="grid grid-cols-1 md:grid-cols-2 gap-4 items-end">
-                        <AutoCompleteAccount
-                          label="الزبون"
+                        <AutoCompleteAccount voucherCurrencyId={Number(state.formData.currency_id) || null}
+                          label={tr("العميل")}
                           value={state.formData.customer_code ?? ""}
-                          placeholder="اختر الزبون"
+                          placeholder={tr("اختر العميل")}
                           leafOnly
                           displayNameFirst
                           requiredTypeValues={[1,2, 3]}
@@ -3623,7 +3726,7 @@ function UnifiedSaleInvoices({
                         />
 
                         <div className="space-y-2">
-                          <Label className="text-sm font-medium">اسم الدافع</Label>
+                          <Label className="text-sm font-medium">{tr("اسم الدافع")}</Label>
                           <div className="flex gap-2">
                             <Input
                               ref={customerNameRef}
@@ -3634,31 +3737,24 @@ function UnifiedSaleInvoices({
                                   formData: { ...prev.formData, customer_name: e.target.value },
                                 }))
                               }
-                              className="text-right h-11 flex-1"
+                              className="text-start h-11 flex-1"
                             />
                           </div>
                         </div>
 
                         <div className="space-y-2">
-                          <Label className="text-sm font-medium">المنطقة</Label>
+                          <Label className="text-sm font-medium">{tr("المنطقة")}</Label>
                           <Input
                             value={state.formData.customer_address ?? ""}
                             readOnly
-                            className="text-right h-11 bg-muted"
+                            className="text-start h-11 bg-muted"
                           />
                         </div>
 
-                        <div className="space-y-2">
-                          <Label className="text-sm font-medium">الرصيد</Label>
-                          <Input
-                            value={selectedCustomerBalance.toFixed(2)}
-                            readOnly
-                            className="text-right h-11 bg-muted"
-                          />
-                        </div>
+                        <AccountBalanceField accountId={state.formData.customer_id} refreshKey={`${state.formData.id}-${state.formData.order_status ?? state.formData.status ?? ""}`} className="space-y-2" labelClassName="text-sm font-medium" inputClassName="h-11 bg-muted" />
 
                         <div className="space-y-2">
-                          <Label className="text-sm font-medium">مشغل مرخص للزبون</Label>
+                          <Label className="text-sm font-medium">{tr("مشغل مرخص للعميل")}</Label>
                           <Input
                             value={state.formData.sales_representative ?? ""}
                             onChange={(e) =>
@@ -3667,12 +3763,12 @@ function UnifiedSaleInvoices({
                                 formData: { ...prev.formData, sales_representative: e.target.value },
                               }))
                             }
-                            className="text-right h-11"
+                            className="text-start h-11"
                           />
                         </div>
 
                         <div className="space-y-2">
-                          <Label className="text-sm font-medium">المندوب</Label>
+                          <Label className="text-sm font-medium">{tr("المندوب")}</Label>
                           <PrimeDropdown
                             inputId="salesman"
                             value={state.formData.salesman || "-1"}
@@ -3699,7 +3795,7 @@ function UnifiedSaleInvoices({
                     <TabsContent value="tax" className="space-y-6 mt-0">
                       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                         <div className="invoice-currency-dropdown-wrap">
-                          <Label>التصنيف الضريبي</Label>
+                          <Label>{tr("التصنيف الضريبي")}</Label>
                           <PrimeDropdown
                             inputId="tax_classification"
                             value={state.formData.tax_classification || 1}
@@ -3722,7 +3818,7 @@ function UnifiedSaleInvoices({
                         </div>
 
                         <div className="invoice-currency-dropdown-wrap">
-                          <Label>النوع</Label>
+                          <Label>{tr("النوع")}</Label>
                           <PrimeDropdown
                             inputId="invoice_type"
                             value={state.formData.invoice_type || 1}
@@ -3745,7 +3841,7 @@ function UnifiedSaleInvoices({
                         </div>
 
                         <div>
-                          <Label className="text-sm font-medium">{"تاريخ التسديد"}</Label>
+                          <Label className="text-sm font-medium">{tr("تاريخ التسديد")}</Label>
                           <Input
                             type="date"
                             value={state.formData.delivery_date ?? ""}
@@ -3755,16 +3851,16 @@ function UnifiedSaleInvoices({
                                 formData: { ...prev.formData, delivery_date: e.target.value },
                               }))
                             }
-                            className="text-right h-11"
-                            dir="rtl"
+                            className="text-start h-11"
+                            dir={appDir()}
                           />
                         </div>
 
                         <div>
-                          <Label>مقاصة</Label>
+                          <Label>{tr("مقاصة")}</Label>
                           <label className="invoice-offset-toggle" htmlFor="is_offset">
                             <span className="invoice-offset-toggle-text">
-                              {state.formData.is_offset ? "مفعلة" : "غير مفعلة"}
+                              {state.formData.is_offset ? tr("مفعلة") : tr("غير مفعلة")}
                             </span>
                             <input
                               id="is_offset"
@@ -3790,7 +3886,7 @@ function UnifiedSaleInvoices({
                         </div>
 
                         <div className="invoice-currency-dropdown-wrap">
-                          <Label>كود المقاصة</Label>
+                          <Label>{tr("كود المقاصة")}</Label>
                           <PrimeDropdown
                             inputId="offset_code"
                             value={state.formData.offset_code}
@@ -3809,16 +3905,16 @@ function UnifiedSaleInvoices({
                               }))
                             }
                             disabled={!state.formData.is_offset}
-                            placeholder="اختر"
+                            placeholder={tr("اختر")}
                             onHide={() => refocusDropdownInput("offset_code")}
                           />
                         </div>
 
                         <div>
-                          <Label className="text-sm font-medium">مبيعات مصدرة</Label>
+                          <Label className="text-sm font-medium">{tr("مبيعات مصدرة")}</Label>
                           <label className="invoice-offset-toggle" htmlFor="exported_sales_toggle">
                             <span className="invoice-offset-toggle-text">
-                              {state.formData.exported_sales ? "مفعلة" : "غير مفعلة"}
+                              {state.formData.exported_sales ? tr("مفعلة") : tr("غير مفعلة")}
                             </span>
                             <input
                               id="exported_sales_toggle"
@@ -3848,13 +3944,13 @@ function UnifiedSaleInvoices({
             </div>
             {state.formData?.id > 0 && state.formData?.printed === 1 && (
               <div className="px-6 py-2 bg-green-100 text-green-800 font-semibold rounded-b-lg text-center text-xl">
-                تمت الطباعة
+                {tr("تمت الطباعة")}
               </div>
 
             )}
             {state.formData?.is_exported === 1 && (
               <div className="px-6 py-2 bg-green-100 text-blue-800 font-semibold rounded-b-lg text-center text-xl">
-                مرحلة
+                {tr("معتمدة")}
               </div>
 
             )}
@@ -3863,7 +3959,7 @@ function UnifiedSaleInvoices({
                 <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3">
                   <CardTitle className="text-lg flex items-center gap-2">
                     <Package className="h-5 w-5 text-primary" />
-                    أصناف الفاتورة
+                    {tr("أصناف الفاتورة")}
                   </CardTitle>
 
                 </div>
@@ -3877,6 +3973,7 @@ function UnifiedSaleInvoices({
                   dataSource={CollectionView}
                   onKeyDown={(s: any, e: any) => onKeyDownGrid(s, e)}
                   cellEditEnded={(s: any, e: any) => onCellEditEnded(s, e)}
+                  beginningEdit={(s: any, e: any) => onBeginningEdit(s, e)}
                   showContextMenu={false}
                   copyItemStoreDown={true}
                   dontConvertToCards={true}
@@ -3895,14 +3992,14 @@ function UnifiedSaleInvoices({
                   <AccordionTrigger className="px-6 py-4 hover:no-underline bg-primary/10 text-primary rounded-t-lg border-b border-primary/20">
                     <CardTitle className="text-lg flex items-center gap-2">
                       <MessageSquare className="h-5 w-5 text-primary" />
-                      الملاحظات
+                      {tr("الملاحظات")}
                     </CardTitle>
                   </AccordionTrigger>
                   <AccordionContent className="pt-4">
                     <CardContent className="space-y-6 pt-0">
 
                       <div className="space-y-2">
-                        <Label className="text-sm font-medium">ملاحظة عامة</Label>
+                        <Label className="text-sm font-medium">{tr("ملاحظة عامة")}</Label>
                         <Textarea
                           value={state.formData.general_notes ?? ""}
                           onChange={(e) =>
@@ -3911,15 +4008,15 @@ function UnifiedSaleInvoices({
                               formData: { ...prev.formData, general_notes: e.target.value },
                             }))
                           }
-                          className="text-right min-h-[90px] resize-none"
+                          className="text-start min-h-[90px] resize-none"
                           rows={3}
-                          placeholder="ملاحظة عامة على الفاتورة"
-                          dir="rtl"
+                          placeholder={tr("ملاحظة عامة على الفاتورة")}
+                          dir={appDir()}
                         />
                       </div>
 
                       <div className="space-y-2">
-                        <Label className="text-sm font-medium">ملاحظات داخلية</Label>
+                        <Label className="text-sm font-medium">{tr("ملاحظات داخلية")}</Label>
                         <Textarea
                           value={state.formData.internal_notes ?? ""}
                           onChange={(e) =>
@@ -3928,14 +4025,14 @@ function UnifiedSaleInvoices({
                               formData: { ...prev.formData, internal_notes: e.target.value },
                             }))
                           }
-                          className="text-right min-h-[100px] resize-none"
+                          className="text-start min-h-[100px] resize-none"
                           rows={4}
-                          placeholder="ملاحظات للاستخدام الداخلي فقط"
-                          dir="rtl"
+                          placeholder={tr("ملاحظات للاستخدام الداخلي فقط")}
+                          dir={appDir()}
                         />
                       </div>
                       <div className="space-y-2">
-                        <Label className="text-sm font-medium">ملاحظات التسليم</Label>
+                        <Label className="text-sm font-medium">{tr("ملاحظات التسليم")}</Label>
                         <Textarea
                           value={state.formData.delivery_notes ?? ""}
                           onChange={(e) =>
@@ -3944,10 +4041,10 @@ function UnifiedSaleInvoices({
                               formData: { ...prev.formData, delivery_notes: e.target.value },
                             }))
                           }
-                          className="text-right min-h-[100px] resize-none"
+                          className="text-start min-h-[100px] resize-none"
                           rows={4}
-                          placeholder="ملاحظات خاصة بالتسليم"
-                          dir="rtl"
+                          placeholder={tr("ملاحظات خاصة بالتسليم")}
+                          dir={appDir()}
                         />
                       </div>
                     </CardContent>
@@ -3960,13 +4057,13 @@ function UnifiedSaleInvoices({
                 <CardHeader className="pb-4">
                   <CardTitle className="text-lg flex items-center gap-2">
                     <Percent className="h-5 w-5 text-primary" />
-                    الخصومات والضرائب
+                    {tr("الخصومات والضرائب")}
                   </CardTitle>
                 </CardHeader>
                 <CardContent className="space-y-6">
                   <div className="grid grid-cols-2 gap-4">
                     <div className="space-y-2">
-                      <Label className="text-sm font-medium">نوع الخصم</Label>
+                      <Label className="text-sm font-medium">{tr("نوع الخصم")}</Label>
                       <Select
                         value={state.formData.discount_type || "percentage"}
                         onValueChange={(value) =>
@@ -3980,13 +4077,13 @@ function UnifiedSaleInvoices({
                           <SelectValue />
                         </SelectTrigger>
                         <SelectContent>
-                          <SelectItem value="percentage">نسبة مئوية</SelectItem>
-                          <SelectItem value="amount">مبلغ ثابت</SelectItem>
+                          <SelectItem value="percentage">{tr("نسبة مئوية")}</SelectItem>
+                          <SelectItem value="amount">{tr("مبلغ ثابت")}</SelectItem>
                         </SelectContent>
                       </Select>
                     </div>
                     <div className="space-y-2">
-                      <Label className="text-sm font-medium">قيمة الخصم</Label>
+                      <Label className="text-sm font-medium">{tr("قيمة الخصم")}</Label>
                       <Input
                         type="number"
                         step="0.01"
@@ -4010,14 +4107,14 @@ function UnifiedSaleInvoices({
                             },
                           }));
                         }}
-                        className="text-right h-11"
-                        dir="rtl"
+                        className="text-start h-11"
+                        dir={appDir()}
                       />
                     </div>
                   </div>
 
                   <div className="space-y-2">
-                    <Label className="text-sm font-medium">نسبة الضريبة (%)</Label>
+                    <Label className="text-sm font-medium">{tr("نسبة الضريبة (%)")}</Label>
                     <Input
                       type="number"
                       step="0.01"
@@ -4028,14 +4125,14 @@ function UnifiedSaleInvoices({
                           formData: { ...prev.formData, vat_percent: Number.parseFloat(e.target.value) || 0 },
                         }))
                       }
-                      className="text-right h-11"
-                      dir="rtl"
+                      className="text-start h-11"
+                      dir={appDir()}
                     />
                   </div>
 
                   <div className="grid grid-cols-2 gap-4">
                     <div className="space-y-2">
-                      <Label className="text-sm font-medium">تكلفة الشحن</Label>
+                      <Label className="text-sm font-medium">{tr("تكلفة الشحن")}</Label>
                       <Input
                         type="number"
                         step="0.01"
@@ -4046,12 +4143,12 @@ function UnifiedSaleInvoices({
                             formData: { ...prev.formData, shipping_cost: Number.parseFloat(e.target.value) || 0 },
                           }))
                         }
-                        className="text-right h-11"
-                        dir="rtl"
+                        className="text-start h-11"
+                        dir={appDir()}
                       />
                     </div>
                     <div className="space-y-2">
-                      <Label className="text-sm font-medium">رسوم أخرى</Label>
+                      <Label className="text-sm font-medium">{tr("رسوم أخرى")}</Label>
                       <Input
                         type="number"
                         step="0.01"
@@ -4062,8 +4159,8 @@ function UnifiedSaleInvoices({
                             formData: { ...prev.formData, other_charges: Number.parseFloat(e.target.value) || 0 },
                           }))
                         }
-                        className="text-right h-11"
-                        dir="rtl"
+                        className="text-start h-11"
+                        dir={appDir()}
                       />
                     </div>
                   </div>
@@ -4074,34 +4171,34 @@ function UnifiedSaleInvoices({
                 <CardHeader className="pb-4">
                   <CardTitle className="text-lg flex items-center gap-2">
                     <Calculator className="h-5 w-5 text-primary" />
-                    ملخص المبالغ
+                    {tr("ملخص المبالغ")}
                   </CardTitle>
                 </CardHeader>
                 <CardContent>
                   <div className="space-y-4">
                     <div className="flex justify-between items-center text-base py-2">
-                      <span className="text-muted-foreground">المجموع الفرعي:</span>
+                      <span className="text-muted-foreground">{tr("المجموع الفرعي:")}</span>
                       <span className="font-semibold text-lg">{totals.subtotal.toFixed(2)} </span>
                     </div>
                     <div className="flex justify-between items-center text-base py-2">
-                      <span className="text-muted-foreground">الخصم:</span>
+                      <span className="text-muted-foreground">{tr("الخصم:")}</span>
                       <span className="font-semibold text-lg text-red-600">-{totals.discount.toFixed(2)} </span>
                     </div>
                     <div className="flex justify-between items-center text-base py-2">
-                      <span className="text-muted-foreground">الضريبة:</span>
+                      <span className="text-muted-foreground">{tr("الضريبة:")}</span>
                       <span className="font-semibold text-lg">{totals.tax.toFixed(2)} </span>
                     </div>
                     <div className="flex justify-between items-center text-base py-2">
-                      <span className="text-muted-foreground">الشحن:</span>
+                      <span className="text-muted-foreground">{tr("الشحن:")}</span>
                       <span className="font-semibold text-lg">{(Number(state.formData.shipping_cost) || 0).toFixed(2)} </span>
                     </div>
                     <div className="flex justify-between items-center text-base py-2">
-                      <span className="text-muted-foreground">رسوم أخرى:</span>
+                      <span className="text-muted-foreground">{tr("رسوم أخرى:")}</span>
                       <span className="font-semibold text-lg">{(Number(state.formData.other_charges) || 0).toFixed(2)} </span>
                     </div>
                     <Separator className="my-4" />
                     <div className="flex justify-between items-center bg-primary/10 p-4 rounded-lg border border-primary/20">
-                      <span className="text-lg font-bold">المجموع الكلي:</span>
+                      <span className="text-lg font-bold">{tr("المجموع الكلي:")}</span>
                       <span className="text-2xl font-bold text-primary">{(Number(totals.total) || 0).toFixed(2)} </span>
                     </div>
                   </div>
@@ -4136,7 +4233,7 @@ function UnifiedSaleInvoices({
         )}
 
         <ReportGenerator
-          title={vch_type === 2 ? "تقرير فواتير المشتريات" : "تقرير فواتير المبيعات"}
+          title={vch_type === 2 ? tr("تقرير فواتير المشتريات") : tr("تقرير فواتير المبيعات")}
           data={allOrders}
           columns={reportColumns}
           isOpen={showReport}

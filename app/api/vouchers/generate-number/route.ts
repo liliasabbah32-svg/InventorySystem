@@ -1,12 +1,9 @@
 import { NextRequest, NextResponse } from "next/server"
-import { Pool } from "pg"
+import { getTenantPool } from "@/lib/database"
+import { resolveBranchSymbol, requestBranchId } from "@/lib/branch-symbol"
 
 export const dynamic = "force-dynamic"
 export const revalidate = 0
-
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-})
 
 function getPrefix(vchType: number, vchBook: string) {
   if (vchType === 1) return `O${vchBook}`
@@ -17,6 +14,7 @@ function getPrefix(vchType: number, vchBook: string) {
 
 export async function GET(request: NextRequest) {
   try {
+    const pool = await getTenantPool()
     const { searchParams } = new URL(request.url)
     const vchBook = (searchParams.get("vch_book") ?? "").trim().toUpperCase()
     const vchType = Number(searchParams.get("voucher_type") ?? searchParams.get("vch_type") ?? 5)
@@ -37,14 +35,14 @@ export async function GET(request: NextRequest) {
       `
         SELECT id, value
         FROM system_settings
-        WHERE id IN ('invoice_prefix', 'invoice_start', 'order_prefix', 'order_start', 'purchase_prefix', 'purchase_start')
+        WHERE id IN ('sales_invoice_prefix', 'sales_invoice_start', 'order_prefix', 'order_start', 'purchase_prefix', 'purchase_start')
       `,
     )
 
     const settings = Object.fromEntries((settingsResult.rows ?? []).map((row) => [row.id, row.value]))
     const configuredPrefix =
       vchType === 5
-        ? settings.invoice_prefix
+        ? settings.sales_invoice_prefix
         : vchType === 1
           ? settings.order_prefix
           : vchType === 2
@@ -53,7 +51,7 @@ export async function GET(request: NextRequest) {
 
     const configuredStart = Number(
       vchType === 5
-        ? settings.invoice_start
+        ? settings.sales_invoice_start
         : vchType === 1
           ? settings.order_start
           : vchType === 2
@@ -62,15 +60,17 @@ export async function GET(request: NextRequest) {
     )
 
     const basePrefix = String(configuredPrefix || getPrefix(vchType, ""))
-    const prefix = `${basePrefix}${vchBook}`
+    // بادئة السند + رمز الفرع (إن مُرّر branch_id) + رمز الدفتر + التسلسل
+    const branchSymbol = await resolveBranchSymbol(await requestBranchId(request, searchParams.get("branch_id")))
+    const prefix = `${basePrefix}${branchSymbol}${vchBook}`
 
     const result = await pool.query(
       `
         SELECT COALESCE(
           MAX(
             CASE
-              WHEN RIGHT(voucher_code, 5) ~ '^[0-9]{5}$'
-                THEN CAST(RIGHT(voucher_code, 5) AS BIGINT)
+              WHEN RIGHT(voucher_code, 7) ~ '^[0-9]{7}$'
+                THEN CAST(RIGHT(voucher_code, 7) AS BIGINT)
               ELSE 0
             END
           ),
@@ -88,7 +88,7 @@ export async function GET(request: NextRequest) {
     const maxSeq = Number(result.rows?.[0]?.max_seq ?? 0)
     const startSeq = Number.isFinite(configuredStart) && configuredStart > 0 ? configuredStart : 1
     const nextNumber = Math.max(maxSeq + 1, startSeq)
-    const voucherCode = `${prefix}${nextNumber.toString().padStart(5, "0")}`
+    const voucherCode = `${prefix}${nextNumber.toString().padStart(7, "0")}`
 
     return NextResponse.json(
       {
@@ -107,6 +107,7 @@ export async function GET(request: NextRequest) {
     )
   } catch (error) {
     console.error("Error generating voucher number:", error)
+    const pool = await getTenantPool()
     const { searchParams } = new URL(request.url)
     const vchBook = (searchParams.get("vch_book") ?? "R").trim().toUpperCase()
     const vchType = Number(searchParams.get("voucher_type") ?? searchParams.get("vch_type") ?? 5)
@@ -114,13 +115,13 @@ export async function GET(request: NextRequest) {
       `
         SELECT id, value
         FROM system_settings
-        WHERE id IN ('invoice_prefix', 'order_prefix', 'purchase_prefix')
+        WHERE id IN ('sales_invoice_prefix', 'order_prefix', 'purchase_prefix')
       `,
     )
     const settings = Object.fromEntries((settingsResult.rows ?? []).map((row) => [row.id, row.value]))
     const configuredPrefix =
       vchType === 5
-        ? settings.invoice_prefix
+        ? settings.sales_invoice_prefix
         : vchType === 1
           ? settings.order_prefix
           : vchType === 2

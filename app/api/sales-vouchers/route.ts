@@ -1,0 +1,894 @@
+import { updateLastPurchasePrices } from "@/lib/last-purchase"
+import { validateAccountStops } from "@/lib/account-stops"
+import { type NextRequest, NextResponse } from "next/server"
+import { withVoucherAudit } from "@/lib/voucher-audit"
+import sql, { withTenantTransaction } from "@/lib/database"
+import { missingSelectionsMessage } from "@/lib/voucher-item-attributes"
+import { deletePosRelatedVouchers } from "@/app/api/pos/_receipts"
+import { isMixedPosReturn, needsPosReceipt } from "@/lib/pos-receipt"
+import { reversePosSessionPayments } from "@/app/api/pos/_session-payments"
+import {
+  ensureTables,
+  saveSalesVoucherItems,
+  fetchSalesVoucherItems,
+  applySalesVoucherStockEffect,
+  reverseSalesVoucherStockMovement,
+  generateSalesVoucherCode,
+  getSalesVoucherNumberSettings,
+  resolveVoucherBookName,
+  SALES_VOUCHER_TYPES,
+  ITEM_ACCOUNT_VCH_TYPES,
+  SALES_INVOICE_VCH_TYPE,
+  RETURN_SELL_VCH_TYPE,
+  PURCHASE_INVOICE_VCH_TYPE,
+  DELIVERY_SELL_VCH_TYPE,
+  DELIVERY_CONSIGNMENT_SALE_VCH_TYPE,
+  RETURN_DELIVERY_CONSIGNMENT_SALE_VCH_TYPE,
+  DELIVERY_PAY_VCH_TYPE,
+  validateItemAccounts,
+  buildSalesVoucherJournalRows,
+  saveJournalRows,
+  linkSalesVoucherItemsToJournals,
+  validateJournalAccountCurrencies,
+  fetchSalesVoucherJournalAccounts,
+  resolveSalesVoucherJournalTypes,
+  ORDER_FULFILLING_VCH_TYPES,
+  isPurchaseSideVoucher,
+  orderFulfillingTypesFor,
+  refreshSalesOrderFulfillment,
+} from "./_lib"
+import { validateItemReferences } from "@/app/api/stock-vouchers/_lib"
+import { authorizeTransaction, transactionFamilyForVoucherType } from "@/lib/transaction-permissions"
+import { attachItemSerials, saveVoucherSerials, validateSerialsRemoval, validateSerialsRemovalOnUpdate, validateVoucherSerials } from "@/lib/item-serials"
+import { consignmentReturnBlocksDeletion, consignmentUsage, INVOICE_SOURCE_CONSIGNMENT, validateFromConsignment } from "@/lib/consignment"
+import { validateNegativeStock } from "@/lib/negative-stock-guard"
+import { computeVoucherTax } from "@/lib/item-vat"
+import { itemLevelVatEnabled, itemVatRates } from "@/lib/item-vat-server"
+import { creditIncreasesFromJournal, validateCustomerCreditLimit } from "@/lib/credit-limit"
+import { queueAutoSms, voucherDocKey } from "@/lib/sms"
+
+const MAX_CODE_RETRY_ATTEMPTS = 5
+
+// عنوان الشحن: shipping_info كائن كامل؛ shipping_address نص العنوان (المرسل إليه + العنوان + الهاتف) للطباعة والبحث.
+const shippingInfoJson = (data: any) => (data.shipping_info && typeof data.shipping_info === "object" ? JSON.stringify(data.shipping_info) : null)
+const shippingAddressText = (data: any) => {
+  const info = data.shipping_info
+  if (!info || typeof info !== "object") return data.shipping_address || ""
+  return [info.destination_name, info.address, info.po_box ? `ص.ب ${info.po_box}` : "", info.phone].map((part: unknown) => String(part || "").trim()).filter(Boolean).join(" — ")
+}
+
+export async function GET(request: NextRequest) {
+  try {
+    await ensureTables()
+
+    const { searchParams } = new URL(request.url)
+    const vchType = Number(searchParams.get("vch_type") || SALES_VOUCHER_TYPES[1])
+    const family = transactionFamilyForVoucherType(vchType)
+    if (!family) return NextResponse.json({ error: "نوع الحركة غير صالح" }, { status: 400 })
+    const authorization = await authorizeTransaction(request, family, "view", searchParams.get("branch_id"))
+    if (!authorization.ok) return authorization.response
+
+    const rows = await sql`
+      SELECT vh.*, EXISTS(
+        SELECT 1
+        FROM voucher_items_tbl inv_item
+        JOIN voucher_header_tbl inv ON inv.id = inv_item.voucher_id
+        WHERE COALESCE(inv.status,1) <> 3 AND inv.vch_type IN (${SALES_INVOICE_VCH_TYPE}, ${PURCHASE_INVOICE_VCH_TYPE})
+          AND inv_item.delivery_item_id IN (
+            SELECT id FROM voucher_items_tbl WHERE voucher_id = vh.id
+          )
+      ) AS has_linked_invoice
+      FROM voucher_header_tbl vh
+      WHERE vh.vch_type = ${vchType} AND vh.status != 3 AND vh.branch_id = ANY(${authorization.branchIds}::int[])
+      ORDER BY vh.id DESC
+    `
+
+    return NextResponse.json(rows)
+  } catch (error) {
+    console.error("Error fetching sales vouchers:", error)
+    return NextResponse.json({ error: "Failed to fetch sales vouchers" }, { status: 500 })
+  }
+}
+
+// يعيد توليد رقم بديل عند تعارض (سباق تزامن بين مستخدمَين على نفس الدفتر)، بنفس منطق
+// stock-vouchers/route.ts تماماً.
+const regenerateOnConflict = async (requestUrl: string, vchType: number, vchBookId: number | null, vchCode: string, branchId?: number | null) => {
+  let code = vchCode
+  let existing = await sql`SELECT id FROM voucher_header_tbl WHERE vch_type = ${vchType} AND vch_code = ${code}`
+  let attempts = 0
+  while (existing.length > 0 && attempts < MAX_CODE_RETRY_ATTEMPTS) {
+    const regenerated = await generateSalesVoucherCode(requestUrl, vchType, vchBookId, branchId)
+    if (!regenerated || regenerated === code) break
+    code = regenerated
+    existing = await sql`SELECT id FROM voucher_header_tbl WHERE vch_type = ${vchType} AND vch_code = ${code}`
+    attempts++
+  }
+  return { code, conflict: existing.length > 0 }
+}
+
+const validateCodeFormat = async (requestUrl: string, vchType: number, vchBookId: number | null, vchCode: string, branchId?: number | null): Promise<string | null> => {
+  const code = String(vchCode || "").trim().toUpperCase()
+  if (!code) return "رقم السند مطلوب"
+  const bookName = await resolveVoucherBookName(vchBookId, branchId)
+  if (!bookName) return null
+  const { prefix } = await getSalesVoucherNumberSettings(requestUrl, vchType)
+  if (!code.startsWith(prefix)) return `رقم السند يجب أن يبدأ بـ ${prefix}`
+  if (code.length < prefix.length + bookName.length) return "رقم السند غير مكتمل"
+  return null
+}
+
+const DELIVERY_VOUCHER_TYPES = [DELIVERY_SELL_VCH_TYPE, DELIVERY_CONSIGNMENT_SALE_VCH_TYPE, DELIVERY_PAY_VCH_TYPE] as const
+const ORDER_SOURCE_VOUCHER_TYPE = 3
+
+const getSalesOrderIdsForVoucher = async (voucherId: number): Promise<number[]> => {
+  const rows = await sql`
+    SELECT DISTINCT oi.order_id
+    FROM voucher_items_tbl vi
+    JOIN order_items oi ON oi.id = vi.order_item_id
+    WHERE vi.voucher_id = ${voucherId}
+  `
+  return rows.map((row: any) => Number(row.order_id)).filter((id: number) => id > 0)
+}
+
+
+// أسطر تحتفظ بربطها بالسند المصدر (delivery_item_id/order_item_id): فاتورة من ارسالية/طلبية/ارسالية برسم
+// البيع، ومرتجع ارسالية برسم البيع (مصدره الارسالية دائماً).
+const keepsSourceLinks = (vchType: number, invoiceSourceType: number) =>
+  [2, 3, INVOICE_SOURCE_CONSIGNMENT].includes(invoiceSourceType) || vchType === RETURN_DELIVERY_CONSIGNMENT_SALE_VCH_TYPE
+
+const validatePayload = (data: any, items: any[]): string | null => {
+  if (!SALES_VOUCHER_TYPES.includes(Number(data.vch_type) as any) || !data.vch_code || !data.vch_date) {
+    return "بيانات السند غير مكتملة"
+  }
+  if (!(Number(data.rate) > 0)) return "سعر الصرف يجب أن يكون أكبر من صفر"
+  const isConsignmentType = [DELIVERY_CONSIGNMENT_SALE_VCH_TYPE, RETURN_DELIVERY_CONSIGNMENT_SALE_VCH_TYPE].includes(Number(data.vch_type))
+  // ارسالية برسم البيع ومرتجعها تتبع المندوب لا العميل (كما في شامل)
+  if (isConsignmentType && !(Number(data.salesman_id) > 0)) return "يجب اختيار المندوب"
+  // العميل نفسه اختياري (بيع نقدي بلا عميل مسجَّل) — لكن عندها يجب تحديد حساب الصندوق واسم الدافع
+  // معاً كحد أدنى للتوثيق المحاسبي بدلاً من حساب العميل.
+  if (!data.account_id && !isConsignmentType) {
+    const hasPosPaymentAccount = Array.isArray(data.pos_payments) && data.pos_payments.some((payment: any) => Number(payment?.amount || 0) > 0 && Number(payment?.account_id || 0) > 0)
+    if (!data.cash_account_id && !hasPosPaymentAccount) return "يجب اختيار حساب الصندوق عند عدم اختيار العميل"
+    if (!String(data.customer_name || "").trim()) return "يجب إدخال اسم الدافع عند عدم اختيار العميل"
+  }
+  if (
+    Number(data.vat_percent || 0) > 0 &&
+    !data.tax_account_id &&
+    !(DELIVERY_VOUCHER_TYPES as readonly number[]).includes(Number(data.vch_type))
+  ) {
+    return "يجب اختيار حساب الضريبة لوجود نسبة ضريبة على السند"
+  }
+  if (items.length === 0) return "يجب إدخال صنف واحد على الأقل"
+  if (items.some((i: any) => !(Number(i.store_id ?? i.warehouse_id) > 0))) return "يجب اختيار المستودع لكل صنف"
+  if (items.some((i: any) => !(Number(i.quantity || 0) > 0))) return "يجب إدخال الكمية لكل صنف"
+  if (items.some((i: any) => Number(i.discount_percent || 0) < 0 || Number(i.discount_percent || 0) > 100)) {
+    return "نسبة الخصم يجب ألا تتجاوز 100% لكل صنف"
+  }
+  const itemAccountsError = validateItemAccounts(Number(data.vch_type), items)
+  if (itemAccountsError) return itemAccountsError
+  return null
+}
+
+// نفس معادلة totals في unified-sales-delivery.tsx بالضبط (بمعزل عن الواجهة) — خصم بمستوى السطر
+// (الخصم %) أولاً، ثم خصم/ضريبة بمستوى السند كاملاً: المجموع الفرعي (كمية × سعر × (1-خصم السطر)
+// لكل الأصناف)، ثم خصم السند (نسبة أو مبلغ ثابت)، ثم ضريبة على الصافي بعد الخصم.
+// مُشتركة بين computeTotalAmount (أدناه) وbuildSalesVoucherJournalRows (تحتاج مبلغ الضريبة وحده
+// لسطر قيد حساب الضريبة) — نفس معادلة totals في unified-sales-delivery.tsx بالضبط.
+// الضريبة على مستوى الصنف (إعداد عام): نسب الأصناف من قاعدة البيانات (لا تُقبل من الواجهة) — null = الإعداد غير مفعّل
+const resolveVatRates = async (items: any[]): Promise<Map<number, number | null> | null> =>
+  (await itemLevelVatEnabled()) ? itemVatRates(items.map((item: any) => Number(item.product_id ?? item.item_id))) : null
+
+// lib/item-vat.ts: نفس المعادلة في الواجهة — خصم السطر، خصم الحملة، خصم السند موزّعاً، ثم ضريبة السند أو ضريبة كل صنف
+const computeVoucherBreakdown = (items: any[], data: any, rates: Map<number, number | null> | null) => computeVoucherTax(
+  items.map((item: any) => ({
+    quantity: Number(item.quantity || 0),
+    unitPrice: Number(item.unit_price || 0),
+    discountPercent: Number(item.discount_percent || 0),
+    discountAmount: Number(item.campaign_discount || 0),
+    vatRate: rates ? rates.get(Number(item.product_id ?? item.item_id)) ?? null : null,
+  })),
+  // سند معفى/صفري (التصنيف الضريبي للسند 2/3) ⇐ بلا ضريبة حتى مع الضريبة على مستوى الصنف
+  [2, 3].includes(Number(data.vat_classification_id))
+    ? { discountType: data.discount_type === "amount" ? "amount" : "percentage", discountValue: Number(data.discount_value || 0), vatPercent: 0, itemLevel: false }
+    : { discountType: data.discount_type === "amount" ? "amount" : "percentage", discountValue: Number(data.discount_value || 0), vatPercent: Number(data.vat_percent || 0), itemLevel: Boolean(rates) },
+)
+
+// أسطر الحفظ مع نسبة ومبلغ ضريبة كل سطر (بنفس ترتيب أسطر الحساب)
+const withLineVat = (rows: any[], breakdown: ReturnType<typeof computeVoucherBreakdown>) =>
+  rows.map((row: any, index: number) => ({
+    ...row,
+    vat_ratio: breakdown.lines[index]?.rate ?? 0,
+    vat_amount: Math.round((breakdown.lines[index]?.vat ?? 0) * 100) / 100,
+  }))
+
+const computeAmountBreakdown = (items: any[], data: any) => {
+  // الخصم بمستوى السطر (نسبة مئوية لكل صنف، عمود "الخصم %") يُطبَّق أولاً قبل خصم/ضريبة السند
+  // كاملاً — نفس معادلة recalcLineAmounts في unified-sales-delivery.tsx بالضبط.
+  const subtotal = items.reduce((sum: number, i: any) => {
+    const lineDiscountPercent = Number(i.discount_percent || 0)
+    return sum + Number(i.quantity || 0) * Number(i.unit_price || 0) * (1 - lineDiscountPercent / 100) - Number(i.campaign_discount || 0)
+  }, 0)
+  const discountValue = Number(data.discount_value || 0)
+  const discount = data.discount_type === "amount" ? discountValue : (subtotal * discountValue) / 100
+  const taxPercent = Number(data.vat_percent || 0)
+  const tax = ((subtotal - discount) * taxPercent) / 100
+  return { subtotal, discount, tax, total: subtotal - discount + tax }
+}
+
+const computeTotalAmount = (items: any[], data: any): number => Math.round(computeAmountBreakdown(items, data).total * 100) / 100
+
+const validateSourceInvoice = async (itemsOrData: any, maybeData?: any, excludeVoucherId = 0): Promise<string | null> => {
+  // Support two call patterns during transition:
+  // - validateSourceInvoice(items, data, excludeId)
+  // - validateSourceInvoice(data, excludeId)
+  let items: any[] = []
+  let data: any = {}
+  if (Array.isArray(itemsOrData)) {
+    items = itemsOrData
+    data = maybeData || {}
+  } else {
+    data = itemsOrData || {}
+  }
+
+  const vchType = Number(data.vch_type || 0)
+  const invoiceSourceType = Number(data.invoice_source_type || 1)
+  // فاتورة "من ارسالية برسم البيع" (4) ومرتجع ارسالية برسم البيع (15): الأسطر من ارسالية مرحّلة واحدة
+  // بحدود المتبقي، والمندوب يؤخذ من الارسالية.
+  if (vchType === RETURN_DELIVERY_CONSIGNMENT_SALE_VCH_TYPE || (vchType === SALES_INVOICE_VCH_TYPE && invoiceSourceType === INVOICE_SOURCE_CONSIGNMENT)) {
+    const result = await validateFromConsignment({ vchType, items, branchId: Number(data.branch_id) || null, excludeVoucherId })
+    if (result.error) return result.error
+    if (Number(result.consignment?.salesman_id) > 0) data.salesman_id = Number(result.consignment.salesman_id)
+    return null
+  }
+  if (![2, 3].includes(invoiceSourceType)) return null
+  const sourceVoucherId = Number(data.source_voucher_id || 0)
+  const sourceVoucherType = Number(data.source_voucher_type || 0)
+  if (!sourceVoucherId || !sourceVoucherType) {
+    return invoiceSourceType === 2
+      ? "يجب اختيار الإرسالية المصدرية للفاتورة"
+      : "يجب اختيار الطلبية المصدرية للفاتورة"
+  }
+
+  // Ensure at least one item links to a delivery/order at item level
+  const hasItemLink = items.some((it: any) =>
+    invoiceSourceType === 2 ? Number(it.delivery_item_id || 0) > 0 : Number(it.order_item_id || 0) > 0,
+  )
+  if (!hasItemLink) {
+    return invoiceSourceType === 2
+      ? "يجب اختيار الإرسالية المصدرية للفاتورة"
+      : "يجب اختيار الطلبية المصدرية للفاتورة"
+  }
+
+  if (invoiceSourceType === 2) {
+    const deliveryItemIds = items.map((item: any) => Number(item.delivery_item_id || 0)).filter((id: number) => id > 0)
+    // ارسالية برسم البيع لها نوع مصدر مستقل (4) — بلا عميل وتُفوتر جزئياً
+    const allowedTypes = vchType === PURCHASE_INVOICE_VCH_TYPE ? [DELIVERY_PAY_VCH_TYPE] : [DELIVERY_SELL_VCH_TYPE]
+    // كل سطر مربوط بإرسالية يُفحص على حدة، والرسالة تذكر السبب الفعلي والإرسالية (بدل رسالة عامة):
+    // سطر إرسالية محذوف · نوع غير مطابق · إرسالية غير مرحّلة/ملغاة · عميل/مورد مختلف · فرع مختلف
+    const linked = (await sql`
+      SELECT vi.id, vi.voucher_id, source.vch_code, source.vch_type, COALESCE(source.status, 1) AS status, source.account_id, source.branch_id
+      FROM voucher_items_tbl vi JOIN voucher_header_tbl source ON source.id = vi.voucher_id
+      WHERE vi.id = ANY(${deliveryItemIds}::int[])
+    `) as any[]
+    const problem = (() => {
+      const found = new Set(linked.map((row) => Number(row.id)))
+      if (deliveryItemIds.some((id) => !found.has(id))) return "بعض أسطر الفاتورة مربوطة بأسطر إرسالية لم تعد موجودة — احذف هذه الأسطر وأعد اختيار الإرسالية"
+      for (const row of linked) {
+        const code = row.vch_code || `#${row.voucher_id}`
+        if (!allowedTypes.includes(Number(row.vch_type))) return `السند ${code} ليس ${vchType === PURCHASE_INVOICE_VCH_TYPE ? "إرسالية مشتريات" : "إرسالية مبيعات"} — لا يمكن الفوترة منه بهذا النوع من الفواتير`
+        if (Number(row.status) === 3) return `الإرسالية ${code} ملغاة — أعد اختيار إرسالية مرحّلة أو احذف أسطرها من الفاتورة`
+        if (Number(row.status) !== 2) return `الإرسالية ${code} غير مرحّلة — رحّلها أولاً ثم احفظ الفاتورة`
+        if (Number(row.account_id) !== Number(data.account_id)) return `الإرسالية ${code} لعميل/مورد آخر — حساب الفاتورة يجب أن يطابق حساب الإرسالية (لا تغيّر العميل بعد اختيار الإرسالية)`
+        if (Number(row.branch_id) !== Number(data.branch_id)) return `الإرسالية ${code} من فرع آخر — فرع الفاتورة يجب أن يطابق فرع الإرسالية`
+      }
+      return null
+    })()
+    if (problem) return problem
+    const sourceItems = linked
+    const deliveryIds = [...new Set(sourceItems.map((row: any) => Number(row.voucher_id)))]
+    if (!deliveryIds.includes(sourceVoucherId)) return "الإرسالية المصدرية غير صالحة"
+    const existing = await sql`
+      SELECT vh.id
+      FROM voucher_header_tbl vh
+      WHERE COALESCE(vh.status,1) <> 3 AND vh.id != ${excludeVoucherId}
+        AND vh.vch_type IN (${SALES_INVOICE_VCH_TYPE}, ${PURCHASE_INVOICE_VCH_TYPE})
+        AND EXISTS (
+          SELECT 1
+          FROM voucher_items_tbl vi
+          WHERE vi.voucher_id = vh.id
+            AND vi.delivery_item_id IN (
+              SELECT id FROM voucher_items_tbl WHERE voucher_id = ANY(${deliveryIds}::int[])
+            )
+        )
+      LIMIT 1
+    `
+    if (existing.length > 0) {
+      return "تم إصدار فاتورة لهذه الإرسالية سابقاً"
+    }
+    return null
+  }
+
+  const orderItemIds = items
+    .map((item: any) => Number(item.order_item_id || 0))
+    .filter((id) => id > 0)
+  if (orderItemIds.length === 0) {
+    return "يجب اختيار الطلبية المصدرية للفاتورة"
+  }
+
+  const invoices = await sql`
+    SELECT vi.order_item_id,
+           COALESCE(SUM(vi.qnty), 0) AS invoiced_quantity,
+           COALESCE(SUM(vi.bonus), 0) AS invoiced_bonus
+    FROM voucher_items_tbl vi
+    JOIN voucher_header_tbl vh ON vh.id = vi.voucher_id
+    -- المُرسَل من الطلبية: فواتير وإرساليات "من طلبية" بنفس الاتجاه (مبيعات/مشتريات)
+    WHERE vh.vch_type = ANY(${orderFulfillingTypesFor(vchType)}::int[])
+      AND vh.status <> 3
+      AND vh.id != ${excludeVoucherId}
+      AND vi.order_item_id = ANY(${orderItemIds}::int[])
+      AND vi.delivery_item_id IS NULL
+    GROUP BY vi.order_item_id
+  `
+
+  const invoiceTotals = new Map<number, { invoiced_quantity: number; invoiced_bonus: number }>()
+  for (const row of invoices) {
+    invoiceTotals.set(Number(row.order_item_id), {
+      invoiced_quantity: Number(row.invoiced_quantity || 0),
+      invoiced_bonus: Number(row.invoiced_bonus || 0),
+    })
+  }
+
+  const orderType=isPurchaseSideVoucher(vchType)?2:1
+  const orderItems = await sql`SELECT oi.id,oi.quantity,COALESCE(oi.bonus,0) bonus,oi.order_id
+    FROM order_items oi JOIN orders o ON o.id=oi.order_id
+    WHERE oi.id=ANY(${orderItemIds}::int[]) AND o.order_type=${orderType}
+      AND COALESCE(o.deleted,false)=false AND o.order_status IN(2,3,4) AND oi.item_status IN(2,3,4)
+      AND o.customer_id=${Number(data.account_id)} AND o.branch_id=${Number(data.branch_id)}`
+
+  const orderItemById = new Map<number, any>()
+  for (const row of orderItems) {
+    orderItemById.set(Number(row.id), row)
+  }
+
+  const currentTotals = new Map<number, { quantity: number; bonus: number }>()
+  for (const item of items) {
+    const id = Number(item.order_item_id || 0)
+    if (id <= 0) continue
+    const existing = currentTotals.get(id) ?? { quantity: 0, bonus: 0 }
+    currentTotals.set(id, {
+      quantity: existing.quantity + Number(item.quantity || 0),
+      bonus: existing.bonus + Number((item.bonus ?? item.bonus_quantity) || 0),
+    })
+  }
+
+  for (const [orderItemId, totals] of currentTotals.entries()) {
+    const orderItem = orderItemById.get(orderItemId)
+    if (!orderItem || !items.some((item: any) => Number(item.order_item_id) === orderItemId && Number(item.source_voucher_id || sourceVoucherId) === Number(orderItem.order_id))) {
+      return "أحد عناصر الطلبية غير صالح لهذه الطلبية المصدرية"
+    }
+
+    const existing = invoiceTotals.get(orderItemId) ?? { invoiced_quantity: 0, invoiced_bonus: 0 }
+    const remainingQuantity = Math.max(0, Number(orderItem.quantity || 0) - existing.invoiced_quantity)
+    const remainingBonus = Math.max(0, Number(orderItem.bonus || 0) - existing.invoiced_bonus)
+    const remainingTotal = remainingQuantity + remainingBonus
+
+    if (totals.quantity > remainingQuantity || totals.bonus > remainingBonus) {
+      return "الكمية أو البونص المحدد يتجاوز المتبقي في الطلبية"
+    }
+
+    if (remainingTotal === 0) {
+      return "تمت فاتورة هذا العنصر بالكامل سابقاً"
+    }
+  }
+
+  return null
+}
+
+async function postHandler(request: NextRequest) {
+  try {
+    await ensureTables()
+    const data = await request.json()
+    const posClientSaleId = String(data.pos_client_sale_id || "").trim() || null
+    if (posClientSaleId) {
+      const existing = await sql`SELECT * FROM voucher_header_tbl WHERE pos_client_sale_id = ${posClientSaleId} LIMIT 1`
+      if (existing[0]) {
+        const existingItems = await fetchSalesVoucherItems(Number(existing[0].id))
+        return NextResponse.json({ ...existing[0], items: existingItems, duplicate: true })
+      }
+    }
+    const family = transactionFamilyForVoucherType(Number(data.vch_type))
+    if (!family) return NextResponse.json({ error: "نوع الحركة غير صالح" }, { status: 400 })
+    const authorization = await authorizeTransaction(request, family, "create", data.branch_id)
+    if (!authorization.ok) return authorization.response
+    if (Number(data.status || 1) === 2) {
+      const posting = await authorizeTransaction(request, family, "post", authorization.branchId)
+      if (!posting.ok) return posting.response
+    }
+    const vchType = Number(data.vch_type)
+    const items = Array.isArray(data.items) ? data.items.filter((i: any) => i?.product_id) : []
+
+    const payloadError = validatePayload(data, items)
+    if (payloadError) return NextResponse.json({ error: payloadError }, { status: 400 })
+    // صنف له "المتغيرات والخصائص" يجب اختيار قيمة لكل خاصية (الكاشير وشاشة المطعم بلا نافذة خصائص فيُستثنيان)
+    if (!data.pos_client_sale_id) {
+      const selectionError = await missingSelectionsMessage(items)
+      if (selectionError) return NextResponse.json({ error: selectionError }, { status: 400 })
+    }
+    const sourceError = await validateSourceInvoice(items, data)
+    if (sourceError) return NextResponse.json({ error: sourceError }, { status: 400 })
+
+    // المستودع/الوحدة موجودان ونشطان فعلياً، وكذلك حساب الصنف لفاتورة مبيعات/مشتريات ومردود
+    // مبيعات/مشتريات تحديداً — بمعزل عمّا رآه العميل عند اختيارهم (قد يكونوا حُذفوا أو أُوقِفوا).
+    const referencesError = await validateItemReferences(items, (ITEM_ACCOUNT_VCH_TYPES as readonly number[]).includes(vchType) ? ["account_id"] : [])
+    if (referencesError) return NextResponse.json({ error: referencesError }, { status: 400 })
+
+    const codeFormatError = await validateCodeFormat(request.url, vchType, data.vch_book_id ?? null, data.vch_code, authorization.branchId)
+    if (codeFormatError) return NextResponse.json({ error: codeFormatError }, { status: 400 })
+
+    const regeneratedCode = await regenerateOnConflict(request.url, vchType, data.vch_book_id ?? null, String(data.vch_code), authorization.branchId)
+    if (regeneratedCode.conflict) return NextResponse.json({ error: "رقم السند مستخدم مسبقاً" }, { status: 400 })
+    // let: يُعاد توليده أدناه إن اصطدم الإدراج برقم مكرر (23505) من حفظ متزامن
+    let vchCode = regeneratedCode.code
+
+    const vatRates = await resolveVatRates(items)
+    const breakdown = computeVoucherBreakdown(items, data, vatRates)
+    const saveBreakdown = breakdown
+    const posPayments = Array.isArray(data.pos_payments)
+      ? data.pos_payments
+          .map((payment: any) => ({
+            payment_method: ["cash", "card", "cheque", "account", "gift_card", "aid_voucher"].includes(String(payment?.payment_method))
+              ? String(payment.payment_method)
+              : "cash",
+            amount: Math.round(Number(payment?.amount || 0) * 100) / 100,
+            account_id: Number(payment?.account_id || 0),
+            reference: String(payment?.reference || "").trim() || null,
+            due_date: payment?.due_date || null,
+            currency_id: Number(payment?.currency_id || data.currency_id || 0) || null,
+            currency_amount: Number(payment?.currency_amount ?? payment?.amount ?? 0),
+            exchange_rate: Number(payment?.exchange_rate || 1),
+            cheque_account: payment?.payment_method === "cheque" ? String(payment?.cheque_account || "").trim() : null,
+            bank_id: payment?.payment_method === "cheque" ? Number(payment?.bank_id || 0) || null : null,
+            branch_id: payment?.payment_method === "cheque" ? Number(payment?.branch_id || 0) || null : null,
+            card_type_id: payment?.payment_method === "card" ? Number(payment?.card_type_id || 0) || null : null,
+            card_expiry: payment?.payment_method === "card" ? String(payment?.card_expiry || "") || null : null,
+          }))
+          .filter((payment: any) => payment.amount > 0)
+      : []
+    if (posPayments.some((payment: any) => !payment.account_id)) {
+      return NextResponse.json({ error: "يجب تحديد الحساب لكل طريقة دفع" }, { status: 400 })
+    }
+    if (posPayments.length) {
+      const paymentsTotal = Math.round(posPayments.reduce((sum: number, payment: any) => sum + payment.amount, 0) * 100) / 100
+      if (Math.abs(paymentsTotal - Math.round(breakdown.total * 100) / 100) > 0.009) {
+        return NextResponse.json({ error: "مجموع الدفعات يجب أن يساوي إجمالي الفاتورة" }, { status: 400 })
+      }
+    }
+    let journalRows: any[] = []
+    let journalTypes = null
+    // إيقاف الحركات على حساب العميل/المورد لهذا النوع من السندات (كل الأنواع، ومنها الإرساليات بلا قيد)
+    const headerStopError = await validateAccountStops([data.account_id], vchType, data.vch_date)
+    if (headerStopError) return NextResponse.json({ error: headerStopError }, { status: 400 })
+    if ((ITEM_ACCOUNT_VCH_TYPES as readonly number[]).includes(vchType)) {
+      journalTypes = await resolveSalesVoucherJournalTypes(vchType)
+      if (!journalTypes) throw new Error("تعذّر تحديد أنواع قيود الفاتورة")
+      journalRows = buildSalesVoucherJournalRows(
+        vchType,
+        items,
+        data.account_id ?? data.cash_account_id ?? posPayments[0]?.account_id ?? null,
+        data.currency_id || null,
+        Number(data.rate || 1),
+        journalTypes,
+        data.tax_account_id ?? null,
+        breakdown.tax,
+        breakdown.discount,
+        breakdown.total,
+      )
+      const mixedPosReturn = vchType === RETURN_SELL_VCH_TYPE && Number(data.pos_point_id) > 0 && isMixedPosReturn(posPayments)
+      if (posPayments.length && journalRows.length && !mixedPosReturn) {
+        const receiptSettlementAccount = Number(data.pos_point_id) > 0 && vchType === 12 && needsPosReceipt(posPayments)
+          ? Number(data.account_id || data.cash_account_id) || null : null
+        const counterRow = journalRows.find((row: any) => Number(row.order_no) === 1)
+        if (counterRow) {
+          journalRows = [
+            ...posPayments.map((payment: any, index: number) => ({
+              ...counterRow,
+              order_no: index + 1,
+              account_id: receiptSettlementAccount && ["cash", "cheque", "card"].includes(payment.payment_method) ? receiptSettlementAccount : payment.account_id,
+              amount: payment.amount,
+              base_curr_amount: Math.round(payment.amount * Number(data.rate || 1) * 100) / 100,
+              note: ({ cash: "دفعة نقدية", card: "دفعة بطاقة", cheque: "دفعة شيك", account: "دفعة على الحساب", gift_card: "بطاقة هدية", aid_voucher: "قسيمة مساعدة" } as Record<string,string>)[payment.payment_method] + " - نقطة البيع",
+            })),
+            ...journalRows
+              .filter((row: any) => row !== counterRow)
+              .map((row: any) => ({ ...row, order_no: Number(row.order_no || 1) + posPayments.length - 1 })),
+          ]
+        }
+      }
+      const currencyError = await validateJournalAccountCurrencies(journalRows, data.currency_id ? Number(data.currency_id) : null)
+      if (currencyError) return NextResponse.json({ error: currencyError }, { status: 400 })
+      const stopError = await validateAccountStops([data.account_id, ...journalRows.map((row: any) => row.account_id)], vchType, data.vch_date)
+      if (stopError) return NextResponse.json({ error: stopError }, { status: 400 })
+      if (vchType === SALES_INVOICE_VCH_TYPE) {
+        // حد الائتمان: بالكاشير فقط الجزء "على الحساب" يبقى ذمة (النقد/البطاقة/الشيك يُسدَّد بسند قبض فوراً)
+        const creditError = await validateCustomerCreditLimit({
+          increases: posPayments.length
+            ? posPayments
+                .filter((payment: any) => payment.payment_method === "account")
+                .map((payment: any) => ({ accountId: payment.account_id, amount: payment.amount * (Number(data.rate) || 1) }))
+            : creditIncreasesFromJournal(journalRows),
+          userId: authorization.userId,
+          branchId: authorization.branchId,
+        })
+        if (creditError) return NextResponse.json({ error: creditError }, { status: 400 })
+      }
+    }
+
+    const amount = Math.round(breakdown.total * 100) / 100
+    const status = Number(data.status || 1)
+    const discountType = data.discount_type === "amount" ? "amount" : "percentage"
+    const invoiceSourceType = Number(data.invoice_source_type || 1)
+    const sourceVoucherId = [2, 3].includes(invoiceSourceType) ? Number(data.source_voucher_id || null) : null
+    const sourceVoucherType = [2, 3].includes(invoiceSourceType) ? Number(data.source_voucher_type || null) : null
+    const itemsToSave = keepsSourceLinks(vchType, invoiceSourceType)
+      ? items
+      : items.map((item: any) => ({
+          ...item,
+          source_voucher_id: null,
+          source_voucher_type: null,
+          delivery_item_id: null,
+          order_item_id: null,
+        }))
+
+    // أصناف لها رقم تسلسلي — نقطة البيع لا تُدخل أرقاماً فلا يُفرض العدد عليها (يُفحص ما أُرسل فقط)
+    const serialError = await validateVoucherSerials({ vchType, voucherId: null, items: itemsToSave, enforceCount: !(Number(data.pos_point_id) > 0 || posClientSaleId) })
+    if (serialError) return NextResponse.json({ error: serialError }, { status: 400 })
+    // منع الرصيد السالب (إن لم يكن مسموحاً) — لا يُطبَّق على نقطة البيع حتى لا يتوقف الكاشير
+    if (!(Number(data.pos_point_id) > 0 || posClientSaleId)) {
+      const negativeStockError = await validateNegativeStock({ vchType, voucherId: null, items: itemsToSave })
+      if (negativeStockError) return NextResponse.json({ error: negativeStockError }, { status: 400 })
+    }
+
+    let result: any[] = []
+    for (let attempt = 0; attempt < MAX_CODE_RETRY_ATTEMPTS; attempt += 1) {
+      try {
+        result = await sql`
+      INSERT INTO voucher_header_tbl (
+        vch_type, vch_code, vch_date, vch_book_id, branch_id, currency_id, rate,
+        account_id, customer_name, to_store_id,
+        amount, manual_voucher, manual_date, note, status, vch_status, is_printed,
+        insert_user, shipping_address, shipping_info, salesman_id, linked_order_id,
+        discount_type, discount_value, vat_percent,
+        vat_classification_id, invoice_type, vat_included, is_maqasa, maqasa_type,
+        phone, due_date, is_exported_sales, location_id, pos_client_sale_id
+      ) VALUES (
+        ${vchType}, ${vchCode}, ${data.vch_date}, ${data.vch_book_id ?? null}, ${authorization.branchId}, ${data.currency_id || null}, ${Number(data.rate || 1)},
+        ${data.account_id}, ${data.customer_name || ""}, ${data.to_store_id || null},
+        ${amount}, ${data.manual_voucher || ""}, ${data.manual_date || null}, ${data.note || ""}, ${status}, ${status === 2 ? 2 : 1}, ${Number(data.is_printed || 0)},
+        ${data.insert_user || null}, ${shippingAddressText(data)}, ${shippingInfoJson(data)}::jsonb, ${data.salesman_id || null}, ${data.linked_order_id || null},
+        ${discountType}, ${Number(data.discount_value || 0)}, ${Number(data.vat_percent || 0)},
+        ${Number(data.vat_classification_id) || 1}, ${Number(data.invoice_type) || 1},
+        ${Boolean(data.vat_included)}, ${Boolean(data.is_maqasa)}, ${data.is_maqasa ? Number(data.maqasa_type) || 1 : null},
+        ${data.phone || ""}, ${data.due_date || null}, ${Boolean(data.is_exported_sales)}, ${data.city_id || null}, ${posClientSaleId}
+      )
+      RETURNING *
+        `
+        break
+      } catch (error: any) {
+        if (String(error?.code || "") !== "23505") throw error
+        const regenerated = await generateSalesVoucherCode(request.url, vchType, data.vch_book_id ?? null, authorization.branchId)
+        if (!regenerated || regenerated === vchCode) break
+        vchCode = regenerated
+      }
+    }
+    if (!result.length) return NextResponse.json({ error: "تعذر توليد رقم سند متاح من دفتر السندات" }, { status: 409 })
+
+    const voucher = result[0]
+    for (const payment of posPayments) {
+      await sql`
+        INSERT INTO pos_sale_payments_tbl (voucher_id, payment_method, amount, account_id, reference, due_date,currency_id,currency_amount,exchange_rate,cheque_account,bank_id,branch_id,card_type_id,card_expiry)
+        VALUES (${voucher.id}, ${payment.payment_method}, ${payment.amount}, ${payment.account_id}, ${payment.reference}, ${payment.due_date},${payment.currency_id},${payment.currency_amount},${payment.exchange_rate},${payment.cheque_account},${payment.bank_id},${payment.branch_id},${payment.card_type_id},${payment.card_expiry})
+      `
+    }
+    const savedItems = await saveSalesVoucherItems(voucher.id, withLineVat(itemsToSave, saveBreakdown))
+    // إجمالي الضريبة في رأس السند (تعتمده التقارير الضريبية — دقيق أيضاً مع الضريبة على مستوى الصنف)
+    await sql`UPDATE voucher_header_tbl SET vat = ${Math.round(saveBreakdown.tax * 100) / 100} WHERE id = ${voucher.id}`
+    await saveVoucherSerials(voucher.id, vchType, savedItems)
+    // فاتورة/إرسالية مشتريات: آخر سعر وتاريخ وعملة شراء للأصناف (إن كان تاريخ السند >= آخر شراء مسجّل)
+    await updateLastPurchasePrices(Number(voucher.id))
+    if ((ITEM_ACCOUNT_VCH_TYPES as readonly number[]).includes(vchType)) {
+      const journalIds = await saveJournalRows(voucher.id, journalRows)
+      await linkSalesVoucherItemsToJournals(savedItems, journalRows, journalIds)
+    }
+    if (status === 2) {
+      await applySalesVoucherStockEffect(vchType, voucher.id, savedItems)
+    }
+    if (ORDER_FULFILLING_VCH_TYPES.includes(vchType)) {
+      const linkedOrderIds = await getSalesOrderIdsForVoucher(voucher.id)
+      if (linkedOrderIds.length > 0) await refreshSalesOrderFulfillment(linkedOrderIds)
+    }
+
+    // نقطة البيع تستخدم حقول رأس السند فقط (رقم السند، والعملة/السعر/العميل لسند القبض) — لا داعي لإعادة قراءة
+    // الأصناف والأرقام التسلسلية وحسابات القيد (4 استعلامات) لبناء ردّ لا يُستخدم.
+    if (posClientSaleId) return NextResponse.json({ ...voucher, city_id: voucher.location_id, items: [] }, { status: 201 })
+
+    // رسالة SMS تلقائية للعميل إن فُعّلت لهذا النوع (lib/sms.ts) — في الخلفية، لا تؤخر الحفظ ولا تشمل نقاط البيع
+    await queueAutoSms(voucherDocKey(vchType), Number(voucher.id), String(authorization.userId))
+
+    const savedItemsWithNames = await attachItemSerials(await fetchSalesVoucherItems(voucher.id, journalTypes?.itemJournalType))
+    const journalAccounts = (ITEM_ACCOUNT_VCH_TYPES as readonly number[]).includes(vchType)
+      ? await fetchSalesVoucherJournalAccounts(voucher.id, vchType, Boolean(voucher.account_id))
+      : { taxAccount: null, cashAccount: null }
+    return NextResponse.json(
+      {
+        ...voucher,
+        city_id: voucher.location_id,
+        cash_account_id: journalAccounts.cashAccount?.id ?? null,
+        cash_account_code: journalAccounts.cashAccount?.code ?? "",
+        cash_account_name: journalAccounts.cashAccount?.name ?? "",
+        tax_account_id: journalAccounts.taxAccount?.id ?? null,
+        tax_account_code: journalAccounts.taxAccount?.code ?? "",
+        tax_account_name: journalAccounts.taxAccount?.name ?? "",
+        items: savedItemsWithNames,
+      },
+      { status: 201 },
+    )
+  } catch (error) {
+    console.error("Error creating sales voucher:", error)
+    const message = error instanceof Error ? error.message : String(error)
+    return NextResponse.json({ error: message || "Failed to create sales voucher" }, { status: 500 })
+  }
+}
+
+async function putHandler(request: NextRequest) {
+  try {
+    return await withTenantTransaction(async () => {
+    await ensureTables()
+    const data = await request.json()
+    const family = transactionFamilyForVoucherType(Number(data.vch_type))
+    if (!family) return NextResponse.json({ error: "نوع الحركة غير صالح" }, { status: 400 })
+    const action = Number(data.status) === 3 ? "delete" : "update"
+    const authorization = await authorizeTransaction(request, family, action, data.branch_id)
+    if (!authorization.ok) return authorization.response
+    if (Number(data.status) === 2) {
+      const posting = await authorizeTransaction(request, family, "post", authorization.branchId)
+      if (!posting.ok) return posting.response
+    }
+    if (!data.id) return NextResponse.json({ error: "معرف السند مطلوب" }, { status: 400 })
+
+    const vchType = Number(data.vch_type)
+    const status = Number(data.status ?? 1)
+
+    const currentRows = await sql`SELECT * FROM voucher_header_tbl WHERE id = ${data.id} FOR UPDATE`
+    if (currentRows.length === 0) return NextResponse.json({ error: "السند غير موجود" }, { status: 404 })
+    const previousStatus = Number(currentRows[0].status)
+    if ([2, 3].includes(previousStatus) && status !== 3) {
+      return NextResponse.json({ error: "السند معتمد ولا يمكن تعديله" }, { status: 400 })
+    }
+
+    if (status === 3) {
+      const voucher = currentRows[0]
+      if (previousStatus !== 3) {
+        if (Number(voucher.vch_type) === DELIVERY_CONSIGNMENT_SALE_VCH_TYPE) {
+          const usage = await consignmentUsage(Number(voucher.id))
+          if (usage.length) return NextResponse.json({ error: `لا يمكن إلغاء الارسالية: صدرت منها ${usage.map((row) => `${Number(row.vch_type) === 15 ? "مرتجع" : "فاتورة"} ${row.vch_code}`).join("، ")}` }, { status: 400 })
+        }
+        // إرسالية مبيعات/مشتريات صدرت منها فاتورة (أو مرتجع) غير ملغاة: إلغاؤها كان يُبقي الفاتورة مربوطة بإرسالية
+        // ملغاة فيفشل ترحيلها لاحقاً بـ"الإرسالية المصدرية لا تطابق نوع الفاتورة أو الحساب أو الفرع"
+        if ([DELIVERY_SELL_VCH_TYPE, DELIVERY_PAY_VCH_TYPE].includes(Number(voucher.vch_type))) {
+          const invoices = (await sql`
+            SELECT DISTINCT inv.vch_code, inv.vch_type
+            FROM voucher_items_tbl inv_item
+            JOIN voucher_header_tbl inv ON inv.id = inv_item.voucher_id AND COALESCE(inv.status, 1) <> 3
+            WHERE inv_item.delivery_item_id IN (SELECT id FROM voucher_items_tbl WHERE voucher_id = ${Number(voucher.id)})
+            LIMIT 10
+          `) as any[]
+          if (invoices.length) {
+            return NextResponse.json({ error: `لا يمكن إلغاء الإرسالية: صدرت منها ${invoices.map((row) => `${[16, 19].includes(Number(row.vch_type)) ? "مرتجع" : "فاتورة"} ${row.vch_code}`).join("، ")} — ألغِ ${invoices.length > 1 ? "السندات المرتبطة" : "السند المرتبط"} أولاً` }, { status: 400 })
+          }
+        }
+        const returnBlock = await consignmentReturnBlocksDeletion(Number(voucher.id))
+        if (returnBlock) return NextResponse.json({ error: returnBlock }, { status: 400 })
+        const serialsRemovalError = await validateSerialsRemoval(Number(voucher.id))
+        if (serialsRemovalError) return NextResponse.json({ error: serialsRemovalError }, { status: 400 })
+        // إلغاء فاتورة مشتريات/مرتجع مبيعات استُهلكت كميتها لاحقاً يجعل الرصيد سالباً
+        const negativeStockError = await validateNegativeStock({ vchType: Number(voucher.vch_type), voucherId: Number(voucher.id), items: [], action: "delete" })
+        if (negativeStockError) return NextResponse.json({ error: negativeStockError }, { status: 400 })
+        await deletePosRelatedVouchers(request, Number(voucher.id))
+        await reversePosSessionPayments(voucher)
+        const affectedOrderIds = ORDER_FULFILLING_VCH_TYPES.includes(Number(voucher.vch_type))
+          ? await getSalesOrderIdsForVoucher(voucher.id) : []
+        await reverseSalesVoucherStockMovement(voucher.id)
+        await sql`UPDATE voucher_header_tbl SET status=3,vch_status=1,last_update_date=CURRENT_TIMESTAMP WHERE id=${voucher.id}`
+        await refreshSalesOrderFulfillment(affectedOrderIds)
+      }
+      const savedItems = await fetchSalesVoucherItems(Number(voucher.id))
+      return NextResponse.json({ ...voucher, status: 3, vch_status: 1, city_id: voucher.location_id, items: savedItems })
+    }
+
+    let items: any[] = []
+    let journalRows: any[] = []
+    let journalTypes = null
+    if (status !== 3) {
+      items = Array.isArray(data.items) ? data.items.filter((i: any) => i?.product_id) : []
+      const payloadError = validatePayload(data, items)
+      if (payloadError) return NextResponse.json({ error: payloadError }, { status: 400 })
+      // صنف له "المتغيرات والخصائص" يجب اختيار قيمة لكل خاصية (الكاشير وشاشة المطعم بلا نافذة خصائص فيُستثنيان)
+      if (!data.pos_client_sale_id) {
+        const selectionError = await missingSelectionsMessage(items)
+        if (selectionError) return NextResponse.json({ error: selectionError }, { status: 400 })
+      }
+      const sourceError = await validateSourceInvoice(items, data, Number(data.id || 0))
+      if (sourceError) return NextResponse.json({ error: sourceError }, { status: 400 })
+
+      const referencesError = await validateItemReferences(items, (ITEM_ACCOUNT_VCH_TYPES as readonly number[]).includes(vchType) ? ["account_id"] : [])
+      if (referencesError) return NextResponse.json({ error: referencesError }, { status: 400 })
+
+      const codeFormatError = await validateCodeFormat(request.url, vchType, data.vch_book_id ?? null, data.vch_code, authorization.branchId)
+      if (codeFormatError) return NextResponse.json({ error: codeFormatError }, { status: 400 })
+
+      const duplicate = await sql`
+        SELECT id FROM voucher_header_tbl WHERE vch_type = ${vchType} AND vch_code = ${data.vch_code} AND id != ${data.id}
+      `
+      if (duplicate.length > 0) return NextResponse.json({ error: "رقم السند مستخدم مسبقاً" }, { status: 400 })
+
+      // إيقاف الحركات على حساب العميل/المورد لهذا النوع من السندات (كل الأنواع، ومنها الإرساليات بلا قيد)
+      const headerStopError = await validateAccountStops([data.account_id], vchType, data.vch_date)
+      if (headerStopError) return NextResponse.json({ error: headerStopError }, { status: 400 })
+      if ((ITEM_ACCOUNT_VCH_TYPES as readonly number[]).includes(vchType)) {
+        journalTypes = await resolveSalesVoucherJournalTypes(vchType)
+        if (!journalTypes) throw new Error("تعذّر تحديد أنواع قيود الفاتورة")
+        const breakdown = computeVoucherBreakdown(items, data, await resolveVatRates(items))
+        journalRows = buildSalesVoucherJournalRows(
+          vchType,
+          items,
+          data.account_id ?? data.cash_account_id ?? null,
+          data.currency_id || null,
+          Number(data.rate || 1),
+          journalTypes,
+          data.tax_account_id ?? null,
+          breakdown.tax,
+          breakdown.discount,
+          breakdown.total,
+        )
+        const currencyError = await validateJournalAccountCurrencies(journalRows, data.currency_id ? Number(data.currency_id) : null)
+        if (currencyError) return NextResponse.json({ error: currencyError }, { status: 400 })
+        const stopError = await validateAccountStops([data.account_id, ...journalRows.map((row: any) => row.account_id)], vchType, data.vch_date)
+        if (stopError) return NextResponse.json({ error: stopError }, { status: 400 })
+        if (vchType === SALES_INVOICE_VCH_TYPE) {
+          // الرصيد يُحسب بلا قيد هذه الفاتورة القديم (يُستبدل بالجديد)
+          const creditError = await validateCustomerCreditLimit({
+            increases: creditIncreasesFromJournal(journalRows),
+            excludeVoucherId: Number(data.id),
+            userId: authorization.userId,
+            branchId: authorization.branchId,
+          })
+          if (creditError) return NextResponse.json({ error: creditError }, { status: 400 })
+        }
+      }
+    }
+
+    const invoiceSourceType = Number(data.invoice_source_type || 1)
+    const sourceVoucherId = [2, 3].includes(invoiceSourceType) ? Number(data.source_voucher_id || null) : null
+    const sourceVoucherType = [2, 3].includes(invoiceSourceType) ? Number(data.source_voucher_type || null) : null
+    const serialError = await validateVoucherSerials({
+      vchType,
+      voucherId: Number(data.id),
+      items: keepsSourceLinks(vchType, invoiceSourceType) ? items : items.map((item) => ({ ...item, delivery_item_id: null })),
+      enforceCount: !(Number(data.pos_point_id) > 0 || currentRows[0].pos_client_sale_id),
+    })
+    if (serialError) return NextResponse.json({ error: serialError }, { status: 400 })
+    // حذف سطر/رقم تسلسلي من سند محفوظ: مسموح فقط إن كان هذا السند آخر حركة على الرقم
+    const serialRemovalError = await validateSerialsRemovalOnUpdate(
+      Number(data.id),
+      keepsSourceLinks(vchType, invoiceSourceType) ? items : items.map((item) => ({ ...item, delivery_item_id: null })),
+    )
+    if (serialRemovalError) return NextResponse.json({ error: serialRemovalError }, { status: 400 })
+    // تعديل (تغيير كمية، حذف سطر، تغيير صنف/وحدة/مستودع) لا يجعل أي رصيد سالباً
+    if (!(Number(data.pos_point_id) > 0 || currentRows[0].pos_client_sale_id)) {
+      const negativeStockError = await validateNegativeStock({
+        vchType,
+        voucherId: Number(data.id),
+        items: keepsSourceLinks(vchType, invoiceSourceType) ? items : items.map((item) => ({ ...item, delivery_item_id: null })),
+      })
+      if (negativeStockError) return NextResponse.json({ error: negativeStockError }, { status: 400 })
+    }
+    const putBreakdown = computeVoucherBreakdown(items, data, await resolveVatRates(items))
+    const saveBreakdown = putBreakdown
+    const amount = Math.round(putBreakdown.total * 100) / 100
+    const discountType = data.discount_type === "amount" ? "amount" : "percentage"
+
+    const result = await sql`
+      UPDATE voucher_header_tbl
+      SET
+        vch_code = ${data.vch_code},
+        vch_date = ${data.vch_date},
+        vch_book_id = ${data.vch_book_id ?? null},
+        branch_id = ${authorization.branchId},
+        currency_id = ${data.currency_id || null},
+        rate = ${Number(data.rate || 1)},
+        account_id = ${data.account_id || null},
+        customer_name = ${data.customer_name || ""},
+        to_store_id = ${data.to_store_id || null},
+        amount = ${amount},
+        manual_voucher = ${data.manual_voucher || ""},
+        manual_date = ${data.manual_date || null},
+        note = ${data.note || ""},
+        status = ${status},
+        vch_status = ${status === 2 ? 2 : 1},
+        is_printed = ${Number(data.is_printed || 0)},
+        shipping_address = ${shippingAddressText(data)},
+        shipping_info = ${shippingInfoJson(data)}::jsonb,
+        salesman_id = ${data.salesman_id || null},
+        linked_order_id = ${data.linked_order_id || null},
+        discount_type = ${discountType},
+        discount_value = ${Number(data.discount_value || 0)},
+        vat_percent = ${Number(data.vat_percent || 0)},
+        vat_classification_id = ${Number(data.vat_classification_id) || 1},
+        invoice_type = ${Number(data.invoice_type) || 1},
+        vat_included = ${Boolean(data.vat_included)},
+        is_maqasa = ${Boolean(data.is_maqasa)},
+        maqasa_type = ${data.is_maqasa ? Number(data.maqasa_type) || 1 : null},
+        phone = ${data.phone || ""},
+        due_date = ${data.due_date || null},
+        is_exported_sales = ${Boolean(data.is_exported_sales)},
+        location_id = ${data.city_id || null},
+        last_update_date = CURRENT_TIMESTAMP
+      WHERE id = ${data.id}
+      RETURNING *
+    `
+
+    const voucher = result[0]
+    const itemsToSave = keepsSourceLinks(vchType, invoiceSourceType)
+      ? items
+      : items.map((item) => ({
+          ...item,
+          source_voucher_id: null,
+          source_voucher_type: null,
+          delivery_item_id: null,
+          order_item_id: null,
+        }))
+
+    const savedItems = await saveSalesVoucherItems(voucher.id, withLineVat(itemsToSave, saveBreakdown))
+    // إجمالي الضريبة في رأس السند (تعتمده التقارير الضريبية — دقيق أيضاً مع الضريبة على مستوى الصنف)
+    await sql`UPDATE voucher_header_tbl SET vat = ${Math.round(saveBreakdown.tax * 100) / 100} WHERE id = ${voucher.id}`
+    await saveVoucherSerials(voucher.id, vchType, savedItems)
+    // فاتورة/إرسالية مشتريات: آخر سعر وتاريخ وعملة شراء للأصناف (إن كان تاريخ السند >= آخر شراء مسجّل)
+    await updateLastPurchasePrices(Number(voucher.id))
+    if ((ITEM_ACCOUNT_VCH_TYPES as readonly number[]).includes(vchType)) {
+      const journalIds = await saveJournalRows(voucher.id, journalRows)
+      await linkSalesVoucherItemsToJournals(savedItems, journalRows, journalIds)
+    }
+    if (status === 2 && previousStatus !== 2) {
+      await applySalesVoucherStockEffect(vchType, voucher.id, savedItems)
+    }
+    if (ORDER_FULFILLING_VCH_TYPES.includes(vchType)) {
+      const linkedOrderIds = await getSalesOrderIdsForVoucher(voucher.id)
+      if (linkedOrderIds.length > 0) await refreshSalesOrderFulfillment(linkedOrderIds)
+    }
+
+    const savedItemsWithNames = await attachItemSerials(await fetchSalesVoucherItems(voucher.id, journalTypes?.itemJournalType))
+    const journalAccounts = (ITEM_ACCOUNT_VCH_TYPES as readonly number[]).includes(vchType)
+      ? await fetchSalesVoucherJournalAccounts(voucher.id, vchType, Boolean(voucher.account_id))
+      : { taxAccount: null, cashAccount: null }
+    return NextResponse.json({
+      ...voucher,
+      city_id: voucher.location_id,
+      cash_account_id: journalAccounts.cashAccount?.id ?? null,
+      cash_account_code: journalAccounts.cashAccount?.code ?? "",
+      cash_account_name: journalAccounts.cashAccount?.name ?? "",
+      tax_account_id: journalAccounts.taxAccount?.id ?? null,
+      tax_account_code: journalAccounts.taxAccount?.code ?? "",
+      tax_account_name: journalAccounts.taxAccount?.name ?? "",
+      items: savedItemsWithNames,
+    })
+    })
+  } catch (error) {
+    console.error("Error updating sales voucher:", error)
+    const message = error instanceof Error ? error.message : String(error)
+    return NextResponse.json({ error: message || "Failed to update sales voucher" }, { status: Number((error as {status?:number})?.status)||500 })
+  }
+}
+
+// أرشفة السندات (تقرير ارشفة السندات): نسخة قبل/بعد + نوع العملية والمستخدم
+export const POST = withVoucherAudit(postHandler, { source: "voucher", kind: "save" })
+export const PUT = withVoucherAudit(putHandler, { source: "voucher", kind: "save" })

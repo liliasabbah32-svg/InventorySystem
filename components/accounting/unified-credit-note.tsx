@@ -1,0 +1,934 @@
+"use client"
+
+import { tr, appDir } from "@/lib/i18n"
+import { useEffect, useMemo, useRef, useState } from "react"
+import { armVoucherWhatsApp } from "@/lib/voucher-print/whatsapp-share"
+import { useCustomerDefaultSalesman } from "@/lib/use-customer-default-salesman"
+import { BillsPaymentDialog } from "@/components/sales/bills-payment-dialog"
+import { FileText, User, Percent, Users2, MessageSquare, Wallet, X } from "lucide-react"
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog"
+import { useWorkspace } from "@/contexts/workspace-context"
+import { Input } from "@/components/ui/input"
+import { Label } from "@/components/ui/label"
+import { Textarea } from "@/components/ui/textarea"
+import { UniversalToolbar } from "@/components/ui/universal-toolbar"
+import ConfirmDialogYesNo from "@/components/ui/ConfirmDialogYesNo"
+import Messages from "@/components/common/Messages"
+import ProgressSpinner from "@/components/ProgressSpinner/ProgressSpinner"
+import AutoCompleteAccount from "@/components/customer/auto-complete-account"
+import AccountBalanceField from "@/components/common/account-balance-field"
+import type { JournalCostCenterSelection } from "@/components/customer/account-cost-centers"
+import DateTimeControl from "@/components/common/date-time-control"
+import PostVoucherDialog, { type PostVoucherAction } from "@/components/common/post-voucher-dialog"
+import { useToast } from "@/hooks/use-toast"
+import PrimeDropdown from "@/components/common/FocusDropdown"
+import TransactionBranchField from "@/components/common/transaction-branch-field"
+import { useWorkspaceTabActive } from "@/contexts/workspace-tab-context"
+import { useNavigationGuard } from "@/lib/navigation-guard"
+import { keepDialogOpenOnEscape } from "@/lib/dialog-escape"
+import { VoucherSearchButton, VoucherSearchDialog } from "@/components/common/voucher-search-dialog"
+import { Button } from "@/components/ui/button"
+import { useTransactionSuccessMessages } from "@/lib/transaction-success"
+
+export interface VoucherRecord {
+  id: number
+  vch_type: number
+  vch_code: string
+  vch_date: string
+  vch_book_id: number | null
+  branch_id: number | null
+  currency_id: number | null
+  rate: number
+  account_id: number | null
+  customer_name: string
+  account_cost_centers?: JournalCostCenterSelection[]
+  debit_account_id: number | null
+  debit_account_cost_centers?: JournalCostCenterSelection[]
+  vat_account_id: number | null
+  vat_account_cost_centers?: JournalCostCenterSelection[]
+  amount_journal_type_8: number | null
+  vat_percent: number
+  vat: number | null
+  amount: number
+  payment_classification_id: number | null
+  salesman_id: number | null
+  manual_voucher: string
+  manual_date: string
+  note: string
+  status: number
+  is_printed?: number
+  account_code?: string
+  account_name?: string
+  debit_account_code?: string
+  debit_account_name?: string
+  vat_account_code?: string
+  vat_account_name?: string
+}
+
+interface CurrencyOption {
+  currency_id?: number
+  id?: number
+  currency_name?: string
+  currency_code?: string
+}
+
+interface LookupOption {
+  id: number
+  name: string
+}
+
+interface UnifiedCreditNoteProps {
+  title: string
+  dialogOpen: boolean
+  currentIndex: number
+  totalRecords: number
+  currencies?: CurrencyOption[]
+  voucherBooks?: LookupOption[]
+  salesmen?: LookupOption[]
+  paymentClassifications?: LookupOption[]
+  form: VoucherRecord
+  isSaving: boolean
+  showDeleteConfirm?: boolean
+  onOpenChange: (open: boolean) => void
+  onNew?: () => void
+  onSave: (action?: PostVoucherAction, keepSavedVoucher?: boolean) => Promise<boolean>
+  onValidateSave?: () => string | null | Promise<string | null>
+  hasUnsavedChanges: () => boolean
+  onDelete?: () => void
+  onClone?: () => void
+  onPrint?: () => void
+  onNavigateRecord?: (record: VoucherRecord) => void
+  onFormChange: (field: string, value: string | number | null | JournalCostCenterSelection[]) => void
+  onBookChange?: (bookId: number | null) => void
+  onCodeResolved?: (id: number) => void
+  onCodeNotFound?: (code: string) => void
+  onConfirmDelete?: () => void
+  onCancelDelete?: () => void
+  canSave?: boolean
+  isFirstRecord?: boolean
+  isLastRecord?: boolean
+  isNewMode?: boolean
+  errorMessages?: string[]
+}
+
+const normalizeVoucherCode = (value: string) => value.toUpperCase().replace(/[^A-Z0-9-]/g, "").slice(0, 10)
+const numberValue = (value: number | null | undefined) => (value === null || value === undefined ? "" : String(value))
+type AmountField = "amount" | "amount_journal_type_8" | "vat"
+
+const blockNonNumericKey = (e: React.KeyboardEvent<HTMLInputElement>) => {
+  const controlKeys = ["Backspace", "Delete", "Tab", "Enter", "ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End"]
+  if (e.ctrlKey || e.metaKey || e.altKey || controlKeys.includes(e.key)) return
+  if (e.key.length === 1 && !/[0-9.]/.test(e.key)) {
+    e.preventDefault()
+  }
+}
+
+export default function UnifiedCreditNote({
+  title,
+  dialogOpen,
+  currentIndex,
+  totalRecords,
+  currencies = [],
+  voucherBooks = [],
+  salesmen = [],
+  paymentClassifications = [],
+  form,
+  isSaving,
+  showDeleteConfirm = false,
+  onOpenChange,
+  onNew,
+  onSave,
+  onValidateSave,
+  hasUnsavedChanges,
+  onDelete,
+  onClone,
+  onPrint,
+  onNavigateRecord,
+  onFormChange,
+  onBookChange,
+  onCodeResolved,
+  onCodeNotFound,
+  onConfirmDelete = () => undefined,
+  onCancelDelete = () => undefined,
+  canSave,
+  isFirstRecord,
+  isLastRecord,
+  isNewMode,
+  errorMessages = [],
+}: UnifiedCreditNoteProps) {
+  const workspaceTabActive = useWorkspaceTabActive()
+  const { fullscreenEnabled } = useWorkspace()
+  const dateInputRef = useRef<HTMLInputElement | null>(null)
+  const messagesRef = useRef<any>(null)
+  // "تمت العملية بنجاح" بعد حفظ السند (lib/transaction-success.ts)
+  useTransactionSuccessMessages(messagesRef)
+  const { toast } = useToast()
+  const [navLoading, setNavLoading] = useState(false)
+  const [postDialogOpen, setPostDialogOpen] = useState(false)
+
+  const isCreditNote = form.vch_type === 6 // per credit-notes/_lib.ts: 6 = اشعار دائن, 7 = اشعار مدين
+  // تسديد الفواتير: توزيع الإشعار الدائن المحفوظ على فواتير العميل المفتوحة.
+  const [billsPaymentOpen, setBillsPaymentOpen] = useState(false)
+  // سند مُرحَّل (status=2): مقفل بالكامل، لا يُعدَّل إلا عبر إلغائه منطقياً (زر حذف).
+  const isLocked = form.status === 2 || form.status === 3
+  // مندوب العميل يُعبّأ تلقائياً عند اختياره (إن كان له مندوب)
+  useCustomerDefaultSalesman({ recordId: form.id, accountId: form.account_id, locked: isLocked, onSalesman: (salesmanId) => onFormChange("salesman_id", salesmanId) })
+  const statusBadge =
+    form.status === 3 ? "ملغي منطقياً" : form.status === 2 ? (form.is_printed === 1 ? "معتمد - مطبوع" : "معتمد") : ""
+
+  useEffect(() => {
+    if (errorMessages.length > 0) {
+      messagesRef.current?.clear?.()
+      messagesRef.current?.show(
+        errorMessages.map((detail) => ({ severity: "error", summary: "", detail, sticky: false, life: 5000 })),
+      )
+    }
+  }, [errorMessages])
+
+  const latestFormRef = useRef(form)
+  latestFormRef.current = form
+  const [showUnsavedConfirm, setShowUnsavedConfirm] = useState(false)
+  const pendingActionRef = useRef<(() => void) | null>(null)
+  const saveInFlightRef = useRef(false)
+  const codeEditedRef = useRef(false)
+  const codeRequestRef = useRef(0)
+  const calculationValuesRef = useRef<Partial<Record<AmountField | "vat_percent", number>>>({})
+
+  useEffect(() => {
+    codeRequestRef.current += 1
+    codeEditedRef.current = false
+    calculationValuesRef.current = {}
+    pendingActionRef.current = null
+    setShowUnsavedConfirm(false)
+  }, [dialogOpen, form.id])
+
+  const guardedAction = (action: () => void) => {
+    if (isSaving || saveInFlightRef.current || navLoading) return
+    codeRequestRef.current += 1
+    if ([2, 3].includes(Number(form.status))) { action(); return }
+    if (showUnsavedConfirm) return
+    if (hasUnsavedChanges()) {
+      pendingActionRef.current = action
+      setShowUnsavedConfirm(true)
+    } else {
+      action()
+    }
+  }
+  // تبديل الشاشة من القائمة/إغلاق التبويب/رجوع المتصفح/تحديث الصفحة مع تغييرات غير محفوظة ⇐ نفس نافذة
+  // التحقق من التغييرات (حفظ/عدم حفظ/إلغاء) — كما في كاشير نقطة البيع (lib/navigation-guard.ts)
+  useNavigationGuard(
+    () => dialogOpen && ![2, 3].includes(Number(form.status)) && hasUnsavedChanges(),
+    (continueNavigation) => guardedAction(continueNavigation),
+  )
+
+  // بحث السندات (زر بجانب رقم السند): اختيار سند يمرّ بنافذة التحقق من التغييرات ثم يعرضه
+  const [voucherSearchOpen, setVoucherSearchOpen] = useState(false)
+  const openSearchedVoucher = (voucherId: number) => guardedAction(async () => {
+    const requestId = codeRequestRef.current
+    const response = await fetch(`/api/credit-notes/${voucherId}`, { cache: "no-store" })
+    const record = await response.json().catch(() => null)
+    if (requestId !== codeRequestRef.current) return
+    if (!response.ok || !record?.id) {
+      messagesRef.current?.show?.([{ severity: "error", summary: "", detail: record?.error || tr("تعذر عرض السند"), life: 3000 }])
+      return
+    }
+    onNavigateRecord?.(record)
+  })
+
+
+  const handleCodeBlur = async () => {
+    if (!codeEditedRef.current) return
+    const raw = form.vch_code.trim()
+    if (!raw) return
+    codeEditedRef.current = false
+    const requestId = ++codeRequestRef.current
+    const recordId = form.id
+    try {
+      const query = new URLSearchParams({ vch_type: String(form.vch_type), raw })
+      if (form.vch_book_id) query.set("vch_book_id", String(form.vch_book_id))
+      if ((form as any).branch_id) query.set("branch_id", String((form as any).branch_id))
+      const response = await fetch(`/api/credit-notes/resolve-code?${query.toString()}`)
+      const data = await response.json()
+      if (requestId !== codeRequestRef.current || latestFormRef.current.id !== recordId || latestFormRef.current.vch_code.trim() !== raw) return
+      if (!response.ok) {
+        messagesRef.current?.show?.([{ severity: "error", summary: "", detail: data.error || tr("تعذر تحديد رقم السند"), life: 3000 }])
+        return
+      }
+      if (data.code && data.code !== form.vch_code) {
+        onFormChange("vch_code", data.code)
+      }
+      if (data.exists && data.id) {
+        if (data.id === form.id) return
+        guardedAction(() => onCodeResolved?.(data.id))
+      } else if (!data.exists && data.code) {
+        guardedAction(() => onCodeNotFound?.(data.code))
+      }
+    } catch (error) {
+      console.error("Failed to resolve voucher code", error)
+    }
+  }
+
+  const handleRequestSave = async () => {
+    if (isLocked || isSaving || saveInFlightRef.current || showUnsavedConfirm) return
+    const requestId = codeRequestRef.current
+    const error = await onValidateSave?.()
+    if (requestId !== codeRequestRef.current) return
+    if (error) {
+      messagesRef.current?.clear?.()
+      messagesRef.current?.show?.([{ severity: "error", summary: "", detail: error, sticky: false, life: 4000 }])
+      return
+    }
+    setPostDialogOpen(true)
+  }
+
+  const cancelPendingAction = () => {
+    if (isSaving || saveInFlightRef.current) return
+    pendingActionRef.current = null
+    setShowUnsavedConfirm(false)
+  }
+
+  const discardAndContinue = () => {
+    if (isSaving || saveInFlightRef.current) return
+    const action = pendingActionRef.current
+    pendingActionRef.current = null
+    setShowUnsavedConfirm(false)
+    action?.()
+  }
+
+  const saveAndContinue = async () => {
+    if (isSaving || saveInFlightRef.current) return
+    saveInFlightRef.current = true
+    setShowUnsavedConfirm(false)
+    const action = pendingActionRef.current
+    pendingActionRef.current = null
+    try {
+      if (await onSave("save", true)) action?.()
+    } finally {
+      saveInFlightRef.current = false
+    }
+  }
+
+  // F3 حفظ / F9 حذف / F4 نسخ / F5 جديد / Ctrl+P طباعة: يتولاها UniversalToolbar (lib/hotkeys.ts)
+
+  const currencyOptions = useMemo(
+    () =>
+      currencies.map((c) => ({
+        label: c.currency_name || c.currency_code || tr("غير محدد"),
+        value: Number(c.currency_id ?? c.id),
+      })),
+    [currencies],
+  )
+
+  const baseCurrencyId = useMemo(
+    () =>
+      currencies.reduce<number | null>((min, c) => {
+        const id = Number(c.currency_id ?? c.id)
+        if (!Number.isFinite(id)) return min
+        return min === null || id < min ? id : min
+      }, null),
+    [currencies],
+  )
+
+  const navigationPending = useRef(false)
+  const handleNavigate = async (direction: "first" | "previous" | "next" | "last") => {
+    if (navigationPending.current || isSaving) return
+    navigationPending.current = true
+    setNavLoading(true)
+    try {
+      const currentId = form.id > 0 ? form.id : 0
+      const isNewRecord = form.id <= 0
+      const effectiveDirection =
+        direction === "previous" && isNewRecord ? "last" : direction === "next" && isNewRecord ? "first" : direction
+
+      const query = new URLSearchParams()
+      query.set("currentId", String(currentId))
+      query.set("vch_type", String(form.vch_type))
+
+      const response = await fetch(`/api/credit-notes/navigation/${effectiveDirection}?${query.toString()}`, { cache: "no-store" })
+      if (!response.ok) return
+
+      const record = await response.json()
+      if (record?.id) onNavigateRecord?.(record)
+    } catch (error) {
+      console.error("Failed to navigate voucher", error)
+    } finally {
+      navigationPending.current = false
+      setNavLoading(false)
+    }
+  }
+
+  useEffect(() => {
+    if (typeof window === "undefined" || !dialogOpen) return
+    const t = setTimeout(() => dateInputRef.current?.focus(), 120)
+    return () => clearTimeout(t)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dialogOpen, form.id, form.vch_code, isNewMode])
+
+  const handleCurrencyChange = async (newCurrencyId: number | null) => {
+    onFormChange("currency_id", newCurrencyId)
+    if (!newCurrencyId) return
+    if (newCurrencyId === baseCurrencyId) {
+      onFormChange("rate", 1)
+      return
+    }
+    try {
+      const query = new URLSearchParams({
+        currency_id: String(newCurrencyId),
+        date: form.vch_date ? form.vch_date.slice(0, 10) : "",
+      })
+      const response = await fetch(`/api/exchange-rates/lookup?${query.toString()}`)
+      const data = response.ok ? await response.json() : null
+      onFormChange("rate", data?.rate ?? 1)
+    } catch (error) {
+      console.error("Failed to fetch exchange rate", error)
+      onFormChange("rate", 1)
+    }
+  }
+
+  // مطابق لـ doCalclation في CreditNote.js: المجموع = المبلغ / (1 + نسبة الضريبة%)، والضريبة =
+  // المجموع - المبلغ. تُعاد الحسابات الثلاثة تبادلياً حسب الحقل الذي غادره المستخدم (blur).
+  const doCalculation = (type: AmountField, source: AmountField | "vat_percent" = type) => {
+    const originalValue = calculationValuesRef.current[source]
+    delete calculationValuesRef.current[source]
+    if (originalValue === undefined || Number(form[source] || 0) === originalValue) return
+    const amount = Number(form.amount || 0)
+    const amountNet = Number(form.amount_journal_type_8 || 0)
+    const vat = Number(form.vat || 0)
+    const vatPercent = Number(form.vat_percent || 0)
+
+    switch (type) {
+      case "amount": {
+        let calcNet = 0
+        let calcVat = 0
+        if (amount > 0) {
+          calcNet = amount / (1 + vatPercent / 100)
+          calcVat = amount - calcNet
+        }
+        onFormChange("amount_journal_type_8", calcNet)
+        onFormChange("vat", calcVat)
+        break
+      }
+      case "amount_journal_type_8": {
+        let calcVat = 0
+        let calcAmount = 0
+        if (amountNet > 0) {
+          calcVat = amountNet * (vatPercent / 100)
+          calcAmount = amountNet + calcVat
+        }
+        onFormChange("amount", calcAmount)
+        onFormChange("vat", calcVat)
+        break
+      }
+      case "vat": {
+        if (!vatPercent) break
+        let calcNet = 0
+        let calcAmount = amount
+        if (vat >= 0) {
+          calcNet = vat / (vatPercent / 100)
+          calcAmount = calcNet + vat
+        }
+        onFormChange("amount", calcAmount)
+        onFormChange("amount_journal_type_8", calcNet)
+        break
+      }
+    }
+  }
+
+  // Enter يتصرف كـ Tab عبر كل حقول النموذج، بدل إرسال الفورم أو أي سلوك افتراضي آخر — إذا كانت
+  // قائمة Prime Dropdown مفتوحة فعلاً (تصفّح بالأسهم/اختيار بالـ Enter) نترك سلوكها الافتراضي.
+  const handleFormEnterAsTab = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    if (event.key !== "Enter") return
+    const target = event.target as HTMLElement
+    if (target.closest(".p-dropdown-panel")) return
+    if (target.tagName === "TEXTAREA" || target.tagName === "BUTTON") return
+
+    const focusable = Array.from(
+      event.currentTarget.querySelectorAll<HTMLElement>(
+        'input:not([disabled]):not([type="hidden"]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+      ),
+    ).filter((el) => el.offsetParent !== null)
+
+    const currentIndex = focusable.indexOf(target)
+    if (currentIndex === -1) return
+    event.preventDefault()
+    focusable[currentIndex + 1]?.focus()
+  }
+
+  return (
+    <>
+      {/* الإغلاق (ESC أو زر X) يمر بالتحقق من التغييرات */}
+      <Dialog open={dialogOpen} modal={showUnsavedConfirm || showDeleteConfirm || postDialogOpen ? false : undefined} onOpenChange={(open) => (open ? onOpenChange(true) : guardedAction(() => onOpenChange(false)))}>
+        <DialogContent
+          inline={fullscreenEnabled && dialogOpen}
+          className="voucher-form w-[97vw] max-w-[1400px] p-0 overflow-hidden max-h-[92vh] overflow-y-auto"
+          hideCloseButton
+          dir={appDir()}
+          onPointerDownOutside={(event) => event.preventDefault()}
+          onInteractOutside={(event) => event.preventDefault()}
+          onEscapeKeyDown={(event) => {
+            keepDialogOpenOnEscape(event, [showUnsavedConfirm, showDeleteConfirm, postDialogOpen, voucherSearchOpen, billsPaymentOpen])
+          }}
+        >
+          <button
+            type="button"
+            aria-label={tr("إغلاق")}
+            onClick={() => guardedAction(() => onOpenChange(false))}
+            className="universal-dialog-close absolute end-[14px] top-[10px] z-[100] inline-flex h-10 w-10 items-center justify-center rounded-full bg-white/95 text-slate-900 shadow-lg ring-1 ring-slate-200 transition-opacity hover:opacity-80 focus:outline-none focus:ring-2 focus:ring-sky-400 focus:ring-offset-2"
+          >
+            <X className="h-4 w-4" />
+          </button>
+          <UniversalToolbar
+            currentRecord={currentIndex + 1}
+            totalRecords={totalRecords}
+            onNew={() => guardedAction(() => onNew?.())}
+            onSave={handleRequestSave}
+            onDelete={onDelete}
+            onClone={onClone}
+            onPrint={onPrint}
+            onWhatsApp={onPrint ? () => { armVoucherWhatsApp(form.account_id); onPrint() } : undefined}
+            onFirst={() => guardedAction(() => void handleNavigate("first"))}
+            onPrevious={() => guardedAction(() => void handleNavigate("previous"))}
+            onNext={() => guardedAction(() => void handleNavigate("next"))}
+            onLast={() => guardedAction(() => void handleNavigate("last"))}
+            isLoading={navLoading}
+            isSaving={isSaving}
+            canSave={canSave && form.status !== 2 && form.status !== 3}
+            canDelete={form.id > 0 && form.status !== 3}
+            canClone={form.id > 0}
+            canPrint={form.id > 0 && form.status !== 3}
+            isFirstRecord={isFirstRecord}
+            isLastRecord={isLastRecord}
+          />
+
+          <div className="relative rounded-b-3xl bg-slate-50/60 px-6 py-6" onKeyDown={handleFormEnterAsTab}>
+            <ProgressSpinner loading={isSaving || navLoading} />
+
+            <DialogHeader className="mb-5 overflow-hidden rounded-2xl bg-gradient-to-l from-emerald-600 via-emerald-600 to-teal-600 px-5 py-4 shadow-lg">
+              <DialogTitle className="flex flex-wrap items-center gap-2 text-lg font-extrabold tracking-tight text-white sm:text-xl">
+                <FileText className="h-5 w-5" />
+                {title}
+                {form.id > 0 ? (
+                  <span className="rounded-full bg-white/15 px-2.5 py-0.5 text-xs font-semibold ring-1 ring-white/30">{form.vch_code}</span>
+                ) : (
+                  <span className="rounded-full bg-white/15 px-2.5 py-0.5 text-xs font-semibold ring-1 ring-white/30">{tr("مسودة")}</span>
+                )}
+                {statusBadge && (
+                  <span
+                    className={`rounded-full px-2.5 py-0.5 text-xs font-semibold ring-1 ${
+                      form.status === 3 ? "!px-4 !py-1 !text-base !font-extrabold bg-red-600 text-white ring-2 ring-white/70 shadow-lg" : "bg-amber-400/20 text-amber-50 ring-amber-200/40"
+                    }`}
+                  >
+                    {statusBadge}
+                  </span>
+                )}
+              </DialogTitle>
+            </DialogHeader>
+            {isCreditNote && <BillsPaymentDialog open={billsPaymentOpen} onOpenChange={setBillsPaymentOpen} voucherId={form.id > 0 ? form.id : null} />}
+
+            <Messages innerRef={messagesRef} />
+
+            <fieldset disabled={isLocked} className="contents">
+              <div className="grid gap-4 lg:grid-cols-2">
+                {/* تفاصيل السند */}
+                <div className="space-y-3 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm sm:p-5">
+                  <div className="flex items-center gap-2 text-sm font-bold text-emerald-700">
+                    <span className="flex h-7 w-7 items-center justify-center rounded-lg bg-emerald-50 ring-1 ring-emerald-100">
+                      <FileText className="h-3.5 w-3.5" />
+                    </span>
+                    {tr("تفاصيل السند")}
+                  </div>
+                  <div className="grid gap-3">
+                    {/* دفتر/رقم/تاريخ/فرع السند بشبكة 2×2 داخل "تفاصيل السند" — نفس ترتيب سند القبض. */}
+                    <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                      <div className="grid gap-1.5 invoice-currency-dropdown-wrap">
+                        <Label>{tr("دفتر السندات *")}</Label>
+                        <PrimeDropdown
+                          value={form.vch_book_id}
+                          options={voucherBooks}
+                          optionLabel="name"
+                          optionValue="id"
+                          placeholder={tr("اختر")}
+                          filter
+                          disabled={isLocked}
+                          className="invoice-currency-dropdown w-full"
+                          panelClassName="invoice-currency-dropdown-panel"
+                          appendTo="self"
+                          panelStyle={{ zIndex: 10000 }}
+                          onChange={(e: any) => {
+                            codeRequestRef.current += 1
+                            codeEditedRef.current = false
+                            if (onBookChange) onBookChange(e.value ?? null)
+                            else onFormChange("vch_book_id", e.value ?? null)
+                          }}
+                        />
+                      </div>
+                      <div className="grid gap-1.5">
+                        <Label htmlFor="vch-code">{tr("رقم السند *")}</Label>
+                        <div className="flex min-w-0 items-center gap-1.5">
+                          <Input
+                            id="vch-code"
+                            value={form.vch_code}
+                            onChange={(e) => {
+                              codeEditedRef.current = true
+                              codeRequestRef.current += 1
+                              onFormChange("vch_code", normalizeVoucherCode(e.target.value))
+                            }}
+                            onBlur={handleCodeBlur}
+                            maxLength={10}
+                            className="focus-visible:border-emerald-400 focus-visible:ring-emerald-100"
+                          />
+                          <VoucherSearchButton onClick={() => setVoucherSearchOpen(true)} />
+                        </div>
+                      </div>
+                      <div className="grid gap-1.5">
+                        <Label htmlFor="vch-date">{tr("تاريخ السند *")}</Label>
+                        <DateTimeControl
+                          id="vch-date"
+                          ref={dateInputRef}
+                          value={form.vch_date ? form.vch_date.slice(0, 10) : ""}
+                          disabled={isLocked}
+                          onChange={(value) => {
+                            onFormChange("vch_date", value)
+                            if (!form.manual_date) onFormChange("manual_date", value)
+                          }}
+                        />
+                      </div>
+                      <TransactionBranchField voucherType={form.vch_type} action={form.id ? "update" : "create"} value={form.branch_id} onChange={(id) => onFormChange("branch_id", id)} disabled={isLocked} />
+                    </div>
+                    <div className="grid grid-cols-2 gap-3">
+                      <div className="grid gap-1.5 invoice-currency-dropdown-wrap">
+                        <Label>{tr("العملة *")}</Label>
+                        <PrimeDropdown
+                          value={form.currency_id}
+                          options={currencyOptions}
+                          optionLabel="label"
+                          optionValue="value"
+                          placeholder={tr("اختر العملة")}
+                          filter
+                          disabled={isLocked}
+                          className="invoice-currency-dropdown w-full"
+                          panelClassName="invoice-currency-dropdown-panel"
+                          appendTo="self"
+                          panelStyle={{ zIndex: 10000 }}
+                          onChange={(e: any) => void handleCurrencyChange(e.value ?? null)}
+                        />
+                      </div>
+                      <div className="grid gap-1.5">
+                        <Label htmlFor="vch-rate">{tr("سعر الصرف *")}</Label>
+                        <Input
+                          id="vch-rate"
+                          type="number"
+                          value={numberValue(form.rate)}
+                          onChange={(e) => onFormChange("rate", e.target.value ? Number(e.target.value) : 1)}
+                          disabled={form.currency_id != null && form.currency_id === baseCurrencyId}
+                          className="focus-visible:border-emerald-400 focus-visible:ring-emerald-100"
+                        />
+                      </div>
+                    </div>
+                    <div className="grid grid-cols-2 gap-3">
+                      <div className="grid gap-1.5">
+                        <Label htmlFor="vch-manual-code">{tr("سند يدوي")}</Label>
+                        <Input
+                          id="vch-manual-code"
+                          value={form.manual_voucher}
+                          onChange={(e) => onFormChange("manual_voucher", e.target.value)}
+                          maxLength={30}
+                          className="focus-visible:border-emerald-400 focus-visible:ring-emerald-100"
+                        />
+                      </div>
+                      <div className="grid gap-1.5">
+                        <Label htmlFor="vch-manual-date">{tr("تاريخ السند اليدوي")}</Label>
+                        <DateTimeControl
+                          id="vch-manual-date"
+                          value={form.manual_date ? form.manual_date.slice(0, 10) : ""}
+                          disabled={isLocked}
+                          onChange={(value) => onFormChange("manual_date", value)}
+                        />
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* تفاصيل العميل */}
+                <div className="space-y-3 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm sm:p-5">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="flex items-center gap-2 text-sm font-bold text-blue-700">
+                      <span className="flex h-7 w-7 items-center justify-center rounded-lg bg-blue-50 ring-1 ring-blue-100">
+                        <User className="h-3.5 w-3.5" />
+                      </span>
+                      {tr("تفاصيل العميل")}
+                    </div>
+                    {isCreditNote && (
+                      // نفس زر "تسديد الفواتير" في فاتورة المبيعات وسند القبض. span بدور زر لا <button>: البطاقة داخل
+                      // <fieldset disabled> الذي يُعطّل أزرار السند المرحّل، والتسديد مطلوب للسند المرحّل تحديداً.
+                      <Button asChild size="sm" variant="outline" className="h-7 cursor-pointer gap-1 px-2 text-xs aria-disabled:cursor-not-allowed aria-disabled:opacity-50">
+                        <span
+                          role="button"
+                          tabIndex={form.id > 0 ? 0 : -1}
+                          aria-disabled={!(form.id > 0)}
+                          title={form.id > 0 ? tr("تسديد الفواتير") : tr("احفظ السند أولاً")}
+                          onClick={() => { if (form.id > 0) setBillsPaymentOpen(true) }}
+                          onKeyDown={(event) => {
+                            if ((event.key === "Enter" || event.key === " ") && form.id > 0) {
+                              event.preventDefault()
+                              event.stopPropagation()
+                              setBillsPaymentOpen(true)
+                            }
+                          }}
+                        >
+                          <Wallet className="h-3.5 w-3.5 text-emerald-600" />
+                          {tr("تسديد الفواتير")}
+                        </span>
+                      </Button>
+                    )}
+                  </div>
+                  <div className="grid gap-3">
+                    <div className="grid grid-cols-2 gap-3">
+                      <AutoCompleteAccount voucherCurrencyId={Number(form.currency_id) || null}
+                        label={tr("العميل *")}
+                        valueMode="id"
+                        value={numberValue(form.account_id)}
+                        onValueChange={(v) => onFormChange("account_id", v ? Number(v) : null)}
+                        onAccountSelect={(account) => account && onFormChange("customer_name", account.name)}
+                        costCenters={form.account_cost_centers}
+                        onCostCentersChange={(selection) => onFormChange("account_cost_centers", selection)}
+                        requiredTypeValues={[2, 3, 5]}
+                        notFoundMessage={tr("العميل المحدد غير موجود")}
+                        disabled={isLocked}
+                      />
+                      <AccountBalanceField accountId={form.account_id} refreshKey={`${form.id}-${form.status}`} />
+                    </div>
+                    <div className="grid gap-3">
+                      <AutoCompleteAccount voucherCurrencyId={Number(form.currency_id) || null}
+                        label={isCreditNote ? tr("الحساب المدين *") : tr("الحساب الدائن *")}
+                        valueMode="id"
+                        value={numberValue(form.debit_account_id)}
+                        onValueChange={(v) => onFormChange("debit_account_id", v ? Number(v) : null)}
+                        costCenters={form.debit_account_cost_centers}
+                        onCostCentersChange={(selection) => onFormChange("debit_account_cost_centers", selection)}
+                        requiredTypeValues={[1]}
+                        notFoundMessage={tr("الحساب غير موجود")}
+                        disabled={isLocked}
+                      />
+                      <div className="grid gap-1.5">
+                        <Label htmlFor="vat-percent">{tr("نسبة الضريبة % *")}</Label>
+                        <Input
+                          id="vat-percent"
+                          type="number"
+                          value={numberValue(form.vat_percent)}
+                          onKeyDown={blockNonNumericKey}
+                          onChange={(e) => onFormChange("vat_percent", e.target.value ? Number(e.target.value) : 0)}
+                          onFocus={(e) => {
+                            calculationValuesRef.current.vat_percent = Number(form.vat_percent || 0)
+                            e.target.select()
+                          }}
+                          onBlur={() => doCalculation("amount", "vat_percent")}
+                          className="focus-visible:border-blue-400 focus-visible:ring-blue-100"
+                        />
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              {/* الضريبة والمبالغ */}
+              <div className="mt-4 grid gap-4 lg:grid-cols-2">
+                <div className="space-y-3 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm sm:p-5">
+                  <div className="flex items-center gap-2 text-sm font-bold text-amber-700">
+                    <span className="flex h-7 w-7 items-center justify-center rounded-lg bg-amber-50 ring-1 ring-amber-100">
+                      <Percent className="h-3.5 w-3.5" />
+                    </span>
+                    {tr("المبالغ والضريبة")}
+                  </div>
+                  <div className="grid grid-cols-3 gap-3">
+                    <div className="grid gap-1.5">
+                      <Label htmlFor="vch-amount-net">{tr("المبلغ *")}</Label>
+                      <Input
+                        id="vch-amount-net"
+                        type="number"
+                        value={numberValue(form.amount_journal_type_8)}
+                        onKeyDown={blockNonNumericKey}
+                        onChange={(e) => onFormChange("amount_journal_type_8", e.target.value ? Number(e.target.value) : 0)}
+                        onFocus={(e) => {
+                          calculationValuesRef.current.amount_journal_type_8 = Number(form.amount_journal_type_8 || 0)
+                          e.target.select()
+                        }}
+                        onBlur={() => doCalculation("amount_journal_type_8")}
+                        className="focus-visible:border-amber-400 focus-visible:ring-amber-100"
+                      />
+                    </div>
+                    <div className="grid gap-1.5">
+                      <Label htmlFor="vch-vat">{tr("الضريبة *")}</Label>
+                      <Input
+                        id="vch-vat"
+                        type="number"
+                        value={numberValue(form.vat)}
+                        onKeyDown={blockNonNumericKey}
+                        onChange={(e) => onFormChange("vat", e.target.value ? Number(e.target.value) : 0)}
+                        onFocus={(e) => {
+                          calculationValuesRef.current.vat = Number(form.vat || 0)
+                          e.target.select()
+                        }}
+                        onBlur={() => doCalculation("vat")}
+                        disabled={!form.vat_percent}
+                        className="focus-visible:border-amber-400 focus-visible:ring-amber-100"
+                      />
+                    </div>
+                    <div className="grid gap-1.5">
+                      <Label htmlFor="vch-amount" className="font-bold text-slate-700">
+                        {tr("المجموع *")}
+                      </Label>
+                      <Input
+                        id="vch-amount"
+                        type="number"
+                        value={numberValue(form.amount)}
+                        onKeyDown={blockNonNumericKey}
+                        onChange={(e) => onFormChange("amount", e.target.value ? Number(e.target.value) : 0)}
+                        onFocus={(e) => {
+                          calculationValuesRef.current.amount = Number(form.amount || 0)
+                          e.target.select()
+                        }}
+                        onBlur={() => doCalculation("amount")}
+                        className="border-emerald-200 bg-emerald-50/60 font-bold text-emerald-800 focus-visible:border-emerald-400 focus-visible:ring-emerald-100"
+                      />
+                    </div>
+                  </div>
+                </div>
+
+                <div className="space-y-3 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm sm:p-5">
+                  <div className="flex items-center gap-2 text-sm font-bold text-amber-700">
+                    <span className="flex h-7 w-7 items-center justify-center rounded-lg bg-amber-50 ring-1 ring-amber-100">
+                      <Wallet className="h-3.5 w-3.5" />
+                    </span>
+                    {tr("حساب الضريبة")}
+                  </div>
+                  <AutoCompleteAccount voucherCurrencyId={Number(form.currency_id) || null}
+                    label={Number(form.vat_percent) > 0 || Number(form.vat) > 0 ? tr("حساب الضريبة *") : tr("حساب الضريبة")}
+                    valueMode="id"
+                    value={numberValue(form.vat_account_id)}
+                    onValueChange={(v) => onFormChange("vat_account_id", v ? Number(v) : null)}
+                    costCenters={form.vat_account_cost_centers}
+                    onCostCentersChange={(selection) => onFormChange("vat_account_cost_centers", selection)}
+                    requiredTypeValues={[1]}
+                    notFoundMessage={tr("الحساب غير موجود")}
+                    disabled={isLocked}
+                  />
+                </div>
+              </div>
+
+              {/* بيانات إضافية */}
+              <div className="mt-4 space-y-3 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm sm:p-5">
+                <div className="flex items-center gap-2 text-sm font-bold text-indigo-700">
+                  <span className="flex h-7 w-7 items-center justify-center rounded-lg bg-indigo-50 ring-1 ring-indigo-100">
+                    <Users2 className="h-3.5 w-3.5" />
+                  </span>
+                  {tr("بيانات إضافية")}
+                </div>
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <div className="grid gap-1.5 invoice-currency-dropdown-wrap">
+                    <Label>{tr("مندوب المبيعات")}</Label>
+                    <PrimeDropdown
+                      value={form.salesman_id}
+                      options={salesmen}
+                      optionLabel="name"
+                      optionValue="id"
+                      placeholder={tr("اختر")}
+                      filter
+                      showClear
+                      disabled={isLocked}
+                      className="invoice-currency-dropdown w-full"
+                      panelClassName="invoice-currency-dropdown-panel"
+                      appendTo="self"
+                      panelStyle={{ zIndex: 10000 }}
+                      onChange={(e: any) => onFormChange("salesman_id", e.value ?? null)}
+                    />
+                  </div>
+                  <div className="grid gap-1.5 invoice-currency-dropdown-wrap">
+                    <Label>{tr("تصنيف الدفعة")}</Label>
+                    <PrimeDropdown
+                      value={form.payment_classification_id}
+                      options={paymentClassifications}
+                      optionLabel="name"
+                      optionValue="id"
+                      placeholder={tr("اختر")}
+                      filter
+                      showClear
+                      disabled={isLocked}
+                      className="invoice-currency-dropdown w-full"
+                      panelClassName="invoice-currency-dropdown-panel"
+                      appendTo="self"
+                      panelStyle={{ zIndex: 10000 }}
+                      onChange={(e: any) => onFormChange("payment_classification_id", e.value ?? null)}
+                    />
+                  </div>
+                </div>
+              </div>
+
+              {/* ملاحظات */}
+              <div className="mt-4 space-y-2 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm sm:p-5">
+                <div className="flex items-center gap-2 text-sm font-bold text-slate-600">
+                  <span className="flex h-7 w-7 items-center justify-center rounded-lg bg-slate-100 ring-1 ring-slate-200">
+                    <MessageSquare className="h-3.5 w-3.5" />
+                  </span>
+                  {tr("ملاحظة عامة للسند")}
+                </div>
+                <Textarea
+                  id="vch-note"
+                  value={form.note}
+                  onChange={(e) => onFormChange("note", e.target.value)}
+                  maxLength={200}
+                  rows={3}
+                  className="focus-visible:border-slate-400 focus-visible:ring-slate-100"
+                />
+              </div>
+            </fieldset>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      <ConfirmDialogYesNo
+        useAppDialog
+        visible={showDeleteConfirm}
+        busy={isSaving}
+        title={tr("تأكيد حذف السند")}
+        message={form.status === 2 ? tr("السند معتمد هل تريد الغاؤه منطقياً؟") : tr("هل تريد حذف هذا {0}؟", title)}
+        onConfirm={onConfirmDelete}
+        onCancel={onCancelDelete}
+      />
+
+      <VoucherSearchDialog
+        open={voucherSearchOpen}
+        onOpenChange={setVoucherSearchOpen}
+        vchType={Number(form.vch_type)}
+        title={title}
+        accountLabel={tr("الحساب")}
+        onSelect={(voucherId) => void openSearchedVoucher(voucherId)}
+      />
+      <ConfirmDialogYesNo
+        useAppDialog
+        visible={showUnsavedConfirm}
+        busy={isSaving}
+        title={tr("التحقق من التغييرات")}
+        message={tr("تم تعديل البيانات، هل تريد الحفظ؟")}
+        showBack
+        confirmLabel={tr("حفظ")}
+        cancelLabel={tr("عدم الحفظ")}
+        backLabel={tr("رجوع")}
+        onConfirm={() => void saveAndContinue()}
+        onCancel={discardAndContinue}
+        onBack={cancelPendingAction}
+        onDismiss={cancelPendingAction}
+      />
+
+      <PostVoucherDialog
+        visible={postDialogOpen}
+        isSaving={isSaving}
+        onSelect={(action) => {
+          setPostDialogOpen(false)
+          onSave(action)
+        }}
+        onCancel={() => setPostDialogOpen(false)}
+      />
+    </>
+  )
+}

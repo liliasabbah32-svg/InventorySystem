@@ -1,0 +1,425 @@
+import { neon } from "@neondatabase/serverless"
+import { Pool } from "pg"
+import { isNeonDatabaseUrl, withDatabaseName } from "./db-url"
+import { getPool, isWorkersRuntime } from "./db-pool"
+
+const MANAGEMENT_DB_NAME = "management"
+
+function buildSqlClient(connectionUrl: string) {
+  // على Workers نستخدم اتصال PostgreSQL المعاد استخدامه حتى مع Neon: تهيئة قاعدة الإدارة
+  // (ensureManagementTables / ensureBillingTables) قد تنفذ عشرات الاستعلامات في أول طلب، وكل طلب
+  // HTTP منفصل عبر neon() يُحتسب subrequest؛ Pool واحد يمنع استنفاد حد Cloudflare.
+  if (!isNeonDatabaseUrl(connectionUrl) || isWorkersRuntime) {
+    // Pool لكل طلب على Workers / لكل عملية على Node (lib/db-pool.ts)
+    const pool = { connect: () => getPool(connectionUrl).connect() }
+    const client: any = async (strings: TemplateStringsArray, ...values: any[]) => {
+      const conn = await pool.connect()
+      try {
+        const query = strings.reduce((prev, curr, i) => prev + curr + (i < values.length ? `$${i + 1}` : ""), "")
+        const result = await conn.query(query, values)
+        return result.rows
+      } finally {
+        conn.release()
+      }
+    }
+    // استعلام نصّي خام (بلا قالب) — تحتاجه lib/provisioning.ts لتنفيذ CREATE DATABASE، وهي عبارة
+    // DDL لا يمكن تمرير اسمها كمعامل $1 مربوط عادي.
+    client.unsafe = async (text: string, params: any[] = []) => {
+      const conn = await pool.connect()
+      try {
+        const result = await conn.query(text, params)
+        return result.rows
+      } finally {
+        conn.release()
+      }
+    }
+    return client
+  }
+  return neon(connectionUrl)
+}
+
+const managementUrl = (process.env.DATABASE_URL || "").trim()
+const adminUrl = managementUrl ? withDatabaseName(managementUrl, "postgres") : ""
+
+function createNoopSqlClient(): any {
+  const client: any = async () => []
+  client.unsafe = async () => []
+  return client
+}
+
+// اتصال ثابت بقاعدة "الإدارة" (management) — على عكس sql الافتراضي في lib/database.ts، هذا الاتصال
+// لا يتبدّل أبداً بحسب الشركة/الجلسة الحالية؛ يبقى دوماً نفس قاعدة الإدارة بصرف النظر عن أي كوكي
+// tenant_db مضبوط، لأنها تخزّن حسابات المستخدمين والشركات نفسها لا بيانات شركة بعينها.
+const sql: any = managementUrl ? buildSqlClient(managementUrl) : createNoopSqlClient()
+
+export default sql
+
+let managementDbEnsured: Promise<void> | null = null
+
+// تُنشئ قاعدة management بالاتصال بقاعدة الصيانة postgres. لا تعتمد عملية البدء على وجود
+// inventory_system أو أي قاعدة شركة مسبقاً.
+async function ensureManagementDatabaseExists() {
+  if (!managementUrl || !adminUrl) return
+  const pool = isWorkersRuntime ? getPool(adminUrl) : new Pool({ connectionString: adminUrl })
+  try {
+    const existing = await pool.query("SELECT 1 FROM pg_database WHERE datname = $1", [MANAGEMENT_DB_NAME])
+    if (existing.rows.length === 0) {
+      await pool.query(`CREATE DATABASE "${MANAGEMENT_DB_NAME}"`)
+    }
+  } finally {
+    if (!isWorkersRuntime) await pool.end()
+  }
+}
+
+export function ensureManagementTables(): Promise<void> {
+  if (!managementUrl) return Promise.resolve()
+  if (!managementDbEnsured) {
+    managementDbEnsured = (async () => {
+      await ensureManagementDatabaseExists()
+      await sql`
+        CREATE TABLE IF NOT EXISTS users (
+          id SERIAL PRIMARY KEY,
+          full_name VARCHAR(150) NOT NULL,
+          email VARCHAR(150) UNIQUE NOT NULL,
+          password_hash VARCHAR(255) NOT NULL,
+          email_verified BOOLEAN DEFAULT false,
+          email_verification_token VARCHAR(255),
+          is_platform_admin BOOLEAN DEFAULT false,
+          is_active BOOLEAN DEFAULT true,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+      `
+      // Ensure `email_verified` exists for older databases created before this column was added
+      await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN DEFAULT false`
+      await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT true`
+      // رقم جوال صاحب الحساب (إلزامي عند التسجيل) — يظهر لمسؤول الموقع في لوحة التحكم ⇐ المستخدمون
+      await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS mobile VARCHAR(30)`
+      await sql`
+        CREATE TABLE IF NOT EXISTS companies (
+          id SERIAL PRIMARY KEY,
+          name VARCHAR(150) NOT NULL,
+          db_name VARCHAR(100) UNIQUE,
+          status VARCHAR(20) NOT NULL DEFAULT 'pending',
+          created_by INTEGER REFERENCES users(id),
+          approved_by INTEGER REFERENCES users(id),
+          approved_at TIMESTAMP,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+      `
+      // انتهاء الاشتراك: يُضبَط سنة واحدة من تاريخ الاعتماد (provisionCompanyDatabase)، لا وقت
+      // الإنشاء (طلب معلَّق قد ينتظر الموافقة أياماً قبل أن يبدأ الاشتراك فعلياً). "منتهية" حالة
+      // محسوبة (status='approved' AND expiry_date < now()) لا عمود قائم بذاته — بهذا "تمديد
+      // الاشتراك" يكفيه تحديث expiry_date وحدها لإعادة تفعيل الشركة تلقائياً دون أي تحوّل حالة إضافي.
+      // status='stopped' حالة منفصلة (إيقاف إداري يدوي من لوحة التحكم)، تُميَّز عن الانتهاء الطبيعي
+      // بالتاريخ لكن تُعامَل بنفس المنع تماماً عند اختيار الشركة (select-company).
+      await sql`ALTER TABLE companies ADD COLUMN IF NOT EXISTS expiry_date TIMESTAMP`
+      await sql`ALTER TABLE companies ADD COLUMN IF NOT EXISTS number_of_users INTEGER DEFAULT 1`
+      await sql`
+        CREATE TABLE IF NOT EXISTS user_company (
+          id SERIAL PRIMARY KEY,
+          user_id INTEGER REFERENCES users(id),
+          company_id INTEGER REFERENCES companies(id),
+          role VARCHAR(20) DEFAULT 'owner',
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          UNIQUE(user_id, company_id)
+        )
+      `
+      await sql`
+        CREATE TABLE IF NOT EXISTS management_sessions (
+          id SERIAL PRIMARY KEY,
+          user_id INTEGER REFERENCES users(id),
+          session_token VARCHAR(255) UNIQUE NOT NULL,
+          expires_at TIMESTAMP NOT NULL,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+      `
+      await sql`
+        CREATE TABLE IF NOT EXISTS management_login_audit (
+          id BIGSERIAL PRIMARY KEY,
+          management_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+          tenant_user_id INTEGER,
+          user_email VARCHAR(150) NOT NULL,
+          user_name VARCHAR(150),
+          company_id INTEGER REFERENCES companies(id) ON DELETE SET NULL,
+          company_name VARCHAR(150),
+          db_name VARCHAR(100),
+          login_type VARCHAR(30) NOT NULL DEFAULT 'tenant',
+          ip_address VARCHAR(64),
+          user_agent TEXT,
+          logged_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+      `
+      await sql`CREATE INDEX IF NOT EXISTS idx_management_login_audit_logged_at ON management_login_audit (logged_at DESC)`
+      await sql`CREATE INDEX IF NOT EXISTS idx_management_login_audit_company_date ON management_login_audit (company_id, logged_at DESC)`
+      await sql`CREATE INDEX IF NOT EXISTS idx_management_login_audit_email_date ON management_login_audit (LOWER(user_email), logged_at DESC)`
+
+      // حضور مستخدمي الشركات (lib/user-presence.ts): آخر نشاط لكل مستخدم + سجل يومي لعدد المستخدمين النشطين
+      await sql`
+        CREATE TABLE IF NOT EXISTS management_user_presence (
+          db_name VARCHAR(100) NOT NULL,
+          tenant_user_id INTEGER NOT NULL,
+          last_seen_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          last_ip VARCHAR(64),
+          logged_out_at TIMESTAMPTZ,
+          PRIMARY KEY (db_name, tenant_user_id)
+        )
+      `
+      await sql`
+        CREATE TABLE IF NOT EXISTS management_user_activity_daily (
+          activity_date DATE NOT NULL,
+          db_name VARCHAR(100) NOT NULL,
+          tenant_user_id INTEGER NOT NULL,
+          first_seen_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          last_seen_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          pings INTEGER NOT NULL DEFAULT 1,
+          PRIMARY KEY (activity_date, db_name, tenant_user_id)
+        )
+      `
+
+      // ارتباط موظف شركة بحساب إدارة عام (اختياري — يُضبَط فقط عبر مسار إنشاء المستخدم الجديد
+      // ثنائي القاعدة، انظر lib/permissions.ts وخطة الصلاحيات) — نشِط/متوقف مقيَّد بهذه العلاقة
+      // (شركة بعينها) لا بالحساب العام نفسه (users.is_active محجوز لمسؤول المنصة فقط).
+      await sql`ALTER TABLE user_company ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT true`
+
+      // تعريفات الصلاحيات القانونية (access_category/access_list) — قاعدة الإدارة هي المصدر الوحيد
+      // للحقيقة من الآن فصاعداً (شاشة "تعريف الصلاحيات" بلوحة تحكم المنصة تكتب هنا)؛ كل قاعدة شركة
+      // تُزامِن نسخة منها عند كل تحميل صفحة رئيسية (syncPermissionDefinitions بـlib/permissions.ts).
+      await sql`
+        CREATE TABLE IF NOT EXISTS access_category (
+          id SERIAL PRIMARY KEY,
+          name VARCHAR(100) NOT NULL,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+      `
+      await sql`
+        CREATE TABLE IF NOT EXISTS access_list (
+          id SERIAL PRIMARY KEY,
+          name VARCHAR(255) NOT NULL,
+          category_id INTEGER REFERENCES access_category(id) ON DELETE SET NULL,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+      `
+      await sql`ALTER TABLE access_list ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`
+      await sql`ALTER TABLE access_list ADD COLUMN IF NOT EXISTS sort_order INTEGER`
+      await sql`
+        UPDATE access_list
+        SET name = 'إضافة مسودة طلبية مبيعات', updated_at = CURRENT_TIMESTAMP
+        WHERE name = 'ادخال مسودة طلبية مبيعات'
+          AND NOT EXISTS (
+            SELECT 1 FROM access_list existing
+            WHERE existing.name = 'إضافة مسودة طلبية مبيعات'
+          )
+      `
+      const draftCategoryRows = await sql`
+        INSERT INTO access_category (name)
+        SELECT 'الحركات'
+        WHERE NOT EXISTS (SELECT 1 FROM access_category WHERE name = 'الحركات')
+        RETURNING id
+      `
+      const draftCategory = draftCategoryRows[0] || (await sql`SELECT id FROM access_category WHERE name = 'الحركات' ORDER BY id LIMIT 1`)[0]
+      if (draftCategory?.id) {
+        for (const permissionName of [
+          'إضافة مسودة طلبية مبيعات',
+          'تعديل مسودة طلبية مبيعات',
+          'استعلام مسودة طلبية مبيعات',
+        ]) {
+          await sql`
+            INSERT INTO access_list (name, category_id)
+            SELECT ${permissionName}, ${draftCategory.id}
+            WHERE NOT EXISTS (SELECT 1 FROM access_list WHERE LOWER(BTRIM(name)) = LOWER(BTRIM(${permissionName})))
+           ON CONFLICT DO NOTHING`
+        }
+      }
+      await sql`DELETE FROM access_list WHERE name IN ('استلام طلب الصناعة', 'تدقيق الصناعة', 'استلام الصناعة من الفرع')`
+      await sql`UPDATE access_list SET sort_order = CASE name
+        WHEN 'إنشاء طلب بضاعة داخلي' THEN 1
+        WHEN 'تدقيق طلب البضاعة' THEN 2
+        WHEN 'تجهيز طلبات البضاعة الداخلية' THEN 3
+        WHEN 'تدقيق الطلبات الجاهزة' THEN 4
+        WHEN 'إرسال طلبات البضاعة' THEN 5
+        WHEN 'استلام طلبات البضاعة' THEN 6
+        WHEN 'تدقيق البضاعة المستلمة' THEN 7
+        ELSE sort_order END
+        WHERE name IN ('إنشاء طلب بضاعة داخلي', 'تدقيق طلب البضاعة', 'تجهيز طلبات البضاعة الداخلية', 'تدقيق الطلبات الجاهزة', 'إرسال طلبات البضاعة', 'استلام طلبات البضاعة', 'تدقيق البضاعة المستلمة')`
+      // مجهود أفضل (best effort): هذا استيراد لمرة واحدة من قاعدة مرجعية خارجية قد لا تملك الجداول
+      // المتوقعة أو يتعذّر الاتصال بها — فشله يجب ألّا يُسقِط إنشاء جداول الإدارة نفسها، وإلا ستفشل
+      // كل عملية تعتمد على ensureManagementTables (مثل إضافة صلاحية جديدة من "تعريف الصلاحيات")
+      // بشكل دائم في كل طلب لاحق أيضاً، لا لمرة واحدة فقط.
+    })().catch((error) => {
+      managementDbEnsured = null
+      throw error
+    })
+  }
+  return managementDbEnsured
+}
+
+/**
+ * Idempotent repair used by the permissions screen. Unlike the one-time table
+ * initializer, this runs on every permission-definition sync, so a long-lived
+ * server process also receives newly deployed access definitions immediately.
+ */
+// بعد نجاح التهيئة مرة في هذه النسخة من الخادم تُتخطّى (قيمة منطقية لا Promise مشترك بين الطلبات)
+let salesDraftDefinitionsSeeded = false
+let transactionDefinitionsSeeded = false
+
+export async function ensureSalesDraftPermissionDefinitions(): Promise<void> {
+  if (salesDraftDefinitionsSeeded) return
+  await ensureManagementTables()
+
+  await sql`
+    UPDATE access_list
+    SET name = 'إضافة مسودة طلبية مبيعات', updated_at = CURRENT_TIMESTAMP
+    WHERE name = 'ادخال مسودة طلبية مبيعات'
+      AND NOT EXISTS (
+        SELECT 1 FROM access_list existing
+        WHERE existing.name = 'إضافة مسودة طلبية مبيعات'
+      )
+  `
+
+  const insertedCategories = await sql`
+    INSERT INTO access_category (name)
+    SELECT 'الحركات'
+    WHERE NOT EXISTS (SELECT 1 FROM access_category WHERE name = 'الحركات')
+    RETURNING id
+  `
+  const category = insertedCategories[0] || (await sql`
+    SELECT id FROM access_category WHERE name = 'الحركات' ORDER BY id LIMIT 1
+  `)[0]
+
+  if (!category?.id) return
+  await sql`
+    INSERT INTO access_list (name, category_id)
+    SELECT u.name, ${category.id}
+    FROM unnest(${["إضافة مسودة طلبية مبيعات", "تعديل مسودة طلبية مبيعات", "استعلام مسودة طلبية مبيعات"]}::text[]) WITH ORDINALITY AS u(name, ord)
+    WHERE NOT EXISTS (SELECT 1 FROM access_list existing WHERE LOWER(BTRIM(existing.name)) = LOWER(BTRIM(u.name)))
+    ORDER BY u.ord
+    ON CONFLICT DO NOTHING
+  `
+  salesDraftDefinitionsSeeded = true
+}
+
+/** Seeds the canonical transaction/action permission matrix in management DB. */
+export async function ensureTransactionPermissionDefinitions(): Promise<void> {
+  if (transactionDefinitionsSeeded) return
+  await ensureManagementTables()
+  const {
+    TRANSACTION_ACTION_LABELS,
+    TRANSACTION_FAMILIES,
+    TRANSACTION_PERMISSION_CATEGORY,
+    legacyTransactionPermissionName,
+    transactionPermissionName,
+    transactionActionsFor,
+    RENAMED_TRANSACTION_PERMISSIONS,
+    REMOVED_TRANSACTION_PERMISSION_NAMES,
+  } = await import("@/lib/transaction-permission-definitions")
+
+  await sql`
+    SELECT setval(
+      pg_get_serial_sequence('access_category', 'id'),
+      GREATEST(COALESCE((SELECT MAX(id) FROM access_category), 0), 1),
+      true
+    )
+  `
+  await sql`
+    SELECT setval(
+      pg_get_serial_sequence('access_list', 'id'),
+      GREATEST(COALESCE((SELECT MAX(id) FROM access_list), 0), 1),
+      true
+    )
+  `
+
+  const inserted = await sql`
+    INSERT INTO access_category (name)
+    SELECT ${TRANSACTION_PERMISSION_CATEGORY}
+    WHERE NOT EXISTS (SELECT 1 FROM access_category WHERE name = ${TRANSACTION_PERMISSION_CATEGORY})
+    RETURNING id
+  `
+  const category = inserted[0] || (await sql`
+    SELECT id FROM access_category WHERE name = ${TRANSACTION_PERMISSION_CATEGORY} ORDER BY id LIMIT 1
+  `)[0]
+  if (!category?.id) return
+
+  // كل مصفوفة الحركات × الإجراءات (~500 صلاحية) بثلاثة أوامر بدل 2-3 أوامر لكل صلاحية: على Cloudflare كل استعلام
+  // لقاعدة الإدارة (عميل neon عبر HTTP) طلب فرعي، والحد 50 لكل طلب ← "Too many subrequests" في شاشة الصلاحيات.
+  const names: string[] = []
+  const legacyFrom: string[] = []
+  const legacyTo: string[] = []
+  for (const family of Object.keys(TRANSACTION_FAMILIES) as Array<keyof typeof TRANSACTION_FAMILIES>) {
+    for (const action of transactionActionsFor(family)) {
+      const name = transactionPermissionName(family, action)
+      const legacyName = legacyTransactionPermissionName(family, action)
+      names.push(name)
+      if (legacyName) {
+        legacyFrom.push(legacyName)
+        legacyTo.push(name)
+      }
+    }
+  }
+  // أسماء أوضح لبعض الصلاحيات (TRANSACTION_PERMISSION_NAME_OVERRIDES): الصف القديم يُعاد تسميته فيبقى معرّفه ومنحه
+  for (const rename of RENAMED_TRANSACTION_PERMISSIONS) {
+    legacyFrom.push(rename.from)
+    legacyTo.push(rename.to)
+  }
+  // إجراءات لم تعد مستخدمة لبعض الحركات — تُحذف من قاعدة الإدارة حتى لا تُنسخ للشركات مجدداً
+  if (REMOVED_TRANSACTION_PERMISSION_NAMES.length) {
+    await sql`DELETE FROM access_list WHERE name = ANY(${REMOVED_TRANSACTION_PERMISSION_NAMES}::text[])`
+  }
+  if (legacyFrom.length) {
+    // الاسم الجديد أُنشئ قبل تعريف إعادة التسمية والقديم ما زال موجوداً ⇐ يُحذف الجديد ليُعاد تسمية القديم (يبقى معرّفه)
+    await sql`
+      DELETE FROM access_list fresh
+      USING unnest(${RENAMED_TRANSACTION_PERMISSIONS.map((r) => r.from)}::text[], ${RENAMED_TRANSACTION_PERMISSIONS.map((r) => r.to)}::text[]) AS u(legacy_name, name)
+      WHERE LOWER(BTRIM(fresh.name)) = LOWER(BTRIM(u.name))
+        AND LOWER(BTRIM(u.name)) <> LOWER(BTRIM(u.legacy_name))
+        AND EXISTS (SELECT 1 FROM access_list old WHERE LOWER(BTRIM(old.name)) = LOWER(BTRIM(u.legacy_name)))
+    `
+    // صف واحد فقط لكل اسم جديد (أقدم صف بالاسم القديم) — وإلا قد يُعاد تسمية صفّين لنفس الاسم بأمر واحد فيتعارضان
+    // مع الفهرس الفريد idx_access_list_normalized_name ("duplicate key value violates unique constraint").
+    await sql`
+      UPDATE access_list al SET name = m.name, category_id = ${category.id}, updated_at = CURRENT_TIMESTAMP
+      FROM (
+        SELECT DISTINCT ON (LOWER(BTRIM(u.name))) u.name,
+               (SELECT MIN(x.id) FROM access_list x WHERE LOWER(BTRIM(x.name)) = LOWER(BTRIM(u.legacy_name))) AS target_id
+        FROM unnest(${legacyFrom}::text[], ${legacyTo}::text[]) AS u(legacy_name, name)
+        ORDER BY LOWER(BTRIM(u.name)), u.legacy_name
+      ) m
+      WHERE al.id = m.target_id
+        AND NOT EXISTS (SELECT 1 FROM access_list existing WHERE LOWER(BTRIM(existing.name)) = LOWER(BTRIM(m.name)))
+    `
+  }
+  await sql`
+    INSERT INTO access_list (name, category_id)
+    SELECT u.name, ${category.id}
+    FROM unnest(${names}::text[]) WITH ORDINALITY AS u(name, ord)
+    WHERE NOT EXISTS (SELECT 1 FROM access_list existing WHERE LOWER(BTRIM(existing.name)) = LOWER(BTRIM(u.name)))
+    ORDER BY u.ord
+    ON CONFLICT DO NOTHING
+  `
+  await sql`UPDATE access_list SET category_id = ${category.id} WHERE name = ANY(${names}::text[]) AND category_id IS DISTINCT FROM ${category.id}`
+
+  await sql`
+    DELETE FROM access_list duplicate
+    USING access_list canonical
+    WHERE LOWER(BTRIM(duplicate.name)) = LOWER(BTRIM(canonical.name))
+      AND duplicate.id > canonical.id
+  `
+  await sql`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_access_list_normalized_name
+    ON access_list (LOWER(BTRIM(name)))
+  `
+  transactionDefinitionsSeeded = true
+}
+
+
+// pg.Pool حقيقي لقاعدة الإدارة — يحتاجه أي كود يريد معاملة (BEGIN/COMMIT/ROLLBACK) عبر عدة استعلامات
+// على نفس الاتصال (sql الافتراضي أعلاه يفتح ويُغلق اتصالاً منفصلاً بكل استدعاء، انظر buildSqlClient،
+// فلا يصلح لمعاملة متعددة الاستعلامات)، بنفس نمط getTenantPool في lib/database.ts تماماً.
+export function getManagementPool(): Pool {
+  if (!managementUrl) {
+    throw new Error("DATABASE_URL is not configured for management database access")
+  }
+  return getPool(managementUrl)
+}

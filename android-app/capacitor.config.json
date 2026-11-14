@@ -1,0 +1,19 @@
+{
+  "appId": "com.noonerp.system",
+  "appName": "NoonERP System",
+  "webDir": "www",
+  "server": {
+    "url": "https://noonerp.sabbahsoft.com",
+    "androidScheme": "https",
+    "cleartext": false,
+    "errorPath": "offline.html",
+    "allowNavigation": [
+      "noonerp.sabbahsoft.com"
+    ]
+  },
+  "android": {
+    "allowMixedContent": false,
+    "captureInput": true,
+    "webContentsDebuggingEnabled": false
+  }
+}

@@ -1,5 +1,6 @@
 "use client"
 
+import { tr, appDir } from "@/lib/i18n"
 import type React from "react"
 
 import { useState, useEffect, useRef, useMemo } from "react"
@@ -7,34 +8,128 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Textarea } from "@/components/ui/textarea"
 import { Checkbox } from "@/components/ui/checkbox"
+import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog"
+import { UNIT_ROLE_COLUMNS, UNIT_ROLE_LABELS } from "@/lib/product-unit-roles"
+import { notifyProductsChanged } from "@/lib/products-changed"
+import { isScaleProduct, validateScaleProductBarcodes } from "@/lib/scale-barcode"
 import { Separator } from "@/components/ui/separator"
 import { UniversalToolbar } from "@/components/ui/universal-toolbar"
-import { Package, Save, X, Barcode, DollarSign, Warehouse, Truck, Info, Settings, Package2, Plus, Currency } from "lucide-react"
+import { Package, Save, X, Barcode, DollarSign, Warehouse, Truck, Info, Settings, Package2, Plus, Currency, SlidersHorizontal, Copy, FileSpreadsheet } from "lucide-react"
 import { WarehouseInventoryTable } from "./warehouse-inventory-table"
 import { BatchTrackingTable } from "./batch-tracking-table"
 import { UNITS } from "@/lib/constants"
-import DataGrid from "../common/DataGrid"
 import DataGridView from "@/components/common/DataGridView"
-import * as wjcInput from '@grapecity/wijmo.input';
+import SimpleListPicker, { type SimpleListPickerItem } from "@/components/common/SimpleListPicker"
 import * as wjGrid from "@grapecity/wijmo.grid";
 import { readonly } from "zod/v4"
 import ProductBarcodes from "./ProductBarcodes"
+import ProductNumbers from "./ProductNumbers"
+import ProductSearchPopup from "./ProductSearchPopup"
 import { Toast } from 'primereact/toast';
-import { Dropdown as PrimeDropdown } from 'primereact/dropdown'
+import PrimeDropdown from '@/components/common/FocusDropdown'
+import MultiSelect from '@/components/common/MultiSelect'
 import SearchCostCenterDialog from "@/components/customer/search-cost-center-dialog"
+import SearchBrandDialog from "@/components/customer/search-brand-dialog"
 import './compact-product-form.css'
 import ProgressSpinner from "../ProgressSpinner/ProgressSpinner"
 import ConfirmDialogYesNo from "../ui/ConfirmDialogYesNo"
-import { useAuth } from "../auth/auth-context"
+import Messages from "@/components/common/Messages"
+import { isPopupOpenOver } from "@/lib/hotkeys"
+import { useFileAccess } from "@/components/auth/use-file-access"
 import ProductCodeInput from "./ProductCodeInput"
 import AutoCompleteAccount from "@/components/customer/auto-complete-account"
-import Util from "../common/Util"
 import sharedDropdownStyles from "../common/Dropdown.module.scss"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
+import AttachmentManager from "@/components/common/AttachmentManager"
+import { ImageUploadField } from "@/components/common/ImageUploadField"
+import { attachEnterAsTab } from "@/components/common/enterAsTab"
+import { useWorkspaceTabActive } from "@/contexts/workspace-tab-context"
+import { useNavigationGuard } from "@/lib/navigation-guard"
+import { ManufacturingComponentsImportDialog, type ImportedComponentLine } from "@/components/import/manufacturing-components-import"
 
+// ارتفاع موحَّد لكل شبكات DataGridView في هذه الشاشة (الوحدات/الأسعار/المستودعات/مراكز التكلفة) —
+// يُمرَّر إلى DataGridView مباشرة (كخاصية style) لا إلى العنصر الملفوف، فيتولى Wijmo تمرير الصفوف
+// داخلياً بشريط تمرير عمودي واحد فقط بدل شريطين متداخلين (الجدول + العنصر الملفوف معاً).
+const TABS_GRID_HEIGHT = 260
+
+interface ProductAttributeLine {
+  name: string
+  values: string[]
+  value_images?: Record<string, string | null>
+}
+
+interface AttributeCatalogItem extends ProductAttributeLine {}
+
+function AttributeNameInput({ value, catalog, onChange, onCreate }: { value: string; catalog: AttributeCatalogItem[]; onChange: (value: string) => void; onCreate: (name: string) => void }) {
+  const [query, setQuery] = useState(value)
+  const [open, setOpen] = useState(false)
+  const rootRef = useRef<HTMLDivElement>(null)
+  useEffect(() => setQuery(value), [value])
+  useEffect(() => {
+    const handlePointerDown = (event: PointerEvent) => {
+      if (!rootRef.current?.contains(event.target as Node)) {
+        setOpen(false)
+        setQuery(value)
+      }
+    }
+    document.addEventListener("pointerdown", handlePointerDown)
+    return () => document.removeEventListener("pointerdown", handlePointerDown)
+  }, [value])
+  const matches = catalog.filter((item) => item.name.toLocaleLowerCase().includes(query.trim().toLocaleLowerCase()))
+  const exactMatch = catalog.some((item) => item.name.toLocaleLowerCase() === query.trim().toLocaleLowerCase())
+  return <div ref={rootRef} className="relative">
+    <Input value={query} placeholder={tr("ابحث أو اكتب متغيراً")} onFocus={() => setOpen(true)} onChange={(event) => { setQuery(event.target.value); setOpen(true) }} />
+    {open && <div className="absolute z-30 mt-1 max-h-44 w-full overflow-auto rounded-md border bg-popover p-1 shadow-lg">
+      {matches.map((item) => <button type="button" key={item.name} className="block w-full rounded px-3 py-2 text-start text-sm hover:bg-muted" onMouseDown={(event) => event.preventDefault()} onClick={() => { setQuery(item.name); setOpen(false); onChange(item.name) }}>{item.name}</button>)}
+      {query.trim() && !exactMatch && <button type="button" className="block w-full rounded px-3 py-2 text-start text-sm font-semibold text-emerald-700 hover:bg-emerald-50" onMouseDown={(event) => event.preventDefault()} onClick={() => { setOpen(false); onCreate(query.trim()) }}>
+        {tr("+ إنشاء المتغير “")}{query.trim()}”
+      </button>}
+    </div>}
+  </div>
+}
+
+function AttributeValueInput({ values, valueImages = {}, suggestions, disabled = false, onChange, onImageChange, onCreate }: { values: string[]; valueImages?: Record<string, string | null>; suggestions: string[]; disabled?: boolean; onChange: (values: string[]) => void; onImageChange: (value: string, image: string | null) => void; onCreate: (value: string) => void }) {
+  const [query, setQuery] = useState("")
+  const [open, setOpen] = useState(false)
+  const rootRef = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    const handlePointerDown = (event: PointerEvent) => {
+      if (!rootRef.current?.contains(event.target as Node)) {
+        setOpen(false)
+        setQuery("")
+      }
+    }
+    document.addEventListener("pointerdown", handlePointerDown)
+    return () => document.removeEventListener("pointerdown", handlePointerDown)
+  }, [])
+  const normalizedQuery = query.trim().toLocaleLowerCase()
+  const filtered = suggestions.filter((value) => value.toLocaleLowerCase().includes(normalizedQuery) && !values.includes(value))
+  const exactMatch = suggestions.find((value) => value.toLocaleLowerCase() === normalizedQuery)
+  const addValue = (value: string) => {
+    const text = value.trim()
+    if (!text || values.some((item) => item.toLocaleLowerCase() === text.toLocaleLowerCase())) return
+    onChange([...values, text])
+    setQuery("")
+    setOpen(false)
+  }
+  return <div ref={rootRef} className={`relative min-w-0 ${disabled ? "opacity-60" : ""}`}>
+    <div className="flex min-h-10 flex-wrap items-center gap-1 rounded-md border bg-background px-2 py-1">
+      {values.map((value) => <span key={value} className="inline-flex items-center gap-2 rounded-xl bg-violet-100 px-2 py-1 text-xs font-medium text-violet-800">
+        <ImageUploadField value={valueImages[value]} onChange={(image) => onImageChange(value, image)} size={36} rounded="2xl" />
+        <span>{value}</span><button type="button" title={tr("إزالة القيمة")} onClick={() => onChange(values.filter((item) => item !== value))}><X className="h-3 w-3" /></button>
+      </span>)}
+      <input disabled={disabled} className="h-7 min-w-[120px] flex-1 bg-transparent text-sm outline-none" value={query} placeholder={disabled ? tr("اختر متغيراً أولاً") : tr("ابحث أو اكتب قيمة")} onFocus={() => setOpen(true)} onChange={(event) => { setQuery(event.target.value); setOpen(true) }} onKeyDown={(event) => {
+        if ((event.key === " " || event.key === "Enter") && query.trim()) { event.preventDefault(); addValue(exactMatch || query) }
+      }} />
+    </div>
+    {open && !disabled && <div className="absolute z-30 mt-1 max-h-44 w-full overflow-auto rounded-md border bg-popover p-1 shadow-lg">
+      {filtered.map((value) => <button type="button" key={value} className="block w-full rounded px-3 py-2 text-start text-sm hover:bg-muted" onMouseDown={(event) => event.preventDefault()} onClick={() => addValue(value)}>{value}</button>)}
+      {query.trim() && !exactMatch && <button type="button" className="block w-full rounded px-3 py-2 text-start text-sm font-semibold text-emerald-700 hover:bg-emerald-50" onMouseDown={(event) => event.preventDefault()} onClick={() => { addValue(query); onCreate(query.trim()) }}>{tr("+ إنشاء القيمة “")}{query.trim()}”</button>}
+    </div>}
+  </div>
+}
 
 interface ProductCostCenterItem {
   id?: number
@@ -44,6 +139,48 @@ interface ProductCostCenterItem {
   default_cost_center_id?: number | null
   cost_center_type_name?: string
   cost_center_name?: string
+}
+
+// صف واحد لكل نوع علامة تجارية (brand_types) — بنفس نمط ProductCostCenterItem أعلاه تماماً؛ قد
+// يُسنَد له علامة تجارية (brands) محدَّدة أو يبقى بلا إسناد (brand_id فارغ).
+interface ProductBrandItem {
+  id?: number
+  product_id?: number
+  brand_type_id: number | null
+  required_in_transactions?: number | null
+  brand_id?: number | null
+  brand_type_name?: string
+  brand_name?: string
+}
+
+interface RelatedProductItem {
+  id?: number
+  product_id: number
+  related_id: number
+  related_code?: string
+  related_name?: string
+  /** اضافة السعر عند الاختيار — لا = يُضاف التابع بسعر صفر */
+  add_price?: boolean
+  /** عدم الطباعة في فواتير المطبخ والمطعم */
+  no_kitchen_print?: boolean
+  ser?: number
+}
+
+interface ManufacturingComponentItem {
+  id?: number
+  product_id: number
+  component_id: number
+  component_code?: string
+  component_name?: string
+  quantity: number
+  unit_id?: number | null
+  units?: { unit_id: number; unit_name: string; factor: number }[]
+  measurment_id?: number | null
+  length?: number | null
+  width?: number | null
+  height?: number | null
+  count?: number | null
+  ser?: number
 }
 
 interface ProductFormData {
@@ -58,14 +195,22 @@ interface ProductFormData {
   brand: string
   model: string
   measurment_unit: number
+  measurment_id: number
   last_purchase_price: number
+  minimum_order_quantity: number
+  related_items_mode: number
+  pos_sold_using_scale: boolean
+  default_printer?: string | null
+  // صنف دخان (عهدة الدخان في الكاشير)
+  is_tobacco: boolean
+  barcode?: string
 
   currency_id: number
   tax_rate: number
   discount_rate: number
 
-  original_number: string
-  factory_number: string
+  original_numbers: string[]
+  factory_numbers: string[]
   location: string
 
   expiry_tracking: boolean
@@ -74,6 +219,8 @@ interface ProductFormData {
   status: number
   type: number
   service_type: number
+  product_type: number
+  tax_classification_id: number
 
   manufacturer_company: string
   length: number
@@ -85,17 +232,61 @@ interface ProductFormData {
   size: string
 
   notes: string
+  transaction_notes: string
   entry_date: string
-  revenue_account_id: number
-  revenue_account_code: string
+  selling_account_id: number
+  selling_account_code: string
   purchase_account_id: number
   purchase_account_code: string
+  selling_returns_account_id: number
+  selling_returns_account_code: string
+  purchase_returns_account_id: number
+  purchase_returns_account_code: string
+  stock_end_account_id: number
+  stock_end_account_code: string
+  stock_start_account_id: number
+  stock_start_account_code: string
+  production_account_id: number
+  production_account_code: string
+  municipality_service_account_id: number
+  municipality_service_account_code: string
+  lsti3mal_account_id: number
+  lsti3mal_account_code: string
 
   units?: UnitItem[],
   prices?: PriceItem[],
   stores?: StoreItem[],
   cost_centers?: ProductCostCenterItem[],
+  product_brands?: ProductBrandItem[],
+  product_image?: string | null,
+  // فروع تقييد ظهور الصنف بالبحث (اختياري) — مصفوفة فارغة = يظهر لكل الفروع (الافتراضي/الحالي)،
+  // وإلا يظهر فقط لمستخدم فرعه أحد هذه المعرّفات (انظر product_branches بـapp/api/inventory/
+  // products/route.ts وتصفية x-branch-id بـauth-context.tsx).
+  branch_ids?: number[],
+  attributes?: ProductAttributeLine[],
 }
+
+type ProductAccountField =
+  | "selling_account_id"
+  | "purchase_account_id"
+  | "selling_returns_account_id"
+  | "purchase_returns_account_id"
+  | "stock_end_account_id"
+  | "stock_start_account_id"
+  | "production_account_id"
+  | "lsti3mal_account_id"
+
+const PRODUCT_ACCOUNT_FIELDS: Array<{ field: ProductAccountField; label: string }> = [
+  { field: "selling_account_id", label: tr("حساب المبيعات") },
+  { field: "purchase_account_id", label: tr("حساب المشتريات") },
+  { field: "selling_returns_account_id", label: tr("حساب مرتجعات المبيعات") },
+  { field: "purchase_returns_account_id", label: tr("حساب مرتجعات المشتريات") },
+  { field: "stock_end_account_id", label: tr("حساب تقييم بضاعة آخر المدة") },
+  { field: "stock_start_account_id", label: tr("حساب تقييم بضاعة أول المدة") },
+  { field: "production_account_id", label: tr("حساب الإنتاج") },
+  { field: "lsti3mal_account_id", label: tr("حساب المصروف في سند الاستعمال") },
+]
+
 export const initialFormData: ProductFormData = {
   id: 0,
   product_code: "",
@@ -108,14 +299,21 @@ export const initialFormData: ProductFormData = {
   brand: "",
   model: "",
   measurment_unit: 1,
+  measurment_id: 1,
   last_purchase_price: 0,
+  minimum_order_quantity: 0,
+  related_items_mode: 1,
+  pos_sold_using_scale: false,
+  is_tobacco: false,
 
   currency_id: 0,
   tax_rate: 15,
   discount_rate: 0,
 
-  original_number: "",
-  factory_number: "",
+  tax_classification_id: 0,
+
+  original_numbers: [],
+  factory_numbers: [],
   location: "",
 
   expiry_tracking: false,
@@ -124,6 +322,7 @@ export const initialFormData: ProductFormData = {
   status: 1,
   type: 1,
   service_type: 0,
+  product_type: 1,
 
   manufacturer_company: "",
   length: 0,
@@ -135,23 +334,43 @@ export const initialFormData: ProductFormData = {
   size: "",
 
   notes: "",
+  transaction_notes: "",
   entry_date: new Date().toISOString().split("T")[0],
-  revenue_account_id: 0,
-  revenue_account_code: "",
+  selling_account_id: 0,
+  selling_account_code: "",
   purchase_account_id: 0,
   purchase_account_code: "",
+  selling_returns_account_id: 0,
+  selling_returns_account_code: "",
+  purchase_returns_account_id: 0,
+  purchase_returns_account_code: "",
+  stock_end_account_id: 0,
+  stock_end_account_code: "",
+  stock_start_account_id: 0,
+  stock_start_account_code: "",
+  production_account_id: 0,
+  production_account_code: "",
+  municipality_service_account_id: 0,
+  municipality_service_account_code: "",
+  lsti3mal_account_id: 0,
+  lsti3mal_account_code: "",
 
   units: [],
   prices: [],
   stores: [],
-  cost_centers: []
+  cost_centers: [],
+  product_brands: [],
+  product_image: null,
+  branch_ids: [],
+  attributes: [],
 };
 
 export interface CompactProductFormProps {
   visible?: any,
   editingProduct?: any
   onHideDialog: (e: any) => void
-  onSuccess?: () => void
+  /** بعد الحفظ: معرّف الصنف المحفوظ — القائمة تحدّث سطره فقط بدل إعادة تحميل كل الأصناف */
+  onSuccess?: (productId?: number) => void
   isSubmitting?: boolean
   entityType?: "products" | "services"
 }
@@ -183,13 +402,19 @@ export function CompactProductForm({
   onSuccess,
   entityType = "products",
 }: CompactProductFormProps) {
+  const workspaceTabActive = useWorkspaceTabActive()
   const isService = entityType === "services"
+  const can = useFileAccess(isService ? "services" : "items")
+  const canView = can("view"), canCreate = can("create"), canUpdate = can("update"), canDelete = can("delete")
   const toast = useRef<Toast>(null);
+  const messagesRef = useRef<any>(null)
   const [formData, setFormData] = useState<ProductFormData>(initialFormData)
   const [isSearching, setIsSearching] = useState(false)
   const [productCodeError, setProductCodeError] = useState("")
   const [showConfirm, setShowConfirm] = useState(false);
   const [showUnsaved, setShowUnsaved] = useState(false);
+  const [copyAccountField, setCopyAccountField] = useState<ProductAccountField | null>(null)
+  const [copyAccountBusy, setCopyAccountBusy] = useState(false)
   const [showSearchDialog, setShowSearchDialog] = useState(false);
   const [nextFunction, setNextFunction] = useState<(() => void) | null>(null);
   const [definitions, setDefinitions] = useState({
@@ -202,7 +427,33 @@ export function CompactProductForm({
     product_category: [] as Array<{ id: number; name: string }>,
     cost_center_types: [] as Array<{ id: number; name: string }>,
     cost_centers: [] as Array<{ id: number; name: string; cost_type_id?: number; parent_id?: number | null }>,
+    tax_classifications: [] as Array<{ id: number; name: string }>,
+    measurment_types: [] as Array<{ id: number; name: string }>,
+    branches: [] as Array<{ id: number; branch_name: string }>,
+    brand_types: [] as Array<{ id: number; name: string }>,
+    brands: [] as Array<{ id: number; name: string; brand_type_id: number }>,
   })
+
+  // تتبع تاريخ الصلاحية/الرقم التشغيلي/الرقم المتسلسل يفترض صنفاً بوحدات عد صحيحة بسيطة — نوع قياس
+  // غير "عادي" (1) يحسب الكمية تلقائياً من أبعاد/عدد متغيّرَين لكل حركة (مساحة/حجم/وزن...)، فلا
+  // معنى لربط دفعة/تسلسل واحد بكمية متغيّرة كهذه. يُفرَض التبادل بالاتجاهين: لا يمكن تفعيل أي من
+  // الثلاث خانات إن كان نوع القياس غير عادي، ولا تغيير نوع القياس عن عادي إن كانت إحداها مُفعَّلة.
+  const MEASUREMENT_TRACKING_CONFLICT_MSG =
+    "لا يمكن تفعيل تاريخ صلاحية / له رقم تشغيلي / له رقم متسلسل لصنف نوع القياس غير عادي"
+  // تُعطَّل هذه الخانات كلياً (لا تُعرَض هذه الرسالة إلا لتوضيح السبب عند محاولة تفعيلها من الشاشات
+  // التي لا تُطبِّق disabled على العنصر نفسه) إن كان للصنف سطر واحد على الأقل بـvoucher_items_tbl
+  // ضمن سند لم يُلغَ منطقياً — انظر isUsedInVouchers وGET /api/inventory/products/[id]/voucher-usage.
+  const VOUCHER_USAGE_TRACKING_LOCK_MSG =
+    "لا يمكن تغيير تاريخ الصلاحية / الرقم التشغيلي / الرقم المتسلسل لصنف له حركة مخزون فعلية"
+
+  const PRODUCT_TYPE_OPTIONS = [
+    { label: tr("بضاعة تجارية"), value: 1 },
+    { label: tr("مواد خام"), value: 2 },
+    { label: tr("لوازم إنتاج"), value: 3 },
+    { label: tr("تحت التصنيع"), value: 4 },
+    { label: tr("بضاعة مصنعة"), value: 5 },
+    { label: tr("مواد للاستهلاك"), value: 6 },
+  ]
   const definitionsRef = useRef({
     categories: [] as Array<{ id: number; group_name: string }>,
     suppliers: [] as Array<{ id: number; name: string; code?: string }>,
@@ -213,26 +464,59 @@ export function CompactProductForm({
     product_category: [] as Array<{ id: number; name: string }>,
     cost_center_types: [] as Array<{ id: number; name: string }>,
     cost_centers: [] as Array<{ id: number; name: string; cost_type_id?: number; parent_id?: number | null }>,
+    tax_classifications: [] as Array<{ id: number; name: string }>,
+    measurment_types: [] as Array<{ id: number; name: string }>,
+    branches: [] as Array<{ id: number; branch_name: string }>,
+    brand_types: [] as Array<{ id: number; name: string }>,
+    brands: [] as Array<{ id: number; name: string; brand_type_id: number }>,
   });
   const unitGridRef = useRef<wjGrid.FlexGrid>(null);
-  const [prices_data, setPricesData] = useState<PriceItem[]>([]);
-  const [units_data, setUnitsData] = useState<UnitItem[]>([]);
-  const [stores_data, setStoresData] = useState<StoreItem[]>([]);
   const [loading, setLoading] = useState(false);
   const [costCenterTypes, setCostCenterTypes] = useState<Array<{ id: number; name: string }>>([]);
   const [costCenters, setCostCenters] = useState<Array<{ id: number; name: string; cost_type_id?: number; parent_id?: number | null }>>([]);
   const [costCenterSearchOpen, setCostCenterSearchOpen] = useState(false)
   const [selectedCostCenterRowIndex, setSelectedCostCenterRowIndex] = useState<number | null>(null)
   const [selectedCostCenterType, setSelectedCostCenterType] = useState<{ id: number; name: string } | null>(null)
+  // نفس نمط مراكز التكلفة أعلاه تماماً (costCenterTypes/costCenters/costCenterSearchOpen...) لكن
+  // للعلامات التجارية — انظر تبويب "brand" وbrandScheme/buildBrandRows أدناه.
+  const [brandTypes, setBrandTypes] = useState<Array<{ id: number; name: string }>>([]);
+  const [brands, setBrands] = useState<Array<{ id: number; name: string; brand_type_id?: number }>>([]);
+  const [brandSearchOpen, setBrandSearchOpen] = useState(false)
+  const [selectedBrandRowIndex, setSelectedBrandRowIndex] = useState<number | null>(null)
+  const [selectedBrandType, setSelectedBrandType] = useState<{ id: number; name: string } | null>(null)
+  const [relatedProducts, setRelatedProducts] = useState<RelatedProductItem[]>([])
+  const [relatedProductSearchOpen, setRelatedProductSearchOpen] = useState(false)
+  const [relatedProductRow, setRelatedProductRow] = useState<number | null>(null)
+  // نافذة خيارات الصنف التابع بعد اختياره من البحث
+  const [relatedOptionsDraft, setRelatedOptionsDraft] = useState<RelatedProductItem | null>(null)
+  const [manufacturingComponents, setManufacturingComponents] = useState<ManufacturingComponentItem[]>([])
+  const [manufacturingComponentSearchOpen, setManufacturingComponentSearchOpen] = useState(false)
+  const [manufacturingComponentsImportOpen, setManufacturingComponentsImportOpen] = useState(false)
+  // منتقيات SimpleListPicker لأعمدة الوحدات/الأسعار/المستودعات/حالة مركز التكلفة — بديل موحَّد عن
+  // Column.editor المباشر (DataGridView الفعلي يتطلّب عنصر تحكم Wijmo حقيقياً لا JSX، انظر
+  // editor?: Control | null في @grapecity/wijmo.react.grid/index.d.ts)، بنفس نمط أزرار البحث
+  // الأخرى في شاشات السندات (بحث صنف/مستودع/وحدة/حساب).
+  const [unitPickerOpen, setUnitPickerOpen] = useState(false)
+  const [unitPickerRow, setUnitPickerRow] = useState<number | null>(null)
+  const [pricesPickerOpen, setPricesPickerOpen] = useState(false)
+  const [pricesPickerRow, setPricesPickerRow] = useState<number | null>(null)
+  const [pricesPickerField, setPricesPickerField] = useState<"category" | "unit" | "currency">("category")
+  const [storePickerOpen, setStorePickerOpen] = useState(false)
+  const [storePickerRow, setStorePickerRow] = useState<number | null>(null)
+  const [statusPickerOpen, setStatusPickerOpen] = useState(false)
+  const [statusPickerRow, setStatusPickerRow] = useState<number | null>(null)
 
   const [unitCurrentRow, setUnitCurrentRow] = useState(0)
   const [barcodeDialogOpen, setBarcodeDialogOpen] = useState(false);
+  const [originalNumbersDialogOpen, setOriginalNumbersDialogOpen] = useState(false);
+  const [factoryNumbersDialogOpen, setFactoryNumbersDialogOpen] = useState(false);
   const [dialogUnitName, setDialogUnitName] = useState("");
   const [dialogBarcodes, setDialogBarcodes] = useState<string[]>([]);
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [success, setSuccess] = useState<string | null>(null)
   const [activeTab, setActiveTab] = useState<string>("units");
+  const [attributeCatalog, setAttributeCatalog] = useState<AttributeCatalogItem[]>([])
   const product_code = useRef<HTMLInputElement>(null);
   const product_name = useRef<HTMLInputElement>(null);
   const initialized = useRef(false);
@@ -242,12 +526,38 @@ export function CompactProductForm({
       setActiveTab("units");
     }
   }, [visible]);
+  useEffect(() => {
+    if (!visible || isService) return
+    fetch("/api/product-attributes").then((response) => response.ok ? response.json() : []).then((data) => setAttributeCatalog(Array.isArray(data) ? data : [])).catch(() => setAttributeCatalog([]))
+  }, [visible, isService])
+  const createAttributeCatalogItem = async (name: string, value?: string) => {
+    const cleanName = name.trim()
+    const cleanValue = value?.trim() || ""
+    if (!cleanName || (value !== undefined && !cleanValue)) return
+    try {
+      const response = await fetch("/api/product-attributes", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: cleanName, value: cleanValue || undefined }),
+      })
+      const data = await response.json()
+      if (!response.ok) throw new Error(data?.error || tr("تعذر إنشاء المتغير"))
+      setAttributeCatalog((current) => {
+        const existing = current.find((item) => item.name.toLocaleLowerCase() === cleanName.toLocaleLowerCase())
+        if (existing) return current.map((item) => item === existing && cleanValue && !item.values.includes(cleanValue) ? { ...item, values: [...item.values, cleanValue] } : item)
+        return [...current, { name: cleanName, values: cleanValue ? [cleanValue] : [] }]
+      })
+      toast.current?.show({ severity: "success", summary: tr("نجاح"), detail: tr("تم إنشاء المتغير أو القيمة"), life: 1800 })
+    } catch (error) {
+      toast.current?.show({ severity: "error", summary: tr("خطأ"), detail: error instanceof Error ? error.message : tr("تعذر الإنشاء"), life: 2500 })
+    }
+  }
   const validateProduct = () => {
     if (formData.product_code === "") {
       toast.current?.show({
         severity: 'error',
-        summary: 'خطأ',
-        detail: isService ? 'يجب ادخال رقم الخدمة' : 'يجب ادخال رقم الصنف',
+        summary: tr("خطأ"),
+        detail: isService ? tr("يجب ادخال رقم الخدمة") : tr("يجب ادخال رقم الصنف"),
         life: 1500
       });
       product_code.current?.focus();
@@ -256,8 +566,8 @@ export function CompactProductForm({
     if (formData.product_name === "") {
       toast.current?.show({
         severity: 'error',
-        summary: 'خطأ',
-        detail: isService ? 'يجب ادخال اسم الخدمة' : 'يجب ادخال اسم الصنف',
+        summary: tr("خطأ"),
+        detail: isService ? tr("يجب ادخال اسم الخدمة") : tr("يجب ادخال اسم الصنف"),
         life: 1500
       });
       product_name.current?.focus();
@@ -266,26 +576,85 @@ export function CompactProductForm({
     if (!formData.units || formData.units.length === 0) {
       toast.current?.show({
         severity: "error",
-        summary: "خطأ",
-        detail: "يجب ادخال وحدة واحدة على الاقل",
+        summary: tr("خطأ"),
+        detail: tr("يجب ادخال وحدة واحدة على الاقل"),
         life: 1500,
       });
       product_name.current?.focus();
       return false;
     }
+    const primaryUnit = [...formData.units].sort((a, b) => Number(a.ser || 0) - Number(b.ser || 0))[0];
+    if (Number(primaryUnit?.to_main_qnty) !== 1) {
+      toast.current?.show({
+        severity: "error",
+        summary: "\u062e\u0637\u0623",
+        detail: "\u0627\u0644\u0639\u0644\u0627\u0642\u0629 \u0628\u0627\u0644\u0648\u062d\u062f\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629 \u0641\u064a \u0623\u0648\u0644 \u0648\u062d\u062f\u0629 \u064a\u062c\u0628 \u0623\u0646 \u062a\u0643\u0648\u0646 1",
+        life: 3000,
+      });
+      setActiveTab("units");
+      return false;
+    }
+    if (!formData.prices || formData.prices.length === 0) {
+      toast.current?.show({
+        severity: "error",
+        summary: tr("خطأ"),
+        detail: tr("يجب ادخال سعر بيع واحد على الاقل"),
+        life: 1500,
+      });
+      return false;
+    }
+
+    // حاجز أخير عند الحفظ (بمعزل عن منع التفعيل التفاعلي بالخانات/القائمة نفسها) — يلتقط أي حالة
+    // وصلت لهذا التعارض بطريقة لم تمر عبر onCheckedChange/onChange (كصنف مُحمَّل من بيانات قديمة
+    // سابقة لهذا القيد).
+    if (
+      Number(formData.measurment_id || 1) !== 1 &&
+      (formData.expiry_tracking || formData.serial_tracking || formData.batch_tracking)
+    ) {
+      toast.current?.show({
+        severity: "error",
+        summary: tr("خطأ"),
+        detail: MEASUREMENT_TRACKING_CONFLICT_MSG,
+        life: 3000,
+      });
+      return false;
+    }
 
     const unitIds = new Set<number>();
+    const scaleError = validateScaleProductBarcodes(formData.pos_sold_using_scale, [formData.barcode, ...(formData.units ?? []).flatMap(unit => unit.barcode_list ?? [])]);
+    if (scaleError) {
+      toast.current?.show({ severity: "error", summary: tr("باركود الميزان"), detail: scaleError, life: 4000 });
+      return false;
+    }
+    const barcodeOwners = new Map<string, string>();
     for (const unit of formData.units ?? []) {
       if (unitIds.has(unit.unit_id)) {
         toast.current?.show({
           severity: "error",
-          summary: "خطأ",
-          detail: `الوحدة ${unit.unit_name} مكررة`,
+          summary: tr("خطأ"),
+          detail: tr("الوحدة {0} مكررة", unit.unit_name),
           life: 1500,
         });
         return false;
       }
       unitIds.add(unit.unit_id);
+      for (const rawBarcode of unit.barcode_list ?? []) {
+        const barcode = String(rawBarcode ?? "").trim();
+        if (!barcode) continue;
+        const key = barcode.toLocaleLowerCase("en");
+        const previousUnit = barcodeOwners.get(key);
+        if (previousUnit) {
+          toast.current?.show({
+            severity: "error",
+            summary: tr("باركود مكرر"),
+            detail: tr("الباركود {0} مكرر في وحدتي {1} و{2}", barcode, previousUnit, unit.unit_name || "بدون اسم"),
+            life: 4000,
+          });
+          setActiveTab("units");
+          return false;
+        }
+        barcodeOwners.set(key, unit.unit_name || "بدون اسم");
+      }
     }
 
     const storeIds = new Set<number>();
@@ -293,8 +662,8 @@ export function CompactProductForm({
       if (storeIds.has(store.store_id)) {
         toast.current?.show({
           severity: "error",
-          summary: "خطأ",
-          detail: `المستودع ${store.store_name} مكرر`,
+          summary: tr("خطأ"),
+          detail: tr("المستودع {0} مكرر", store.store_name),
           life: 1500,
         });
         return false;
@@ -304,12 +673,21 @@ export function CompactProductForm({
     if (formData.prices && formData.prices.length > 0) {
       const priceKeys = new Set<string>();
       for (const price of formData.prices) {
+        if (!unitIds.has(Number(price.unit_id))) {
+          toast.current?.show({
+            severity: "error",
+            summary: tr("خطأ"),
+            detail: tr("وحدة سعر البيع {0} غير مضافة إلى وحدات الصنف. اختر وحدة من وحدات الصنف.", price.unit_name || ""),
+            life: 3000,
+          });
+          return false;
+        }
         const key = `${price.unit_id}-${price.price_category_id}`;
         if (priceKeys.has(key)) {
           toast.current?.show({
             severity: "error",
-            summary: "خطأ",
-            detail: `الوحدة ${price.unit_name} مع الفئة ${price.price_name} مكررة`,
+            summary: tr("خطأ"),
+            detail: tr("الوحدة {0} مع الفئة {1} مكررة", price.unit_name, price.price_name),
             life: 1500,
           });
           return false;
@@ -325,8 +703,8 @@ export function CompactProductForm({
         if (warehouseIds.has(store.store_id)) {
           toast.current?.show({
             severity: "error",
-            summary: "خطأ",
-            detail: `المستودع ${store.store_name} مكرر`,
+            summary: tr("خطأ"),
+            detail: tr("المستودع {0} مكرر", store.store_name),
             life: 1500,
           });
           return false;
@@ -335,17 +713,33 @@ export function CompactProductForm({
       }
     }
 
+    const attributeNames = new Set<string>()
+    for (const attribute of formData.attributes || []) {
+      const name = attribute.name.trim()
+      if (!name || attribute.values.length === 0) {
+        setActiveTab("attributes")
+        toast.current?.show({ severity: "error", summary: tr("خطأ"), detail: tr("يجب كتابة اسم الخاصية وإضافة قيمة واحدة على الأقل"), life: 3000 })
+        return false
+      }
+      const key = name.toLocaleLowerCase()
+      if (attributeNames.has(key)) {
+        setActiveTab("attributes")
+        toast.current?.show({ severity: "error", summary: tr("خطأ"), detail: tr("الخاصية {0} مكررة", name), life: 3000 })
+        return false
+      }
+      attributeNames.add(key)
+    }
+
     return true;
   }
-  const handleSaveProduct = async () => {
+  const handleSaveProduct = async (): Promise<boolean | undefined> => {
     try {
-      let permission = 1
-      if (formData.id > 0) permission = 2
-      if (!Util.checkUserAccess(permission)) {
+      const productNameEn = formData.product_name_en.trim()
+      if (!(formData.id > 0 ? canUpdate : canCreate)) {
         toast.current?.show({
           severity: 'error',
           summary: '',
-          detail: formData.id === 0 ? 'لا يوجد لديك صلاحية اضافة صنف ' : 'لا يوجد لديك صلاحية تعديل صنف',
+          detail: formData.id === 0 ? tr("لا يوجد لديك صلاحية اضافة صنف ") : tr("لا يوجد لديك صلاحية تعديل صنف"),
           life: 3000
         });
         return
@@ -359,40 +753,91 @@ export function CompactProductForm({
         setIsSubmitting(false)
         return
       }
+        const componentIds = new Set<number>()
+        for (const component of manufacturingComponents) {
+          if (Number(component.component_id) === Number(formData.id)) {
+            setActiveTab("manufacturing-components")
+            toast.current?.show({ severity: "error", summary: tr("خطأ"), detail: tr("لا يمكن إضافة الصنف نفسه كمكون تصنيع"), life: 3000 })
+            setIsSubmitting(false)
+            return
+          }
+          if (componentIds.has(Number(component.component_id))) {
+            setActiveTab("manufacturing-components")
+            toast.current?.show({ severity: "error", summary: tr("خطأ"), detail: tr("مكون التصنيع مكرر"), life: 3000 })
+            setIsSubmitting(false)
+            return
+          }
+          if (!Number.isFinite(Number(component.quantity)) || Number(component.quantity) <= 0) {
+            setActiveTab("manufacturing-components")
+            toast.current?.show({ severity: "error", summary: tr("خطأ"), detail: tr("يجب أن تكون كمية كل مكون أكبر من صفر"), life: 3000 })
+            setIsSubmitting(false)
+            return
+          }
+          componentIds.add(Number(component.component_id))
+        }
+
+      // وحدة الجرد/الشراء/التقارير غير محددة لأي وحدة ⇐ تُسند للوحدة الأولى (والخادم يطبق نفس القاعدة)
+      const savedUnits = (() => {
+        const list = (formData.units || []).map((unit) => ({ ...unit }))
+        const first = list.find((unit) => Number(unit.unit_id || 0) > 0)
+        if (first) for (const column of Object.values(UNIT_ROLE_COLUMNS)) {
+          if (!list.some((unit) => Number(unit.unit_id || 0) > 0 && (unit as any)[column] === true)) (first as any)[column] = true
+        }
+        return list
+      })()
+      setFormData((prev) => ({ ...prev, units: savedUnits }))
 
       const response = await fetch("/api/inventory/products", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           ...formData,
+          units: savedUnits,
+          product_name_en: productNameEn,
           type: isService ? 2 : 1,
           service_type: isService ? 1 : 0,
+          ...(formData.id > 0 ? {} : {
+            related_item_ids: relatedProducts.map((row) => row.related_id),
+            related_items_mode: formData.related_items_mode,
+            manufacturing_components: manufacturingComponents.map((row) => ({
+              component_id: row.component_id, quantity: calculateManufacturingComponentQuantity(row), unit_id: row.unit_id,
+              length: row.length, width: row.width, height: row.height, count: row.count,
+            })),
+          }),
         }),
       })
 
       const responseData = await response.json()
       if (!response.ok) {
-        throw new Error(responseData.error || "فشل في حفظ المنتج")
+        throw new Error(responseData.error || responseData.message || tr("فشل في حفظ المنتج"))
       }
+      const savedProductId = Number(responseData.id || responseData.productId || responseData.product?.id || formData.id)
+      // الأصناف التابعة ومكونات التصنيع مستقلتان — تُحفظان معاً بدل واحدة بعد الأخرى
+      if (savedProductId > 0 && formData.id > 0 && canUpdate) await Promise.all([saveRelatedProducts(savedProductId), saveManufacturingComponents(savedProductId)])
 
       setSuccess(formData.id ? "تم تحديث المنتج بنجاح ✅" : "تم إنشاء المنتج بنجاح ✅")
       toast.current?.show({
         severity: 'success',
-        summary: 'نجاح',
-        detail: 'تمت العملية بنجاح ✅',
+        summary: tr("نجاح"),
+        detail: tr("تمت العملية بنجاح ✅"),
         life: 3000
       });
-      await reset_fields()
-      onSuccess?.()
+      onSuccess?.(savedProductId > 0 ? savedProductId : undefined)
+      notifyProductsChanged() // نوافذ بحث الأصناف المفتوحة (في أي تبويب) تُحدّث قائمتها
+      // بعد الحفظ (إضافة أو تعديل): تفريغ الحقول وفتح سجل جديد برقم صنف جديد — مثل زر "جديد"
+      if (canCreate) await reset_fields()
+      else onHideDialog(true)
+      return true
 
     } catch (err) {
       console.error("[ProductDialog] Error saving product:", err)
       toast.current?.show({
         severity: 'error',
-        summary: 'خطأ',
-        detail: 'فشلت العملية',
+        summary: tr("خطأ"),
+        detail: err instanceof Error ? err.message : tr("فشلت العملية"),
         life: 5000
       });
+      return false
     } finally {
       setIsSubmitting(false)
     }
@@ -405,6 +850,7 @@ export function CompactProductForm({
   };
 
   const handleDeleteClick = (checkUnsaved: any) => {
+    if (!canDelete) return
 
     const currentHash = getFormDataHash(formData);
     if (checkUnsaved === true && currentHash !== initialHash.current) {
@@ -415,18 +861,18 @@ export function CompactProductForm({
     if (!formData.id) {
       toast.current?.show({
         severity: 'warn',
-        summary: 'تنبيه',
-        detail: 'لا يوجد صنف لحذفه',
+        summary: tr("تنبيه"),
+        detail: tr("لا يوجد صنف لحذفه"),
         life: 3000
       });
       return;
     }
 
-    if (!Util.checkUserAccess(3)) {
+    if (!canDelete) {
       toast.current?.show({
         severity: 'error',
         summary: '',
-        detail: 'لا يوجد لديك صلاحية حذف صنف',
+        detail: tr("لا يوجد لديك صلاحية حذف صنف"),
         life: 3000
       });
       return
@@ -437,17 +883,18 @@ export function CompactProductForm({
   };
 
   const handleDeleteProduct = async () => {
-    setLoading(true)
+    if (!canDelete) return
     if (!formData.id) {
       toast.current?.show({
         severity: 'warn',
-        summary: 'تنبيه',
-        detail: 'لا يوجد صنف لحذفه',
+        summary: tr("تنبيه"),
+        detail: tr("لا يوجد صنف لحذفه"),
         life: 3000
       });
       return;
     }
 
+    setLoading(true)
     try {
       const response = await fetch(`/api/inventory/products?id=${formData.id}`, {
         method: "DELETE",
@@ -456,26 +903,24 @@ export function CompactProductForm({
       const result = await response.json();
 
       if (!response.ok) {
-        throw new Error(result.error || "فشل في حذف الصنف");
+        throw new Error(result.error || tr("فشل في حذف الصنف"));
       }
 
       toast.current?.show({
         severity: 'success',
-        summary: 'نجاح',
-        detail: 'تم حذف الصنف بنجاح ✅',
+        summary: tr("نجاح"),
+        detail: tr("تم حذف الصنف بنجاح ✅"),
         life: 3000
       });
+      notifyProductsChanged()
 
-      reset_fields(); // clear form
+      await reset_fields(); // clear form
 
     } catch (err) {
       console.error("Error deleting product:", err);
-      toast.current?.show({
-        severity: 'error',
-        summary: 'خطأ',
-        detail: 'فشلت العملية ❌',
-        life: 5000
-      });
+      // سبب الرفض من الخادم (مثل "لا يمكن حذف الصنف لارتباطه بحركات") في مكوّن الرسائل أعلى النموذج
+      messagesRef.current?.clear?.()
+      messagesRef.current?.show?.([{ severity: "error", summary: "", detail: err instanceof Error && err.message ? err.message : tr("تعذر حذف الصنف"), life: 6000 }])
     } finally {
       setLoading(false)
     }
@@ -483,16 +928,131 @@ export function CompactProductForm({
 
 
   const getNewProductCode = async (): Promise<string> => {
-    const res = await fetch("/api/utilities/getLastProductCode");
-    const data = await res.json();
-    const lastCode = data.lastCode;
-    return lastCode.toString();
+    if (!canCreate) return ""
+    try {
+      // الخدمات: آخر رقم خدمة + 1، والأصناف: آخر رقم صنف + 1
+      const res = await fetch(`/api/utilities/getLastProductCode?type=${isService ? "services" : "products"}`);
+      if (!res.ok) {
+        throw new Error(`Product code request failed with status ${res.status}`)
+      }
+      const data = await res.json();
+      if (data?.lastCode === undefined || data?.lastCode === null) {
+        throw new Error("Product code response does not contain lastCode")
+      }
+      return data.lastCode.toString();
+    } catch (error) {
+      console.warn("Unable to generate a new product code:", error)
+      toast.current?.show({
+        severity: "warn",
+        summary: tr("تنبيه"),
+        detail: tr("تعذر توليد رقم الصنف. تحقق من الاتصال ثم حاول مرة أخرى."),
+        life: 4000,
+      })
+      return ""
+    }
   };
   const [currentProductId, setCurrentProductId] = useState<number>(0);
+  // موقع الصنف الحالي وعدد الأصناف الكلي لعرض "رقم السجل" وتفعيل أزرار التنقل بشكل صحيح
+  const [recordPosition, setRecordPosition] = useState(0);
+  const [recordTotal, setRecordTotal] = useState(0);
+  // true إن كان للصنف الحالي (بمعرّفه) سطر واحد على الأقل بـvoucher_items_tbl ضمن سند لم يُلغَ
+  // منطقياً (status != 3) — يُعطِّل خانات "له تاريخ صلاحية"/"له رقم متسلسل"/"له رقم تشغيلي" أدناه
+  // إذ تغييرها بأثر رجعي على صنف استُخدِم فعلياً يُناقض بيانات تلك السطور القائمة. يُعاد ضبطه false
+  // عند فتح صنف جديد (reset_fields) وعند كل تحميل صنف موجود (loadData) قبل الفحص الفعلي.
+  const [isUsedInVouchers, setIsUsedInVouchers] = useState(false);
+  const navigationRequestRef = useRef(0)
+  const navigationBusyRef = useRef(false)
+
+  // يُطبَّق على أي صنف مُحمَّل بنجاح (تصفّح تسلسلي أو اختيار مباشر عبر البحث بـByid) — مُستخرَجة
+  // كدالة مشتركة بدل تكرارها لكل مسار، بعد أن كانت مسارات النجاح المختلفة (لا الأخطاء فقط) تُكرِّر
+  // نفس تحويل الوحدات/الأسعار/المستودعات وضبط formData/initialHash/currentProductId حرفياً.
+  const applyLoadedProduct = async (product: any) => {
+    if (!canView) return
+    // definitionsRef.current لا الحالة definitions — الحالة مُحدَّثة عبر setDefinitions (غير متزامنة،
+    // تُطبَّق بالعرض التالي) بينما هذه الدالة تُستدعى من نفس تشغيلة useEffect التي استدعت
+    // fetchDefinitions أصلاً (مرة واحدة فقط، محروسة بـinitialized.current)، فتبقى definitions هنا
+    // دوماً بقيمتها الأولية الفارغة عند أول تحميل صنف — تماماً سبب ظهور اسم الوحدة/فئة السعر فارغين
+    // بتبويب "أسعار البيع" عند فتح/حفظ صنف لأول مرة. نفس النمط الصحيح المُستخدَم أصلاً أدناه لـ
+    // costCenterRows/brandRows.
+    const unitsWithNames = (product.units ?? []).map((unit: any, index: number) => {
+      const unitDef = definitionsRef.current.units.find((u: any) => u.id === unit.unit_id);
+      return { ...unit, ser: index + 1, unit_name: unitDef?.unit_name || "", is_stock_count_unit: unit.is_stock_count_unit === true, is_purchase_unit: unit.is_purchase_unit === true, is_report_unit: unit.is_report_unit === true };
+    });
+
+    const pricesWithNames = (product.prices ?? []).map((price: any, index: number) => {
+      const unitDef = definitionsRef.current.units.find((u: any) => u.id === price.unit_id);
+      const priceCategoryDef = definitionsRef.current.price_category.find((p: any) => p.id === price.price_category_id);
+      const currencyDef = definitionsRef.current.currencies.find((c: any) => c.id === price.currency_id);
+      return {
+        ...price,
+        ser: index + 1,
+        unit_name: unitDef?.unit_name || "",
+        price_name: priceCategoryDef?.name || "",
+        currency_name: currencyDef?.currency_name || "",
+      };
+    });
+
+    const storesWithNames = (product.stores ?? []).map((store: any) => {
+      const storeDef = definitionsRef.current.warehouses.find((w: any) => w.id === store.warehouse_id);
+      return {
+        ...store,
+        store_name: storeDef?.warehouse_name || "",
+        store_id: storeDef?.id || 0,
+      };
+    });
+
+    const costCenterRows = buildCostCenterRows(product.cost_centers ?? [], definitionsRef.current.cost_center_types, definitionsRef.current.cost_centers);
+    const brandRows = buildBrandRows(product.product_brands ?? [], definitionsRef.current.brand_types, definitionsRef.current.brands);
+
+    const newFormData = {
+      ...product,
+      pos_sold_using_scale: isScaleProduct(product.pos_sold_using_scale),
+      default_printer: product.default_printer || "",
+      is_tobacco: product.is_tobacco === true || product.is_tobacco === "true",
+      product_type: Number(product.product_type ?? 1) || 1,
+      units: unitsWithNames,
+      prices: pricesWithNames,
+      stores: storesWithNames,
+      cost_centers: costCenterRows,
+      product_brands: brandRows,
+      default_store: product.default_store ?? 0,
+      notes: product.notes ?? "",
+      transaction_notes: product.transaction_notes ?? "",
+      original_numbers: Array.isArray(product.original_numbers) ? product.original_numbers : [],
+      factory_numbers: Array.isArray(product.factory_numbers) ? product.factory_numbers : [],
+      branch_ids: Array.isArray(product.branch_ids) ? product.branch_ids : [],
+      related_products: Array.isArray(product.related_products) ? product.related_products : [],
+      // GET /api/inventory/ProductsNavigations/[navigationType] يُعيد "SELECT * FROM products"
+      // خاماً — أعمدة الصلاحية/الدفعة الفعلية على الجدول هي has_expiry_date/has_batch_number لا
+      // expiry_tracking/batch_tracking (المستخدَمان في formData وفي حفظ /api/inventory/products
+      // POST)، فيُطابَق هنا صراحةً بدل الاعتماد على الانتشار الخام أعلاه (كان سيترك خانتي
+      // "له تاريخ صلاحية"/"له رقم تشغيلي" غير مؤشَّرتين دوماً عند تعديل صنف قائم فعلياً يحملهما).
+      expiry_tracking: Boolean(product.expiry_tracking ?? product.has_expiry_date ?? product.has_expiry ?? false),
+      batch_tracking: Boolean(product.batch_tracking ?? product.has_batch_number ?? product.has_batch ?? false),
+    };
+    setFormData(newFormData);
+    setRelatedProducts([])
+    setManufacturingComponents([])
+    if (Number(product.id) > 0) fetch(`/api/inventory/products/${product.id}/related-items`).then((r) => r.ok ? r.json() : []).then((rows) => setRelatedProducts(Array.isArray(rows) ? rows.map((row: RelatedProductItem, index: number) => ({ ...row, add_price: row.add_price !== false, no_kitchen_print: row.no_kitchen_print === true, product_id: Number(product.id), ser: index + 1 })) : [])).catch(() => setRelatedProducts([]))
+    if (Number(product.id) > 0) fetch(`/api/inventory/products/${product.id}/manufacturing-components`).then((r) => r.ok ? r.json() : []).then((rows) => setManufacturingComponents(Array.isArray(rows) ? rows.map((row: ManufacturingComponentItem, index: number) => ({ ...row, product_id: Number(product.id), ser: index + 1 })) : [])).catch(() => setManufacturingComponents([]))
+    initialHash.current = getFormDataHash(newFormData);
+    baselineCodeRef.current = String(newFormData.product_code || "");
+    setCurrentProductId(product.id);
+    setRecordPosition(Number(product.record_position) || 0);
+    setRecordTotal(Number(product.record_total) || 0);
+    setIsUsedInVouchers(false);
+    fetch(`/api/inventory/products/${product.id}/voucher-usage`)
+      .then((r) => (r.ok ? r.json() : { used: false }))
+      .then((data) => setIsUsedInVouchers(Boolean(data?.used)))
+      .catch(() => setIsUsedInVouchers(false));
+    setLoading(false)
+  };
+
   const loadData = async (
     navigationType: "first" | "previous" | "next" | "last" | "Byid",
     productId?: number, checkUnsaved?: any // explicitly pass ID when needed
   ) => {
+    if (!canView) return
     const currentHash = getFormDataHash(formData);
     if (checkUnsaved === undefined) checkUnsaved = true
     if (checkUnsaved === true && currentHash !== initialHash.current && initialHash.current !== 0) {
@@ -500,12 +1060,15 @@ export function CompactProductForm({
       setNextFunction(() => () => loadData(navigationType, productId, false));
       return
     }
+    navigationBusyRef.current = true
+    const requestId = navigationRequestRef.current + 1
+    navigationRequestRef.current = requestId
     try {
-      if (!Util.checkUserAccess(10)) {
+      if (!canView) {
         toast.current?.show({
           severity: 'error',
           summary: '',
-          detail: 'لا يوجد لديك استعلام صنف',
+          detail: tr("لا يوجد لديك استعلام صنف"),
           life: 3000
         });
         return;
@@ -514,7 +1077,7 @@ export function CompactProductForm({
       setLoading(true)
       let url = new URL(`/api/inventory/ProductsNavigations/${navigationType}`, location.origin);
       url.searchParams.set("type", isService ? "services" : "products");
-
+      console.log("productId ",productId)
       // Determine ID to use
       if (navigationType === "Byid" && productId) {
         url.searchParams.set("id", String(productId));
@@ -523,64 +1086,67 @@ export function CompactProductForm({
       }
 
       const res = await fetch(url.toString());
+      if (requestId !== navigationRequestRef.current) return
+      console.log("loadData response:", res);
+
+      // Byid (اختيار صنف من نافذة البحث) له معالجة أخطاء مستقلة عن رسائل حدود التصفّح
+      // (بداية/نهاية السجلات) التي لا معنى لها هنا أصلاً — طلب صنف بعينه بمعرّفه، لا تنقّل تسلسلي.
+      if (navigationType === "Byid") {
+        if (!res.ok) {
+          const errorBody = await res.json().catch(() => null)
+          toast.current?.show({
+            severity: 'error',
+            summary: '',
+            detail: errorBody?.error === "No product found" ? tr("لم يتم العثور على الصنف") : (errorBody?.error || tr("تعذّر تحميل الصنف")),
+            life: 3000
+          });
+          setLoading(false)
+          return;
+        }
+        const product = await res.json();
+        if (!product?.id) {
+          toast.current?.show({ severity: 'error', summary: '', detail: tr("لم يتم العثور على الصنف"), life: 3000 });
+          setLoading(false)
+          return;
+        }
+        await applyLoadedProduct(product)
+        return
+      }
+
+      if (!res.ok) {
+        toast.current?.show({
+          severity: 'error',
+          summary: '',
+          detail: navigationType === "previous" || navigationType === "first"
+            ? tr("بداية السجلات")
+            : tr("نهاية السجلات"),
+          life: 3000
+        });
+        setLoading(false)
+        return;
+      }
       const product = await res.json();
+      console.log("loadData product:", product);
       if (!product.id || product.id === currentProductId) {
         toast.current?.show({
           severity: 'error',
           summary: '',
           detail: navigationType === "previous" || navigationType === "first"
-            ? 'بداية السجلات'
-            : 'نهاية السجلات',
+            ? tr("بداية السجلات")
+            : tr("نهاية السجلات"),
           life: 3000
         });
         setLoading(false)
         return;
       }
 
-      // Map units, prices, stores
-      const unitsWithNames = (product.units ?? []).map((unit: any) => {
-        const unitDef = definitions.units.find((u: any) => u.id === unit.unit_id);
-        return { ...unit, unit_name: unitDef?.unit_name || "" };
-      });
-
-      const pricesWithNames = (product.prices ?? []).map((price: any) => {
-        const unitDef = definitions.units.find((u: any) => u.id === price.unit_id);
-        const priceCategoryDef = definitions.price_category.find((p: any) => p.id === price.price_category_id);
-        const currencyDef = definitions.currencies.find((c: any) => c.id === price.currency_id);
-        return {
-          ...price,
-          unit_name: unitDef?.unit_name || "",
-          price_name: priceCategoryDef?.name || "",
-          currency_name: currencyDef?.currency_name || "",
-        };
-      });
-
-      const storesWithNames = (product.stores ?? []).map((store: any) => {
-        const storeDef = definitions.warehouses.find((w: any) => w.id === store.warehouse_id);
-        return {
-          ...store,
-          store_name: storeDef?.warehouse_name || "",
-          store_id: storeDef?.id || 0,
-        };
-      });
-
-      const costCenterRows = buildCostCenterRows(product.cost_centers ?? [], definitionsRef.current.cost_center_types, definitionsRef.current.cost_centers);
-
-      const newFormData = {
-        ...product,
-        units: unitsWithNames,
-        prices: pricesWithNames,
-        stores: storesWithNames,
-        cost_centers: costCenterRows,
-        default_store: product.default_store ?? 0,
-      };
-      setFormData(newFormData);
-      const currentHash = getFormDataHash(newFormData);
-      initialHash.current = (currentHash);
-      setCurrentProductId(product.id);
-      setLoading(false)
+      await applyLoadedProduct(product)
     } catch (err) {
       console.error(err);
+      toast.current?.show({ severity: 'error', summary: '', detail: tr("تعذر تحميل بيانات الصنف"), life: 3000 })
+    } finally {
+      navigationBusyRef.current = false
+      if (requestId === navigationRequestRef.current) setLoading(false)
     }
   };
 
@@ -624,9 +1190,17 @@ export function CompactProductForm({
         .filter((_, i) => i !== index) // remove the unit at index
         .map((unit, i) => ({ ...unit, ser: i + 1 })); // reindex `ser`
 
+      // أسعار البيع المعرّفة على وحدة حُذفت (ولم تبقَ بسطر آخر) تُحذف معها — لا تبقى على وحدة غير موجودة بالصنف
+      const removedUnitId = Number(prev.units[index]?.unit_id) || 0
+      const stillUsed = updatedUnits.some((unit) => Number(unit.unit_id) === removedUnitId)
+      const prices = removedUnitId && !stillUsed
+        ? (prev.prices ?? []).filter((price) => Number(price.unit_id) !== removedUnitId).map((price, i) => ({ ...price, ser: i + 1 }))
+        : prev.prices
+
       return {
         ...prev,
         units: updatedUnits,
+        prices,
       };
     });
   };
@@ -661,6 +1235,60 @@ export function CompactProductForm({
     });
   };
 
+  const updateUnitRow = (index: number, patch: Partial<UnitItem>) => {
+    setFormData((prev) => {
+      const units = [...(prev.units ?? [])]
+      if (!units[index]) return prev
+      const oldUnitId = Number(units[index].unit_id) || 0
+      units[index] = { ...units[index], ...patch }
+      const newUnitId = Number(units[index].unit_id) || 0
+      // تغيير وحدة السطر (مثلاً قطعة ← كرتونة): أسطر "أسعار البيع" المعرّفة على الوحدة القديمة تنتقل للوحدة الجديدة —
+      // كانت تبقى على القديمة فيظهر بتبويب الأسعار اسم الوحدة السابق (ما لم تبقَ الوحدة القديمة مستخدمة بسطر آخر)
+      if (patch.unit_id === undefined || !oldUnitId || oldUnitId === newUnitId || units.some((unit) => Number(unit.unit_id) === oldUnitId)) {
+        return { ...prev, units }
+      }
+      const prices = (prev.prices ?? []).map((price) =>
+        Number(price.unit_id) === oldUnitId ? { ...price, unit_id: newUnitId, unit_name: String(units[index].unit_name || "") } : price,
+      )
+      return { ...prev, units, prices }
+    })
+  }
+
+  const updatePriceRow = (index: number, patch: Partial<PriceItem>) => {
+    setFormData((prev) => {
+      const prices = [...(prev.prices ?? [])]
+      if (!prices[index]) return prev
+      prices[index] = { ...prices[index], ...patch }
+      return { ...prev, prices }
+    })
+  }
+
+  const moveGridOnEnter = (grid: wjGrid.FlexGrid, event: KeyboardEvent) => {
+    if (event.key !== "Enter" || event.shiftKey || event.ctrlKey || event.altKey || event.metaKey) return
+    const selection = grid.selection
+    if (!selection || selection.row < 0 || selection.col < 0) return
+    event.preventDefault()
+    event.stopPropagation()
+    grid.finishEditing()
+    const editableColumns = grid.columns.filter((column: any) => column.visible && !column.isReadOnly)
+    const current = editableColumns.findIndex((column: any) => column.index === selection.col)
+    let row = selection.row
+    let column = editableColumns[current + 1]
+    if (!column) { row += 1; column = editableColumns[0] }
+    if (!column || row >= grid.rows.length) return
+    grid.select(row, column.index)
+    grid.startEditing(true, row, column.index)
+  }
+
+  const updateStoreRow = (index: number, patch: Partial<StoreItem>) => {
+    setFormData((prev) => {
+      const stores = [...(prev.stores ?? [])]
+      if (!stores[index]) return prev
+      stores[index] = { ...stores[index], ...patch }
+      return { ...prev, stores }
+    })
+  }
+
   const countries = [
     "السعودية",
     "الإمارات",
@@ -680,6 +1308,8 @@ export function CompactProductForm({
   ]
 
   const initialHash = useRef(0);
+  // رقم السجل المعروض (أو الرقم المولَّد للجديد) — مغادرة حقل الرقم دون تغييره لا تعيد تحميل شيء
+  const baselineCodeRef = useRef("");
   const hashCode = (str: string) => {
     let hash = 0;
     for (let i = 0; i < str.length; i++) {
@@ -697,13 +1327,20 @@ export function CompactProductForm({
   const stockStatuses = ["متوفر", "تحت الحد الأدنى", "نفد المخزون", "محجوز", "تالف"]
   const doHotKeys = useRef(true)
   const reset_fields = async (from_code = 0, code = "") => {
+    if (!canCreate) {
+      setFormData({ ...initialFormData })
+      setCurrentProductId(0)
+      initialHash.current = getFormDataHash(initialFormData)
+      return
+    }
+    // Cancel any product navigation still in flight. Otherwise a slow response
+    // can overwrite the new blank form after the user presses "جديد".
+    navigationRequestRef.current += 1
+    navigationBusyRef.current = false
     
     let newCode = code;
     if (from_code === 0) newCode = await getNewProductCode();
     console.log("from_code ",from_code ," code ",code," newCode ",newCode)
-    setUnitsData([]);
-    setPricesData([]);
-    setStoresData([]);
 
     // --- Units ---
     const firstUnit = definitionsRef.current.units[0] || { id: 0, unit_name: "" };
@@ -714,6 +1351,8 @@ export function CompactProductForm({
       to_main_qnty: 1,
       ser: 1,
       barcode_list: [],
+      // الوحدة الأولى للصنف الجديد: وحدة الجرد والشراء والتقارير افتراضياً
+      is_stock_count_unit: true, is_purchase_unit: true, is_report_unit: true,
     };
 
     // --- Prices ---
@@ -742,6 +1381,9 @@ export function CompactProductForm({
 
     // --- Build new form data ---
     const costCenterRows = buildCostCenterRows([], definitionsRef.current.cost_center_types, definitionsRef.current.cost_centers);
+    const brandRows = buildBrandRows([], definitionsRef.current.brand_types, definitionsRef.current.brands);
+
+    const defaultProductAccounts = await loadProductAccountDefaults()
 
     let newFormData = {
       ...initialFormData,
@@ -750,8 +1392,11 @@ export function CompactProductForm({
       prices: [newPrice],
       stores: [newStore],
       cost_centers: costCenterRows,
+      product_brands: brandRows,
       type: isService ? 2 : 1,
       service_type: isService ? 1 : 0,
+      ...defaultProductAccounts,
+      tax_classification_id: definitionsRef.current.tax_classifications?.[0]?.id || 0,
     };
 
     if (definitionsRef.current.currencies.length > 0) {
@@ -759,17 +1404,25 @@ export function CompactProductForm({
     }
 
     setFormData(newFormData);
+    setRelatedProducts([])
+    setManufacturingComponents([])
+    initialHash.current = getFormDataHash(newFormData);
+    baselineCodeRef.current = String(newFormData.product_code || "");
     setCurrentProductId(0);
+    setRecordPosition(0);
+    fetch(`/api/inventory/ProductsNavigations/count?type=${isService ? "services" : "products"}`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => { if (data) setRecordTotal(Number(data.total) || 0) })
+      .catch(() => undefined);
+    setIsUsedInVouchers(false);
     setActiveTab("units");
-
-    const currentHash = getFormDataHash(newFormData);
-    initialHash.current = currentHash;
 
     product_name.current?.focus();
   };
 
 
   const onNew = async (checkUnsaved: any) => {
+    if (!canCreate) return
     const currentHash = getFormDataHash(formData);
     if (checkUnsaved === true && currentHash !== initialHash.current) {
       setShowUnsaved(true)
@@ -777,31 +1430,74 @@ export function CompactProductForm({
       return
     }
     setLoading(true)
-    await reset_fields()
-    setLoading(false)
+    try {
+      await reset_fields()
+    } finally {
+      setLoading(false)
+    }
 
   }
+
   useEffect(() => {
-    if (initialized.current) return;
+    if (initialized.current) {
+      const requestedId = Number(editingProduct?.id || 0)
+      if (visible && requestedId > 0 && requestedId !== currentProductId) void loadData("Byid", requestedId, false)
+      return;
+    }
     initialized.current = true;
     const initFormData = async () => {
       setLoading(true)
-      const result = await fetchDefinitions(); // now returns a single object
-
-      if (editingProduct) {
-        loadData("Byid", editingProduct.id);
-
-      } else {
-        // Populate from initial form data + first currency if available
-        reset_fields()
-
+      try {
+        await fetchDefinitions();
+        if (editingProduct) {
+          await loadData("Byid", editingProduct.id);
+        } else {
+          // Populate from initial form data + first currency if available
+          await reset_fields()
+        }
+      } catch (error) {
+        console.warn("Unable to initialize compact product form:", error)
+        toast.current?.show({
+          severity: "error",
+          summary: tr("خطأ في الاتصال"),
+          detail: tr("تعذر تحميل بيانات الصنف. تحقق من الاتصال ثم حاول مرة أخرى."),
+          life: 5000,
+        })
+      } finally {
+        setLoading(false)
       }
-      setLoading(false)
     };
 
-    initFormData();
-  }, [editingProduct]);
+    void initFormData();
+  }, [editingProduct?.id, visible, canView, canCreate]);
 
+  // يضمن ظهور مراكز التكلفة في الشبكة حتى لو اكتمل جلبها (fetchDefinitions) بعد استدعاء
+  // reset_fields/loadData بلحظة — نفس مصدر البيانات المستخدَم في unified-accounts-refactored.tsx
+  // (/api/cost-center-types و/api/cost-centers)، لكن هنا يُعاد بناء صفوف formData.cost_centers من
+  // التعريفات فور توفّرها إن كانت الشبكة لا تزال فارغة رغم توفّر أنواع مراكز التكلفة.
+  useEffect(() => {
+    if (definitions.cost_center_types.length === 0) return
+    if ((formData.cost_centers?.length ?? 0) > 0) return
+    const costCenterRows = buildCostCenterRows(formData.cost_centers ?? [], definitions.cost_center_types, definitions.cost_centers)
+    // صفوف محسوبة لا تعديل من المستخدم: يُحدَّث خط الأساس معها إن كان النموذج غير معدَّل (لا رسالة "تم تعديل السجل" زائفة)
+    const wasClean = getFormDataHash(formData) === initialHash.current
+    const next = { ...formData, cost_centers: costCenterRows }
+    setFormData(next)
+    if (wasClean) initialHash.current = getFormDataHash(next)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [definitions.cost_center_types, definitions.cost_centers])
+
+  // نفس منطق تأثير مراكز التكلفة أعلاه تماماً لكن للعلامات التجارية
+  useEffect(() => {
+    if (definitions.brand_types.length === 0) return
+    if ((formData.product_brands?.length ?? 0) > 0) return
+    const brandRows = buildBrandRows(formData.product_brands ?? [], definitions.brand_types, definitions.brands)
+    const wasClean = getFormDataHash(formData) === initialHash.current
+    const next = { ...formData, product_brands: brandRows }
+    setFormData(next)
+    if (wasClean) initialHash.current = getFormDataHash(next)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [definitions.brand_types, definitions.brands])
 
   const popupHasCalled = () => {
     doHotKeys.current = false
@@ -815,18 +1511,15 @@ export function CompactProductForm({
   useEffect(() => {
     if (!visible) return; // attach only when dialog is open
 
-    const handler = (e: KeyboardEvent) => {
+    const handler = (e: KeyboardEvent) => { if (!workspaceTabActive.current) return;
       /*if (e.key === "Escape") {
         e.preventDefault();
         if (doHotKeys.current) onHideDialog(doHotKeys.current); // close only your nested popup
       }*/
-      if (e.key === "F4") {
+      // F3 حفظ / F9 حذف / F4 نسخ / F5 جديد: UniversalToolbar (lib/hotkeys.ts)
+      if (e.key === "F7") {
         e.preventDefault();
-        if (doHotKeys.current) handleDeleteClick(true)
-      }
-      if (e.key === "F3") {
-        e.preventDefault();
-        if (doHotKeys.current) handleSaveProduct()
+        if (activeTab === "related") deleteRelatedProduct(relatedProductRow ?? -1)
       }
     };
 
@@ -834,8 +1527,18 @@ export function CompactProductForm({
     return () => window.removeEventListener("keydown", handler, true);
   }, [visible, onHideDialog, handleDeleteClick]);
 
+  const formRootRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!visible || !formRootRef.current) return;
+    const root = formRootRef.current
+    // Enter = Tab يعمل ما لم تكن نافذة منبثقة مفتوحة فعلاً فوق النموذج — لا يعتمد على doHotKeys وحده
+    // (علَم يدوي قد يبقى false إن لم يُستدعَ popupHasClosed بعد نافذة ما، فيتوقف Enter في النموذج كله)
+    const enabled = { get current() { return doHotKeys.current || !isPopupOpenOver(root) } }
+    return attachEnterAsTab(root, enabled);
+  }, [visible]);
 
-  const adjustCode = (code: string, codeLen: number = 8): string => {
+
+  const adjustCode = (code: string, codeLen: number = 10): string => {
     if (!code || !code.trim()) return '';
 
     code = code.trim().toUpperCase();
@@ -853,7 +1556,6 @@ export function CompactProductForm({
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
-    formData.units = units_data
     handleSaveProduct()
   }
 
@@ -861,9 +1563,92 @@ export function CompactProductForm({
     setFormData((prev) => ({ ...prev, [field]: value }))
   }
 
+  const copySelectedAccountToAllItems = async () => {
+    if (!copyAccountField) return
+    // حساب فارغ يُنسخ كـ null (يُفرَّغ الحساب في الأصناف التالية)
+    const accountId = Number(formData[copyAccountField]) > 0 ? Number(formData[copyAccountField]) : null
+    if (!(Number(formData.id) > 0)) return
+    setCopyAccountBusy(true)
+    try {
+      const response = await fetch("/api/inventory/products/copy-account", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ field: copyAccountField, account_id: accountId, after_product_id: Number(formData.id) }),
+      })
+      const data = await response.json()
+      if (!response.ok) throw new Error(data?.error || tr("تعذر نسخ الحساب إلى الأصناف"))
+      toast.current?.show({
+        severity: "success",
+        summary: tr("تم النسخ"),
+        detail: tr("تم تحديث الحساب في {0} صنف", Number(data.updated_count || 0)),
+        life: 3500,
+      })
+      setCopyAccountField(null)
+    } catch (error) {
+      toast.current?.show({
+        severity: "error",
+        summary: tr("خطأ"),
+        detail: error instanceof Error ? error.message : tr("تعذر نسخ الحساب إلى الأصناف"),
+        life: 3500,
+      })
+    } finally {
+      setCopyAccountBusy(false)
+    }
+  }
+
+  const fetchAccountById = async (accountId: number) => {
+    if (!Number.isInteger(accountId) || accountId <= 0) return null
+    try {
+      const response = await fetch(`/api/accounts/${accountId}`)
+      if (!response.ok) return null
+      return await response.json()
+    } catch (error) {
+      console.error("Failed to load account by id:", error)
+      return null
+    }
+  }
+
+  const loadProductAccountDefaults = async () => {
+    try {
+      const response = await fetch("/api/settings/system")
+      if (!response.ok) return {}
+      const settings = await response.json()
+      const accountKeys = [
+        { setting: "default_selling_account_id", idKey: "selling_account_id", codeKey: "selling_account_code" },
+        { setting: "default_purchase_account_id", idKey: "purchase_account_id", codeKey: "purchase_account_code" },
+        { setting: "default_selling_returns_account_id", idKey: "selling_returns_account_id", codeKey: "selling_returns_account_code" },
+        { setting: "default_purchase_returns_account_id", idKey: "purchase_returns_account_id", codeKey: "purchase_returns_account_code" },
+        { setting: "default_stock_end_account_id", idKey: "stock_end_account_id", codeKey: "stock_end_account_code" },
+        { setting: "default_stock_start_account_id", idKey: "stock_start_account_id", codeKey: "stock_start_account_code" },
+        { setting: "default_production_account_id", idKey: "production_account_id", codeKey: "production_account_code" },
+        { setting: "default_municipality_service_account_id", idKey: "municipality_service_account_id", codeKey: "municipality_service_account_code" },
+        { setting: "default_lsti3mal_account_id", idKey: "lsti3mal_account_id", codeKey: "lsti3mal_account_code" },
+      ]
+
+      const defaults: Partial<ProductFormData> = {}
+      const accountPromises = accountKeys.map(async ({ setting, idKey, codeKey }) => {
+        const accountId = Number(settings[setting])
+        if (!Number.isInteger(accountId) || accountId <= 0) {
+          return null
+        }
+        const account = await fetchAccountById(accountId)
+        if (!account) return null
+        defaults[idKey as keyof ProductFormData] = account.id
+        defaults[codeKey as keyof ProductFormData] = account.code
+        return null
+      })
+      await Promise.all(accountPromises)
+      return defaults
+    } catch (error) {
+      console.error("Error loading product account defaults:", error)
+      return {}
+    }
+  }
+
   const validateProductCode = (code: string): boolean => {
-    // يجب أن يكون الكود بحد أقصى 8 خانات ويحتوي على أرقام وحروف إنجليزية فقط
-    const regex = /^[A-Za-z0-9]{1,8}$/
+    // يجب أن يكون الكود بحد أقصى 10 خانات (كان 8 — طول التوليد التلقائي بـ
+    // app/api/utilities/getLastProductCode أصبح 10 خانات) ويحتوي على أرقام وحروف إنجليزية فقط
+    const regex = /^[A-Za-z0-9]{1,10}$/
     return regex.test(code)
   }
   const gridStyle = {
@@ -885,6 +1670,11 @@ export function CompactProductForm({
         to_main_qnty: 1,                  // default value
         ser: maxSer + 1,
         barcode_list: [],
+        // أول وحدة تُضاف ⇐ الأدوار الثلاثة محددة؛ ما بعدها بلا أدوار (وحدة واحدة لكل دور)
+        ...(() => {
+          const first = !units.some((row) => Number(row.unit_id || 0) > 0)
+          return { is_stock_count_unit: first, is_purchase_unit: first, is_report_unit: first }
+        })(),
       };
       return {
         ...prev,
@@ -900,7 +1690,8 @@ export function CompactProductForm({
       const maxSer = prevPrices.reduce((max, row) => (row.ser > max ? row.ser : max), 0);
 
       const firstPrice = definitionsRef.current.price_category[0] || { id: 0, name: "" };
-      const firstUnit = definitionsRef.current.units[0] || { id: 0, unit_name: "" };
+      const productUnit = prev.units?.[0];
+      const firstUnit = productUnit ? { id: productUnit.unit_id, unit_name: productUnit.unit_name || "" } : { id: 0, unit_name: "" };
       const firstCurrency = definitionsRef.current.currencies[0] || { id: 0, currency_name: "" };
 
       const newPrice: PriceItem = {
@@ -912,6 +1703,7 @@ export function CompactProductForm({
         unit_name: firstUnit.unit_name,
         currency_id: firstCurrency.id,
         currency_name: firstCurrency.currency_name,
+        price: 0,
       };
 
       return {
@@ -945,107 +1737,111 @@ export function CompactProductForm({
   };
 
 
-  const getUnitsEditor = () => {
-    // Return a function to create Wijmo Input ComboBox for React
-    return (cell: any) => {
-      const editorHost = document.createElement("div");
-      const combo = new wjcInput.ComboBox(editorHost, {
-        itemsSource: definitions.units || [],
-        displayMemberPath: "unit_name",
-        selectedValuePath: "id",
-      });
-      return editorHost;
-    };
-  };
+  // تبويبات الوحدات/الأسعار/المستودعات/مراكز التكلفة تُصيَّر عبر <DataGridView> (نفس مكوّن سندات
+  // الحركة/الاستلام لتوحيد الشكل) — أعمدة الاختيار (اسم الوحدة/فئة السعر/عملة البيع/المستودع/حالة
+  // مركز التكلفة) للقراءة فقط بجانبها زر بحث يفتح SimpleListPicker، بدل Column.editor مباشرةً
+  // (DataGridView الفعلي يتطلّب عنصر تحكم Wijmo حقيقياً واحداً ثابتاً للعمود بأكمله — انظر
+  // editor?: Control | null في @grapecity/wijmo.react.grid/index.d.ts — لا دالة تُستدعى لكل خلية؛
+  // محاولة سابقة بدالة تُعيد <div> فيه wjcInput.ComboBox مُنشأ يدوياً كانت تتحطّم فوراً عند فتح
+  // "صنف جديد" بخطأ Wijmo الداخلي "Element is already hosting a control"). هذا النمط (نص + زر بحث)
+  // مطابق تماماً لبقية أعمدة الاختيار في شاشات السندات (بحث صنف/مستودع/وحدة/حساب).
   const selectionChanged = (s: wjGrid.FlexGrid, e: wjGrid.CellRangeEventArgs) => {
-    setUnitCurrentRow(s.selection._row);
+    setUnitCurrentRow(Math.max(0, s.selection.row));
   }
   const cellEditEnded = (s: wjGrid.FlexGrid, e: wjGrid.CellRangeEventArgs) => {
     const editedItem = s.rows[e.row]?.dataItem;
     const colName = s.columns[e.col]?.name;
-    if (!editedItem || !colName) return;
-
-
-    // Example: if unit_name changed, you can update to_main or other fields
-    if (colName === "to_main_qnty") {
-      // ensure types match
-
-      if (e.row === 0) {
-        editedItem.to_main_qnty = 1;
-        setUnitsData((prev) => {
-          const newData = [...prev];
-          newData[e.row] = { ...editedItem }; // update only the edited row
-          return newData;
-        });
-      }
+    // وحدة الجرد/الشراء/التقارير: وحدة واحدة فقط لكل دور — تأشير وحدة يلغي تأشير البقية
+    if (editedItem && colName && (Object.values(UNIT_ROLE_COLUMNS) as string[]).includes(colName)) {
+      const checked = editedItem[colName] === true;
+      setFormData((prev) => ({
+        ...prev,
+        units: (prev.units || []).map((unit) => Number(unit.ser) === Number(editedItem.ser) ? { ...unit, [colName]: checked } : checked ? { ...unit, [colName]: false } : unit),
+      }));
+      return;
     }
+    if (!editedItem || colName !== "to_main_qnty") return;
+    const isPrimaryUnit = Number(editedItem.ser) === 1;
+    const raw = Number(editedItem.to_main_qnty);
+    const isValid = Number.isFinite(raw) && raw >= 0.000001 && raw <= 100000;
+    if (isPrimaryUnit && raw !== 1) {
+      toast.current?.show({
+        severity: "error",
+        summary: "\u062e\u0637\u0623",
+        detail: "\u0627\u0644\u0639\u0644\u0627\u0642\u0629 \u0628\u0627\u0644\u0648\u062d\u062f\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629 \u0641\u064a \u0623\u0648\u0644 \u0648\u062d\u062f\u0629 \u064a\u062c\u0628 \u0623\u0646 \u062a\u0643\u0648\u0646 1",
+        life: 3000,
+      });
+    }
+    const value = isPrimaryUnit ? 1 : isValid ? raw : 1;
+    if (!isValid && !isPrimaryUnit) {
+      toast.current?.show({
+        severity: "error",
+        summary: tr("خطأ"),
+        detail: tr("العلاقة بالوحدة الرئيسية يجب أن تكون رقماً بين 0.000001 و100000"),
+        life: 3000,
+      });
+    }
+    editedItem.to_main_qnty = value;
+    setFormData((prev) => {
+      const units = [...(prev.units || [])];
+      const unitIndex = units.findIndex((unit) => Number(unit.ser) === Number(editedItem.ser));
+      const targetIndex = unitIndex >= 0 ? unitIndex : e.row;
+      if (!units[targetIndex]) return prev;
+      units[targetIndex] = { ...units[targetIndex], to_main_qnty: value };
+      return { ...prev, units };
+    });
   };
 
   const getScheme = () => {
     let scheme = {
       name: 'UnitsScheme_Table',
-      filter: true,
-      showFooter: true,
-      sortable: true,
-      allowGrouping: false,
       responsiveColumnIndex: 2,
       columns: [
         {
           header: "##", name: "ser", width: 50
         },
         { header: "id", name: "id", width: 150, visible: false },
-        { header: "رقم الوحدة", name: "unit_id", width: 150, visible: false },
+        { header: tr("رقم الوحدة"), name: "unit_id", width: 150, visible: false },
         {
-          header: "اسم الوحدة",
+          header: tr("اسم الوحدة"),
           name: "unit_name",
-          width: 220,
-          editor: (cell: any) => (
-            <select
-              value={cell.row.dataItem.unit_name || ""}
-              onChange={(e) => {
-                const newValue = e.target.value;
-
-                // Find the selected unit from definitions
-                const selectedUnit = definitions.units.find((u: any) => u.unit_name === newValue);
-
-                // Update React state
-                setUnitsData((prev: UnitItem[] = []) => {
-                  const updated = [...prev];
-                  const rowIndex = cell.row.index;
-
-                  updated[rowIndex] = {
-                    ...updated[rowIndex],
-                    unit_name: newValue,
-                    unit_id: selectedUnit ? selectedUnit.id : 0, // fallback
-                  };
-
-                  return updated;
-                });
-
-                // Optional: also update the grid's dataItem if required
-                cell.row.dataItem.unit_name = newValue;
-                cell.row.dataItem.unit_id = selectedUnit ? selectedUnit.id : 0;
-              }}
-              className="px-2 py-1 w-full"
-            >
-              {(definitions.units || []).map((u: any) => (
-                <option key={u.id} value={u.unit_name}>
-                  {u.unit_name}
-                </option>
-              ))}
-            </select>
-          ),
+          width: "*",
+          minWidth: 180,
+          isReadOnly: true,
         },
-        { header: "العلاقة بالرئيسية", name: "to_main_qnty", width: 150, visible: true },
         {
-          header: "الباركود",
+          name: "btnSearchUnit",
+          header: " ",
+          width: 56,
+          buttonBody: "button" as const,
+          align: "center" as const,
+          title: tr("بحث"),
+          iconType: "search",
+          isReadOnly: true,
+          // ser (رقم تسلسلي مُخزَّن على الصف نفسه وقت البناء) لا ctx.row.index — هذه الشبكة
+          // sortable/filter مُفعَّلان، فقد يختلف ترتيب العرض المرئي عن الفهرس الفعلي في formData.units.
+          onClick: (e: any, ctx: any) => {
+            setUnitPickerRow(Number(ctx.row.dataItem?.ser || 0) - 1)
+            setUnitPickerOpen(true)
+          },
+          visible: true,
+          visibleInColumnChooser: true,
+        },
+        { header: tr("العلاقة بالرئيسية"), name: "to_main_qnty", width: 150, dataType: "Number", visible: true },
+        { header: UNIT_ROLE_LABELS.stock_count, name: UNIT_ROLE_COLUMNS.stock_count, width: 110, dataType: 3, align: "center" as const },
+        { header: UNIT_ROLE_LABELS.purchase, name: UNIT_ROLE_COLUMNS.purchase, width: 110, dataType: 3, align: "center" as const },
+        { header: UNIT_ROLE_LABELS.report, name: UNIT_ROLE_COLUMNS.report, width: 120, dataType: 3, align: "center" as const },
+        {
+          header: tr("الباركود"),
           name: "barcode",
           buttonBody: "button" as const,
           width: 100,
           iconType: "barcode",
-          readonly: true,
-          onClick: (item: { id: number }) => {
-            handleBarcodeClick(item);
+          title: tr("باركود"),
+          isReadOnly: true,
+          onClick: (e: any, ctx: any) => {
+            setUnitCurrentRow(Math.max(0, Number(ctx.row.dataItem?.ser || 1) - 1));
+            handleBarcodeClick(ctx.row.dataItem);
           }
         },
 
@@ -1054,7 +1850,7 @@ export function CompactProductForm({
           name: "barcode_list",
           width: 100,
           iconType: "barcode",
-          readonly: true,
+          isReadOnly: true,
           visible: false
 
         },
@@ -1063,8 +1859,9 @@ export function CompactProductForm({
           name: "delete",
           width: 80,
           buttonBody: "button" as const,
-          iconType: "trash",
-          onClick: (item: { ser: number }) => handleDeleteUnit(item.ser - 1)
+          iconType: "delete",
+          title: tr("حذف"),
+          onClick: (e: any, ctx: any) => handleDeleteUnit(Number(ctx.row.dataItem?.ser || 0) - 1)
         }
       ],
     }
@@ -1074,111 +1871,92 @@ export function CompactProductForm({
   const getPricesScheme = () => {
     let scheme = {
       name: 'PricesScheme_Table',
-      filter: true,
-      showFooter: true,
-      sortable: true,
-      allowGrouping: false,
       responsiveColumnIndex: 2,
       columns: [
         { header: "##", name: "ser", width: 50 },
-        { header: "رقم الفئة", name: "price_category_id", width: 150, visible: false },
+        { header: tr("رقم الفئة"), name: "price_category_id", width: 150, visible: false },
         {
-          header: "فئة السعر",
+          header: tr("فئة السعر"),
           name: "price_name",
-          width: 220,
-          editor: (cell: any) => (
-            <select
-              value={cell.row.dataItem.price_name || ""}
-              onChange={(e) => {
-                const newValue = e.target.value;
-                cell.row.dataItem.price_name = newValue;
-                const selectedPrice = definitions.price_category.find((u: any) => u.name === newValue);
-
-                setFormData(prev => {
-                  const updatedPrices = (prev.prices || []).map((row, i) =>
-                    i === cell.row.index
-                      ? { ...row, price_name: newValue, price_category_id: selectedPrice ? selectedPrice.id : 0 }
-                      : row
-                  );
-                  return { ...prev, prices: updatedPrices };
-                });
-              }}
-              className="px-2 py-1 w-full"
-            >
-              {(definitions.price_category || []).map((u: any) => (
-                <option key={u.id} value={u.name}>{u.name}</option>
-              ))}
-            </select>
-          ),
+          width: "*",
+          minWidth: 180,
+          isReadOnly: true,
         },
-        { header: "رقم الوحدة", name: "unit_id", width: 150, visible: false },
         {
-          header: "اسم الوحدة",
+          name: "btnSearchPriceCategory",
+          header: " ",
+          width: 56,
+          buttonBody: "button" as const,
+          align: "center" as const,
+          title: tr("بحث"),
+          iconType: "search",
+          isReadOnly: true,
+          onClick: (e: any, ctx: any) => {
+            setPricesPickerField("category")
+            setPricesPickerRow(Number(ctx.row.dataItem?.ser || 0) - 1)
+            setPricesPickerOpen(true)
+          },
+          visible: true,
+          visibleInColumnChooser: true,
+        },
+        { header: tr("رقم الوحدة"), name: "unit_id", width: 150, visible: false },
+        {
+          header: tr("اسم الوحدة"),
           name: "unit_name",
-          width: 220,
-          editor: (cell: any) => (
-            <select
-              value={cell.row.dataItem.unit_name || ""}
-              onChange={(e) => {
-                const newValue = e.target.value;
-                cell.row.dataItem.unit_name = newValue;
-                const selectedUnit = definitions.units.find((u: any) => u.unit_name === newValue);
-
-                setFormData(prev => {
-                  const updatedPrices = (prev.prices || []).map((row, i) =>
-                    i === cell.row.index
-                      ? { ...row, unit_name: newValue, unit_id: selectedUnit ? selectedUnit.id : 0 }
-                      : row
-                  );
-                  return { ...prev, prices: updatedPrices };
-                });
-              }}
-              className="px-2 py-1 w-full"
-            >
-              {(definitions.units || []).map((u: any) => (
-                <option key={u.id} value={u.unit_name}>{u.unit_name}</option>
-              ))}
-            </select>
-          ),
+          width: "*",
+          minWidth: 150,
+          isReadOnly: true,
         },
-        { header: "السعر شامل الضريبة", name: "price", width: 150 },
-        { header: "رقم العملة", name: "currency_id", width: 150, visible: false },
         {
-          header: "عملة البيع",
-          name: "currency",
+          name: "btnSearchPriceUnit",
+          header: " ",
+          width: 56,
+          buttonBody: "button" as const,
+          align: "center" as const,
+          title: tr("بحث"),
+          iconType: "search",
+          isReadOnly: true,
+          onClick: (e: any, ctx: any) => {
+            setPricesPickerField("unit")
+            setPricesPickerRow(Number(ctx.row.dataItem?.ser || 0) - 1)
+            setPricesPickerOpen(true)
+          },
+          visible: true,
+          visibleInColumnChooser: true,
+        },
+        { header: tr("السعر شامل الضريبة"), name: "price", width: 150 },
+        { header: tr("رقم العملة"), name: "currency_id", width: 150, visible: false },
+        {
+          header: tr("عملة البيع"),
+          name: "currency_name",
           width: 150,
-          editor: (cell: any) => (
-            <select
-              value={cell.row.dataItem.currency_name || ""}
-              onChange={(e) => {
-                const newValue = e.target.value;
-                cell.row.dataItem.currency_name = newValue;
-                const selectedCurrency = definitions.currencies.find((u: any) => u.currency_name === newValue);
-
-                setFormData(prev => {
-                  const updatedPrices = (prev.prices || []).map((row, i) =>
-                    i === cell.row.index
-                      ? { ...row, currency_name: newValue, currency_id: selectedCurrency ? selectedCurrency.id : 0 }
-                      : row
-                  );
-                  return { ...prev, prices: updatedPrices };
-                });
-              }}
-              className="px-2 py-1 w-full"
-            >
-              {(definitions.currencies || []).map((u: any) => (
-                <option key={u.id} value={u.currency_name}>{u.currency_name}</option>
-              ))}
-            </select>
-          ),
+          isReadOnly: true,
+        },
+        {
+          name: "btnSearchPriceCurrency",
+          header: " ",
+          width: 56,
+          buttonBody: "button" as const,
+          align: "center" as const,
+          title: tr("بحث"),
+          iconType: "search",
+          isReadOnly: true,
+          onClick: (e: any, ctx: any) => {
+            setPricesPickerField("currency")
+            setPricesPickerRow(Number(ctx.row.dataItem?.ser || 0) - 1)
+            setPricesPickerOpen(true)
+          },
+          visible: true,
+          visibleInColumnChooser: true,
         },
         {
           header: " ",
           name: "delete",
           width: 80,
           buttonBody: "button" as const,
-          iconType: "trash",
-          onClick: (item: { ser: number }) => handleDeletePrice(item.ser - 1)
+          iconType: "delete",
+          title: tr("حذف"),
+          onClick: (e: any, ctx: any) => handleDeletePrice(Number(ctx.row.dataItem?.ser || 0) - 1)
         }
       ],
     };
@@ -1188,61 +1966,219 @@ export function CompactProductForm({
     name: "warehouseInventory",
     responsiveColumnIndex: 0,
     columns: [
-      { header: "رقم الستودع", name: "store_id", width: 150, visible: false },
+      { header: tr("رقم الستودع"), name: "store_id", width: 150, visible: false },
       {
-        name: "warehouse_id",
-        header: "المستودع",
-        width: 220,
-        editor: (cell: any) => (
-          <select
-            value={cell.row.dataItem.store_name || ""}
-            onChange={(e) => {
-              const newValue = e.target.value;
-              cell.row.dataItem.store_name = newValue;
-              const selectedStore = definitions.warehouses.find((u: any) => u.warehouse_name === newValue);
-              setFormData(prev => {
-                const updatedstores = (prev.stores || []).map((row, i) =>
-                  i === cell.row.index
-                    ? {
-                      ...row,
-                      store_name: newValue,
-                      store_id: selectedStore ? selectedStore.id : 0 // fallback
-                    }
-                    : row
-                );
-
-                return {
-                  ...prev,
-                  stores: updatedstores,
-                };
-              });
-            }}
-            className="px-2 py-1 w-full"
-          >
-            {(definitions.warehouses || []).map((u: any) => (
-              <option key={u.id} value={u.warehouse_name}>
-                {u.warehouse_name}
-              </option>
-            ))}
-          </select>
-        ),
+        name: "store_name",
+        header: tr("المستودع"),
+        width: "*",
+        minWidth: 180,
+        isReadOnly: true,
       },
-      { name: "shelf", header: "الرف", width: 120 },
-      { name: "reorder_quantity", header: "كمية اعادة الطلب", width: 120 },
-      { name: "min_quantity", header: "حد أدنى", width: 120 },
-      { name: "max_quantity", header: "حد أقصى", width: 120 },
+      {
+        name: "btnSearchStore",
+        header: " ",
+        width: 56,
+        buttonBody: "button" as const,
+        align: "center" as const,
+        title: tr("بحث"),
+        iconType: "search",
+        isReadOnly: true,
+        onClick: (e: any, ctx: any) => {
+          setStorePickerRow(Number(ctx.row.dataItem?.ser || 0) - 1)
+          setStorePickerOpen(true)
+        },
+        visible: true,
+        visibleInColumnChooser: true,
+      },
+      { name: "shelf", header: tr("الرف"), width: 120 },
+      { name: "reorder_quantity", header: tr("كمية اعادة الطلب"), width: 120 },
+      { name: "min_quantity", header: tr("حد أدنى"), width: 120 },
+      { name: "max_quantity", header: tr("حد أقصى"), width: 120 },
       {
         name: "actions",
         header: " ",
         buttonBody: "button" as const,
-        iconType: "trash",
+        iconType: "delete",
+        className: "btn-delete",
+        title: tr("حذف"),
         width: 100,
-        onClick: (item: { ser: number }) => handleDeleteStore(item.ser - 1)
+        onClick: (e: any, ctx: any) => handleDeleteStore(Number(ctx.row.dataItem?.ser || 0) - 1)
       }
     ]
   });
+
+  const relatedProductScheme = useMemo(() => ({
+    name: "ProductRelatedItemsScheme",
+    responsiveColumnIndex: 2,
+    columns: [
+      { header: "##", name: "ser", width: 55 },
+      { header: tr("رقم الصنف"), name: "related_code", width: 180, isReadOnly: true },
+      { header: tr("اسم الصنف"), name: "related_name", width: "*", minWidth: 220, isReadOnly: true },
+      { header: tr("اضافة السعر عند الاختيار"), name: "add_price", width: 170, dataType: 3, align: "center" },
+      { header: tr("عدم الطباعة في فواتير المطبخ والمطعم"), name: "no_kitchen_print", width: 240, dataType: 3, align: "center" },
+      // ترويسة فارغة (مسافة) — النص الفارغ يجعل الشبكة تعرض اسم الحقل "delete"
+      { header: " ", name: "delete", width: 80, buttonBody: "button" as const, iconType: "delete", title: tr("حذف"), onClick: (_e: any, ctx: any) => deleteRelatedProduct(Number(ctx.row.dataItem?.ser || 0) - 1) },
+    ],
+  }), [])
+
+  const addRelatedProduct = (product: any) => {
+    const relatedId = Number(product?.id)
+    if (!relatedId || relatedId === Number(formData.id)) {
+      toast.current?.show({ severity: "error", summary: "", detail: tr("لا يمكن إضافة الصنف نفسه ضمن الأصناف التابعة"), life: 3000 })
+      return
+    }
+    if (relatedProducts.some((row) => Number(row.related_id) === relatedId)) {
+      toast.current?.show({ severity: "error", summary: "", detail: tr("الصنف التابع مضاف مسبقاً"), life: 3000 })
+      return
+    }
+    setRelatedProductSearchOpen(false)
+    setRelatedOptionsDraft({ product_id: Number(formData.id), related_id: relatedId, related_code: product.product_code, related_name: product.product_name, add_price: true, no_kitchen_print: false })
+  }
+
+  const confirmRelatedOptions = () => {
+    const draft = relatedOptionsDraft
+    if (!draft) return
+    setRelatedProducts((current) => current.some((row) => Number(row.related_id) === Number(draft.related_id)) ? current : [...current, { ...draft, ser: current.length + 1 }])
+    setRelatedOptionsDraft(null)
+  }
+
+  // تعديل خانتي الخيارات مباشرة في الشبكة
+  const onRelatedCellEditEnded = (grid: wjGrid.FlexGrid, event: wjGrid.CellRangeEventArgs) => {
+    const item = grid.rows[event.row]?.dataItem as RelatedProductItem | undefined
+    if (!item) return
+    setRelatedProducts((current) => current.map((row) => row.ser === item.ser ? { ...row, add_price: item.add_price !== false, no_kitchen_print: item.no_kitchen_print === true } : row))
+  }
+
+  const deleteRelatedProduct = (index: number) => {
+    if (index < 0 || index >= relatedProducts.length) return
+    setRelatedProducts((current) => current.filter((_row, rowIndex) => rowIndex !== index).map((row, rowIndex) => ({ ...row, ser: rowIndex + 1 })))
+    setRelatedProductRow(null)
+  }
+
+  const saveRelatedProducts = async (productId: number) => {
+    const response = await fetch(`/api/inventory/products/${productId}/related-items`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ related_items: relatedProducts.map((row) => ({ related_id: row.related_id, add_price: row.add_price !== false, no_kitchen_print: row.no_kitchen_print === true })) }) })
+    if (!response.ok) { const data = await response.json().catch(() => null); throw new Error(data?.error || tr("فشل حفظ الأصناف التابعة")) }
+  }
+  const calculateManufacturingComponentQuantity = (row: ManufacturingComponentItem) => {
+    if (Number(row.measurment_id || 1) === 1) return Number(row.quantity || 0)
+    return Number(row.length || 0) * Number(row.width || 0) * (Number(row.measurment_id) === 3 ? Number(row.height || 0) : 1) * Number(row.count || 0)
+  }
+
+  // Use one guard for actions that leave or replace the currently edited product.
+  // The pending action is resumed only after Save succeeds, or immediately when
+  // the user chooses No. Back/Cancel clears it and keeps the current form open.
+  const requestAfterUnsavedCheck = (action: () => void) => {
+    if (getFormDataHash(formData) !== initialHash.current) {
+      setNextFunction(() => action)
+      setShowUnsaved(true)
+      popupHasCalled()
+      return
+    }
+    action()
+  }
+  // تبديل الشاشة من القائمة/إغلاق التبويب/رجوع المتصفح/تحديث الصفحة مع تغييرات غير محفوظة ⇐ نفس نافذة
+  // التحقق من التغييرات — كما في كاشير نقطة البيع (lib/navigation-guard.ts)
+  useNavigationGuard(
+    () => Boolean(visible && getFormDataHash(formData) !== initialHash.current),
+    (continueNavigation) => requestAfterUnsavedCheck(continueNavigation),
+  )
+
+  const hasMeasuredComponents = manufacturingComponents.some((row) => Number(row.measurment_id || 1) !== 1)
+  const hasVolumeComponents = manufacturingComponents.some((row) => Number(row.measurment_id) === 3)
+  // الوحدة: DataMap واحد بكل وحدات المكونات، والقائمة المنسدلة لكل سطر تعرض وحدات صنفه فقط
+  const manufacturingUnitsKey = manufacturingComponents.map((row) => (row.units || []).map((unit) => `${unit.unit_id}:${unit.unit_name}`).join(",")).join("|")
+  const manufacturingUnitMap = useMemo(() => {
+    const all = new Map<number, string>()
+    for (const row of manufacturingComponents) for (const unit of row.units || []) all.set(unit.unit_id, unit.unit_name)
+    const map = new wjGrid.DataMap([...all].map(([unit_id, unit_name]) => ({ unit_id, unit_name })), "unit_id", "unit_name")
+    map.getDisplayValues = (dataItem?: any) => (dataItem?.units || []).map((unit: any) => unit.unit_name)
+    return map
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [manufacturingUnitsKey])
+  const manufacturingComponentScheme = useMemo(() => ({
+    name: "ProductManufacturingComponentsScheme",
+    columns: [
+      { header: "##", name: "ser", width: 55 },
+      { header: tr("رقم الصنف"), name: "component_code", width: 180, isReadOnly: true },
+      { header: tr("اسم الصنف"), name: "component_name", width: "*", minWidth: 220, isReadOnly: true },
+      { header: tr("الطول"), name: "length", width: 110, dataType: "Number", visible: hasMeasuredComponents },
+      { header: tr("العرض"), name: "width", width: 110, dataType: "Number", visible: hasMeasuredComponents },
+      { header: tr("الارتفاع"), name: "height", width: 110, dataType: "Number", visible: hasVolumeComponents },
+      { header: tr("العدد"), name: "count", width: 110, dataType: "Number", visible: hasMeasuredComponents },
+      { header: tr("الوحدة"), name: "unit_id", width: 140, dataMap: manufacturingUnitMap },
+      { header: tr("الكمية المطلوبة"), name: "quantity", width: 150, isReadOnly: false },
+      { header: " ", name: "delete", width: 80, buttonBody: "button" as const, iconType: "delete", title: tr("حذف"), onClick: (_e: any, ctx: any) => deleteManufacturingComponent(Number(ctx.row.dataItem?.ser || 0) - 1) },
+    ],
+  }), [hasMeasuredComponents, hasVolumeComponents, manufacturingUnitMap])
+  const manufacturingComponentBeginningEdit = (grid: wjGrid.FlexGrid, event: wjGrid.CellRangeEventArgs) => {
+    const row = grid.rows[event.row]?.dataItem as ManufacturingComponentItem | undefined
+    const column = grid.columns[event.col]?.name
+    if (row && column === "quantity" && Number(row.measurment_id || 1) !== 1) event.cancel = true
+    if (row && ["length", "width", "height", "count"].includes(column || "") && Number(row.measurment_id || 1) === 1) event.cancel = true
+    if (row && column === "height" && Number(row.measurment_id) !== 3) event.cancel = true
+    // أصناف القياس كميتها محسوبة بوحدتها الرئيسية من الأبعاد
+    if (row && column === "unit_id" && (Number(row.measurment_id || 1) !== 1 || (row.units || []).length < 2)) event.cancel = true
+  }
+  const manufacturingComponentCellEditEnded = (grid: wjGrid.FlexGrid, event: wjGrid.CellRangeEventArgs) => {
+    const column = grid.columns[event.col]?.name
+    if (!["length", "width", "height", "count"].includes(column || "")) return
+    const edited = grid.rows[event.row]?.dataItem as ManufacturingComponentItem | undefined
+    if (!edited || Number(edited.measurment_id || 1) === 1) return
+    edited.quantity = calculateManufacturingComponentQuantity(edited)
+    setManufacturingComponents((current) => current.map((row, index) => index === event.row ? { ...edited } : row))
+  }
+  const addManufacturingComponent = (product: any) => {
+    const componentId = Number(product?.id)
+    if (!componentId || componentId === Number(formData.id)) {
+      toast.current?.show({ severity: "error", summary: "", detail: tr("لا يمكن إضافة الصنف نفسه كمكون تصنيع"), life: 3000 })
+      return
+    }
+    if (manufacturingComponents.some((row) => Number(row.component_id) === componentId)) {
+      toast.current?.show({ severity: "error", summary: "", detail: tr("مكون التصنيع مكرر"), life: 3000 })
+      return
+    }
+    // Manufacturing components reference the base product itself, not a temporary
+    // attribute choice made in ProductSearchPopup (for example "النوع: MDF").
+    const componentName = String(product.base_product_name || product.product_name || "").replace(/\s*\([^)]*\)\s*$/, "").trim()
+    const measurmentId = Number(product.measurment_id || 1)
+    setManufacturingComponents((current) => [...current, { product_id: Number(formData.id), component_id: componentId, component_code: product.product_code, component_name: componentName, measurment_id: measurmentId, length: measurmentId === 1 ? null : 1, width: measurmentId === 1 ? null : 1, height: measurmentId === 3 ? 1 : null, count: measurmentId === 1 ? null : 1, quantity: 1, ser: current.length + 1 }])
+    setManufacturingComponentSearchOpen(false)
+    // وحدات المكوّن (للقائمة المنسدلة) — الرئيسية افتراضياً
+    fetch(`/api/inventory/products/${formData.id}/manufacturing-components`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ codes: [product.product_code] }) })
+      .then((response) => response.ok ? response.json() : [])
+      .then((rows: any[]) => {
+        const found = rows.find((row) => Number(row.id) === componentId)
+        if (!found) return
+        setManufacturingComponents((current) => current.map((row) => Number(row.component_id) === componentId && !row.units?.length ? { ...row, units: found.units, unit_id: found.units[0]?.unit_id ?? null } : row))
+      })
+      .catch(() => {})
+  }
+  // استيراد Excel: المكوّن الموجود تُستبدل وحدته وكميته، والجديد يُضاف في آخر الجدول
+  const importManufacturingComponents = (lines: ImportedComponentLine[]) => {
+    setManufacturingComponents((current) => {
+      const next = [...current]
+      for (const { product, unit, quantity } of lines) {
+        const measured = Number(product.measurment_id || 1) !== 1
+        const values = { component_code: product.product_code, component_name: product.product_name, measurment_id: product.measurment_id, units: product.units, unit_id: measured ? product.units[0]?.unit_id ?? null : unit?.unit_id ?? null, quantity, length: measured ? 1 : null, width: measured ? 1 : null, height: Number(product.measurment_id) === 3 ? 1 : null, count: measured ? quantity : null }
+        const index = next.findIndex((row) => Number(row.component_id) === product.id)
+        if (index >= 0) next[index] = { ...next[index], ...values }
+        else next.push({ product_id: Number(formData.id), component_id: product.id, ...values, ser: next.length + 1 })
+      }
+      return next.map((row, index) => ({ ...row, ser: index + 1 }))
+    })
+  }
+  const deleteManufacturingComponent = (index: number) => setManufacturingComponents((current) => current.filter((_row, rowIndex) => rowIndex !== index).map((row, rowIndex) => ({ ...row, ser: rowIndex + 1 })))
+  const saveManufacturingComponents = async (productId: number) => {
+    const response = await fetch(`/api/inventory/products/${productId}/manufacturing-components`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ components: manufacturingComponents.map((row) => ({ component_id: row.component_id, quantity: calculateManufacturingComponentQuantity(row), unit_id: row.unit_id, length: row.length, width: row.width, height: row.height, count: row.count })) }) })
+    if (!response.ok) { const data = await response.json().catch(() => null); throw new Error(data?.error || tr("فشل حفظ مكونات التصنيع")) }
+  }
   const searchProductByCode = async (code: string) => {
+    if (!canView) return
     if (!code || code.length === 0) return
+    // الرقم لم يتغيّر (رقم السجل المعروض أو الرقم المولَّد للجديد) ⇐ لا بحث: كانت مغادرة حقل الرقم تعيد
+    // تحميل نفس السجل بلا فحص التغييرات فتُفقَد التعديلات غير المحفوظة بصمت
+    if (code.trim().toUpperCase() === String(baselineCodeRef.current || "").trim().toUpperCase()) return
+    const restoreCode = () => setFormData((prev) => ({ ...prev, product_code: baselineCodeRef.current }))
 
     try {
       setIsSearching(true)
@@ -1252,6 +2188,35 @@ export function CompactProductForm({
       if (response.ok) {
         const product = await response.json()
         if (product && product.id) {
+          const isProductServiceType = Number(product.type) === 2
+          if (isService && !isProductServiceType) {
+            toast.current?.show({
+              severity: 'error',
+              summary: tr("خطأ"),
+              detail: tr("الرقم المدخل رقم صنف لا يمكن عرض تفاصيله"),
+              life: 2500,
+            })
+            restoreCode()
+            return
+          }
+          if (!isService && isProductServiceType) {
+            toast.current?.show({
+              severity: 'error',
+              summary: tr("خطأ"),
+              detail: tr("الرقم المدخل رقم خدمة لا يمكن عرض التفاصيل"),
+              life: 2500,
+            })
+            restoreCode()
+            return
+          }
+
+          // Use the single navigation loader for every existing product. The old
+          // code below rebuilt only part of the form from the code-search response,
+          // racing with ProductCodeInput's Byid request and sometimes replacing
+          // prices/navigation state with an incomplete product snapshot.
+          // مع فحص التغييرات غير المحفوظة (نافذة "تم تعديل السجل هل تريد الحفظ؟")
+          await loadData("Byid", Number(product.id), true)
+          return
 
           const unitsWithNames = (product.units ?? []).map((unit: any) => {
             const unitDef = definitions.units.find((u: any) => u.id === unit.unit_id);
@@ -1275,12 +2240,20 @@ export function CompactProductForm({
           });
 
           const costCenterRows = buildCostCenterRows(product.cost_centers ?? [], definitionsRef.current.cost_center_types, definitionsRef.current.cost_centers);
+          const brandRows = buildBrandRows(product.product_brands ?? [], definitionsRef.current.brand_types, definitionsRef.current.brands);
 
           setFormData({
             ...product,
+            product_type: Number(product.product_type ?? 1) || 1,
             units: unitsWithNames,
             prices: pricesWithNames,
             cost_centers: costCenterRows,
+            product_brands: brandRows,
+            notes: product.notes ?? "",
+            transaction_notes: product.transaction_notes ?? "",
+            original_numbers: Array.isArray(product.original_numbers) ? product.original_numbers : [],
+            factory_numbers: Array.isArray(product.factory_numbers) ? product.factory_numbers : [],
+            branch_ids: Array.isArray(product.branch_ids) ? product.branch_ids : [],
 
           });
           setCurrentProductId(product.id);
@@ -1288,14 +2261,15 @@ export function CompactProductForm({
       } else if (response.status === 403) {
         toast.current?.show({
           severity: 'error',
-          summary: 'خطأ',
-          detail: 'الصنف محذوف لا يمكن عرض بياناته',
+          summary: tr("خطأ"),
+          detail: tr("الصنف محذوف لا يمكن عرض بياناته"),
           life: 1500
         });
         reset_fields()
       }
       else if (response.status === 404) {
-        reset_fields(1, code)
+        // رقم جديد على سجل محفوظ ⇐ سجل جديد بهذا الرقم (بعد فحص التغييرات)؛ على سجل جديد يبقى ما أُدخل كما هو
+        if (currentProductId > 0) requestAfterUnsavedCheck(() => { void reset_fields(1, code) })
       }
     } catch (error) {
       console.error("Error searching for product:", error)
@@ -1306,10 +2280,10 @@ export function CompactProductForm({
 
   const handleProductCodeChange = (value: string) => {
     // تنظيف القيمة للسماح بالأرقام والحروف الإنجليزية فقط
-    const cleanValue = value.replace(/[^A-Za-z0-9]/g, "").slice(0, 8)
+    const cleanValue = value.replace(/[^A-Za-z0-9]/g, "").slice(0, 10)
 
     if (cleanValue !== value) {
-      setProductCodeError("يُسمح بالأرقام والحروف الإنجليزية فقط (حد أقصى 8 خانات)")
+      setProductCodeError(tr("يُسمح بالأرقام والحروف الإنجليزية فقط (حد أقصى 10 خانات)"))
     } else {
       setProductCodeError("")
     }
@@ -1317,11 +2291,10 @@ export function CompactProductForm({
     updateFormData("product_code", cleanValue)
   }
 
-  const handleProductCodeBlur = () => {
-    //if (formData.product_code && validateProductCode(formData.product_code)) {
-    formData.product_code = adjustCode(formData.product_code)
-    searchProductByCode(formData.product_code)
-    // }
+  const handleProductCodeBlur = async () => {
+    const adjustedCode = adjustCode(formData.product_code)
+    updateFormData("product_code", adjustedCode)
+    await searchProductByCode(adjustedCode)
   }
 
   const buildCostCenterRows = (assignedRows: any[] = [], types: any[] = [], centers: any[] = []) => {
@@ -1329,7 +2302,7 @@ export function CompactProductForm({
       const assignment = (assignedRows || []).find((row: any) => Number(row?.cost_center_type_id) === Number(type.id))
       const selectedId = assignment?.default_cost_center_id != null ? Number(assignment.default_cost_center_id) : null
       const requiredValue = Number(assignment?.required_in_transactions ?? 1)
-      const requiredLabel = costCenterStatusOptions.find((option) => option.value === requiredValue)?.label || "اختياري"
+      const requiredLabel = costCenterStatusOptions.find((option) => option.value === requiredValue)?.label || tr("اختياري")
       return {
         id: assignment?.id ?? 0,
         product_id: assignment?.product_id ?? 0,
@@ -1353,12 +2326,62 @@ export function CompactProductForm({
     })
   }
 
+  // نفس منطق buildCostCenterRows أعلاه تماماً لكن للعلامات التجارية — صف واحد لكل نوع علامة تجارية
+  // (brand_types)، مع إسناد اختياري لعلامة تجارية (brands) محدَّدة من نفس النوع.
+  const buildBrandRows = (assignedRows: any[] = [], types: any[] = [], brandsList: any[] = []) => {
+    return (types || []).map((type: any) => {
+      const assignment = (assignedRows || []).find((row: any) => Number(row?.brand_type_id) === Number(type.id))
+      const selectedId = assignment?.brand_id != null ? Number(assignment.brand_id) : null
+      const requiredValue = Number(assignment?.required_in_transactions ?? 1)
+      const requiredLabel = costCenterStatusOptions.find((option) => option.value === requiredValue)?.label || tr("اختياري")
+      return {
+        id: assignment?.id ?? 0,
+        product_id: assignment?.product_id ?? 0,
+        brand_type_id: Number(type.id),
+        brand_type_name: type.name || "",
+        required_in_transactions: requiredValue,
+        required_label: requiredLabel,
+        brand_id: selectedId,
+        brand_name: selectedId != null
+          ? brandsList.find((brand: any) => Number(brand.id) === selectedId)?.name || ""
+          : "",
+      }
+    })
+  }
+
+  const updateBrandRow = (index: number, field: string, value: any) => {
+    setFormData((prev) => {
+      const rows = [...(prev.product_brands ?? [])]
+      rows[index] = { ...rows[index], [field]: value }
+      return { ...prev, product_brands: rows }
+    })
+  }
+
   const fetchDefinitions = async () => {
     try {
       const definitionsObj: any = {}
+      let failedRequests = 0
+      const startFetch = async (url: string): Promise<Response> => {
+        try {
+          return await fetch(url)
+        } catch (error) {
+          failedRequests += 1
+          console.warn(`Unable to load product definition ${url}:`, error)
+          return new Response(null, { status: 503, statusText: "Network request failed" })
+        }
+      }
+      // كل التعريفات تُطلب معاً من البداية (كانت تُطلب واحداً تلو الآخر: 14 رحلة متتالية للخادم — بطيء جداً
+      // مع خادم بعيد). المعالجة أدناه تبقى بنفس الترتيب تماماً؛ كل خطوة تنتظر طلبها الذي بدأ مسبقاً.
+      const definitionUrls = [
+        "/api/item-groups", "/api/suppliers", "/api/warehouses", "/api/units", "/api/exchange-rates",
+        "/api/pricecategory", "/api/measurment-types", "/api/branches", "/api/tax-classifications",
+        "/api/product-categories", "/api/cost-center-types", "/api/cost-centers", "/api/brand-types", "/api/brands",
+      ]
+      const startedFetches = new Map(definitionUrls.map((url) => [url, startFetch(url)] as const))
+      const fetchDefinition = (url: string): Promise<Response> => startedFetches.get(url) ?? startFetch(url)
 
       // Categories
-      const categoriesResponse = await fetch("/api/item-groups")
+      const categoriesResponse = await fetchDefinition("/api/item-groups")
       if (categoriesResponse.ok) {
         const categoriesData = await categoriesResponse.json()
         definitionsObj.categoriesData = categoriesData
@@ -1367,7 +2390,7 @@ export function CompactProductForm({
       }
 
       // Suppliers
-      const suppliersResponse = await fetch("/api/suppliers")
+      const suppliersResponse = await fetchDefinition("/api/suppliers")
       if (suppliersResponse.ok) {
         const suppliersData = await suppliersResponse.json()
         definitionsObj.suppliersData = suppliersData
@@ -1375,7 +2398,7 @@ export function CompactProductForm({
       }
 
       // Warehouses
-      const warehousesResponse = await fetch("/api/warehouses")
+      const warehousesResponse = await fetchDefinition("/api/warehouses")
       if (warehousesResponse.ok) {
         const warehousesData = await warehousesResponse.json()
         definitionsObj.warehousesData = warehousesData
@@ -1384,7 +2407,7 @@ export function CompactProductForm({
       }
 
       // Units
-      const unitsResponse = await fetch("/api/units")
+      const unitsResponse = await fetchDefinition("/api/units")
       if (unitsResponse.ok) {
         const unitsData = await unitsResponse.json()
         definitionsObj.unitsData = unitsData
@@ -1393,16 +2416,20 @@ export function CompactProductForm({
       }
 
       // Currencies
-      const currenciesResponse = await fetch("/api/exchange-rates")
+      const currenciesResponse = await fetchDefinition("/api/exchange-rates")
       if (currenciesResponse.ok) {
         const currenciesData = await currenciesResponse.json()
-        definitionsObj.currenciesData = currenciesData.rates
-        definitionsRef.current.currencies = currenciesData.rates
-        setDefinitions((prev) => ({ ...prev, currencies: currenciesData.rates }))
+        // The response id belongs to exchange_rates; product_prices references currency.id.
+        const currencies = (currenciesData.rates || [])
+          .map((currency: any) => ({ ...currency, id: Number(currency.currency_id) }))
+          .filter((currency: any) => Number.isInteger(currency.id) && currency.id > 0)
+        definitionsObj.currenciesData = currencies
+        definitionsRef.current.currencies = currencies
+        setDefinitions((prev) => ({ ...prev, currencies }))
       }
 
       // Price categories
-      const pricesResponse = await fetch("/api/pricecategory")
+      const pricesResponse = await fetchDefinition("/api/pricecategory")
       if (pricesResponse.ok) {
         const pricesData = await pricesResponse.json()
         definitionsObj.pricesData = pricesData
@@ -1410,7 +2437,45 @@ export function CompactProductForm({
         setDefinitions((prev) => ({ ...prev, price_category: pricesData }))
       }
 
-      const productCategoryResponse = await fetch("/api/product-categories")
+      // Measurment types (نوع القياس)
+      const measurmentTypesResponse = await fetchDefinition("/api/measurment-types")
+      if (measurmentTypesResponse.ok) {
+        const measurmentTypesData = await measurmentTypesResponse.json()
+        definitionsObj.measurmentTypesData = measurmentTypesData
+        definitionsRef.current.measurment_types = measurmentTypesData
+        setDefinitions((prev) => ({ ...prev, measurment_types: measurmentTypesData }))
+      }
+
+      // فروع تقييد ظهور الصنف بالبحث (اختياري — انظر حقل "الفروع" أدناه بتبويب "عام")
+      try {
+        const branchesResp = await fetchDefinition("/api/branches")
+        if (branchesResp.ok) {
+          const branchesData = await branchesResp.json()
+          const list = Array.isArray(branchesData) ? branchesData : []
+          definitionsObj.branches = list
+          definitionsRef.current.branches = list
+          setDefinitions((prev) => ({ ...prev, branches: list }))
+        }
+      } catch (e) {
+        console.warn("Failed to load branches", e)
+      }
+
+      // Tax classifications
+      try {
+        const taxResp = await fetchDefinition("/api/tax-classifications")
+        if (taxResp.ok) {
+          const taxData = await taxResp.json()
+          // endpoint returns { categories }
+          const list = taxData.categories || taxData || []
+          definitionsObj.tax_classifications = list
+          definitionsRef.current.tax_classifications = list
+          setDefinitions((prev) => ({ ...prev, tax_classifications: list }))
+        }
+      } catch (e) {
+        console.warn("Failed to load tax classifications", e)
+      }
+
+      const productCategoryResponse = await fetchDefinition("/api/product-categories")
       if (productCategoryResponse.ok) {
         const productCategory = await productCategoryResponse.json()
         definitionsObj.product_category = productCategory
@@ -1418,16 +2483,19 @@ export function CompactProductForm({
         setDefinitions((prev) => ({ ...prev, product_category: productCategory.categories }))
       }
 
-      const costCenterTypeResponse = await fetch("/api/cost-center-types")
+      const costCenterTypeResponse = await fetchDefinition("/api/cost-center-types")
       if (costCenterTypeResponse.ok) {
-        const costCenterTypesData = await costCenterTypeResponse.json()
+        const costCenterTypesData = (await costCenterTypeResponse.json()) as Array<{ id: number; name: string }>
+        // مطابقاً لِـunified-accounts-refactored.tsx: ترتيب تصاعدي حسب الرقم — الاستجابة الخام غير
+        // مُرتَّبة بالضرورة.
+        costCenterTypesData.sort((a, b) => (a.id || 0) - (b.id || 0))
         definitionsObj.costCenterTypes = costCenterTypesData
         definitionsRef.current.cost_center_types = costCenterTypesData
         setCostCenterTypes(costCenterTypesData)
         setDefinitions((prev) => ({ ...prev, cost_center_types: costCenterTypesData }))
       }
 
-      const costCentersResponse = await fetch("/api/cost-centers")
+      const costCentersResponse = await fetchDefinition("/api/cost-centers")
       if (costCentersResponse.ok) {
         const costCentersData = await costCentersResponse.json()
         definitionsObj.costCenters = costCentersData
@@ -1435,9 +2503,36 @@ export function CompactProductForm({
         setCostCenters(costCentersData)
         setDefinitions((prev) => ({ ...prev, cost_centers: costCentersData }))
       }
+
+      const brandTypesResponse = await fetchDefinition("/api/brand-types")
+      if (brandTypesResponse.ok) {
+        const brandTypesData = (await brandTypesResponse.json()) as Array<{ id: number; name: string }>
+        brandTypesData.sort((a, b) => (a.id || 0) - (b.id || 0))
+        definitionsObj.brandTypes = brandTypesData
+        definitionsRef.current.brand_types = brandTypesData
+        setBrandTypes(brandTypesData)
+        setDefinitions((prev) => ({ ...prev, brand_types: brandTypesData }))
+      }
+
+      const brandsResponse = await fetchDefinition("/api/brands")
+      if (brandsResponse.ok) {
+        const brandsData = await brandsResponse.json()
+        definitionsObj.brands = brandsData
+        definitionsRef.current.brands = brandsData
+        setBrands(brandsData)
+        setDefinitions((prev) => ({ ...prev, brands: brandsData }))
+      }
+      if (failedRequests > 0) {
+        toast.current?.show({
+          severity: "warn",
+          summary: tr("اتصال غير مستقر"),
+          detail: tr("تعذر تحميل بعض تعريفات الأصناف. يمكنك متابعة العمل أو إعادة المحاولة."),
+          life: 4000,
+        })
+      }
       return definitionsObj
     } catch (error) {
-      console.error("Error fetching definitions:", error)
+      console.warn("Error fetching product definitions:", error)
       return {}
     }
   }
@@ -1453,48 +2548,55 @@ export function CompactProductForm({
   }
 
   const costCenterStatusOptions = [
-    { label: "اختياري", value: 1 },
-    { label: "إجباري", value: 2 },
-    { label: "ممنوع", value: 3 },
+    { label: tr("اختياري"), value: 1 },
+    { label: tr("إجباري"), value: 2 },
+    { label: tr("ممنوع"), value: 3 },
   ]
+
+  // ترتيب ثابت بلا إعادة فرز حسب القيمة المُختارة حالياً — النسخة السابقة كانت تُعيد بناء المصفوفة
+  // (بمرجع جديد) وتُقدِّم العنصر المُختار لأول القائمة في كل عرض، ما كان يُربك حالة Dropdown
+  // الداخلية (فتح/تحديد) ويمنع فعلياً تغيير الخيار عند الضغط على عنصر آخر.
+  const defaultStoreOptions = useMemo(
+    () => [
+      { label: tr("بلا تحديد"), value: null as number | null },
+      ...(definitions.warehouses || []).map((warehouse: any) => ({
+        label: warehouse.warehouse_name,
+        value: Number(warehouse.id),
+      })),
+    ],
+    [definitions.warehouses],
+  )
 
   const costCenterScheme = useMemo(() => ({
     name: "ProductCostCenterScheme",
     columns: [
-      { header: "نوع مركز التكلفة", name: "cost_center_type_name", width: 220, minWidth: 180, isReadOnly: true },
+      { header: tr("نوع مركز التكلفة"), name: "cost_center_type_name", width: '*', minWidth: 100, isReadOnly: true },
       {
-        header: "الحالة",
+        header: tr("الحالة"),
         name: "required_label",
         width: 140,
         minWidth: 120,
-        editor: (cell: any) => {
-          const editorHost = document.createElement("div")
-          const select = document.createElement("select")
-          select.className = "w-full rounded border border-input bg-background px-2 py-1 text-sm"
-          select.value = String(cell.row.dataItem.required_in_transactions ?? 1)
-
-          costCenterStatusOptions.forEach((option) => {
-            const optionEl = document.createElement("option")
-            optionEl.value = String(option.value)
-            optionEl.textContent = option.label
-            select.appendChild(optionEl)
-          })
-
-          select.onchange = (event) => {
-            const nextValue = Number((event.target as HTMLSelectElement).value || 1)
-            const nextLabel = costCenterStatusOptions.find((option) => option.value === nextValue)?.label || "اختياري"
-            cell.row.dataItem.required_in_transactions = nextValue
-            cell.row.dataItem.required_label = nextLabel
-            updateCostCenterRow(cell.row.index, "required_in_transactions", nextValue)
-            updateCostCenterRow(cell.row.index, "required_label", nextLabel)
-          }
-
-          editorHost.appendChild(select)
-          return editorHost
-        },
+        isReadOnly: true,
       },
       {
-        header: "مركز التكلفة",
+        name: "btnStatus",
+        header: " ",
+        width: 56,
+        buttonBody: "button" as const,
+        align: "center" as const,
+        title: tr("تغيير الحالة"),
+        iconType: "edit",
+        className: "btn-status",
+        isReadOnly: true,
+        onClick: (e: any, ctx: any) => {
+          setStatusPickerRow(ctx.row.index)
+          setStatusPickerOpen(true)
+        },
+        visible: true,
+        visibleInColumnChooser: true,
+      },
+      {
+        header: tr("مركز التكلفة"),
         name: "cost_center_name",
         width: 260,
         minWidth: 220,
@@ -1504,18 +2606,16 @@ export function CompactProductForm({
         name: "btnSearch",
         header: " ",
         width: 56,
-        buttonBody: "button",
-        align: "center",
-        title: "بحث",
+        buttonBody: "button" as const,
+        align: "center" as const,
+        title: tr("بحث"),
         iconType: "search",
         className: "btn-search",
         isReadOnly: true,
         onClick: (e: any, ctx: any) => {
-          e.stopPropagation()
-          const rowIndex = ctx.row.index
-          const row = formData.cost_centers?.[rowIndex]
+          const row = ctx.row.dataItem
           if (!row) return
-          setSelectedCostCenterRowIndex(rowIndex)
+          setSelectedCostCenterRowIndex(ctx.row.index)
           setSelectedCostCenterType({ id: Number(row.cost_center_type_id), name: row.cost_center_type_name || "" })
           setCostCenterSearchOpen(true)
         },
@@ -1526,18 +2626,16 @@ export function CompactProductForm({
         name: "btnDelete",
         header: " ",
         width: 56,
-        buttonBody: "button",
-        align: "center",
-        title: "حذف",
+        buttonBody: "button" as const,
+        align: "center" as const,
+        title: tr("حذف"),
         iconType: "delete",
         className: "btn-delete",
         isReadOnly: true,
         onClick: (e: any, ctx: any) => {
-          e.stopPropagation()
           const rowIndex = ctx.row.index
           updateCostCenterRow(rowIndex, "default_cost_center_id", null)
           updateCostCenterRow(rowIndex, "cost_center_name", "")
-          updateCostCenterRow(rowIndex, "required_label", costCenterStatusOptions.find((option) => option.value === (formData.cost_centers?.[rowIndex]?.required_in_transactions ?? 1))?.label || "اختياري")
         },
         visible: true,
         visibleInColumnChooser: true,
@@ -1545,41 +2643,130 @@ export function CompactProductForm({
     ],
   }), [costCenterStatusOptions, formData.cost_centers])
 
+  // نفس نمط costCenterScheme أعلاه تماماً لكن للعلامات التجارية
+  const brandScheme = useMemo(() => ({
+    name: "ProductBrandScheme",
+    columns: [
+      { header: tr("نوع العلامة التجارية"), name: "brand_type_name", width: '*', minWidth: 100, isReadOnly: true },
+      {
+        header: tr("العلامة التجارية"),
+        name: "brand_name",
+        width: 260,
+        minWidth: 220,
+        isReadOnly: true,
+      },
+      {
+        name: "btnSearch",
+        header: " ",
+        width: 56,
+        buttonBody: "button" as const,
+        align: "center" as const,
+        title: tr("بحث"),
+        iconType: "search",
+        className: "btn-search",
+        isReadOnly: true,
+        onClick: (e: any, ctx: any) => {
+          const row = ctx.row.dataItem
+          if (!row) return
+          setSelectedBrandRowIndex(ctx.row.index)
+          setSelectedBrandType({ id: Number(row.brand_type_id), name: row.brand_type_name || "" })
+          setBrandSearchOpen(true)
+        },
+        visible: true,
+        visibleInColumnChooser: true,
+      },
+      {
+        name: "btnDelete",
+        header: " ",
+        width: 56,
+        buttonBody: "button" as const,
+        align: "center" as const,
+        title: tr("حذف"),
+        iconType: "delete",
+        className: "btn-delete",
+        isReadOnly: true,
+        onClick: (e: any, ctx: any) => {
+          const rowIndex = ctx.row.index
+          updateBrandRow(rowIndex, "brand_id", null)
+          updateBrandRow(rowIndex, "brand_name", "")
+        },
+        visible: true,
+        visibleInColumnChooser: true,
+      },
+    ],
+  }), [formData.product_brands])
+
   return (
-    <div className="h-screen flex flex-col bg-background overflow-hidden text-lg" dir="rtl">
-      {/* Universal Toolbar - Fixed at top */}
-      <div className="flex-shrink-0">
+    <div className={`h-full ${isService ? "min-h-0 text-sm compact-service-form-root" : "min-h-[70vh] text-lg"} min-w-0 flex flex-col overflow-hidden compact-product-form-root`} dir={appDir()}>
+      {/* Keep the toolbar flush with the dialog, matching the sales-delivery form. */}
+      <div className="relative flex flex-shrink-0 items-center" dir={appDir()}>
+        <button
+          type="button"
+          onClick={() => requestAfterUnsavedCheck(() => onHideDialog(true))}
+          aria-label={tr("إغلاق")}
+          className="absolute end-[14px] top-[10px] z-50 inline-flex h-10 w-10 items-center justify-center rounded-full border border-rose-300/60 bg-rose-50 text-rose-600 shadow-lg transition-colors hover:bg-rose-100 focus:outline-none focus:ring-2 focus:ring-rose-400 focus:ring-offset-2"
+        >
+          <X className="h-4 w-4" />
+          <span className="sr-only">{tr("إغلاق")}</span>
+        </button>
         <UniversalToolbar
-          currentRecord={1}
-          totalRecords={1}
+          fileFamily={isService ? "services" : "items"}
+          currentRecord={currentProductId > 0 ? recordPosition : recordTotal + 1}
+          totalRecords={currentProductId > 0 ? recordTotal : recordTotal + 1}
           onFirst={async () => { await loadData('first') }}
-          onPrevious={async () => { await loadData('previous') }}
-          onNext={async () => { await loadData('next') }}
+          onPrevious={async () => { await loadData(currentProductId > 0 ? 'previous' : 'last') }}
+          onNext={async () => { await loadData(currentProductId > 0 ? 'next' : 'first') }}
           onLast={async () => { await loadData('last') }}
           onNew={() => onNew(true)}
           onSave={() => { handleSaveProduct(); }}
           onDelete={() => { handleDeleteClick(true) }}
-          onReport={() => undefined}
-          onExportExcel={() => undefined}
-          onPrint={() => console.log("Print product")}
-          isLoading={isSearching}
+          isLoading={loading || isSearching}
           isSaving={isSubmitting}
-          canSave={true}
-          canDelete={currentProductId > 0}
-          isFirstRecord={true}
-          isLastRecord={true}
+          canSave={currentProductId > 0 ? canUpdate : canCreate}
+          canDelete={currentProductId > 0 && canDelete}
+          isFirstRecord={currentProductId > 0 ? recordPosition <= 1 : recordTotal === 0}
+          isLastRecord={currentProductId > 0 ? recordPosition >= recordTotal : recordTotal === 0}
+          isNewRecord={currentProductId === 0}
         />
       </div>
+      <Messages innerRef={messagesRef} />
+      {/* useAppDialog: نوافذ التأكيد من نفس نظام نافذة الصنف (Radix) — نافذة PrimeReact خارجها كانت تُعرض
+          فوق نافذة صنف "modal" لا تسمح بالنقر/التركيز خارجها، فيتجمّد النظام حتى تحديث الصفحة */}
       <ConfirmDialogYesNo
+        useAppDialog
+        title={tr("حذف الصنف")}
         visible={showConfirm}
         onConfirm={confirmDelete}
         onCancel={() => { setShowConfirm(false); popupHasClosed() }}
-        message="هل تريد حذف هذا الصنف؟"
+        message={tr("هل تريد حذف هذا الصنف؟")}
       />
 
       <ConfirmDialogYesNo
+        useAppDialog
+        visible={copyAccountField !== null}
+        title={tr("تأكيد نسخ الحساب")}
+        message={copyAccountField && Number(formData[copyAccountField]) > 0
+          ? tr("سيتم نسخ {0} المحدد إلى جميع الأصناف التالية لهذا الصنف (غير المحذوفة). هل تريد المتابعة؟", PRODUCT_ACCOUNT_FIELDS.find(({ field }) => field === copyAccountField)?.label || "الحساب")
+          : tr("{0} فارغ: سيتم تفريغه في جميع الأصناف التالية لهذا الصنف (غير المحذوفة). هل تريد المتابعة؟", PRODUCT_ACCOUNT_FIELDS.find(({ field }) => field === copyAccountField)?.label || "الحساب")}
+        confirmLabel={tr("نسخ إلى جميع الأصناف")}
+        busy={copyAccountBusy}
+        onConfirm={() => void copySelectedAccountToAllItems()}
+        onCancel={() => setCopyAccountField(null)}
+      />
+
+      <ConfirmDialogYesNo
+        useAppDialog
+        title={tr("تغييرات غير محفوظة")}
+        onDismiss={() => { setShowUnsaved(false); setNextFunction(null); popupHasClosed(); }}
         visible={showUnsaved}
-        onConfirm={() => { setShowUnsaved(false); handleSaveProduct() }}
+        onConfirm={async () => {
+          const requestedAction = nextFunction
+          setShowUnsaved(false)
+          const saved = await handleSaveProduct()
+          popupHasClosed()
+          if (saved && requestedAction) requestedAction()
+          if (saved) setNextFunction(null)
+        }}
         onCancel={async () => {
           setShowUnsaved(false); popupHasClosed();
           if (nextFunction) {
@@ -1588,152 +2775,213 @@ export function CompactProductForm({
 
           }
         }}
-        message="تم تعديل السجل هل تريد الحفظ؟"
-        onBack={() => { setShowUnsaved(false); popupHasClosed(); }}
+        message={tr("تم تعديل السجل هل تريد الحفظ؟")}
+        onBack={() => { setShowUnsaved(false); setNextFunction(null); popupHasClosed(); }}
         showBack={true}
       />
 
       <Toast ref={toast} position="top-left" className="custom-toast" />
       <ProgressSpinner loading={loading} />
-      <div className="flex-1 overflow-y-auto overflow-x-hidden">
-        <div className="mx-auto w-full max-w-7xl space-y-4 p-3 pb-8 sm:space-y-6 sm:p-4 sm:pb-10 lg:p-6 lg:pb-12">
+      <div ref={formRootRef} className={`flex-1 overflow-y-auto overflow-x-hidden min-h-0 ${isService ? "compact-service-form-scroll" : ""}`}>
+        <div className={`mx-auto w-full max-w-full ${isService ? "space-y-2 p-2 pb-3 sm:space-y-3 sm:p-3" : "space-y-4 p-2 pb-8 sm:space-y-6 sm:p-4 sm:pb-10 lg:p-6 lg:pb-12"}`}>
           {/* Header */}
-          <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
             <div>
               <h1 className="text-xl font-bold text-foreground flex items-center gap-3 sm:text-2xl">
                 <Package className="h-7 w-7 text-primary" />
-                {isService ? (editingProduct ? "تعديل خدمة" : "خدمة جديدة") : (editingProduct ? "تعديل صنف" : "صنف جديد")}
+                {isService ? (editingProduct ? tr("تعديل خدمة") : tr("خدمة جديدة")) : (editingProduct ? tr("تعديل صنف") : tr("صنف جديد"))}
               </h1>
             </div>
           </div>
 
-          <form onSubmit={handleSubmit} className="space-y-6">
-            <div className="mb-4">
-              <h2 className="text-lg font-semibold text-foreground sm:text-xl">المعلومات الأساسية والتعريف</h2>
+          <form onSubmit={handleSubmit} className={isService ? "space-y-2" : "space-y-6"}>
+            <div className={isService ? "mb-1" : "mb-4"}>
+              <h2 className={isService ? "text-sm font-semibold text-foreground" : "text-lg font-semibold text-foreground sm:text-xl"}>{tr("المعلومات الأساسية والتعريف")}</h2>
             </div>
             <Card>
-              <CardContent className="space-y-4 p-4 sm:p-6">
-                {/* الصف الأول: الأكواد والتعريف */}
-                <div className="grid grid-cols-1 xl:grid-cols-12 gap-4">
-                  {/* Product Code - 2 columns */}
+              <CardContent className={isService ? "space-y-2 p-2 sm:p-3" : "space-y-4 p-4 sm:p-6"}>
+                {/* نفس تصميم components/products/unified-customers.tsx: الصورة يساراً، وأكواد
+                    التعريف (الرقم/الاسم العربي/الاسم الإنجليزي) يميناً — الرقم في سطره الخاص،
+                    ثم كل اسم بسطر كامل العرض تحته. */}
+                <div className={`flex flex-col items-stretch ${isService ? "gap-2 md:flex-row" : "gap-4 md:flex-row"}`}>
+                  <div className={`flex-1 ${isService ? "space-y-2" : "space-y-4"}`}>
+                    <div className={`grid grid-cols-1 md:grid-cols-3 ${isService ? "gap-2" : "gap-4"}`}>
+                      <div>
+                        <ProductCodeInput
+                          formData={formData}
+                          handleProductCodeChange={(code) => setFormData((prev) => ({ ...prev, product_code: code }))}
+                          onBlur={async () => {
+                            const adjustedCode = adjustCode(formData.product_code || "")
+                            setFormData((prev) => ({ ...prev, product_code: adjustedCode }))
+                            await searchProductByCode(adjustedCode)
+                          }}
+                          onSelectProductId={(id) => {
+                            // لا يُعدَّل formData.id هنا مباشرة قبل اكتمال التحميل — كان هذا يُخطئ
+                            // مقارنة الهاش في loadData (تُحسَب من formData الحالي الذي أصبح يحمل
+                            // معرّف الصنف الجديد بينما initialHash لا يزال لبيانات الصنف/النموذج
+                            // السابق)، فتظهر رسالة تصفّح غير صحيحة بدل تحميل الصنف المختار فعلياً.
+                            // loadData("Byid", ...) وحدها من تُحدِّث formData بالكامل عند النجاح.
+                            loadData("Byid", id)
+                          }}
+                          visible={true}
+                          priceCategoryId={1}
+                          productTypes={isService ? [2] : [1]}
+                          onRequestSearch={(openSearch) => { if (canView) requestAfterUnsavedCheck(openSearch) }}
+                          codeLabel={isService ? tr("رقم الخدمة *") : tr("رقم الصنف *")}
+                          searchTitle={isService ? tr("بحث الخدمات") : tr("بحث الأصناف")}
+                        />
+                      </div>
+                    </div>
 
+                    <div className={`grid grid-cols-1 md:grid-cols-2 ${isService ? "gap-2" : "gap-4"}`}>
+                      <div>
+                        <Label htmlFor="product_name" className="text-sm font-medium">
+                          {isService ? tr("اسم الخدمة *") : tr("اسم الصنف *")}
+                        </Label>
+                        <Input
+                          ref={product_name}
+                          id="product_name"
+                          value={formData.product_name}
+                          onChange={(e) => updateFormData("product_name", e.target.value)}
+                          // الاسم الإنجليزي فارغ ⇐ يُعبّأ بالاسم العربي عند مغادرة الحقل (يمكن تعديله بعدها)
+                          onBlur={(e) => {
+                            const arabicName = e.target.value.trim()
+                            if (arabicName && !String(formData.product_name_en || "").trim()) updateFormData("product_name_en", arabicName)
+                          }}
+                          className="text-start"
+                          placeholder={isService ? tr("اسم الخدمة باللغة العربية") : tr("اسم الصنف باللغة العربية")}
+                          required
+                        />
+                      </div>
 
-                  <div className="col-span-1 xl:col-span-2 w-full">
-                    <ProductCodeInput
-                      formData={formData}
-                      handleProductCodeChange={(code) => setFormData((prev) => ({ ...prev, product_code: code }))}
-                      onSelectProductId={(id) => {
-                        setFormData((prev) => ({
-                          ...prev,
-                          id: Number(id), // convert string → number
-                        }))
-                        loadData("Byid", id);
-
-                      }}
-                      visible={true}
-                      codeLabel={isService ? "رقم الخدمة *" : "رقم الصنف *"}
-                      searchTitle={isService ? "بحث الخدمات" : "بحث الأصناف"}
-                    />
+                      <div>
+                        <Label htmlFor="product_name_en" className="text-sm font-medium">
+                          {isService ? tr("اسم الخدمة بالإنجليزية") : tr("اسم الصنف بالإنجليزية")}
+                        </Label>
+                        <Input
+                          id="product_name_en"
+                          value={formData.product_name_en}
+                          onChange={(e) => updateFormData("product_name_en", e.target.value)}
+                          className="text-end"
+                          placeholder={isService ? tr("اسم الخدمة بالإنجليزية") : tr("اسم الصنف بالإنجليزية")}
+                        />
+                      </div>
+                    </div>
                   </div>
-                  {/* Arabic Name - 5 columns */}
-                  <div className="col-span-1 lg:col-span-5 xl:col-span-5">
-                    <Label htmlFor="product_name" className="text-sm font-medium">
-                      {isService ? "اسم الخدمة *" : "اسم الصنف *"}
-                    </Label>
-                    <Input
-                      ref={product_name}
-                      id="product_name"
-                      value={formData.product_name}
-                      onChange={(e) => {
-                        updateFormData("product_name", e.target.value);
-                        if (formData.product_name_en === '')
-                          updateFormData("product_name_en", e.target.value)
-                      }}
-                      className="text-right"
-                      placeholder="اسم الصنف باللغة العربية"
-                      required
-                    />
-                  </div>
 
-                  {/* English Name - 5 columns */}
-                  <div className="col-span-1 lg:col-span-5 xl:col-span-5">
-                    <Label htmlFor="product_name_en" className="text-sm font-medium">
-                      {isService ? "اسم الخدمة بالإنجليزية" : "اسم الصنف بالإنجليزية"}
-                    </Label>
-                    <Input
-                      id="product_name_en"
-                      value={formData.product_name_en}
-                      onChange={(e) => updateFormData("product_name_en", e.target.value)}
-                      className="text-left"
-                      placeholder="Product Name in English"
-                    />
-                  </div>
+                  <ImageUploadField
+                    value={formData.product_image}
+                    onChange={(value) => updateFormData("product_image", value)}
+                    label={isService ? tr("صورة الخدمة") : tr("صورة الصنف")}
+                    size={isService ? 88 : 160}
+                  />
                 </div>
 
 
-                <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-4">
+                <div className={`grid grid-cols-1 sm:grid-cols-2 ${isService ? "gap-2 sm:grid-cols-3" : "gap-4 xl:grid-cols-5"}`}>
                   {!isService && (
                     <>
                       <div>
                         <Label htmlFor="category" className="text-sm font-medium">
-                          التصنيف
+                          {tr("التصنيف")}
                         </Label>
-                        <Select
-                          value={formData?.category_id != null ? formData.category_id.toString() : ""} // convert number → string
-                          onValueChange={(value) =>
-                            setFormData((prev) => ({
-                              ...prev,
-                              category_id: Number(value), // convert string → number
-                            }))
-                          }
-                        >
-                          <SelectTrigger>
-                            <SelectValue placeholder="اختر التصنيف" />
-                          </SelectTrigger>
-                          <SelectContent>
-                            <SelectItem value="-1">بلا</SelectItem>
-                            {definitions.product_category.map((category) => (
-                              <SelectItem key={category.id} value={String(category.id)}>
-                                {category.name}
-                              </SelectItem>
-                            ))}
-                          </SelectContent>
-                        </Select>
+                        <div className={sharedDropdownStyles.dropDownWrapper}>
+                          <PrimeDropdown
+                            inputId="category_id"
+                            value={formData.category_id ? Number(formData.category_id) : null}
+                            options={[
+                              { label: tr("بلا"), value: null },
+                              ...(definitions.product_category || []).map((category) => ({
+                                label: category.name,
+                                value: Number(category.id),
+                              })),
+                            ]}
+                            optionLabel="label"
+                            optionValue="value"
+                            placeholder={tr("اختر التصنيف")}
+                            className={`${sharedDropdownStyles.dropDown} w-full`}
+                            panelClassName={sharedDropdownStyles.dropDownPanel}
+                            appendTo={() => document.body}
+                            onChange={(e: any) => updateFormData("category_id", Number(e.value) || 0)}
+                          />
+                        </div>
                       </div>
 
                       <div>
                         <Label htmlFor="category" className="text-sm font-medium">
-                          مجموعة الصنف
+                          {tr("مجموعة الصنف")}
                         </Label>
-                        <Select
-                          value={formData?.main_stock_id != null ? formData.main_stock_id.toString() : ""}
-                          onValueChange={(value: string) => {
-                            setFormData(prev => ({
-                              ...prev,
-                              main_stock_id:parseInt(value, 10) || 0,
-                            }));
-                          }}
-                        >
-                          <SelectTrigger>
-                            <SelectValue placeholder="اختر المجموعة" />
-                          </SelectTrigger>
-                          <SelectContent>
-                            <SelectItem value="-1">بلا</SelectItem>
-                            {definitions.categories.map((category) => (
-                              <SelectItem key={category.id} value={String(category.id)}>
-                                {category.group_name}
-                              </SelectItem>
-                            ))}
-                          </SelectContent>
-                        </Select>
+                        <div className={sharedDropdownStyles.dropDownWrapper}>
+                          <PrimeDropdown
+                            inputId="main_stock_id"
+                            value={formData.main_stock_id ? Number(formData.main_stock_id) : null}
+                            options={[
+                              { label: tr("بلا"), value: null },
+                              ...(definitions.categories || []).map((category) => ({
+                                label: category.group_name,
+                                value: Number(category.id),
+                              })),
+                            ]}
+                            optionLabel="label"
+                            optionValue="value"
+                            placeholder={tr("اختر المجموعة")}
+                            className={`${sharedDropdownStyles.dropDown} w-full`}
+                            panelClassName={sharedDropdownStyles.dropDownPanel}
+                            appendTo={() => document.body}
+                            onChange={(e: any) => updateFormData("main_stock_id", Number(e.value) || 0)}
+                          />
+                        </div>
                       </div>
+
+                      <div>
+                        <Label htmlFor="product_type" className="text-sm font-medium">
+                          {tr("نوع الصنف")}
+                        </Label>
+                        <div className={sharedDropdownStyles.dropDownWrapper}>
+                          <PrimeDropdown
+                            inputId="product_type"
+                            value={formData.product_type || null}
+                            options={PRODUCT_TYPE_OPTIONS}
+                            optionLabel="label"
+                            optionValue="value"
+                            placeholder={tr("اختر نوع الصنف")}
+                            className={`${sharedDropdownStyles.dropDown} w-full`}
+                            panelClassName={sharedDropdownStyles.dropDownPanel}
+                            appendTo={() => document.body}
+                            onChange={(e: any) => updateFormData("product_type", e.value || 1)}
+                          />
+                        </div>
+                      </div>
+                      <div>
+                        <Label htmlFor="tax_classification" className="text-sm font-medium">
+                          {tr("التصنيف الضريبي")}
+                        </Label>
+                        <div className={sharedDropdownStyles.dropDownWrapper}>
+                          <PrimeDropdown
+                            inputId="tax_classification"
+                            value={formData.tax_classification_id || null}
+                            options={[
+                              { label: tr("بلا"), value: null },
+                              ...(definitions.tax_classifications || []).map((t: any) => ({ label: t.name, value: Number(t.id) })),
+                            ]}
+                            optionLabel="label"
+                            optionValue="value"
+                            placeholder={tr("اختر التصنيف الضريبي")}
+                            className={`${sharedDropdownStyles.dropDown} w-full`}
+                            panelClassName={sharedDropdownStyles.dropDownPanel}
+                            appendTo={() => document.body}
+                            onChange={(e: any) => updateFormData("tax_classification_id", Number(e.value) || 0)}
+                          />
+                        </div>
+                      </div>
+
                     </>
                   )}
 
                   {isService && (
-                    <div className="xl:col-span-2">
-                      <Label className="text-sm font-medium">نوع الخدمة</Label>
-                      <div className="mt-2 flex flex-wrap items-center gap-4">
+                    <div className="sm:col-span-2">
+                      <Label className="text-sm font-medium">{tr("نوع الخدمة")}</Label>
+                      <div className="mt-1 flex flex-wrap items-center gap-3">
                         <label className="flex items-center gap-2 text-sm">
                           <input
                             type="radio"
@@ -1742,7 +2990,7 @@ export function CompactProductForm({
                             checked={formData.service_type === 1}
                             onChange={() => updateFormData("service_type", 1)}
                           />
-                          خدمة مقدمة
+                          {tr("خدمة مقدمة")}
                         </label>
                         <label className="flex items-center gap-2 text-sm">
                           <input
@@ -1752,62 +3000,34 @@ export function CompactProductForm({
                             checked={formData.service_type === 0}
                             onChange={() => updateFormData("service_type", 0)}
                           />
-                          خدمة متلقاة
+                          {tr("خدمة متلقاة")}
                         </label>
                       </div>
                     </div>
                   )}
 
-                  <div>
-                    <Label htmlFor="status" className="text-sm font-medium">
-                      {isService ? "حالة الخدمة" : "حالة الصنف"}
-                    </Label>
-                    <Select disabled={formData.id === 0} value={formData?.status != null ? formData.status.toString() : "1"} onValueChange={(value) => updateFormData("status", value)}>
-                      <SelectTrigger>
-                        <SelectValue />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="1">نشط</SelectItem>
-                        <SelectItem value="2">غير نشط</SelectItem>
-                        <SelectItem value="3">متوقف</SelectItem>
-                      </SelectContent>
-                    </Select>
-                  </div>
                 </div>
-
-                {!isService && (
-                  <div>
-                    <Label htmlFor="description" className="text-sm font-medium">
-                      وصف الصنف
-                    </Label>
-                    <Textarea
-                      id="description"
-                      value={formData.description}
-                      onChange={(e) => updateFormData("description", e.target.value)}
-                      className="text-right"
-                      rows={2}
-                      placeholder="وصف مفصل للصنف"
-                    />
-                  </div>
-                )}
               </CardContent>
             </Card>
 
-            <Tabs value={activeTab} onValueChange={(v) => setActiveTab(v)} dir="rtl">
-              <TabsList className="h-auto w-full flex flex-wrap justify-start gap-2 overflow-x-auto rounded-xl bg-gradient-to-r from-slate-50 via-blue-50 to-slate-50 p-2 shadow-md border border-slate-200/60 backdrop-blur-sm" style={{ direction: "rtl" }}>
-                <TabsTrigger value="units" className="whitespace-nowrap rounded-lg px-3 py-2 text-sm font-medium transition-all duration-200 sm:px-4 sm:text-base data-[state=active]:bg-gradient-to-r data-[state=active]:from-emerald-500 data-[state=active]:to-emerald-600 data-[state=active]:text-white data-[state=active]:shadow-lg data-[state=inactive]:hover:bg-slate-200/40">الوحدات</TabsTrigger>
-                <TabsTrigger value="prices" className="whitespace-nowrap rounded-lg px-3 py-2 text-sm font-medium transition-all duration-200 sm:px-4 sm:text-base data-[state=active]:bg-gradient-to-r data-[state=active]:from-blue-500 data-[state=active]:to-blue-600 data-[state=active]:text-white data-[state=active]:shadow-lg data-[state=inactive]:hover:bg-slate-200/40">اسعار البيع</TabsTrigger>
-                {isService ? (
-                  <TabsTrigger value="accounts" className="whitespace-nowrap rounded-lg px-3 py-2 text-sm font-medium transition-all duration-200 sm:px-4 sm:text-base data-[state=active]:bg-gradient-to-r data-[state=active]:from-emerald-500 data-[state=active]:to-emerald-600 data-[state=active]:text-white data-[state=active]:shadow-lg data-[state=inactive]:hover:bg-slate-200/40">الحسابات المحاسبية</TabsTrigger>
-                ) : (
+            <Tabs value={activeTab} onValueChange={(v) => setActiveTab(v)} dir={appDir()} className="min-w-0">
+              <TabsList className={`flex h-auto w-full min-w-0 flex-nowrap justify-start overflow-x-auto rounded-xl border border-slate-200/60 bg-gradient-to-r from-slate-50 via-blue-50 to-slate-50 shadow-md backdrop-blur-sm ${isService ? "gap-1 p-1" : "gap-2 p-2"}`} style={{ direction: appDir() }}>
+                <TabsTrigger value="units" className="whitespace-nowrap rounded-lg px-3 py-2 text-sm font-medium transition-all duration-200 sm:px-4 sm:text-base data-[state=active]:bg-gradient-to-r data-[state=active]:from-emerald-500 data-[state=active]:to-emerald-600 data-[state=active]:text-white data-[state=active]:shadow-lg data-[state=inactive]:hover:bg-slate-200/40">{tr("الوحدات")}</TabsTrigger>
+                <TabsTrigger value="prices" className="whitespace-nowrap rounded-lg px-3 py-2 text-sm font-medium transition-all duration-200 sm:px-4 sm:text-base data-[state=active]:bg-gradient-to-r data-[state=active]:from-blue-500 data-[state=active]:to-blue-600 data-[state=active]:text-white data-[state=active]:shadow-lg data-[state=inactive]:hover:bg-slate-200/40">{tr("اسعار البيع")}</TabsTrigger>
+                <TabsTrigger value="accounts" className="whitespace-nowrap rounded-lg px-3 py-2 text-sm font-medium transition-all duration-200 sm:px-4 sm:text-base data-[state=active]:bg-gradient-to-r data-[state=active]:from-emerald-500 data-[state=active]:to-emerald-600 data-[state=active]:text-white data-[state=active]:shadow-lg data-[state=inactive]:hover:bg-slate-200/40">{isService ? tr("الحسابات المحاسبية") : tr("الحسابات")}</TabsTrigger>
+                {isService ? null : (
                   <>
-                    <TabsTrigger value="brand" className="whitespace-nowrap rounded-lg px-3 py-2 text-sm font-medium transition-all duration-200 sm:px-4 sm:text-base data-[state=active]:bg-gradient-to-r data-[state=active]:from-orange-500 data-[state=active]:to-orange-600 data-[state=active]:text-white data-[state=active]:shadow-lg data-[state=inactive]:hover:bg-slate-200/40">العلامة التجارية</TabsTrigger>
-                    <TabsTrigger value="measurements" className="whitespace-nowrap rounded-lg px-3 py-2 text-sm font-medium transition-all duration-200 sm:px-4 sm:text-base data-[state=active]:bg-gradient-to-r data-[state=active]:from-red-500 data-[state=active]:to-red-600 data-[state=active]:text-white data-[state=active]:shadow-lg data-[state=inactive]:hover:bg-slate-200/40">القياسات</TabsTrigger>
-                    <TabsTrigger value="pricing" className="whitespace-nowrap rounded-lg px-3 py-2 text-sm font-medium transition-all duration-200 sm:px-4 sm:text-base data-[state=active]:bg-gradient-to-r data-[state=active]:from-cyan-500 data-[state=active]:to-cyan-600 data-[state=active]:text-white data-[state=active]:shadow-lg data-[state=inactive]:hover:bg-slate-200/40">سعر الشراء والضريبة</TabsTrigger>
-                    <TabsTrigger value="additional" className="whitespace-nowrap rounded-lg px-3 py-2 text-sm font-medium transition-all duration-200 sm:px-4 sm:text-base data-[state=active]:bg-gradient-to-r data-[state=active]:from-violet-500 data-[state=active]:to-violet-600 data-[state=active]:text-white data-[state=active]:shadow-lg data-[state=inactive]:hover:bg-slate-200/40">معلومات إضافية</TabsTrigger>
-                    <TabsTrigger value="stores" className="whitespace-nowrap rounded-lg px-3 py-2 text-sm font-medium transition-all duration-200 sm:px-4 sm:text-base data-[state=active]:bg-gradient-to-r data-[state=active]:from-amber-500 data-[state=active]:to-amber-600 data-[state=active]:text-white data-[state=active]:shadow-lg data-[state=inactive]:hover:bg-slate-200/40">تفاصيل المستودعات</TabsTrigger>
-                    <TabsTrigger value="costcenters" className="whitespace-nowrap rounded-lg px-3 py-2 text-sm font-medium transition-all duration-200 sm:px-4 sm:text-base data-[state=active]:bg-gradient-to-r data-[state=active]:from-fuchsia-500 data-[state=active]:to-fuchsia-600 data-[state=active]:text-white data-[state=active]:shadow-lg data-[state=inactive]:hover:bg-slate-200/40">مراكز التكلفة</TabsTrigger>
-                    <TabsTrigger value="notes" className="whitespace-nowrap rounded-lg px-3 py-2 text-sm font-medium transition-all duration-200 sm:px-4 sm:text-base data-[state=active]:bg-gradient-to-r data-[state=active]:from-slate-600 data-[state=active]:to-slate-700 data-[state=active]:text-white data-[state=active]:shadow-lg data-[state=inactive]:hover:bg-slate-200/40">ملاحظات</TabsTrigger>
+                    <TabsTrigger value="attributes" className="whitespace-nowrap rounded-lg px-3 py-2 text-sm font-medium transition-all duration-200 sm:px-4 sm:text-base data-[state=active]:bg-gradient-to-r data-[state=active]:from-violet-500 data-[state=active]:to-purple-600 data-[state=active]:text-white data-[state=active]:shadow-lg data-[state=inactive]:hover:bg-slate-200/40">{tr("المتغيرات والخصائص")}</TabsTrigger>
+                    <TabsTrigger value="brand" className="whitespace-nowrap rounded-lg px-3 py-2 text-sm font-medium transition-all duration-200 sm:px-4 sm:text-base data-[state=active]:bg-gradient-to-r data-[state=active]:from-orange-500 data-[state=active]:to-orange-600 data-[state=active]:text-white data-[state=active]:shadow-lg data-[state=inactive]:hover:bg-slate-200/40">{tr("العلامة التجارية")}</TabsTrigger>
+                    <TabsTrigger value="measurements" className="whitespace-nowrap rounded-lg px-3 py-2 text-sm font-medium transition-all duration-200 sm:px-4 sm:text-base data-[state=active]:bg-gradient-to-r data-[state=active]:from-red-500 data-[state=active]:to-red-600 data-[state=active]:text-white data-[state=active]:shadow-lg data-[state=inactive]:hover:bg-slate-200/40">{tr("القياسات")}</TabsTrigger>
+                    <TabsTrigger value="pricing" className="whitespace-nowrap rounded-lg px-3 py-2 text-sm font-medium transition-all duration-200 sm:px-4 sm:text-base data-[state=active]:bg-gradient-to-r data-[state=active]:from-cyan-500 data-[state=active]:to-cyan-600 data-[state=active]:text-white data-[state=active]:shadow-lg data-[state=inactive]:hover:bg-slate-200/40">{tr("سعر الشراء والضريبة")}</TabsTrigger>
+                    <TabsTrigger value="additional" className="whitespace-nowrap rounded-lg px-3 py-2 text-sm font-medium transition-all duration-200 sm:px-4 sm:text-base data-[state=active]:bg-gradient-to-r data-[state=active]:from-violet-500 data-[state=active]:to-violet-600 data-[state=active]:text-white data-[state=active]:shadow-lg data-[state=inactive]:hover:bg-slate-200/40">{tr("معلومات إضافية")}</TabsTrigger>
+                    <TabsTrigger value="stores" className="whitespace-nowrap rounded-lg px-3 py-2 text-sm font-medium transition-all duration-200 sm:px-4 sm:text-base data-[state=active]:bg-gradient-to-r data-[state=active]:from-amber-500 data-[state=active]:to-amber-600 data-[state=active]:text-white data-[state=active]:shadow-lg data-[state=inactive]:hover:bg-slate-200/40">{tr("تفاصيل المستودعات")}</TabsTrigger>
+                    <TabsTrigger value="costcenters" className="whitespace-nowrap rounded-lg px-3 py-2 text-sm font-medium transition-all duration-200 sm:px-4 sm:text-base data-[state=active]:bg-gradient-to-r data-[state=active]:from-fuchsia-500 data-[state=active]:to-fuchsia-600 data-[state=active]:text-white data-[state=active]:shadow-lg data-[state=inactive]:hover:bg-slate-200/40">{tr("مراكز التكلفة")}</TabsTrigger>
+                    <TabsTrigger value="notes" className="whitespace-nowrap rounded-lg px-3 py-2 text-sm font-medium transition-all duration-200 sm:px-4 sm:text-base data-[state=active]:bg-gradient-to-r data-[state=active]:from-slate-600 data-[state=active]:to-slate-700 data-[state=active]:text-white data-[state=active]:shadow-lg data-[state=inactive]:hover:bg-slate-200/40">{tr("ملاحظات")}</TabsTrigger>
+                    <TabsTrigger value="attachments" className="whitespace-nowrap rounded-lg px-3 py-2 text-sm font-medium transition-all duration-200 sm:px-4 sm:text-base data-[state=active]:bg-gradient-to-r data-[state=active]:from-slate-600 data-[state=active]:to-slate-700 data-[state=active]:text-white data-[state=active]:shadow-lg data-[state=inactive]:hover:bg-slate-200/40">{tr("المرفقات")}</TabsTrigger>
+                    <TabsTrigger value="related" className="whitespace-nowrap rounded-lg px-3 py-2 text-sm font-medium transition-all duration-200 sm:px-4 sm:text-base data-[state=active]:bg-gradient-to-r data-[state=active]:from-teal-500 data-[state=active]:to-teal-600 data-[state=active]:text-white data-[state=active]:shadow-lg data-[state=inactive]:hover:bg-slate-200/40">{tr("الأصناف التابعة")}</TabsTrigger>
+                    <TabsTrigger value="manufacturing-components" className="whitespace-nowrap rounded-lg px-3 py-2 text-sm font-medium transition-all duration-200 sm:px-4 sm:text-base data-[state=active]:bg-gradient-to-r data-[state=active]:from-emerald-500 data-[state=active]:to-emerald-600 data-[state=active]:text-white data-[state=active]:shadow-lg data-[state=inactive]:hover:bg-slate-200/40">{tr("مكونات التصنيع")}</TabsTrigger>
                   </>
                 )}
               </TabsList>
@@ -1817,7 +3037,7 @@ export function CompactProductForm({
                   <CardHeader className="pb-2 flex items-center justify-between">
                     <CardTitle className="flex items-center gap-2 text-lg">
                       <Package className="h-5 w-5 text-primary" />
-                      الوحدات
+                      {tr("الوحدات")}
                     </CardTitle>
                     {!isService && (
                       <button type="button"
@@ -1825,7 +3045,7 @@ export function CompactProductForm({
                         onClick={() => handleAddUnit()}
                       >
                         <Plus className="h-4 w-4" />
-                        إضافة
+                        {tr("إضافة")}
                       </button>
                     )}
                   </CardHeader>
@@ -1834,12 +3054,17 @@ export function CompactProductForm({
                     <div className="grid grid-cols-12 gap-4">
                       <div className="col-span-12 md:col-span-12">
                         <div className="w-full overflow-x-auto">
-                          <DataGrid
-                            ref={unitGridRef}
+                          <DataGridView
+                            key={`product-prices-${currentProductId}`}
+                            style={{ height: isService ? 190 : TABS_GRID_HEIGHT }}
                             dataSource={formData.units ?? []}
                             scheme={getScheme()}
                             selectionChanged={selectionChanged}
                             cellEditEnded={(s: any, e: any) => cellEditEnded(s, e)}
+                            onKeyDownCapture={moveGridOnEnter}
+                            isReport={false}
+                            showContextMenu={false}
+                            dontConvertToCards={true}
                           />
                         </div>
                         <ProductBarcodes
@@ -1850,6 +3075,8 @@ export function CompactProductForm({
                           }}
                           unitName={dialogUnitName}
                           barcodes={dialogBarcodes}
+                          reservedBarcodes={(formData.units ?? []).flatMap((unit, index) => index === unitCurrentRow ? [] : (unit.barcode_list ?? []))}
+                          soldUsingScale={Boolean(formData.pos_sold_using_scale)}
                           onUpdateBarcodes={(newBarcodes) => setDialogBarcodes(newBarcodes)}
                         />
                       </div>
@@ -1863,22 +3090,28 @@ export function CompactProductForm({
                   <CardHeader className="pb-2 flex items-center justify-between">
                     <CardTitle className="flex items-center gap-2 text-lg">
                       <Package className="h-5 w-5 text-primary" />
-                      اسعار البيع
+                      {tr("اسعار البيع")}
                     </CardTitle>
                     <button type="button"
                       className="flex items-center gap-1 bg-primary text-white px-3 py-1 rounded hover:bg-blue-600 transition"
                       onClick={() => handleAddPriceRow()}
                     >
                       <Plus className="h-4 w-4" />
-                      إضافة
+                      {tr("إضافة")}
                     </button>
                   </CardHeader>
                   <CardContent>
                     <div className="grid grid-cols-12 gap-4">
                       <div className="col-span-12 md:col-span-12">
                         <div className="w-full overflow-x-auto">
-                          <DataGrid dataSource={formData.prices ?? []}
+                          <DataGridView
+                            style={{ height: isService ? 190 : TABS_GRID_HEIGHT }}
+                            dataSource={formData.prices ?? []}
                             scheme={getPricesScheme()}
+                            onKeyDownCapture={moveGridOnEnter}
+                            isReport={false}
+                            showContextMenu={false}
+                            dontConvertToCards={true}
                           />
                         </div>
                       </div>
@@ -1887,101 +3120,95 @@ export function CompactProductForm({
                 </Card>
               </TabsContent>
 
-              {isService && (
-                <TabsContent value="accounts">
-                  <Card>
-                    <CardHeader className="pb-4">
-                      <CardTitle className="flex items-center gap-2 text-lg">
-                        <Currency className="h-5 w-5 text-primary" />
-                        الحسابات المحاسبية
-                      </CardTitle>
-                    </CardHeader>
-                    <CardContent>
-                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                        <div>
-                          <Label htmlFor="revenue_account" className="text-sm font-medium">
-                            حساب الإيرادات
-                          </Label>
-                          <AutoCompleteAccount
-                            value={formData.revenue_account_code}
-                            onValueChange={(value) => updateFormData("revenue_account_code", value)}
-                            onAccountSelect={(account) => updateFormData("revenue_account_id", account?.id ?? 0)}
-                            label="حساب الإيرادات"
-                            placeholder="اختر حساب الإيرادات"
-                            showClearButton={true}
-                            showSearchButton={true}
-                            className="w-full"
-                          />
+              <TabsContent value="accounts">
+                <Card>
+                  <CardHeader className="pb-4">
+                    <CardTitle className="flex items-center gap-2 text-lg">
+                      <Currency className="h-5 w-5 text-primary" />
+                      {tr("الحسابات")}
+                    </CardTitle>
+                  </CardHeader>
+                  <CardContent>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-4">
+                      {PRODUCT_ACCOUNT_FIELDS.map(({ field, label }) => (
+                        <div key={field} className="flex min-w-0 items-end gap-2">
+                          <div className="min-w-0 flex-1">
+                            <AutoCompleteAccount
+                              value={formData[field] ? String(formData[field]) : ""}
+                              valueMode="id"
+                              onValueChange={(value) => updateFormData(field, Number(value) || 0)}
+                              onAccountSelect={(account) => updateFormData(field, account?.id ?? 0)}
+                              label={label}
+                              placeholder=""
+                              showClearButton={true}
+                              showSearchButton={true}
+                              className="w-full"
+                              showCostCenterButton={false}
+                              leafOnly
+                            />
+                          </div>
+                          {!isService && (
+                            <Button
+                              type="button"
+                              size="icon"
+                              variant="outline"
+                              className="mb-0.5 h-10 w-10 shrink-0"
+                              title={tr("نسخ هذا الحساب إلى جميع الأصناف التالية")}
+                              aria-label={tr("نسخ {0} إلى جميع الأصناف التالية", label)}
+                              disabled={!canUpdate || !(Number(formData.id) > 0) || copyAccountBusy}
+                              onClick={() => setCopyAccountField(field)}
+                            >
+                              <Copy className="h-4 w-4" />
+                            </Button>
+                          )}
                         </div>
-                        <div>
-                          <Label htmlFor="purchase_account" className="text-sm font-medium">
-                            حساب المشتريات
-                          </Label>
-                          <AutoCompleteAccount
-                            value={formData.purchase_account_code}
-                            onValueChange={(value) => updateFormData("purchase_account_code", value)}
-                            onAccountSelect={(account) => updateFormData("purchase_account_id", account?.id ?? 0)}
-                            label="حساب المشتريات"
-                            placeholder="اختر حساب المشتريات"
-                            showClearButton={true}
-                            showSearchButton={true}
-                            className="w-full"
-                          />
-                        </div>
-                      </div>
-                    </CardContent>
-                  </Card>
-                </TabsContent>
-              )}
+                      ))}
+                    </div>
+                  </CardContent>
+                </Card>
+              </TabsContent>
 
               {!isService && (
                 <>
+                  <TabsContent value="attributes">
+                    <Card>
+                      <CardHeader className="pb-3"><div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between"><CardTitle className="flex items-center gap-2 text-lg"><SlidersHorizontal className="h-5 w-5 text-violet-600" />{tr("المتغيرات والخصائص")}</CardTitle><Button type="button" variant="outline" onClick={() => setFormData((previous) => ({ ...previous, attributes: [...(previous.attributes || []), { name: "", values: [] }] }))}><Plus className="me-2 h-4 w-4" />{tr("إضافة متغير")}</Button></div></CardHeader>
+                      <CardContent className="space-y-3">
+                        {!(formData.attributes || []).length && <button type="button" onClick={() => setFormData((previous) => ({ ...previous, attributes: [{ name: "", values: [] }] }))} className="w-full rounded-xl border-2 border-dashed p-8 text-muted-foreground hover:border-violet-400 hover:text-violet-700">{tr("+ إضافة أول متغير للصنف")}</button>}
+                        {(formData.attributes || []).map((attribute, index) => {
+                          const normalizedName = attribute.name.trim().toLocaleLowerCase()
+                          const catalogEntry = attributeCatalog.find((item) => item.name.toLocaleLowerCase() === normalizedName)
+                          const updateAttribute = (patch: Partial<ProductAttributeLine>) => setFormData((previous) => ({ ...previous, attributes: (previous.attributes || []).map((item, itemIndex) => itemIndex === index ? { ...item, ...patch } : item) }))
+                          return <div key={index} className="grid min-w-0 gap-3 rounded-xl border bg-card p-4 md:grid-cols-[minmax(180px,.7fr)_minmax(260px,1.3fr)_44px]">
+                            <div className="min-w-0"><Label>{tr("المتغير *")}</Label><div className="mt-1"><AttributeNameInput value={attribute.name} catalog={attributeCatalog} onChange={(name) => updateAttribute({ name })} onCreate={(name) => { updateAttribute({ name }); void createAttributeCatalogItem(name) }} /></div></div>
+                            <div className="min-w-0"><Label>{tr("الخصائص *")}</Label><div className="mt-1"><AttributeValueInput disabled={!catalogEntry} values={attribute.values} valueImages={attribute.value_images} suggestions={catalogEntry?.values || []} onChange={(values) => updateAttribute({ values, value_images: Object.fromEntries(Object.entries(attribute.value_images || {}).filter(([value]) => values.includes(value))) })} onImageChange={(value, image) => updateAttribute({ value_images: { ...(attribute.value_images || {}), [value]: image } })} onCreate={(value) => void createAttributeCatalogItem(attribute.name, value)} /></div></div>
+                            <Button type="button" size="icon" variant="ghost" className="self-end text-red-600" onClick={() => setFormData((previous) => ({ ...previous, attributes: (previous.attributes || []).filter((_, itemIndex) => itemIndex !== index) }))}><X className="h-4 w-4" /></Button>
+                          </div>
+                        })}
+                        <p className="text-xs text-muted-foreground">{tr("يبقى هذا صنفاً واحداً؛ تُختار خصائص المتغير المطلوبة عند إضافته إلى أي حركة.")}</p>
+                      </CardContent>
+                    </Card>
+                  </TabsContent>
                   <TabsContent value="brand">
                     <Card>
                       <CardHeader className="pb-4">
                         <CardTitle className="flex items-center gap-2 text-lg">
                           <Settings className="h-5 w-5 text-primary" />
-                          العلامة التجارية
+                          {tr("العلامة التجارية")}
                         </CardTitle>
                       </CardHeader>
-                      <CardContent>
-                        <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-5 gap-4">
-                          <div>
-                            <Label htmlFor="brand" className="text-sm font-medium">
-                              العلامة التجارية
-                            </Label>
-                            <Input
-                              id="brand"
-                              value={formData.brand}
-                              onChange={(e) => updateFormData("brand", e.target.value)}
-                              className="text-right"
-                              placeholder="اسم العلامة التجارية"
-                            />
-                          </div>
-                          <div>
-                            <Label htmlFor="model" className="text-sm font-medium">
-                              الموديل
-                            </Label>
-                            <Input
-                              id="model"
-                              value={formData.model}
-                              onChange={(e) => updateFormData("model", e.target.value)}
-                              className="text-right"
-                              placeholder="رقم أو اسم الموديل"
-                            />
-                          </div>
-                          <div>
-                            <Label htmlFor="manufacturer_company" className="text-sm font-medium">
-                              الشركة المصنعة
-                            </Label>
-                            <Input
-                              id="manufacturer_company"
-                              value={formData.manufacturer_company}
-                              onChange={(e) => updateFormData("manufacturer_company", e.target.value)}
-                              className="text-right"
-                              placeholder="اسم الشركة المصنعة"
-                            />
-                          </div>
+                      <CardContent className="space-y-6">
+                        {/* شبكة العلامات التجارية بنفس أسلوب تبويب "مراكز التكلفة" تماماً: صف واحد
+                            لكل نوع علامة تجارية، بزر بحث يفتح SearchBrandDialog مقيَّداً بذلك النوع. */}
+                        <div className="w-full overflow-x-auto rounded-lg border">
+                          <DataGridView
+                            style={{ height: TABS_GRID_HEIGHT }}
+                            scheme={brandScheme}
+                            dataSource={formData.product_brands ?? []}
+                            isReport={false}
+                            showContextMenu={false}
+                            dontConvertToCards={true}
+                          />
                         </div>
                       </CardContent>
                     </Card>
@@ -1992,31 +3219,48 @@ export function CompactProductForm({
                       <CardHeader className="pb-4">
                         <CardTitle className="flex items-center gap-2 text-lg">
                           <Package className="h-5 w-5 text-primary" />
-                          القياسات
+                          {tr("القياسات")}
                         </CardTitle>
                       </CardHeader>
                       <CardContent>
                         <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-6 gap-4">
                           <div>
-                            <Label htmlFor="main_unit" className="text-sm font-medium">
-                              نوع القياس
+                            <Label htmlFor="measurment_id" className="text-sm font-medium">
+                              {tr("نوع القياس")}
                             </Label>
-                            <Select value={formData?.measurment_unit != null ? formData.measurment_unit.toString() : '1'} onValueChange={(value) => updateFormData("measurment_unit", value)}>
-                              <SelectTrigger>
-                                <SelectValue />
-                              </SelectTrigger>
-                              <SelectContent>
-                                <SelectItem value="1">عادي</SelectItem>
-                                <SelectItem value="2">مساحة</SelectItem>
-                                <SelectItem value="3">حجم</SelectItem>
-                                <SelectItem value="4">وزن</SelectItem>
-                                <SelectItem value="5">بروفيل</SelectItem>
-                              </SelectContent>
-                            </Select>
+                            <div className={sharedDropdownStyles.dropDownWrapper}>
+                              <PrimeDropdown
+                                inputId="measurment_id"
+                                value={formData?.measurment_id != null ? Number(formData.measurment_id) : null}
+                                options={definitions.measurment_types}
+                                optionLabel="name"
+                                optionValue="id"
+                                placeholder={tr("اختر نوع القياس")}
+                                className={`${sharedDropdownStyles.dropDown} w-full`}
+                                panelClassName={sharedDropdownStyles.dropDownPanel}
+                                appendTo={() => document.body}
+                                onChange={(e: any) => {
+                                  const newValue = Number(e.value) || 1
+                                  if (
+                                    newValue !== 1 &&
+                                    (formData.expiry_tracking || formData.serial_tracking || formData.batch_tracking)
+                                  ) {
+                                    toast.current?.show({
+                                      severity: "error",
+                                      summary: tr("خطأ"),
+                                      detail: MEASUREMENT_TRACKING_CONFLICT_MSG,
+                                      life: 3000,
+                                    })
+                                    return
+                                  }
+                                  updateFormData("measurment_id", newValue)
+                                }}
+                              />
+                            </div>
                           </div>
                           <div>
                             <Label htmlFor="length" className="text-sm font-medium">
-                              الطول
+                              {tr("الطول")}
                             </Label>
                             <Input
                               id="length"
@@ -2024,12 +3268,12 @@ export function CompactProductForm({
                               step="0.01"
                               value={formData.length}
                               onChange={(e) => updateFormData("length", Number.parseFloat(e.target.value) || 1)}
-                              className="text-right"
+                              className="text-start"
                             />
                           </div>
                           <div>
                             <Label htmlFor="width" className="text-sm font-medium">
-                              العرض
+                              {tr("العرض")}
                             </Label>
                             <Input
                               id="width"
@@ -2037,43 +3281,43 @@ export function CompactProductForm({
                               step="0.01"
                               value={formData.width}
                               onChange={(e) => updateFormData("width", Number.parseFloat(e.target.value) || 0)}
-                              className="text-right"
+                              className="text-start"
                             />
                           </div>
                           <div>
                             <Label htmlFor="height" className="text-sm font-medium">
-                              الارتفاع
+                              {tr("الارتفاع")}
                             </Label>
                             <Input
                               id="height"
                               value={formData.height}
                               onChange={(e) => updateFormData("height", e.target.value)}
-                              className="text-right"
+                              className="text-start"
                               placeholder=""
                             />
                           </div>
                           <div>
                             <Label htmlFor="density" className="text-sm font-medium">
-                              الكثافة
+                              {tr("الكثافة")}
                             </Label>
                             <Input
                               id="density"
                               value={formData.density}
                               onChange={(e) => updateFormData("density", e.target.value)}
-                              className="text-right"
+                              className="text-start"
                               placeholder=""
                             />
                           </div>
                           <div>
                             <Label htmlFor="color" className="text-sm font-medium">
-                              اللون
+                              {tr("اللون")}
                             </Label>
                             <Input
                               id="color"
                               value={formData.color}
                               onChange={(e) => updateFormData("color", e.target.value)}
-                              className="text-right"
-                              placeholder="لون الصنف"
+                              className="text-start"
+                              placeholder={tr("لون الصنف")}
                             />
                           </div>
                         </div>
@@ -2086,14 +3330,14 @@ export function CompactProductForm({
                       <CardHeader className="pb-4">
                         <CardTitle className="flex items-center gap-2 text-lg">
                           <DollarSign className="h-5 w-5 text-primary" />
-                          سعر الشراء والضريبة
+                          {tr("سعر الشراء والضريبة")}
                         </CardTitle>
                       </CardHeader>
                       <CardContent>
                         <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-6 gap-4">
                           <div>
                             <Label htmlFor="last_purchase_price" className="text-sm font-medium">
-                              آخر سعر شراء
+                              {tr("آخر سعر شراء")}
                             </Label>
                             <Input
                               id="last_purchase_price"
@@ -2101,37 +3345,69 @@ export function CompactProductForm({
                               step="0.01"
                               value={formData.last_purchase_price}
                               onChange={(e) => updateFormData("last_purchase_price", Number.parseFloat(e.target.value) || 0)}
-                              className="text-right"
+                              className="text-start"
                               disabled
                             />
                           </div>
+                          {/* تُحدَّث تلقائياً من فاتورة/إرسالية المشتريات (lib/last-purchase.ts) */}
                           <div>
-                            <Label htmlFor="currency" className="text-sm font-medium">
-                              عملة الشراء
+                            <Label htmlFor="last_purchase_date" className="text-sm font-medium">{tr("تاريخ آخر شراء")}</Label>
+                            <Input id="last_purchase_date" value={String((formData as any).last_purchase_date || "").slice(0, 10)} className="text-start" disabled readOnly />
+                          </div>
+                          <div>
+                            <Label htmlFor="last_purchase_currency" className="text-sm font-medium">{tr("عملة آخر شراء")}</Label>
+                            <Input
+                              id="last_purchase_currency"
+                              value={(() => {
+                                const currencyId = Number((formData as any).last_purchase_currency_id) || 0
+                                if (!currencyId) return ""
+                                const currency: any = definitionsRef.current.currencies.find((item: any) => Number(item.id) === currencyId)
+                                return currency?.currency_code || currency?.currency_name || String(currencyId)
+                              })()}
+                              className="text-start"
+                              disabled
+                              readOnly
+                            />
+                          </div>
+                          <div>
+                            <Label htmlFor="minimum_order_quantity" className="text-sm font-medium">
+                              {tr("أقل كمية للطلب")}
                             </Label>
-                            <Select
-                              value={formData.currency_id?.toString() || ""}
-                              onValueChange={(value) => {
-                                updateFormData("currency_id", Number(value));
-                              }}
-                            >
-                              <SelectTrigger>
-                                <span>
-                                  {definitions.currencies.find(c => c.id === formData.currency_id)?.currency_name || "اختر العملة"}
-                                </span>
-                              </SelectTrigger>
-                              <SelectContent>
-                                {definitions.currencies.map((currency) => (
-                                  <SelectItem key={currency.id} value={currency.id.toString()}>
-                                    {currency.currency_name}
-                                  </SelectItem>
-                                ))}
-                              </SelectContent>
-                            </Select>
+                            <Input
+                              id="minimum_order_quantity"
+                              type="number"
+                              min="0"
+                              step="0.0001"
+                              value={formData.minimum_order_quantity ?? 0}
+                              onChange={(e) => updateFormData("minimum_order_quantity", Number.parseFloat(e.target.value) || 0)}
+                              className="text-start"
+                            />
+                          </div>
+                          <div>
+                            <Label htmlFor="currency_id" className="text-sm font-medium">
+                              {tr("عملة الشراء")}
+                            </Label>
+                            <div className={sharedDropdownStyles.dropDownWrapper}>
+                              <PrimeDropdown
+                                inputId="currency_id"
+                                value={formData.currency_id ? Number(formData.currency_id) : null}
+                                options={(definitions.currencies || []).map((currency) => ({
+                                  label: currency.currency_name,
+                                  value: Number(currency.id),
+                                }))}
+                                optionLabel="label"
+                                optionValue="value"
+                                placeholder={tr("اختر العملة")}
+                                className={`${sharedDropdownStyles.dropDown} w-full`}
+                                panelClassName={sharedDropdownStyles.dropDownPanel}
+                                appendTo={() => document.body}
+                                onChange={(e: any) => updateFormData("currency_id", Number(e.value) || 0)}
+                              />
+                            </div>
                           </div>
                           <div>
                             <Label htmlFor="tax_rate" className="text-sm font-medium">
-                              نسبة الضريبة (%)
+                              {tr("نسبة الضريبة (%)")}
                             </Label>
                             <Input
                               id="tax_rate"
@@ -2139,7 +3415,7 @@ export function CompactProductForm({
                               step="0.01"
                               value={formData.tax_rate}
                               onChange={(e) => updateFormData("tax_rate", Number.parseFloat(e.target.value) || 0)}
-                              className="text-right"
+                              className="text-start"
                             />
                           </div>
                         </div>
@@ -2153,34 +3429,194 @@ export function CompactProductForm({
                       <CardHeader className="pb-4">
                         <CardTitle className="flex items-center gap-2 text-lg">
                           <Warehouse className="h-5 w-5 text-primary" />
-                          معلومات إضافية
+                          {tr("معلومات إضافية")}
                         </CardTitle>
                       </CardHeader>
                       <CardContent>
-                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
                           <div>
-                            <Label htmlFor="original_number" className="text-sm font-medium">
-                              الرقم الأصلي
+                            <Label className="text-sm font-medium">
+                              {tr("الرقم الأصلي")}
                             </Label>
-                            <Input
-                              id="original_number"
-                              type="number"
-                              value={formData.original_number}
-                              onChange={(e) => updateFormData("original_number", e.target.value)}
-                              className="text-right"
-                            />
+                            <Button
+                              type="button"
+                              variant="outline"
+                              className="w-full justify-between text-start"
+                              onClick={() => setOriginalNumbersDialogOpen(true)}
+                            >
+                              <span>
+                                {formData.original_numbers.length > 0
+                                  ? tr("{0} رقم", formData.original_numbers.length)
+                                  : tr("اضافة")}
+                              </span>
+                            </Button>
                           </div>
                           <div>
-                            <Label htmlFor="factory_number" className="text-sm font-medium">
-                              رقم المصنع
+                            <Label className="text-sm font-medium">
+                              {tr("رقم المصنع")}
                             </Label>
-                            <Input
-                              id="factory_number"
-                              type="number"
-                              value={formData.factory_number}
-                              onChange={(e) => updateFormData("factory_number", e.target.value)}
-                              className="text-right"
+                            <Button
+                              type="button"
+                              variant="outline"
+                              className="w-full justify-between text-start"
+                              onClick={() => setFactoryNumbersDialogOpen(true)}
+                            >
+                              <span>
+                                {formData.factory_numbers.length > 0
+                                  ? tr("{0} رقم", formData.factory_numbers.length)
+                                  : tr("اضافة")}
+                              </span>
+                            </Button>
+                          </div>
+                          <div>
+                            <Label htmlFor="measurment_unit" className="text-sm font-medium">
+                              {tr("وحدة عد كميات الصنف ")}<span className="text-red-500">*</span>
+                            </Label>
+                            <div className={sharedDropdownStyles.dropDownWrapper}>
+                              <PrimeDropdown
+                                inputId="measurment_unit"
+                                value={formData?.measurment_unit != null ? Number(formData.measurment_unit) : 1}
+                                options={[
+                                  { label: tr("عشري"), value: 1 },
+                                  { label: tr("عدد صحيح"), value: 2 },
+                                ]}
+                                optionLabel="label"
+                                optionValue="value"
+                                placeholder={tr("عشري")}
+                                className={`${sharedDropdownStyles.dropDown} w-full`}
+                                panelClassName={sharedDropdownStyles.dropDownPanel}
+                                appendTo={() => document.body}
+                                onChange={(e: any) => updateFormData("measurment_unit", Number(e.value) || 1)}
+                              />
+                            </div>
+                          </div>
+                        </div>
+                        <Separator className="my-4" />
+                        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                          {!isService && <div className="space-y-2 sm:col-span-3">
+                            <div className="flex items-center gap-2"><Checkbox id="pos_sold_using_scale" checked={Boolean(formData.pos_sold_using_scale)} onCheckedChange={checked => updateFormData("pos_sold_using_scale", checked === true)} /><Label htmlFor="pos_sold_using_scale">{tr("يباع بالميزان الالكتروني")}</Label></div>
+                            {formData.pos_sold_using_scale && <p className="text-xs text-muted-foreground">{tr("باركود الصنف 7 أرقام مثل 2000001. الأرقام الستة التالية في باركود الميزان تمثل الكمية مقسومة على 1000.")}</p>}
+                          </div>}
+                          {!isService && <div className="space-y-2 sm:col-span-3">
+                            <Label htmlFor="default_printer">{tr("الطابعة الافتراضية")}</Label>
+                            <Input id="default_printer" dir="ltr" maxLength={150} className="max-w-md" value={formData.default_printer || ""} onChange={(e) => updateFormData("default_printer", e.target.value)} placeholder={tr("اسم الطابعة في Windows")} />
+                            <p className="text-xs text-muted-foreground">{tr("مع تفعيل \"طباعة على المخزون الرئيسي\" في الكاشير والمطعم: تُطبع ورقة الصنف على هذه الطابعة، وإن تُركت فارغة فعلى طابعة مجموعة الصنف.")}</p>
+                          </div>}
+                          {!isService && <div className="space-y-2 sm:col-span-3">
+                            <div className="flex items-center gap-2"><Checkbox id="is_tobacco" checked={Boolean(formData.is_tobacco)} onCheckedChange={checked => updateFormData("is_tobacco", checked === true)} /><Label htmlFor="is_tobacco">{tr("دخان")}</Label></div>
+                            {formData.is_tobacco && <p className="text-xs text-muted-foreground">{tr("يدخل في \"عهدة الدخان\" بالكاشير: يستلم الكاشير كميته عند فتح العهدة ويسلّم المتبقي عند تسليمها.")}</p>}
+                          </div>}
+                          <div className="flex items-center gap-2">
+                            <Checkbox
+                              id="expiry_tracking"
+                              checked={formData.expiry_tracking}
+                              disabled={isUsedInVouchers}
+                              onCheckedChange={(checked) => {
+                                if (isUsedInVouchers) {
+                                  toast.current?.show({
+                                    severity: "error",
+                                    summary: tr("خطأ"),
+                                    detail: VOUCHER_USAGE_TRACKING_LOCK_MSG,
+                                    life: 3000,
+                                  })
+                                  return
+                                }
+                                const isChecked = checked === true
+                                if (isChecked && Number(formData.measurment_id || 1) !== 1) {
+                                  toast.current?.show({
+                                    severity: "error",
+                                    summary: tr("خطأ"),
+                                    detail: MEASUREMENT_TRACKING_CONFLICT_MSG,
+                                    life: 3000,
+                                  })
+                                  return
+                                }
+                                updateFormData("expiry_tracking", isChecked)
+                              }}
                             />
+                            <Label
+                              htmlFor="expiry_tracking"
+                              className={`text-sm font-medium ${isUsedInVouchers ? "text-muted-foreground cursor-not-allowed" : "cursor-pointer"}`}
+                            >
+                              {tr("له تاريخ صلاحية")}
+                            </Label>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <Checkbox
+                              id="serial_tracking"
+                              checked={formData.serial_tracking}
+                              disabled={isUsedInVouchers}
+                              onCheckedChange={(checked) => {
+                                if (isUsedInVouchers) {
+                                  toast.current?.show({
+                                    severity: "error",
+                                    summary: tr("خطأ"),
+                                    detail: VOUCHER_USAGE_TRACKING_LOCK_MSG,
+                                    life: 3000,
+                                  })
+                                  return
+                                }
+                                const isChecked = checked === true
+                                if (isChecked && Number(formData.measurment_id || 1) !== 1) {
+                                  toast.current?.show({
+                                    severity: "error",
+                                    summary: tr("خطأ"),
+                                    detail: MEASUREMENT_TRACKING_CONFLICT_MSG,
+                                    life: 3000,
+                                  })
+                                  return
+                                }
+                                updateFormData("serial_tracking", isChecked)
+                              }}
+                            />
+                            <Label
+                              htmlFor="serial_tracking"
+                              className={`text-sm font-medium ${isUsedInVouchers ? "text-muted-foreground cursor-not-allowed" : "cursor-pointer"}`}
+                            >
+                              {tr("له رقم متسلسل")}
+                            </Label>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <Checkbox
+                              id="batch_tracking"
+                              checked={formData.batch_tracking}
+                              disabled={isUsedInVouchers}
+                              onCheckedChange={(checked) => {
+                                if (isUsedInVouchers) {
+                                  toast.current?.show({
+                                    severity: "error",
+                                    summary: tr("خطأ"),
+                                    detail: VOUCHER_USAGE_TRACKING_LOCK_MSG,
+                                    life: 3000,
+                                  })
+                                  return
+                                }
+                                const isChecked = checked === true
+                                if (isChecked && Number(formData.measurment_id || 1) !== 1) {
+                                  toast.current?.show({
+                                    severity: "error",
+                                    summary: tr("خطأ"),
+                                    detail: MEASUREMENT_TRACKING_CONFLICT_MSG,
+                                    life: 3000,
+                                  })
+                                  return
+                                }
+                                // تفعيل "له رقم تشغيلي" يُفعِّل "له تاريخ صلاحية" تلقائياً معه (دفعة
+                                // بلا تاريخ صلاحية غير منطقية عملياً) — أما إلغاؤه فلا يُلغي تاريخ
+                                // الصلاحية تلقائياً، لأنه قد يبقى مطلوباً بذاته دون تتبع دفعات.
+                                setFormData((prev) => ({
+                                  ...prev,
+                                  batch_tracking: isChecked,
+                                  expiry_tracking: isChecked ? true : prev.expiry_tracking,
+                                }))
+                              }}
+                            />
+                            <Label
+                              htmlFor="batch_tracking"
+                              className={`text-sm font-medium ${isUsedInVouchers ? "text-muted-foreground cursor-not-allowed" : "cursor-pointer"}`}
+                            >
+                              {tr("له رقم تشغيلي")}
+                            </Label>
                           </div>
                         </div>
                       </CardContent>
@@ -2192,21 +3628,21 @@ export function CompactProductForm({
                       <CardHeader className="pb-2 flex items-center justify-between">
                         <CardTitle className="flex items-center gap-2 text-lg">
                           <Warehouse className="h-5 w-5 text-primary" />
-                          تفاصيل المستودعات
+                          {tr("تفاصيل المستودعات")}
                         </CardTitle>
                         <button type="button"
                           className="flex items-center gap-1 bg-primary text-white px-3 py-1 rounded hover:bg-blue-600 transition"
                           onClick={() => handleAddStoreRow()}
                         >
                           <Plus className="h-4 w-4" />
-                          إضافة
+                          {tr("إضافة")}
                         </button>
                       </CardHeader>
                       <CardContent>
                         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4">
                           <div>
                             <Label htmlFor="default_store" className="text-sm font-medium">
-                              المستودع الافتراضي في الحركات
+                              {tr("المستودع الافتراضي في الحركات")}
                             </Label>
                             <div className={sharedDropdownStyles.dropDownWrapper}>
                               <PrimeDropdown
@@ -2214,29 +3650,10 @@ export function CompactProductForm({
                                 value={formData.default_store ? Number(formData.default_store) : null}
                                 className={`${sharedDropdownStyles.dropDown} w-full`}
                                 panelClassName={sharedDropdownStyles.dropDownPanel}
-                                options={(() => {
-                                  const options = [
-                                    { label: "بلا تحديد", value: null },
-                                    ...((definitions.warehouses || []).map((warehouse: any) => ({
-                                      label: warehouse.warehouse_name,
-                                      value: Number(warehouse.id),
-                                    })))
-                                  ]
-
-                                  if (formData.default_store) {
-                                    const selectedId = Number(formData.default_store)
-                                    options.sort((a, b) => {
-                                      if (a.value === selectedId) return -1
-                                      if (b.value === selectedId) return 1
-                                      return 0
-                                    })
-                                  }
-
-                                  return options
-                                })()}
+                                options={defaultStoreOptions}
                                 optionLabel="label"
                                 optionValue="value"
-                                placeholder="اختر المستودع"
+                                placeholder={tr("اختر المستودع")}
                                 filter={true}
                                 filterInputAutoFocus={true}
                                 onChange={(e) => updateFormData("default_store", e.value ?? 0)}
@@ -2246,7 +3663,14 @@ export function CompactProductForm({
                         </div>
                         <div className="grid grid-cols-1 gap-4">
                           <div className="w-full overflow-x-auto">
-                            <DataGrid dataSource={formData.stores ?? []} scheme={getStoresScheme()} />
+                            <DataGridView
+                              style={{ height: TABS_GRID_HEIGHT }}
+                              dataSource={formData.stores ?? []}
+                              scheme={getStoresScheme()}
+                              isReport={false}
+                              showContextMenu={false}
+                              dontConvertToCards={true}
+                            />
                           </div>
                         </div>
                       </CardContent>
@@ -2258,18 +3682,22 @@ export function CompactProductForm({
                       <CardHeader className="pb-4">
                         <CardTitle className="flex items-center gap-2 text-lg">
                           <Settings className="h-5 w-5 text-primary" />
-                          مراكز التكلفة
+                          {tr("مراكز التكلفة")}
                         </CardTitle>
                       </CardHeader>
                       <CardContent>
-                        <div className="overflow-hidden rounded-lg border">
-                          <div className="h-[420px] min-h-[320px] overflow-auto">
-                            <DataGridView
-                              scheme={costCenterScheme}
-                              dataSource={formData.cost_centers ?? []}
-                              defaultRowHeight={44}
-                            />
-                          </div>
+                        {/* نفس الارتفاع الثابت المستخدَم في بقية تبويبات هذه الشاشة (TABS_GRID_HEIGHT)
+                            — تمرَّر إلى DataGridView مباشرة (لا على العنصر الملفوف) ليتولى Wijmo
+                            تمرير الصفوف داخلياً بشريط تمرير واحد بدل شريطين متداخلين. */}
+                        <div className="w-full overflow-x-auto rounded-lg border">
+                          <DataGridView
+                            style={{ height: TABS_GRID_HEIGHT }}
+                            scheme={costCenterScheme}
+                            dataSource={formData.cost_centers ?? []}
+                            isReport={false}
+                            showContextMenu={false}
+                            dontConvertToCards={true}
+                          />
                         </div>
                       </CardContent>
                     </Card>
@@ -2278,31 +3706,127 @@ export function CompactProductForm({
                   <TabsContent value="notes">
                     <Card>
                       <CardHeader className="pb-4">
-                        <CardTitle className="text-lg">ملاحظات وتفاصيل إضافية</CardTitle>
+                        <CardTitle className="text-lg">{tr("ملاحظات وتفاصيل إضافية")}</CardTitle>
                       </CardHeader>
                       <CardContent>
                         <div>
                           <Label htmlFor="notes" className="text-sm font-medium">
-                            ملاحظات
+                            {tr("ملاحظات")}
                           </Label>
                           <Textarea
                             id="notes"
                             value={formData.notes}
                             onChange={(e) => updateFormData("notes", e.target.value)}
-                            className="text-right"
+                            className="text-start"
                             rows={3}
-                            placeholder="أي ملاحظات أو تفاصيل إضافية حول الصنف"
+                            placeholder={tr("أي ملاحظات أو تفاصيل إضافية حول الصنف")}
                           />
+                          <Label htmlFor="transaction_notes" className="mt-4 block text-sm font-medium">
+                            {tr("ملاحظات تظهر في الحركات")}
+                          </Label>
+                          <Textarea
+                            id="transaction_notes"
+                            value={formData.transaction_notes ?? ""}
+                            maxLength={100}
+                            onChange={(e) => updateFormData("transaction_notes", e.target.value.slice(0, 100))}
+                            className="text-start"
+                            rows={3}
+                            placeholder={tr("ملاحظة تظهر عند اختيار الصنف في الحركات")}
+                          />
+                          <div className="mt-1 text-end text-xs text-muted-foreground">
+                            {(formData.transaction_notes ?? "").length}/100
+                          </div>
                         </div>
                       </CardContent>
                     </Card>
                   </TabsContent>
+
+                  <TabsContent value="attachments">
+                    <Card>
+                      <CardHeader className="pb-4">
+                        <CardTitle className="text-lg">{tr("المرفقات")}</CardTitle>
+                      </CardHeader>
+                      <CardContent>
+                        <AttachmentManager modelName="product" recordId={formData.id > 0 ? formData.id : null} />
+                      </CardContent>
+                    </Card>
+                  </TabsContent>
+                  {!isService && <TabsContent value="related">
+                    <Card>
+                      <CardHeader className="pb-2"><div className="flex items-center justify-between gap-2"><CardTitle className="text-lg">{tr("الأصناف التابعة")}</CardTitle><Button type="button" onClick={() => setRelatedProductSearchOpen(true)} disabled={!formData.id}><Plus className="me-2 h-4 w-4" />{tr("إضافة صنف")}</Button></div></CardHeader>
+                      <CardContent><div className="mb-4 max-w-xl"><Label>{tr("إضافة الأصناف التابعة")}</Label><select className="mt-1 h-10 w-full rounded-md border bg-background px-3" value={formData.related_items_mode || 1} onChange={(event) => updateFormData("related_items_mode", Number(event.target.value))}><option value={1}>{tr("عدم المعالجة")}</option><option value={2}>{tr("إضافة الأصناف التابعة فقط")}</option><option value={3}>{tr("إضافة الصنف والاصناف التابعة")}</option><option value={4}>{tr("اختيار يدوي من الاصناف التابعة")}</option></select></div>{!formData.id && <p className="mb-3 text-sm text-muted-foreground">{tr("احفظ الصنف أولاً لإضافة أصناف تابعة.")}</p>}<div className="w-full overflow-x-auto rounded-lg border"><DataGridView style={{ height: TABS_GRID_HEIGHT }} dataSource={relatedProducts} scheme={relatedProductScheme} cellEditEnded={onRelatedCellEditEnded} selectionChanged={(grid: wjGrid.FlexGrid) => setRelatedProductRow(grid.selection.row)} isReport={false} showContextMenu={false} dontConvertToCards={true} /></div><p className="mt-2 text-xs text-muted-foreground">{tr("F7: حذف الصف المحدد")}</p></CardContent>
+                    </Card>
+                  </TabsContent>}
+                  {!isService && <TabsContent value="manufacturing-components">
+                    <Card>
+                      <CardHeader className="pb-2"><div className="flex items-center justify-between gap-2"><CardTitle className="text-lg">{tr("مكونات التصنيع")}</CardTitle><div className="flex flex-wrap items-center gap-2"><Button type="button" variant="outline" onClick={() => setManufacturingComponentsImportOpen(true)} disabled={!formData.id || !canUpdate}><FileSpreadsheet className="me-2 h-4 w-4" />{tr("استيراد من Excel")}</Button><Button type="button" onClick={() => setManufacturingComponentSearchOpen(true)} disabled={!formData.id}><Plus className="me-2 h-4 w-4" />{tr("إضافة مكون")}</Button></div></div></CardHeader>
+                      <CardContent>{!formData.id && <p className="mb-3 text-sm text-muted-foreground">{tr("احفظ الصنف أولاً لإضافة مكونات التصنيع.")}</p>}<div className="w-full overflow-x-auto rounded-lg border"><DataGridView style={{ height: TABS_GRID_HEIGHT }} dataSource={manufacturingComponents} scheme={manufacturingComponentScheme} isReport={false} showContextMenu={false} dontConvertToCards={true} beginningEdit={manufacturingComponentBeginningEdit} cellEditEnded={manufacturingComponentCellEditEnded} /></div><p className="mt-2 text-xs text-muted-foreground">{tr("الكمية تُحتسب تلقائياً من الأبعاد والعدد لمكونات القياس غير العادي، ويمكن تعديلها مباشرة للمكونات العادية.")}</p></CardContent>
+                    </Card>
+                  </TabsContent>}
                 </>
               )}
             </Tabs>
           </form>
         </div>
       </div>
+      {/* خارج <Tabs> عمداً — زرّا "اضافة" لهما في تبويب "معلومات إضافية"، بينما كانت هاتان
+          النافذتان مُعشَّشتين سابقاً داخل TabsContent="units"؛ Radix Tabs لا يُبقي محتوى التبويبات
+          غير النشطة في DOM افتراضياً، فكان الضغط على "اضافة" من تبويب آخر لا يُظهر شيئاً إطلاقاً
+          لأن هاتين النافذتين لم تكونا موجودتين في DOM أصلاً حينها. */}
+      <ProductNumbers
+        open={originalNumbersDialogOpen}
+        onOpenChange={setOriginalNumbersDialogOpen}
+        title={tr("الرقم الأصلي")}
+        numbers={formData.original_numbers}
+        onUpdateNumbers={(newNumbers) => updateFormData("original_numbers", newNumbers)}
+        numberType={1}
+        excludeProductId={formData.id}
+        currentProductName={formData.product_name}
+        onDuplicateError={(message) => toast.current?.show({ severity: "error", summary: "", detail: message, life: 4000 })}
+      />
+      <ProductSearchPopup
+        visible={relatedProductSearchOpen && canView && canUpdate}
+        onClose={() => { setRelatedProductSearchOpen(false); setRelatedProductRow(null) }}
+        onSelect={(products) => addRelatedProduct(products[0])}
+        priceCategoryId={1}
+        ShowSelect={false}
+        searchText=""
+        productTypes={[1]}
+      />
+      <Dialog open={Boolean(relatedOptionsDraft)} onOpenChange={(open) => { if (!open) setRelatedOptionsDraft(null) }}>
+        <DialogContent className="max-w-md" dir={appDir()}>
+          <DialogHeader><DialogTitle>{tr("خيارات الصنف التابع")}</DialogTitle></DialogHeader>
+          {relatedOptionsDraft && <div className="space-y-4">
+            <div className="rounded-md border bg-muted/40 px-3 py-2 text-sm"><span className="font-mono">{relatedOptionsDraft.related_code}</span> — {relatedOptionsDraft.related_name}</div>
+            <label className="flex cursor-pointer items-center gap-2 text-sm"><Checkbox checked={relatedOptionsDraft.add_price !== false} onCheckedChange={(checked) => setRelatedOptionsDraft((draft) => draft && { ...draft, add_price: checked === true })} />{tr("اضافة السعر عند الاختيار")}</label>
+            <label className="flex cursor-pointer items-center gap-2 text-sm"><Checkbox checked={relatedOptionsDraft.no_kitchen_print === true} onCheckedChange={(checked) => setRelatedOptionsDraft((draft) => draft && { ...draft, no_kitchen_print: checked === true })} />{tr("عدم الطباعة في فواتير المطبخ والمطعم")}</label>
+          </div>}
+          <DialogFooter className="gap-2"><Button type="button" variant="outline" onClick={() => setRelatedOptionsDraft(null)}>{tr("إلغاء")}</Button><Button type="button" onClick={confirmRelatedOptions}>{tr("موافق")}</Button></DialogFooter>
+        </DialogContent>
+      </Dialog>
+      {formData.id > 0 && <ManufacturingComponentsImportDialog open={manufacturingComponentsImportOpen && canUpdate} onOpenChange={setManufacturingComponentsImportOpen} productId={Number(formData.id)} onLines={importManufacturingComponents} />}
+      <ProductSearchPopup
+        visible={manufacturingComponentSearchOpen && canView && canUpdate}
+        onClose={() => setManufacturingComponentSearchOpen(false)}
+        onSelect={(products) => addManufacturingComponent(products[0])}
+        priceCategoryId={1}
+        ShowSelect={false}
+        searchText=""
+        productTypes={[1]}
+        selectBaseProduct
+        title={tr("اختيار مكون تصنيع")}
+      />
+      <ProductNumbers
+        open={factoryNumbersDialogOpen}
+        onOpenChange={setFactoryNumbersDialogOpen}
+        title={tr("رقم المصنع")}
+        numbers={formData.factory_numbers}
+        onUpdateNumbers={(newNumbers) => updateFormData("factory_numbers", newNumbers)}
+        numberType={2}
+        excludeProductId={formData.id}
+        currentProductName={formData.product_name}
+        onDuplicateError={(message) => toast.current?.show({ severity: "error", summary: "", detail: message, life: 4000 })}
+      />
       {costCenterSearchOpen && selectedCostCenterType && (
         <SearchCostCenterDialog
           open={costCenterSearchOpen}
@@ -2322,6 +3846,86 @@ export function CompactProductForm({
             setSelectedCostCenterRowIndex(null)
             setSelectedCostCenterType(null)
             setCostCenterSearchOpen(false)
+          }}
+        />
+      )}
+
+      <SimpleListPicker
+        open={unitPickerOpen}
+        onOpenChange={setUnitPickerOpen}
+        title={tr("اختر الوحدة")}
+        items={(definitions.units || []).map((u: any): SimpleListPickerItem => ({ id: u.id, label: u.unit_name }))}
+        onSelect={(item) => {
+          if (unitPickerRow == null) return
+          updateUnitRow(unitPickerRow, { unit_id: Number(item.id), unit_name: item.label })
+        }}
+      />
+
+      <SimpleListPicker
+        open={pricesPickerOpen}
+        onOpenChange={setPricesPickerOpen}
+        title={pricesPickerField === "category" ? tr("اختر فئة السعر") : pricesPickerField === "unit" ? tr("اختر الوحدة") : tr("اختر العملة")}
+        items={
+          pricesPickerField === "category"
+            ? (definitions.price_category || []).map((c: any): SimpleListPickerItem => ({ id: c.id, label: c.name }))
+            : pricesPickerField === "unit"
+              ? Array.from(new Map((formData.units || []).filter((u: UnitItem) => Number(u.unit_id) > 0).map((u: UnitItem) => [Number(u.unit_id), { id: Number(u.unit_id), label: String(u.unit_name || "") }])).values()) as SimpleListPickerItem[]
+              : (definitions.currencies || []).map((c: any): SimpleListPickerItem => ({ id: c.id, label: c.currency_name }))
+        }
+        onSelect={(item) => {
+          if (pricesPickerRow == null) return
+          if (pricesPickerField === "category") {
+            updatePriceRow(pricesPickerRow, { price_category_id: Number(item.id), price_name: item.label })
+          } else if (pricesPickerField === "unit") {
+            updatePriceRow(pricesPickerRow, { unit_id: Number(item.id), unit_name: item.label })
+          } else {
+            updatePriceRow(pricesPickerRow, { currency_id: Number(item.id), currency_name: item.label })
+          }
+        }}
+      />
+
+      <SimpleListPicker
+        open={storePickerOpen}
+        onOpenChange={setStorePickerOpen}
+        title={tr("اختر المستودع")}
+        items={(definitions.warehouses || []).map((w: any): SimpleListPickerItem => ({ id: w.id, label: w.warehouse_name }))}
+        onSelect={(item) => {
+          if (storePickerRow == null) return
+          updateStoreRow(storePickerRow, { store_id: Number(item.id), store_name: item.label })
+        }}
+      />
+
+      <SimpleListPicker
+        open={statusPickerOpen}
+        onOpenChange={setStatusPickerOpen}
+        title={tr("حالة مركز التكلفة")}
+        items={costCenterStatusOptions.map((option): SimpleListPickerItem => ({ id: option.value, label: option.label }))}
+        onSelect={(item) => {
+          if (statusPickerRow == null) return
+          updateCostCenterRow(statusPickerRow, "required_in_transactions", Number(item.id))
+          updateCostCenterRow(statusPickerRow, "required_label", item.label)
+        }}
+      />
+
+      {brandSearchOpen && selectedBrandType && (
+        <SearchBrandDialog
+          open={brandSearchOpen}
+          onOpenChange={(open) => {
+            setBrandSearchOpen(open)
+            if (!open) {
+              setSelectedBrandRowIndex(null)
+              setSelectedBrandType(null)
+            }
+          }}
+          type={selectedBrandType}
+          brands={brands as any}
+          onSelect={(brand) => {
+            if (selectedBrandRowIndex == null) return
+            updateBrandRow(selectedBrandRowIndex, "brand_id", Number(brand.id))
+            updateBrandRow(selectedBrandRowIndex, "brand_name", brand.name || "")
+            setSelectedBrandRowIndex(null)
+            setSelectedBrandType(null)
+            setBrandSearchOpen(false)
           }}
         />
       )}

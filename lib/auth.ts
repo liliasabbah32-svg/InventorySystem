@@ -1,48 +1,8 @@
-import { neon } from "@neondatabase/serverless"
-import { JsConfig } from "next/dist/build/load-jsconfig"
-import { Pool } from "pg"
-import { Json } from "twilio/lib/interfaces"
-
-let sql: any = null
-
-try {
-  if (!process.env.DATABASE_URL) {
-    console.error("[v0] DATABASE_URL environment variable is not set")
-  } else {
-    const dbUrl = process.env.DATABASE_URL
-    console.log("dbUrl ",dbUrl)
-    if (dbUrl.includes("localhost") || dbUrl.includes("127.0.0.1")) {
-      console.log("[v0] Using local PostgreSQL with pg Pool")
-      const pool = new Pool({ connectionString: dbUrl })
-      sql = async (strings: TemplateStringsArray, ...values: any[]) => {
-        const client = await pool.connect()
-        try {
-          const query =
-            strings.reduce(
-              (prev, curr, i) =>
-                prev + curr + (i < values.length ? `$${i + 1}` : ""),
-              ""
-            )
-          const result = await client.query(query, values)
-          return result.rows
-        } finally {
-          client.release()
-        }
-      }
-    } else {
-      console.log("[v0] Using Neon serverless client")
-      sql = neon(dbUrl)
-    }
-
-    console.log("[v0] Database client initialized successfully")
-  }
-} catch (error) {
-  console.error("[v0] Failed to initialize DB client:", error)
-  sql = null
-}
+import sql, { resolveCurrentDbName } from "./database"
+import { ensurePermissionTables } from "./permissions"
+import managementSql, { getManagementPool, ensureManagementTables } from "./management-db"
 
 export default sql
-
 
 export interface User {
   id: string
@@ -55,7 +15,40 @@ export interface User {
   organizationId: number
   isActive: boolean
   lastLogin?: Date,
-  dashboard_layout?: JsConfig
+  dashboard_layout?: any
+  branchId?: number
+  branchName?: string
+}
+
+let branchColumnEnsured: Promise<void> | null = null
+function ensureBranchColumn() {
+  if (!branchColumnEnsured) {
+    branchColumnEnsured = (async () => {
+      // جدول branches نفسه قد لا يكون موجوداً بعد (قاعدة شركة حديثة التزويد لم تُنشأ فيها سوى
+      // user_settings)، ولا يكفي هنا عمل CREATE TABLE IF NOT EXISTS مطابقاً فقط لعمود id المُشار
+      // إليه من user_settings.branch_id — بل نحتاج الجدول كاملاً لأن استعلام الدخول (authenticateUser)
+      // يعمل LEFT JOIN عليه مباشرة، وسيفشل بالكامل (relation does not exist) إن لم يكن موجوداً إطلاقاً.
+      await sql`
+        CREATE TABLE IF NOT EXISTS branches (
+          id SERIAL PRIMARY KEY,
+          branch_code VARCHAR(20) UNIQUE NOT NULL,
+          branch_name VARCHAR(100) NOT NULL,
+          bank_id INTEGER,
+          address TEXT,
+          manager VARCHAR(100),
+          phone VARCHAR(20),
+          status INTEGER DEFAULT 1,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+      `
+      await sql`ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS branch_id INTEGER`
+    })().catch((error: unknown) => {
+      branchColumnEnsured = null
+      throw error
+    })
+  }
+  return branchColumnEnsured
 }
 
 export interface LoginCredentials {
@@ -73,27 +66,126 @@ export interface AuthResult {
   token?: string
 }
 
+// bcrypt بملح لكل كلمة مرور. التجزئات القديمة (SHA-256 بلا ملح، 64 خانة hex) تبقى مقبولة في verifyPassword
+// وتُستبدل بـbcrypt عند أول تسجيل دخول ناجح (needsPasswordRehash). التجزئة لم تعد حتمية: قارن دائماً بـverifyPassword.
+const BCRYPT_ROUNDS = 10
+
 export async function hashPassword(password: string): Promise<string> {
-  const encoder = new TextEncoder()
-  const data = encoder.encode(password)
-  const hashBuffer = await crypto.subtle.digest("SHA-256", data)
-  const hashArray = Array.from(new Uint8Array(hashBuffer))
-  const hashHex = hashArray.map((b) => b.toString(16).padStart(2, "0")).join("")
-  return hashHex
+  const bcrypt = await import("bcryptjs")
+  return bcrypt.hash(password, BCRYPT_ROUNDS)
 }
 
-async function verifyPassword(password: string, hashedPassword: string): Promise<boolean> {
+async function legacySha256(password: string): Promise<string> {
+  const hashBuffer = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(password))
+  return Array.from(new Uint8Array(hashBuffer)).map((b) => b.toString(16).padStart(2, "0")).join("")
+}
+
+export function needsPasswordRehash(hashedPassword: string | null | undefined): boolean {
+  return /^[a-f0-9]{64}$/i.test(String(hashedPassword || ""))
+}
+
+export async function verifyPassword(password: string, hashedPassword: string | null | undefined): Promise<boolean> {
   try {
-    if (hashedPassword.startsWith("$2b$") || hashedPassword.startsWith("$2a$")) {
-      console.log("[v0] Old bcrypt format detected - accepting any password for development")
-      return true
+    const stored = String(hashedPassword || "")
+    if (!stored || !password) return false
+    if (stored.startsWith("$2b$") || stored.startsWith("$2a$") || stored.startsWith("$2y$")) {
+      const bcrypt = await import("bcryptjs")
+      return bcrypt.compare(password, stored)
+    }
+    if (!needsPasswordRehash(stored)) return false
+    const nodeCrypto = await import("node:crypto")
+    return nodeCrypto.timingSafeEqual(Buffer.from(await legacySha256(password), "hex"), Buffer.from(stored.toLowerCase(), "hex"))
+  } catch (error) {
+    console.error("[auth] verifyPassword error:", error)
+    return false
+  }
+}
+
+// الجزء المشترك بين تسجيل الدخول العادي (authenticateUser، بعد التحقق من كلمة المرور) وتسجيل
+// الدخول التلقائي عند اختيار شركة (authenticateByEmail، بلا كلمة مرور أصلاً — الهوية مُثبَتة
+// مسبقاً عبر جلسة الإدارة mgmt_session): تحديث آخر دخول، بناء كائن المستخدم، تسجيل الحدث، وإصدار
+// رمز الجلسة.
+async function finalizeLogin(dbUser: any, ip?: string, userAgent?: string): Promise<AuthResult> {
+  const user: User = {
+    id: dbUser.id,
+    username: dbUser.username,
+    fullName: dbUser.fullName,
+    email: dbUser.email,
+    role: dbUser.role,
+    department: dbUser.department,
+    permissions: dbUser.permissions,
+    organizationId: dbUser.organizationId,
+    isActive: dbUser.isActive,
+    lastLogin: new Date(),
+    dashboard_layout: dbUser.dashboard_layout,
+    branchId: dbUser.branchId ?? undefined,
+    branchName: dbUser.branchName ?? undefined,
+  }
+
+  await Promise.allSettled([
+    sql`
+      UPDATE user_settings
+      SET last_login = NOW(), updated_at = NOW()
+      WHERE user_id = ${dbUser.id}
+    `,
+    logAuditEvent({
+      userId: dbUser.id,
+      userName: dbUser.fullName,
+      action: "login",
+      module: "authentication",
+      status: "success",
+      details: `User login successful from IP: ${ip || "unknown"}`,
+    }),
+  ])
+
+  return {
+    success: true,
+    user,
+    token: generateSessionToken(dbUser.id),
+  }
+}
+
+// تسجيل دخول موثوق بلا كلمة مرور — يُستخدَم فقط من /api/management/select-company بعد التحقق من
+// أن المستخدم يملك جلسة إدارة صالحة (mgmt_session) ويملك الشركة المُختارة فعلاً؛ يبحث عن مستخدم
+// بنفس بريد حساب الإدارة داخل قاعدة الشركة المُختارة (ضمن withTenantDb) لتسجيل دخوله تلقائياً دون
+// إعادة طلب كلمة المرور. إن لم يوجد مستخدم بهذا البريد في هذه الشركة، يعيد success:false ليعرض
+// العميل نموذج الدخول الاعتيادي لتلك الشركة بدلاً من ذلك.
+export async function authenticateByEmail(email: string, opts: { ip?: string; userAgent?: string } = {}): Promise<AuthResult> {
+  try {
+    if (!sql) {
+      return { success: false, error: "خطأ في الاتصال بقاعدة البيانات" }
     }
 
-    const passwordHash = await hashPassword(password)
-    return passwordHash === hashedPassword
-  } catch (error) {
-    console.log("[v0] Error in verifyPassword:", error)
-    return false
+    await ensureBranchColumn()
+
+    const dbUsers = (await sql`
+      SELECT
+        us.user_id as id,
+        us.username,
+        us.full_name as "fullName",
+        us.email,
+        us.role,
+        us.department,
+        us.is_active as "isActive",
+        us.organization_id as "organizationId",
+        us.permissions,
+        us.dashboard_layout,
+        us.branch_id as "branchId",
+        b.branch_name as "branchName"
+      FROM user_settings us
+      LEFT JOIN branches b ON b.id = us.branch_id
+      WHERE LOWER(us.email) = ${email.trim().toLowerCase()}
+      AND us.is_active = true
+    `) as any[]
+
+    if (dbUsers.length === 0) {
+      return { success: false, error: "لا يوجد مستخدم بهذا البريد الإلكتروني في هذه الشركة" }
+    }
+
+    return await finalizeLogin(dbUsers[0], opts.ip, opts.userAgent)
+  } catch (error: any) {
+    console.error("[v0] authenticateByEmail error:", error?.message)
+    return { success: false, error: "حدث خطأ في النظام. يرجى المحاولة مرة أخرى." }
   }
 }
 
@@ -108,43 +200,30 @@ export async function authenticateUser(credentials: LoginCredentials): Promise<A
     }
 
     try {
+      await ensureBranchColumn()
 
       const dbUsers = (await sql`
-        SELECT 
-          user_id as id,
-          username,
-          full_name as "fullName",
-          email,
-          role,
-          department,
-          password_hash,
-          is_active as "isActive",
-          organization_id as "organizationId",
-          permissions,
-          dashboard_layout
-        FROM user_settings 
-        WHERE (username = ${credentials.username} OR email = ${credentials.username})
-        AND is_active = true
+        SELECT
+          us.user_id as id,
+          us.username,
+          us.full_name as "fullName",
+          us.email,
+          us.role,
+          us.department,
+          us.password_hash,
+          us.is_active as "isActive",
+          us.organization_id as "organizationId",
+          us.permissions,
+          us.dashboard_layout,
+          us.branch_id as "branchId",
+          b.branch_name as "branchName"
+        FROM user_settings us
+        LEFT JOIN branches b ON b.id = us.branch_id
+        WHERE (us.username = ${credentials.username} OR us.email = ${credentials.username})
+        AND us.is_active = true
       `) as any[]
 
-      console.log("users :", dbUsers)
-      
-
       if (dbUsers.length === 0) {
-        console.log("[v0] No users found with username/email:", credentials.username)
-
-        try {
-          const allUsers = await sql`
-            SELECT user_id, username, email, full_name, is_active 
-            FROM user_settings 
-            ORDER BY created_at DESC
-            LIMIT 10
-          `
-          console.log("[v0] Available users in database:", allUsers)
-        } catch (listError) {
-          console.log("[v0] Could not list available users:", listError)
-        }
-
         try {
           await logFailedLoginAttempt({
             username: credentials.username,
@@ -163,14 +242,6 @@ export async function authenticateUser(credentials: LoginCredentials): Promise<A
       }
 
       const dbUser = dbUsers[0]
-      console.log("[v0] Found user:", {
-        id: dbUser.id,
-        username: dbUser.username,
-        fullName: dbUser.fullName,
-        email: dbUser.email,
-        isActive: dbUser.isActive,
-        hasPassword: dbUser.password_hash ? "YES" : "NO",
-      })
       const isPasswordValid = await verifyPassword(credentials.password, dbUser.password_hash)
 
       if (!isPasswordValid) {
@@ -192,62 +263,13 @@ export async function authenticateUser(credentials: LoginCredentials): Promise<A
         }
       }
 
-      try {
-        await sql`
-          UPDATE user_settings 
-          SET last_login = NOW(), updated_at = NOW()
-          WHERE user_id = ${dbUser.id}
-        `
-      } catch (updateError) {
-        console.log("[v0] Failed to update last login:", updateError)
+      if (needsPasswordRehash(dbUser.password_hash)) {
+        const upgraded = await hashPassword(credentials.password)
+        await sql`UPDATE user_settings SET password_hash = ${upgraded} WHERE user_id = ${dbUser.id}`.catch((error: unknown) =>
+          console.error("[auth] password rehash failed:", error))
       }
 
-      // Get user permissions from database
-      let permissions = ["جميع الصلاحيات"]
-      if (dbUser.permissions && Array.isArray(dbUser.permissions)) {
-        permissions = dbUser.permissions
-      } else if (typeof dbUser.permissions === "string") {
-        try {
-          permissions = JSON.parse(dbUser.permissions)
-        } catch {
-          permissions = ["جميع الصلاحيات"]
-        }
-      }
-
-      const user: User = {
-        id: dbUser.id,
-        username: dbUser.username,
-        fullName: dbUser.fullName,
-        email: dbUser.email,
-        role: dbUser.role,
-        department: dbUser.department,
-        permissions:dbUser.permissions,
-        organizationId: dbUser.organizationId,
-        isActive: dbUser.isActive,
-        lastLogin: new Date(),
-        dashboard_layout: dbUser.dashboard_layout
-      }
-
-      try {
-        await logAuditEvent({
-          userId: dbUser.id,
-          userName: dbUser.fullName,
-          action: "login",
-          module: "authentication",
-          status: "success",
-          details: `User login successful from IP: ${credentials.ip || "unknown"}`,
-        })
-      } catch (auditError) {
-        console.log("[v0] Failed to log audit event:", auditError)
-      }
-
-      console.log("[v0] Database authentication successful for:", dbUser.username)
-
-      return {
-        success: true,
-        user,
-        token: generateSessionToken(dbUser.id),
-      }
+      return await finalizeLogin(dbUser, credentials.ip, credentials.userAgent)
     } catch (dbError: any) {
       console.error("[v0] Database query error:", {
         error: dbError,
@@ -291,16 +313,22 @@ export async function createUser(userData: {
   department: string
   organizationId: number
   permissions?: string[]
+  branchId?: number | null
+  jobRoleId?: number | null
+  managementUserId?: number | null
 }): Promise<{ success: boolean; error?: string; userId?: string }> {
   if (!sql) {
     return { success: false, error: "خطأ في الاتصال بقاعدة البيانات" }
   }
 
   try {
+    await ensureBranchColumn()
+    await ensurePermissionTables(await resolveCurrentDbName())
+
     // Check if username or email already exists
     const existingUsers = await sql`
-      SELECT user_id FROM user_settings 
-      WHERE username = ${userData.username} OR email = ${userData.email}
+      SELECT user_id FROM user_settings
+      WHERE username = ${userData.username} OR LOWER(TRIM(email)) = ${userData.email.trim().toLowerCase()}
     `
 
     if (existingUsers.length > 0) {
@@ -310,42 +338,130 @@ export async function createUser(userData: {
     // Update hashPassword call to be async
     const passwordHash = await hashPassword(userData.password)
 
-    const existingUserIds = await sql`
-      SELECT user_id FROM user_settings 
-      WHERE user_id ~ '^[0-9]+$'
-      ORDER BY CAST(user_id AS INTEGER) DESC 
-      LIMIT 1
-    `
-
-    let nextUserId = "1"
-    if (existingUserIds.length > 0) {
-      const lastId = Number.parseInt(existingUserIds[0].user_id)
-      nextUserId = (lastId + 1).toString()
-    }
-
-    console.log("[v0] Creating user with sequential ID:", nextUserId)
-
     // Insert new user
-    await sql`
+    const createdUsers = await sql`
       INSERT INTO user_settings (
-        user_id, username, email, password_hash, full_name, role, department,
-        organization_id, permissions, is_active, language, timezone, 
+        username, email, password_hash, full_name, role, department,
+        organization_id, permissions, branch_id, job_role_id, management_user_id, is_active, language, timezone,
         date_format, time_format, notifications_enabled, email_notifications,
         sms_notifications, theme_preference, sidebar_collapsed, created_at, updated_at
       ) VALUES (
-        ${nextUserId}, ${userData.username}, ${userData.email}, ${passwordHash},
+        ${userData.username}, ${userData.email}, ${passwordHash},
         ${userData.fullName}, ${userData.role}, ${userData.department},
-        ${userData.organizationId}, ${JSON.stringify(userData.permissions || ["جميع الصلاحيات"])},
+        ${userData.organizationId}, ${JSON.stringify(userData.permissions || [])},
+        ${userData.branchId ?? null}, ${userData.jobRoleId ?? null}, ${userData.managementUserId ?? null},
         true, 'ar', 'Asia/Riyadh', 'DD/MM/YYYY', '24h', true, true, false,
         'slate', false, NOW(), NOW()
-      )
+      ) RETURNING user_id
     `
 
-    console.log("[v0] User created successfully with sequential ID:", nextUserId)
+    const nextUserId = String(createdUsers[0].user_id)
     return { success: true, userId: nextUserId }
   } catch (error) {
     console.error("Create user error:", error)
     return { success: false, error: "حدث خطأ في إنشاء المستخدم" }
+  }
+}
+
+// Email uniqueness is local to the company. An existing management identity may
+// join another company without changing its password or existing memberships.
+export async function createTenantEmployeeWithManagementLink(userData: {
+  username: string
+  email: string
+  password: string
+  fullName: string
+  role: string
+  department: string
+  organizationId: number
+  permissions?: string[]
+  branchId?: number | null
+  jobRoleId?: number | null
+}): Promise<{ success: boolean; error?: string; userId?: string; existingIdentity?: boolean }> {
+  const email = userData.email?.trim().toLowerCase()
+  if (!email) {
+    return { success: false, error: "البريد الإلكتروني مطلوب" }
+  }
+
+  await ensureManagementTables()
+
+  const existingTenantUser = await sql`SELECT user_id FROM user_settings WHERE LOWER(TRIM(email)) = ${email}`
+  if (existingTenantUser.length) {
+    return { success: false, error: "البريد الإلكتروني مستخدَم بالفعل لمستخدم آخر في هذه الشركة" }
+  }
+
+  const currentDbName = await resolveCurrentDbName()
+  const companyRows = await managementSql`SELECT id FROM companies WHERE db_name = ${currentDbName}`
+  const companyId: number | null = companyRows[0]?.id ?? null
+
+  // لا صف شركة بقاعدة الإدارة (قاعدة مرجعية محلية بلا تتبّع، أو بيئة تطوير مباشرة بلا كوكي
+  // tenant_db) — يستمر إنشاء المستخدم محلياً بالشركة كما كان يعمل تماماً قبل هذه الميزة، بلا أي
+  // ربط بقاعدة الإدارة، بدل رفض إضافة موظف بالكامل في تلك البيئات.
+  if (!companyId) {
+    console.warn("[auth] createTenantEmployeeWithManagementLink: no management.companies row for", currentDbName)
+    return createUser(userData)
+  }
+
+  // بريد بلا حساب إدارة: لا يُنشأ حساب في management.users (كان يمنع التسجيل لاحقاً بنفس البريد) — يُنشأ
+  // مستخدم الشركة فقط مع دعوة معلّقة تتحوّل لعضوية عند التسجيل أو تعيين كلمة المرور (lib/company-invitations.ts)
+  const existingIdentity = await managementSql`SELECT id FROM users WHERE LOWER(email) = ${email} LIMIT 1`
+  if (!existingIdentity.length) {
+    const tenantOnly = await createUser({ ...userData, email })
+    if (tenantOnly.success && tenantOnly.userId) {
+      const { inviteEmailToCompany } = await import("@/lib/company-invitations")
+      await inviteEmailToCompany({ email, companyId, dbName: currentDbName, tenantUserId: tenantOnly.userId, fullName: userData.fullName })
+    }
+    return { ...tenantOnly, existingIdentity: false }
+  }
+
+  const passwordHash = await hashPassword(userData.password)
+
+  const managementPool = getManagementPool()
+  const managementClient = await managementPool.connect()
+  try {
+    await managementClient.query("BEGIN")
+
+    const existing = await managementClient.query(`SELECT id, password_hash FROM users WHERE LOWER(email) = $1`, [email])
+    let managementUserId: number = existing.rows[0]?.id
+    const existingIdentityHash: string | null = existing.rows[0]?.password_hash ?? null
+    if (!managementUserId) {
+      const inserted = await managementClient.query(
+        `INSERT INTO users (full_name, email, password_hash, email_verified, is_active)
+         VALUES ($1, $2, $3, true, true) ON CONFLICT (email) DO NOTHING RETURNING id`,
+        [userData.fullName, email, passwordHash],
+      )
+      managementUserId = inserted.rows[0]?.id
+        ?? (await managementClient.query(`SELECT id FROM users WHERE email = $1`, [email])).rows[0]?.id
+      if (!managementUserId) throw new Error("Unable to resolve management identity")
+    }
+
+    await managementClient.query(
+      `INSERT INTO user_company (user_id, company_id, role, is_active) VALUES ($1, $2, 'employee', true)
+       ON CONFLICT (user_id, company_id) DO NOTHING`,
+      [managementUserId, companyId],
+    )
+
+    // كلمة المرور نفسها تُجزَّأ هنا مرة أخرى (bcrypt بملح مختلف) — قيمتان مختلفتان لكن verifyPassword يقبل كلتيهما.
+    const tenantResult = await createUser({ ...userData, email, managementUserId })
+
+    if (!tenantResult.success) {
+      await managementClient.query("ROLLBACK")
+      return tenantResult
+    }
+
+    // حساب إدارة موجود مسبقاً (نفس الشخص بشركة أخرى): كلمة المرور واحدة للهوية — تُنسَخ تجزئتها الحالية
+    // لسجل الشركة بدل كلمة المرور المُدخلة/المولّدة، فيدخل بكلمة مروره المعتادة في كل الشركات.
+    if (existingIdentityHash && tenantResult.userId) {
+      await sql`UPDATE user_settings SET password_hash = ${existingIdentityHash} WHERE user_id = ${Number(tenantResult.userId)}`
+    }
+
+    await managementClient.query("COMMIT")
+    return { ...tenantResult, existingIdentity: Boolean(existingIdentityHash) }
+  } catch (error) {
+    await managementClient.query("ROLLBACK")
+    console.error("[auth] createTenantEmployeeWithManagementLink error:", error)
+    return { success: false, error: "حدث خطأ في إنشاء المستخدم" }
+  } finally {
+    managementClient.release()
   }
 }
 

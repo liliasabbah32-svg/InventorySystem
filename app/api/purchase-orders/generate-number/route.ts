@@ -1,8 +1,6 @@
 import { type NextRequest, NextResponse } from "next/server"
-import { neon } from "@neondatabase/serverless"
-
-const sql = neon(process.env.DATABASE_URL!)
-
+import sql from "@/lib/database"
+import { resolveBranchSymbol, requestBranchId } from "@/lib/branch-symbol"
 export async function GET(request: NextRequest) {
   try {
     console.log("[v0] API: Starting purchase order number generation")
@@ -39,7 +37,9 @@ export async function GET(request: NextRequest) {
       })
     }
 
-    const prefix = normalizedSettings.purchase_prefix || "P"
+    // بادئة السند + رمز الفرع (لا دفتر سندات لأوامر الشراء) + التسلسل
+    const branchSymbol = await resolveBranchSymbol(await requestBranchId(request, new URL(request.url).searchParams.get("branch_id")))
+    const prefix = `${normalizedSettings.purchase_prefix || "P"}${branchSymbol}`
 
     // Get the latest order number with this prefix
     const result = await sql`
@@ -69,7 +69,7 @@ export async function GET(request: NextRequest) {
     }
 
     // Generate new order number with prefix and sequential number
-    const paddedNumber = nextNumber.toString().padStart(7, "0")
+    const paddedNumber = nextNumber.toString().padStart(9, "0")
     const orderNumber = `${prefix}${paddedNumber}`
 
     console.log("[v0] API: Generated order number:", orderNumber)

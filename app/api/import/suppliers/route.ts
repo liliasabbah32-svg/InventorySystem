@@ -1,11 +1,23 @@
+import { authorizeFile } from "@/lib/file-permissions"
 import { type NextRequest, NextResponse } from "next/server"
-import { neon } from "@neondatabase/serverless"
+import sql from "@/lib/database"
 import { generateSupplierNumber } from "@/lib/number-generator"
 
-const sql = neon(process.env.DATABASE_URL!)
+const normalizeImportedCode = (rawValue: unknown, prefix = "S") => {
+  const cleaned = String(rawValue ?? "").trim().toUpperCase().replace(/[^A-Z0-9]/g, "")
+  if (!cleaned) return ""
+
+  // حروف الرقم نفسه تبقى كما هي، والأرقام تُكمَّل بأصفار من اليسار حتى 10 خانات (S0000029 -> S000000029)
+  const match = cleaned.match(/^([A-Z]*)(\d*)$/)
+  if (!match) return cleaned
+  const prefixValue = match[1] || String(prefix).trim().toUpperCase()
+  return `${prefixValue}${match[2].padStart(Math.max(0, 10 - prefixValue.length), "0")}`
+}
 
 export async function POST(request: NextRequest) {
   try {
+    const permission = await authorizeFile(request, "suppliers", "create")
+    if (!permission.ok) return permission.response
     const { data } = await request.json()
 
     if (!Array.isArray(data) || data.length === 0) {
@@ -26,8 +38,8 @@ export async function POST(request: NextRequest) {
           continue
         }
 
-        // Generate supplier code if not provided
-        let supplierCode = item.supplier_code
+        // Generate supplier code if not provided and normalize imported values to the same 10-digit format
+        let supplierCode = normalizeImportedCode(item.supplier_code, "S")
         if (!supplierCode) {
           supplierCode = await generateSupplierNumber()
         }
@@ -66,7 +78,7 @@ export async function POST(request: NextRequest) {
         success++
       } catch (error) {
         console.error(`Error importing supplier ${item.supplier_name}:`, error)
-        errors.push(`السطر ${data.indexOf(item) + 1}: ${error.message}`)
+        errors.push(`السطر ${data.indexOf(item) + 1}: ${error instanceof Error ? error.message : String(error)}`)
         failed++
       }
     }

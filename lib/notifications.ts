@@ -1,7 +1,9 @@
-import { neon } from "@neondatabase/serverless"
+import sql from "@/lib/database"
 import { sendTemplateMessage, sendTextMessage } from "./whatsapp-service"
 
-const sql = neon(process.env.DATABASE_URL!)
+// (كان يُنشئ عميل neon() خاصاً به دوماً بصرف النظر عن كون DATABASE_URL يشير لخادم Postgres محلي —
+// عميل neon يتواصل عبر HTTP فقط، فيفشل بـ"fetch failed" حِيال أي قاعدة محلية. الاستيراد من
+// lib/database.ts يُحيل لنفس منطق التبديل pg/neon المستخدَم بباقي المشروع.)
 
 export interface Notification {
   id: number
@@ -197,7 +199,7 @@ export async function createOrderAdvanceNotification(
           from_stage: fromStageName,
           to_stage: toStageName,
           stage_name: toStageName,
-          total_amount: totalAmount.toLocaleString("ar-SA", {
+          total_amount: totalAmount.toLocaleString("ar-SA-u-nu-latn", {
             style: "currency",
             currency: "SAR",
           }),
@@ -312,7 +314,7 @@ export async function checkOverdueOrdersAndNotify() {
           hours_overdue: Math.floor(order.hours_in_stage),
           partner_name: order.partner_name,
           total_amount:
-            order.total_amount?.toLocaleString("ar-SA", {
+            order.total_amount?.toLocaleString("ar-SA-u-nu-latn", {
               style: "currency",
               currency: "SAR",
             }) || "غير محدد",
@@ -338,6 +340,11 @@ export async function checkOverdueOrdersAndNotify() {
 }
 
 // الحصول على التنبيهات للمستخدم أو القسم
+function isNotificationsTableMissingError(error: any) {
+  const message = String(error?.message || error)
+  return /relation \"notifications\" does not exist|undefined_table/i.test(message)
+}
+
 export async function getNotifications(
   userId?: number,
   department?: string,
@@ -390,6 +397,10 @@ export async function getNotifications(
     const result = await sql.unsafe(query, params)
     return result as Notification[]
   } catch (error) {
+    if (isNotificationsTableMissingError(error)) {
+      console.warn("Notifications table missing; returning empty list.")
+      return []
+    }
     console.error("Error fetching notifications:", error)
     throw error
   }
@@ -472,6 +483,10 @@ export async function getUnreadNotificationCount(userId?: number, department?: s
     const result = await sql.unsafe(query, params)
     return result && result[0] ? Number.parseInt(result[0].count) : 0
   } catch (error) {
+    if (isNotificationsTableMissingError(error)) {
+      console.warn("Notifications table missing; returning unread count 0.")
+      return 0
+    }
     console.error("Error getting unread notification count:", error)
     return 0
   }

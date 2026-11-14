@@ -1,6 +1,7 @@
 "use client";
 
 import React from 'react';
+import { gridActionClass, gridActionStyle, gridActionLabel } from './grid-action-icons';
 import { FlexGridColumn, FlexGrid, FlexGridCellTemplate } from '@grapecity/wijmo.react.grid';
 import * as wjcCore from '@grapecity/wijmo';
 import { GroupPanel } from '@grapecity/wijmo.react.grid.grouppanel';
@@ -19,12 +20,24 @@ import * as schemeHelper from './SchemeHelper';
 import Input from './Input';
 import Util from './Util';
 import { ArabicToLatinNumbers } from './ArabicToLatinNumbers';
+
+const createScheme = (scheme) => {
+  if (!scheme || !Array.isArray(scheme.columns)) {
+    return { name: 'default', columns: [] };
+  }
+  return schemeHelper.create(scheme);
+};
 //import GridGlobalization from './GridGlobalization';
 import { FaFlag,FaFlagCheckered } from 'react-icons/fa';
 import { Toast } from 'primereact/toast';
 import 'primeicons/primeicons.css';
 import './DataGridView.scss';
 import * as wjSpark from '@grapecity/wijmo.chart.finance.analytics';
+
+const wijmoLicenseKey = typeof process !== 'undefined' ? process.env.NEXT_PUBLIC_WIJMO_LICENSE_KEY : '';
+if (wijmoLicenseKey) {
+  wjcCore.setLicenseKey(wijmoLicenseKey);
+}
 // import './DataGridView.css';
 
 const defaultStrings = {
@@ -41,16 +54,19 @@ export default class DataGridView extends React.Component {
   constructor(props) {
     super(props);
     let dir = "rtl";
-    this.columnTooltips = new Tooltip({
-      position: PopupPosition.Above,
-      showAtMouse: true,
-      showDelay: 600,
-      cssClass: 'rtl',
-    });
+    this.columnTooltips = typeof window !== 'undefined'
+      ? new Tooltip({
+          position: PopupPosition.Above,
+          showAtMouse: true,
+          showDelay: 600,
+          cssClass: 'rtl',
+        })
+      : null;
+    const schemePtr = createScheme(props.scheme);
     this.state = {
-      defaultValueFilters: schemeHelper.createFilters(props.scheme),
-      summaryReducer: schemeHelper.createSummaryReducer(props.scheme),
-      footerRows: schemeHelper.createFooterRows(props.scheme),
+      defaultValueFilters: schemeHelper.createFilters(schemePtr),
+      summaryReducer: schemeHelper.createSummaryReducer(schemePtr),
+      footerRows: schemeHelper.createFooterRows(schemePtr),
       //groupColumn: schemeHelper.createGroupColumn(props.scheme, props.scheme.allowGrouping),
       selection: undefined,
       currentSelection: null,
@@ -63,7 +79,7 @@ export default class DataGridView extends React.Component {
       progress: 0,
       selectedItems: undefined,
       buttonsColumns: this.createButtonsColumns(this.props.scheme),
-      isDesktop: window.innerWidth > 800,
+      isDesktop: typeof window !== 'undefined' ? window.innerWidth > 800 : false,
       hasError: false,
       errorInfo: null,
       searchText: '',
@@ -75,7 +91,42 @@ export default class DataGridView extends React.Component {
     this.setState({ hasError: true, errorInfo: { error: String(error), info } });
   }
 
+  _applyUserGridSettings = (settings) => {
+    if (!this.flex) return;
+    const rootStyles = typeof window !== 'undefined' ? getComputedStyle(document.documentElement) : null;
+    const headerHeight = Number(settings && settings.gridHeaderHeight) || parseInt(rootStyles?.getPropertyValue('--datagrid-header-height'), 10) || 40;
+    const rowHeight = Number(settings && settings.gridRowHeight) || parseInt(rootStyles?.getPropertyValue('--datagrid-row-height'), 10) || 50;
+    if (this.flex.columnHeaders?.rows?.length) this.flex.columnHeaders.rows[0].height = headerHeight;
+    if (this.flex.rows) this.flex.rows.defaultSize = rowHeight;
+    if (this.flex.invalidate) this.flex.invalidate();
+    // CellMaker uses inline dimensions, so resize action buttons after redraw.
+    if (typeof window !== 'undefined') {
+      window.requestAnimationFrame(() => this.applyButtonColors());
+    }
+  };
+
+  componentDidUpdate(prevProps) {
+    // buttonsColumns wires each button column's onClick into a Wijmo CellMaker template built
+    // from the scheme object at the time it was created. Callers commonly rebuild `scheme` in a
+    // useMemo keyed on live state (e.g. row data), so the onClick closures captured here can go
+    // stale — clicking the button silently runs against whatever state existed when this
+    // component first mounted. Rebuilding buttonsColumns whenever the scheme prop actually
+    // changes keeps every button column's click handler current.
+    if (prevProps.scheme !== this.props.scheme) {
+      this.setState({ buttonsColumns: this.createButtonsColumns(this.props.scheme) });
+    }
+
+    // selectionMode is only applied once inside initialized() at first mount — a grid whose
+    // isReport prop flips later (e.g. a voucher moving from draft to مرحّل without the grid
+    // itself remounting) would otherwise keep the stale selection mode indefinitely.
+    if (prevProps.isReport !== this.props.isReport && this.flex) {
+      this.flex.selectionMode = this.props.isReport ? wjGrid.SelectionMode.Row : wjGrid.SelectionMode.Cell;
+    }
+  }
+
   componentDidMount = () => {
+    this._isUnmounted = false;
+    this._deferredInitTimer = null;
     //GridGlobalization();
     
     this.setState(
@@ -93,17 +144,14 @@ export default class DataGridView extends React.Component {
     // because the grid wasn't fully initialized yet.
     try {
       window.addEventListener('resize', this._updateGridLayout);
-      if (this.flex) {
-        // FlexGrid.addEventListener(target, type, handler)
-        this.flex.addEventListener(window, 'resize', this._updateGridLayout);
-      }
     } catch (err) {
       // Defensive fallback: schedule registration on next tick if something goes wrong now.
       console.error('[v0] Failed to attach resize handlers, deferring:', err);
-      setTimeout(() => {
+      this._deferredInitTimer = setTimeout(() => {
+        this._deferredInitTimer = null;
+        if (this._isUnmounted) return;
         try {
           window.addEventListener('resize', this._updateGridLayout);
-          if (this.flex) this.flex.addEventListener(window, 'resize', this._updateGridLayout);
         } catch (e) {
           console.error('[v0] Deferred resize handler registration failed:', e);
         }
@@ -114,20 +162,48 @@ export default class DataGridView extends React.Component {
     window['grid'] = this.flex;
     // Listen for window resize to update predicate (document does not fire resize).
     window.addEventListener('resize', this.updatePredicate);
+
+    // يُطلَق من lib/system-settings-sync.ts بعد كل مزامنة (تحميل أول أو حفظ إعداد "عدد الخانات
+    // العشرية" بشاشة إعدادات السندات) — formatItem أعلاه يقرأ Util.getSystemSetting(17) عند كل
+    // رسم خلية، لكن Wijmo لا يُعيد رسم الخلايا تلقائياً فقط لأن localStorage تغيّر؛ invalidate()
+    // يجبر إعادة تنسيق كل الخلايا المعروضة فوراً بالقيمة الجديدة دون حاجة لإعادة تحميل الصفحة.
+    this._onSystemSettingsUpdated = () => {
+      try {
+        if (this.flex && this.flex.invalidate) this.flex.invalidate();
+      } catch (e) {
+        /* ignore */
+      }
+    };
+    window.addEventListener('system-settings-updated', this._onSystemSettingsUpdated);
+    window.addEventListener('datagrid-settings-updated', this._applyUserGridSettings);
+    this._applyUserGridSettings();
   };
 
   componentWillUnmount() {
+    this._isUnmounted = true;
+    if (this._deferredInitTimer) {
+      clearTimeout(this._deferredInitTimer);
+      this._deferredInitTimer = null;
+    }
     try {
-      window.removeEventListener('resize', this._updateGridLayout);
-      window.removeEventListener('resize', this.updatePredicate);
+      if (this.columnTooltips && this.columnTooltips.dispose) {
+        this.columnTooltips.dispose();
+        this.columnTooltips = null;
+      }
+      if (typeof window !== 'undefined' && window.grid === this.flex) {
+        delete window.grid;
+      }
     } catch (e) {
       /* ignore */
     }
 
     try {
-      if (this.flex && this.flex.removeEventListener) {
-        this.flex.removeEventListener(window, 'resize', this._updateGridLayout);
+      window.removeEventListener('resize', this._updateGridLayout);
+      window.removeEventListener('resize', this.updatePredicate);
+      if (this._onSystemSettingsUpdated) {
+        window.removeEventListener('system-settings-updated', this._onSystemSettingsUpdated);
       }
+      window.removeEventListener('datagrid-settings-updated', this._applyUserGridSettings);
     } catch (e) {
       /* ignore */
     }
@@ -147,7 +223,7 @@ export default class DataGridView extends React.Component {
     this.setState({ isDesktop: window.innerWidth > 800 });
   };
 createButtonsColumns = () => {
-    let schemePtr = schemeHelper.create(this.props.scheme);
+    const schemePtr = createScheme(this.props.scheme);
     let columns = schemePtr.columns.filter((col) => !col.visible || col.visible === true);
     let buttonsColumns = [];
     columns.map((col) => {
@@ -155,8 +231,17 @@ createButtonsColumns = () => {
         buttonsColumns.push({
           colName: col.name,
           template: CellMaker.makeButton({
-            attributes: { title: col.title, style: this.getButtonInlineStyle(col.className) },
+            // col.title || '' وليس col.title مباشرة — setAttribute('title', undefined) في DOM
+            // يضبط الخاصية فعلياً على النص الحرفي "undefined" بدل تركها فارغة، فتظهر "undefined"
+            // كتلميح (tooltip) لأي عمود زر لم يُحدَّد له title صراحةً.
+            attributes: {
+              type: 'button',
+              title: col.title || this.getButtonLabel(col) || gridActionLabel(col.iconType, col.className),
+              'aria-label': col.title || this.getButtonLabel(col) || gridActionLabel(col.iconType, col.className),
+              style: this.getButtonInlineStyle(col.className, col.iconType),
+            },
             cssClass: this.setButtonClass(col.className, col.iconType),
+            text: this.getButtonLabel(col),
             click: col.onClick,
           }),
         });
@@ -187,12 +272,21 @@ createButtonsColumns = () => {
   };
 
   render = () => {
-    let schemePtr = schemeHelper.create(this.props.scheme);
+    if (!this.props.scheme || !Array.isArray(this.props.scheme.columns)) {
+      return (
+        <div className="p-4 bg-red-50 border border-red-200 rounded text-sm text-red-700">
+          <strong>خطأ في تحميل الجدول</strong>
+          <div>DataGridView: لم يتم توفير مخطط صالح للجدول.</div>
+        </div>
+      );
+    }
+
+    const schemePtr = createScheme(this.props.scheme);
     let columns = schemePtr.columns.filter((col) => !col.visible || col.visible === true);
     if (this.state.columns) {
-      columns = this.state.columns;
+      columns = this.mergeSavedColumnWidths(columns, this.state.columns);
     }
-    const serialColumn = {
+    /*const serialColumn = {
       name: '__serial',
       header: '##',
       width: 60,
@@ -203,7 +297,7 @@ createButtonsColumns = () => {
       align: 'center',
       body: 'serial',
     };
-    columns = [serialColumn, ...columns.filter((col) => col.name !== '__serial')];
+    columns = [serialColumn, ...columns.filter((col) => col.name !== '__serial')];*/
     this.filterColumns = [];
     columns.forEach((element) => {
       if (element.name !== '__serial' && element.filterable !== false) this.filterColumns.push(element.name);
@@ -220,8 +314,56 @@ createButtonsColumns = () => {
         ? this.state.columnChooserItemsSource.filter((item) => item.header.toLowerCase().includes(this.state.searchText.toLowerCase()))
         : [];
     const height = this.props.containerStyle || {};
+    const {
+      innerRef,
+      dataSource,
+      idProperty,
+      isReport,
+      containerStyle,
+      defaultRowHeight,
+      scheme,
+      parent,
+      focusFilter,
+      hideSearch,
+      pageId,
+      allowDragging,
+      allowMerging,
+      columnHeaderHeight,
+      onKeyDown,
+      onMouseDown,
+      onRowClick,
+      onRowDoubleClick,
+      columnsCustomMenu,
+      registerContextMenuEvent,
+      showContextMenu,
+      exportFileName,
+      allowExcelExport,
+      exportHiddenColumns,
+      copyItemStoreDown,
+      checkBoxSelector,
+      ShowColumsSpan,
+      ColumsSpanFrom,
+      ColumsSpanTo,
+      ColumsSpanHeader,
+      showStaticFooter,
+      dontConvertToCards,
+      dontDoLessThan3,
+      doHideVisibleCol,
+      from_permissions,
+      ...gridProps
+    } = this.props;
+    Object.keys(gridProps).forEach((key) => {
+      if (/^on[A-Z]/.test(key)) {
+        delete gridProps[key];
+      }
+    });
+    // Prevent passing certain custom props through to the DOM via spread — these
+    // belong to the Wijmo components or our API and React warns if forwarded
+    // to a native element. Remove common ones here.
+    delete gridProps.wordWrap;
+    delete gridProps.wordwrap;
     return (
-      <div style={height}>
+      <div style={height} dir="rtl">
         {this.state.hasError && (
           <div className="p-4 bg-red-50 border border-red-200 rounded text-sm text-red-700">
             <strong>خطأ في تحميل الجدول</strong>
@@ -259,19 +401,19 @@ createButtonsColumns = () => {
         )}
         <FlexGrid
           id="theGridTallRows"
-          ref={this.props.innerRef}
+          ref={innerRef}
           headersVisibility={this.props.headersVisibility ? this.props.headersVisibility : 'Column'}
           isReadOnly={this.props.isReport ? true : false}
           quickAutoSize={false}
-          quickRowHeights={false}
           
           initialized={this.initialized.bind(this)}
           itemsSource={this.props.dataSource}
-          {...this.props}
-          wordWrap={true}
+          {...gridProps}
+          beginningEdit={this.props.beginningEdit}
+          cellEditEnded={this.props.cellEditEnded}
           allowMerging={true}
-          loadingRows={() => this.columnTooltips.dispose()}
-          //keyActionEnter={this.props.isReport ? '0' : this.props.keyActionEnter}
+          loadingRows={() => this.columnTooltips?.dispose?.()}
+          {...(this.props.isReport ? { keyActionEnter: '0' } : {})}
         >
           {this.props.allowDragging && (this.props.allowDragging === 'Rows' || this.props.allowDragging === 'Both') && (
             <FlexGridCellTemplate cellType="RowHeader" template={this.rowHeaderTemplate} />
@@ -298,6 +440,7 @@ createButtonsColumns = () => {
                 isContentHtml={col.isContentHtml}
                 cellTemplate={col.buttonBody === 'button' ? this.createButton(col) : undefined}
                 editor={col.editor ? col.editor : undefined}
+                dataMap={col.dataMap ? col.dataMap : undefined}
                 align={col.align}
                 maxLength={col.maxLength}
                 cssClass={col.align && col.align === 'left' ? styles.valueLeftStyle : ''}
@@ -309,7 +452,7 @@ createButtonsColumns = () => {
               >
                 {col.body && col.body === 'serial' && <FlexGridCellTemplate cellType="Cell" template={this.getSerialTemplate} />}
                 {col.body && col.body !== 'serial' && <FlexGridCellTemplate cellType="Cell" template={col.body} />}
-                {!col.body && this.isStatusColumn(col.name) && (
+                {!col.body && !col.dataMap && this.isStatusColumn(col.name) && (
                   <FlexGridCellTemplate cellType="Cell" template={(cell) => this.getTemplate(cell, col.name)} />
                 )}
                 {!col.body &&col.name === 'campaign' && (
@@ -464,13 +607,15 @@ createButtonTemplate = (col) => (ctx) => {
   cell.style.alignItems = 'center';
 
   const btn = document.createElement('button');
-  btn.title = col.title || '';
+  btn.title = col.title || this.getButtonLabel(col) || gridActionLabel(col.iconType, col.className);
+  btn.type = 'button';
+  btn.setAttribute('aria-label', btn.title);
   // use helper to derive consistent css classes for grid buttons
   btn.className = this.setButtonClass(col.className, col.iconType);
-  btn.innerHTML = col.iconType ? `<i class="${col.iconType}"></i>` : col.title;
+  btn.textContent = this.getButtonLabel(col);
 
   // Inline style fallback so colors appear even when global CSS is overridden
-  const inline = this.getButtonInlineStyle(col.className);
+  const inline = this.getButtonInlineStyle(col.className, col.iconType);
   if (inline) btn.style.cssText += inline;
 
   btn.addEventListener('click', (e) => col.onClick?.(ctx.item, e));
@@ -478,6 +623,25 @@ createButtonTemplate = (col) => (ctx) => {
 };
 
 
+
+  // يدمج فقط عرض العمود (width) المحفوظ سابقاً في localStorage فوق أعمدة الـscheme الحالية — لا
+  // يستبدلها بالكامل كما كان يحدث سابقاً (columns = this.state.columns مباشرة). كانت هذه الاستبدالة
+  // الكاملة تُسقِط visible/isReadOnly/dataType/onClick... المحسوبة ديناميكياً بالكود الحالي وتُرجِع
+  // بدلاً منها القيم القديمة المحفوظة وقت آخر حفظ لنفس scheme.name — وبما أن عدة شاشات مختلفة (سند
+  // ادخال/اخراج بضاعة، استعمال، ارسالية داخلية) تشترك نفس scheme.name ("StockVoucherItemsScheme")،
+  // كان أي تعديل على visible لعمود (كعمود "المستودع" بالسطر) لا يظهر أثره إطلاقاً لأي مستخدم لديه
+  // بيانات محفوظة سابقاً من قبل تعديل الكود — يبقى العمود أو قيمته مخفياً/فارغاً رغم صحة الكود.
+  mergeSavedColumnWidths = (freshColumns, savedColumns) => {
+    if (!Array.isArray(savedColumns) || savedColumns.length === 0) return freshColumns;
+    const widthByKey = {};
+    savedColumns.forEach((sc) => {
+      const key = sc && (sc.binding || sc.name);
+      if (key && typeof sc.width !== 'undefined') widthByKey[key] = sc.width;
+    });
+    return freshColumns.map((col) =>
+      Object.prototype.hasOwnProperty.call(widthByKey, col.name) ? { ...col, width: widthByKey[col.name] } : col
+    );
+  };
 
   saveGridState(flexGrid, scheme) {
     if (!flexGrid) return;
@@ -525,114 +689,24 @@ createButtonTemplate = (col) => (ctx) => {
 
   
 
-  setButtonClass = (className, iconType) => {
-    const classes = ['wj-cell-maker-btn'];
-    const cls = (className || 'default').toLowerCase();
-    const icon = (iconType || '').toLowerCase();
+  setButtonClass = (className, iconType) => gridActionClass(className, iconType);
 
-    switch (cls) {
-      case 'danger':
-        classes.push('btn-danger');
-        break;
-      case 'warning':
-        classes.push('btn-warning');
-        break;
-      case 'info':
-        classes.push('btn-info');
-        break;
-      case 'success':
-        classes.push('btn-success');
-        break;
-      default:
-        classes.push('btn-default');
-        break;
-    }
-
-    switch (icon) {
-      case 'search':
-        classes.push('pi', 'pi-search');
-        break;
-      case 'edit':
-        classes.push('pi', 'pi-pencil');
-        break;
-      case 'delete':
-        classes.push('pi', 'pi-trash');
-        break;
-      case 'add':
-        classes.push('pi', 'pi-plus');
-        break;
-      case 'view':
-      case 'eye':
-        classes.push('pi', 'pi-eye');
-        break;
-      case 'save':
-        classes.push('pi', 'pi-save');
-        break;
-      default:
-        break;
-    }
-
-    return classes.join(' ');
+  getButtonLabel = (col = {}) => {
+    if (col.buttonLabel) return col.buttonLabel;
+    return '';
   };
 
-  // Returns inline style string for a given button class to be used as a
-  // fallback when CSS rules are overridden or not applied by the environment.
-  getButtonInlineStyle = (className) => {
-    const cls = (className || 'default').toLowerCase();
-    switch (cls) {
-      case 'danger':
-        return 'background:#dc3545;color:#fff;border:none;';
-      case 'warning':
-        return 'background:#ffb84d;color:#222;border:none;';
-      case 'info':
-        return 'background:#17a2b8;color:#fff;border:none;';
-      case 'success':
-        return 'background:#28a745;color:#fff;border:none;';
-      default:
-        return 'background:#f1f1f1;color:#222;border:none;';
-    }
-  };
+  getButtonInlineStyle = (className, iconType) => gridActionStyle(className, iconType);
 
-  // Apply inline colors/styles to any buttons inside the grid host.
-  // This is a runtime fallback for environments where external CSS is
-  // overridden or CellMaker doesn't propagate classes/styles reliably.
+  // Fit action controls to the row height and allow text labels to expand.
   applyButtonColors = () => {
-    try {
-      if (!this.flex || !this.flex.hostElement) return;
-      const btns = this.flex.hostElement.querySelectorAll('button');
-      btns.forEach((btn) => {
-        const cls = (btn.className || '').toLowerCase();
-        // size and base styles
-        btn.style.height = btn.style.height || '30px';
-        btn.style.minWidth = btn.style.minWidth || '32px';
-        btn.style.padding = btn.style.padding || '0 8px';
-        btn.style.borderRadius = btn.style.borderRadius || '8px';
-        btn.style.border = btn.style.border || 'none';
-
-        if (cls.indexOf('btn-danger') > -1) {
-          btn.style.background = '#dc3545';
-          btn.style.color = '#fff';
-        } else if (cls.indexOf('btn-warning') > -1) {
-          btn.style.background = '#ffb84d';
-          btn.style.color = '#222';
-        } else if (cls.indexOf('btn-info') > -1) {
-          btn.style.background = '#17a2b8';
-          btn.style.color = '#fff';
-        } else if (cls.indexOf('btn-success') > -1) {
-          btn.style.background = '#28a745';
-          btn.style.color = '#fff';
-        } else if (cls.indexOf('btn-default') > -1 || cls.indexOf('wj-cell-maker') > -1 || cls.indexOf('wj-cell-maker-btn') > -1) {
-          // default neutral look
-          btn.style.background = '#f1f1f1';
-          btn.style.color = '#222';
-        }
-        // ensure icon color follows button
-        const icon = btn.querySelector('i');
-        if (icon) icon.style.color = 'inherit';
-      });
-    } catch (e) {
-      /* ignore */
-    }
+    if (!this.flex?.hostElement) return;
+    const rowHeight = Number(this.flex.rows?.defaultSize) || 50;
+    const size = Math.max(24, Math.min(30, rowHeight - 10));
+    this.flex.hostElement.querySelectorAll('button.dgv-action').forEach(button => {
+      button.style.setProperty('--dgv-action-size', size + 'px');
+      button.classList.toggle('has-label', Boolean(button.textContent?.trim()));
+    });
   };
 
   filter = (e) => {
@@ -702,6 +776,7 @@ createButtonTemplate = (col) => (ctx) => {
   };
 
   initialized(flexgrid) {
+    if (this._isUnmounted) return;
     this.flex = flexgrid;
     // Defensive init: sometimes Wijmo initializes before the host has layout/size
     // causing assertions. If the host is not sized yet or initialization throws,
@@ -717,7 +792,10 @@ createButtonTemplate = (col) => (ctx) => {
           this._initAttempts = attempts + 1;
           const delay = 50 * Math.pow(2, attempts); // 50,100,200,...
           console.warn('[v0] FlexGrid host has no size yet, deferring initialization by', delay, 'ms (attempt', this._initAttempts, ')');
-          setTimeout(() => this.initialized(flexgrid), delay);
+          this._deferredInitTimer = setTimeout(() => {
+            this._deferredInitTimer = null;
+            this.initialized(flexgrid);
+          }, delay);
           return;
         }
       }
@@ -731,6 +809,7 @@ createButtonTemplate = (col) => (ctx) => {
       this.flex.selectionMode = this.props.isReport ? wjGrid.SelectionMode.Row : wjGrid.SelectionMode.Cell;
       if (this.props.columnHeaderHeight) this.flex.columnHeaders.rows[0].height = this.props.columnHeaderHeight;
       else this.flex.columnHeaders.rows[0].height = 40;
+      this._applyUserGridSettings();
       this.flex.columns.height = 150;
       // this.flex.autoSizeRow(0, true); header 2 row height
       // add blank row initially
@@ -759,6 +838,13 @@ createButtonTemplate = (col) => (ctx) => {
           // }
           this.props.onKeyDown(this.flex, e);
         });
+      }
+      // Some editable grids must commit and navigate on the same Enter press.
+      // Capture runs before Wijmo consumes Enter to merely close its editor.
+      if (this.props.onKeyDownCapture) {
+        this.flex.hostElement.addEventListener('keydown', (e) => {
+          this.props.onKeyDownCapture(this.flex, e);
+        }, true);
       }
       if (this.props.onMouseDown) {
         this.flex.hostElement.addEventListener('mousedown', (e) => {
@@ -1008,11 +1094,26 @@ createButtonTemplate = (col) => (ctx) => {
           }
         }
 
-        if (this.props.isReport) {
+        {
+          // تنسيق أعمدة الأرقام (عدد الخانات العشرية عبر Util.getSystemSetting(17)، المرتبط الآن
+          // بـ"عدد الخانات العشرية" بإعدادات السندات العامة — انظر lib/system-settings-sync.ts) كان
+          // مقصوراً على this.props.isReport (شبكات التقارير فقط)، فتبقى شبكات الإدخال (سندات
+          // المخزون/طلبات وتسليم المبيعات...) بلا أي تنسيق عشري رغم استخدامها نفس DataGridView —
+          // يُطبَّق الآن على كل شبكة تستخدم هذا المكوّن بصرف النظر عن isReport؛ باقي السلوكيات
+          // المشروطة بـisReport أعلاه (تلوين الصفوف الزوجية/الفردية، عرض البطاقات الضيق...) بلا تغيير.
           //cells formatting
           if (e.panel === flexgrid.cells) {
             let col = flexgrid.columns[e.col];
-            if (col.dataType === 2) {
+            // لا تلمس محتوى الخلية أثناء تحريرها فعلياً — Wijmo يضع عنصر <input> حقيقياً بداخلها
+            // عند التحرير، وformatItem يُعاد استدعاؤه أثناء ذلك أيضاً؛ الكتابة فوق textContent هنا
+            // كانت تمحو ذلك الـinput بنص ثابت في كل مرة، فيبدو العمود كأنه للقراءة فقط (خصوصاً
+            // بمجرد إضافة dataType: Number لأي عمود، حتى بلا isReadOnly صراحةً).
+            const isEditingThisCell = flexgrid.editRange && flexgrid.editRange.row === e.row && flexgrid.editRange.col === e.col;
+            // A DataMap owns the displayed text (for example an item-status
+            // dropdown). Formatting its underlying numeric key here replaces
+            // the mapped label with values such as 4.000 and can also disrupt
+            // the dropdown editor when the user enters the cell.
+            if (col.dataType === 2 && !col.dataMap && !isEditingThisCell) {
               let value = flexgrid.getCellData(e.row, e.col, false);
 
               const _col = this.props.scheme.columns.filter((c) => c.name === col.name);
@@ -1025,7 +1126,7 @@ createButtonTemplate = (col) => (ctx) => {
                 col.name !== 'ser' &&
                 col.name !== 'status' &&
                 col.name !== 'code' &&
-                !_col[0].withoutFractions
+                !(_col[0] && _col[0].withoutFractions)
               ) {
                 if (value === null) {
                   e.cell.textContent = '';
@@ -1229,8 +1330,9 @@ createButtonTemplate = (col) => (ctx) => {
           try {
             if (flexgrid.selection && flexgrid.selection._row > -1) {
               let hti = flexgrid.hitTest(e);
-              if (hti.cellType === wjGrid.CellType.Cell && (e.target.classList[0] === 'wj-cell' || e.target.classList.length <= 0)) {
-                this.props.onRowDoubleClick(flexgrid.rows[flexgrid.selection._row].dataItem, flexgrid.selection);
+              if (hti.cellType === wjGrid.CellType.Cell && hti.row > -1 && (e.target.classList[0] === 'wj-cell' || e.target.classList.length <= 0)) {
+                flexgrid.select(hti.row, hti.col);
+                this.props.onRowDoubleClick(flexgrid.rows[hti.row].dataItem, flexgrid.selection);
               }
             }
           } catch (e) {
@@ -1354,7 +1456,7 @@ createButtonTemplate = (col) => (ctx) => {
     let format = [];
     let columns = schemePtr.columns;
     if (this.state.columns) {
-      columns = this.state.columns;
+      columns = this.mergeSavedColumnWidths(columns, this.state.columns);
     }
     if (!columns || columns.length <= 0) {
       return;
@@ -1405,6 +1507,7 @@ createButtonTemplate = (col) => (ctx) => {
   }
 
   _updateGridLayout = () => {
+    if (this._isUnmounted || !this.flex || !this.flex.hostElement) return;
     const schemePtr = schemeHelper.create(this.props.scheme);
     // show/hide columns
     //let narrow = this.flex ? this.flex.hostElement.clientWidth < 400 && !this.restoreLayout : false;
@@ -1454,7 +1557,7 @@ createButtonTemplate = (col) => (ctx) => {
       }
 
       this.flex.headersVisibility = narrow ? 'None' : this.props.headersVisibility ? this.props.headersVisibility : 'Column';
-      this.setState({ narrow: narrow });
+      if (this.state.narrow !== narrow) this.setState({ narrow: narrow });
     }
   };
 
@@ -1468,7 +1571,7 @@ createButtonTemplate = (col) => (ctx) => {
       const schemePtr = schemeHelper.create(this.props.scheme);
       let columns = schemePtr.columns;
       if (this.state.columns) {
-        columns = this.state.columns;
+        columns = this.mergeSavedColumnWidths(columns, this.state.columns);
       }
       if (!columns || columns.length <= 0) {
         return;
@@ -1692,7 +1795,9 @@ createButtonTemplate = (col) => (ctx) => {
   exportCSV() {
     let rng = new wjGrid.CellRange(0, 0, this.flex.rows.length - 1, this.flex.columns.length - 1),
       csv = this.flex.getClipString(rng, wjGrid.ClipStringOptions.CSV, true, false);
-    saveFile(csv, this.props.exportFileName ? this.props.exportFileName + '.csv' : 'FlexGrid.csv');
+    // Excel on Windows may open UTF-8 CSV as a legacy code page without a BOM,
+    // which corrupts Arabic headers and cell values.
+    saveFile(new Blob(["\uFEFF", csv], { type: 'text/csv;charset=utf-8' }), this.props.exportFileName ? this.props.exportFileName + '.csv' : 'FlexGrid.csv');
   }
 
   formatItemXlsx = (args) => {
@@ -1838,11 +1943,12 @@ createButtonTemplate = (col) => (ctx) => {
 
 const normalizeArabic = (text) => {
   if (!text) return '';
+  // نفس توحيد البحث في النظام (lib/arabic-search.ts): همزات ⇐ ا، ة ⇐ ه، ى/ئ ⇐ ي، ؤ ⇐ و، بلا تشكيل، أرقام لاتينية
   return text
-    .replace(/(أ|إ|آ|ى)/g, 'ا')
-    .replace(/(ه|ة)/g, 'ا')
-    .replace(/(ؤ|و)/g, 'و')
-    .replace(/(ى|ي|ئ)/g, 'ي')
-    .replace(/[ًٌٍَُِْ]/g, '')
+    .replace(/[ً-ٰٟـ]/g, '')
+    .replace(/[أإآٱ]/g, 'ا')
+    .replace(/ة/g, 'ه')
+    .replace(/[ىئ]/g, 'ي')
+    .replace(/ؤ/g, 'و')
     .replace(/[٠١٢٣٤٥٦٧٨٩]/g, (d) => '0123456789'['٠١٢٣٤٥٦٧٨٩'.indexOf(d)]);
 };

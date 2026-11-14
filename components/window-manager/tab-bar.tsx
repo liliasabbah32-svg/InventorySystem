@@ -1,4 +1,5 @@
 "use client"
+import { appDir } from "@/lib/i18n"
 import { Button } from "@/components/ui/button"
 import { X, Minus, MoreHorizontal } from "lucide-react"
 import { useWindowManager } from "@/contexts/window-manager-context"
@@ -16,7 +17,7 @@ export function TabBar() {
   console.log("[v0] TabBar rendering:", { tabCount: tabWindows.length, activeWindowId })
 
   return (
-    <div className="flex items-center bg-muted/30 border-b border-border px-2 py-1 gap-1" dir="rtl">
+    <div className="flex items-center bg-muted/30 border-b border-border px-2 py-1 gap-1" dir={appDir()}>
       <div className="flex items-center gap-1 flex-1 overflow-x-auto">
         {tabWindows.map((window) => (
           <div
@@ -61,7 +62,7 @@ export function TabBar() {
       {windows.filter((w) => w.isMinimized).length > 0 && (
         <Button variant="ghost" size="sm" className="px-2">
           <MoreHorizontal className="h-4 w-4" />
-          <span className="mr-1 text-xs">{windows.filter((w) => w.isMinimized).length}</span>
+          <span className="ms-1 text-xs">{windows.filter((w) => w.isMinimized).length}</span>
         </Button>
       )}
     </div>

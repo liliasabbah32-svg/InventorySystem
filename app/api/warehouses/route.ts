@@ -1,48 +1,7 @@
-import { type NextRequest, NextResponse } from "next/server"
-import { neon } from "@neondatabase/serverless"
-
-import { Pool } from "pg"
-
-let sql: any = null
-
-try {
-  if (!process.env.DATABASE_URL) {
-    console.error("[v0] DATABASE_URL environment variable is not set")
-  } else {
-    const dbUrl = process.env.DATABASE_URL
-
-    if (dbUrl.includes("localhost") || dbUrl.includes("127.0.0.1")) {
-      console.log("[v0] Using local PostgreSQL with pg Pool")
-      const pool = new Pool({ connectionString: dbUrl })
-      sql = async (strings: TemplateStringsArray, ...values: any[]) => {
-        const client = await pool.connect()
-        try {
-          const query =
-            strings.reduce(
-              (prev, curr, i) =>
-                prev + curr + (i < values.length ? `$${i + 1}` : ""),
-              ""
-            )
-          const result = await client.query(query, values)
-          return result.rows
-        } finally {
-          client.release()
-        }
-      }
-    } else {
-      console.log("[v0] Using Neon serverless client")
-      sql = neon(dbUrl)
-    }
-
-    console.log("[v0] Database client initialized successfully")
-  }
-} catch (error) {
-  console.error("[v0] Failed to initialize DB client:", error)
-  sql = null
-}
-
-export default sql
-
+import { type NextRequest } from "next/server"
+import { NextResponse } from "next/server"
+import sql from "@/lib/database"
+import { ensureWarehouseCostCentersTable, saveWarehouseCostCenters } from "@/lib/cost-center-defaults"
 type Warehouse = {
   id: number
   warehouse_code: string
@@ -51,12 +10,13 @@ type Warehouse = {
   description?: string
   location?: string
   is_active: boolean
+  status: number
   created_at: string
   updated_at: string
 }
+
 export async function GET() {
   try {
-    // Check if warehouses table exists, if not create it
     await sql`
       CREATE TABLE IF NOT EXISTS warehouses (
         id SERIAL PRIMARY KEY,
@@ -66,12 +26,16 @@ export async function GET() {
         description TEXT,
         location VARCHAR(200),
         is_active BOOLEAN DEFAULT true,
+        status INTEGER DEFAULT 1,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
     `
 
-    // Check if table is empty and populate with default warehouses
+    await sql`ALTER TABLE warehouses ADD COLUMN IF NOT EXISTS status INTEGER DEFAULT 1`
+    // الطابعة الافتراضية للمستودع (طباعة الطلبية حسب المستودع)
+    await sql`ALTER TABLE warehouses ADD COLUMN IF NOT EXISTS default_printer VARCHAR(150)`
+
     const existingWarehouses = await sql`SELECT COUNT(*) as count FROM warehouses`
 
     if (existingWarehouses[0].count === 0) {
@@ -85,8 +49,8 @@ export async function GET() {
 
       for (const warehouse of defaultWarehouses) {
         await sql`
-          INSERT INTO warehouses (warehouse_code, warehouse_name, warehouse_name_en, location, is_active)
-          VALUES (${warehouse.code}, ${warehouse.name}, ${warehouse.name_en}, ${warehouse.location}, true)
+          INSERT INTO warehouses (warehouse_code, warehouse_name, warehouse_name_en, location, is_active, status)
+          VALUES (${warehouse.code}, ${warehouse.name}, ${warehouse.name_en}, ${warehouse.location}, true, 1)
         `
       }
     }
@@ -100,14 +64,31 @@ export async function GET() {
         description,
         location,
         is_active,
+        status,
+        default_printer,
         created_at,
         updated_at
       FROM warehouses
-      WHERE is_active = true
-      ORDER BY id
+      WHERE status != 3
+      ORDER BY warehouse_code ASC NULLS LAST, id ASC
     `
 
-    return NextResponse.json(warehouses.map((w:Warehouse) => ({ ...w, name: w.warehouse_name })))
+    // مراكز التكلفة الافتراضية لكل مستودع (تُستخدم لسطور الأصناف بالسندات — انظر lib/cost-center-defaults.ts)
+    // مراكز التكلفة إضافة اختيارية — فشلها لا يُفرغ قائمة المستودعات نفسها
+    let costCenterRows: any[] = []
+    try {
+      await ensureWarehouseCostCentersTable()
+      costCenterRows = (await sql`SELECT warehouse_id, cost_center_type_id, default_cost_center_id, required_in_transactions FROM warehouse_costcenters_tbl`) as any[]
+    } catch (costCenterError) {
+      console.error("Error loading warehouse cost centers:", costCenterError)
+    }
+    return NextResponse.json(warehouses.map((w: Warehouse) => ({
+      ...w,
+      name: w.warehouse_name,
+      cost_centers: costCenterRows
+        .filter((row) => Number(row.warehouse_id) === Number(w.id))
+        .map((row) => ({ cost_center_type_id: Number(row.cost_center_type_id), default_cost_center_id: row.default_cost_center_id == null ? null : Number(row.default_cost_center_id), required_in_transactions: Number(row.required_in_transactions || 1) })),
+    })))
   } catch (error) {
     console.error("Error fetching warehouses:", error)
     return NextResponse.json({ error: "Failed to fetch warehouses" }, { status: 500 })
@@ -118,32 +99,32 @@ export async function POST(request: NextRequest) {
   try {
     const data = await request.json()
 
-    if (!data.warehouse_name || !data.warehouse_code) {
-      return NextResponse.json({ error: "اسم المستودع ورمزه مطلوبان" }, { status: 400 })
+    if (!data.warehouse_name) {
+      return NextResponse.json({ error: "اسم المستودع مطلوب" }, { status: 400 })
     }
 
-    // Check if warehouse code already exists
-    const existingWarehouse = await sql`
-      SELECT id FROM warehouses WHERE warehouse_code = ${data.warehouse_code}
-    `
-
-    if (existingWarehouse.length > 0) {
-      return NextResponse.json({ error: "رمز المستودع موجود مسبقاً" }, { status: 400 })
-    }
-
+    const status = Number(data.status ?? 1)
     const result = await sql`
+      WITH next_warehouse AS (
+        SELECT nextval(pg_get_serial_sequence('warehouses', 'id')) AS id
+      )
       INSERT INTO warehouses (
-        warehouse_code, warehouse_name, warehouse_name_en, description, location, is_active
-      ) VALUES (
-        ${data.warehouse_code}, 
+        id, warehouse_code, warehouse_name, warehouse_name_en, description, location, is_active, status, default_printer
+      ) SELECT
+        id,
+        LPAD(id::text, 4, '0'),
         ${data.warehouse_name}, 
         ${data.warehouse_name_en || ""}, 
         ${data.description || ""}, 
         ${data.location || ""}, 
-        ${data.is_active !== false}
-      ) RETURNING *
+        ${status === 1},
+        ${status},
+        ${String(data.default_printer || "").trim() || null}
+      FROM next_warehouse
+      RETURNING *
     `
 
+    await saveWarehouseCostCenters(Number(result[0].id), data.cost_centers)
     return NextResponse.json({ ...result[0], name: result[0].warehouse_name }, { status: 201 })
   } catch (error) {
     console.error("Error creating warehouse:", error)

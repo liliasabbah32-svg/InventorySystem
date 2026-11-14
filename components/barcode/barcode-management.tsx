@@ -1,4 +1,6 @@
 "use client"
+import { tr, appDir } from "@/lib/i18n"
+import { VoucherListHero } from "@/components/common/voucher-list-shell"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { BarcodeScanner } from "./barcode-scanner"
 import { BarcodeGenerator } from "./barcode-generator"
@@ -6,24 +8,18 @@ import { Scan, QrCode, Package } from "lucide-react"
 
 export function BarcodeManagement() {
   return (
-    <div className="space-y-6 p-6 bg-background min-h-screen" dir="rtl">
-      <div>
-        <h1 className="text-3xl font-bold text-foreground flex items-center gap-3">
-          <Package className="h-8 w-8 text-primary" />
-          إدارة الباركود
-        </h1>
-        <p className="text-muted-foreground mt-1">مسح وإنشاء وإدارة الباركود للمنتجات</p>
-      </div>
+    <div className="space-y-6 p-6 bg-background min-h-screen" dir={appDir()}>
+<VoucherListHero title={tr("إدارة الباركود")} subtitle={tr("مسح وإنشاء وإدارة الباركود للمنتجات")} icon={Package} category={tr("المخزون")} />
 
       <Tabs defaultValue="scanner" className="w-full">
         <TabsList className="grid w-full grid-cols-2">
           <TabsTrigger value="scanner" className="flex items-center gap-2">
             <Scan className="h-4 w-4" />
-            ماسح الباركود
+            {tr("ماسح الباركود")}
           </TabsTrigger>
           <TabsTrigger value="generator" className="flex items-center gap-2">
             <QrCode className="h-4 w-4" />
-            مولد الباركود
+            {tr("مولد الباركود")}
           </TabsTrigger>
         </TabsList>
 

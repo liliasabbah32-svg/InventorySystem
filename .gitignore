@@ -6,9 +6,14 @@
 # next.js
 /.next/
 /out/
+# stale renamed build dirs left behind by some tooling instead of being deleted (e.g. .next.stale-20260802/)
+.next.stale-*/
 
 # production
 /build
+
+# uploaded attachments (runtime data, per-server local disk storage)
+/uploads
 
 # debug
 npm-debug.log*
@@ -27,3 +32,15 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+certificates
+# ملفات مؤقتة لفحوصات المتصفح والسجلات
+tmp/
+
+# OpenNext / Cloudflare
+.open-next
+.wrangler
+.dev.vars
+
+# مشغّلات ويندوز المبنية (النسخة المنشورة في public/downloads)
+launchers/windows/dist/

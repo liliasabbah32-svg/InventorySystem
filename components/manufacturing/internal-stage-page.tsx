@@ -1,0 +1,299 @@
+"use client"
+
+import { tr, appDir } from "@/lib/i18n"
+import { useEffect, useMemo, useRef, useState } from "react"
+import { ArrowDownUp, CheckCircle2, Copy, FileText, Save, Search } from "lucide-react"
+import { Button } from "@/components/ui/button"
+import { Input } from "@/components/ui/input"
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog"
+import Messages from "@/components/common/Messages"
+import { useAuth } from "@/components/auth/auth-context"
+import InternalItemImage from "./internal-item-image"
+import {
+  INTERNAL_STATUS_LABELS, INTERNAL_STEPS, InternalLockedState, InternalPageHeader, InternalRequestCard, InternalStepper, RefreshButton, SIDE_LABELS,
+  formatQuantity, isStepEnabled, useInternalWorkflow, type InternalStepKey,
+} from "./internal-workflow-shared"
+
+type QuantityField = "qnty" | "prepared_quantity" | "received_quantity"
+type StageRules = { editable: QuantityField | null; columns: QuantityField[]; fill?: { label: string; from: (item: any) => number } }
+
+// ما يُعرض ويُعدَّل في كل مرحلة — نفس القواعد التي يقبلها الخادم (processInternalManufacturingAction).
+const STAGE_RULES: Record<Exclude<InternalStepKey, "request">, StageRules> = {
+  requestAudit: { editable: "qnty", columns: ["qnty"] },
+  preparation: { editable: "prepared_quantity", columns: ["qnty", "prepared_quantity"], fill: { label: tr("تجهيز كامل الكميات المطلوبة"), from: (item) => Number(item.qnty) } },
+  readyAudit: { editable: "prepared_quantity", columns: ["qnty", "prepared_quantity"], fill: { label: tr("مطابقة للكميات المطلوبة"), from: (item) => Number(item.qnty) } },
+  send: { editable: null, columns: ["qnty", "prepared_quantity"] },
+  receive: { editable: "received_quantity", columns: ["qnty", "prepared_quantity", "received_quantity"], fill: { label: tr("استلام كامل الكميات المجهزة"), from: (item) => Number(item.prepared_quantity || item.qnty) } },
+  receivedAudit: { editable: null, columns: ["qnty", "prepared_quantity", "received_quantity"] },
+}
+const COLUMN_LABELS: Record<QuantityField, string> = { qnty: tr("الكمية المطلوبة"), prepared_quantity: tr("الكمية المجهزة"), received_quantity: tr("الكمية المستلمة") }
+
+function initialValue(stage: Exclude<InternalStepKey, "request">, item: any) {
+  if (stage === "requestAudit") return Number(item.qnty)
+  if (stage === "preparation") return Number(item.prepared_quantity) > 0 ? Number(item.prepared_quantity) : Number(item.qnty)
+  if (stage === "readyAudit") return Number(item.prepared_quantity || 0)
+  if (stage === "receive") return Number(item.received_quantity) > 0 ? Number(item.received_quantity) : Number(item.prepared_quantity || item.qnty)
+  return 0
+}
+
+export default function InternalStagePage({ stageKey }: { stageKey: Exclude<InternalStepKey, "request"> }) {
+  const step = INTERNAL_STEPS.find((candidate) => candidate.key === stageKey)!
+  const rules = STAGE_RULES[stageKey]
+  const { activeBranchId } = useAuth()
+  const workflow = useInternalWorkflow()
+  const [requests, setRequests] = useState<any[]>([])
+  const [loading, setLoading] = useState(false)
+  const [listError, setListError] = useState("")
+  const [search, setSearch] = useState("")
+  const [oldestFirst, setOldestFirst] = useState(true)
+  const [selected, setSelected] = useState<any | null>(null)
+  const [values, setValues] = useState<Record<number, string>>({})
+  const [saving, setSaving] = useState(false)
+  const pageMessagesRef = useRef<any>(null)
+  const dialogMessagesRef = useRef<any>(null)
+  const inputRefs = useRef<Array<HTMLInputElement | null>>([])
+  const mobileInputRefs = useRef<Array<HTMLInputElement | null>>([])
+  const sequenceRef = useRef(0)
+
+  const allowed = workflow.permissions?.[step.permission] === true
+  const canEditRequest = stageKey === "requestAudit" && (allowed || workflow.permissions?.edit === true)
+  const enabled = isStepEnabled(step, workflow.settings)
+  // "استلام البضاعة تلقائي": اعتماد التجهيز ينشئ الارسالية الداخلية ويغلق الطلب
+  const autoReceive = stageKey === "preparation" && workflow.settings?.autoReceive === true
+  const approveLabel = autoReceive ? tr("تجهيز واستلام تلقائي") : step.verb
+
+  const load = async () => {
+    const branchId = Number(activeBranchId || 0)
+    const sequence = ++sequenceRef.current
+    if (!branchId) { setRequests([]); return }
+    setLoading(true)
+    try {
+      const response = await fetch(`/api/internal-manufacturing-requests?status=${step.status}&_=${Date.now()}`, { cache: "no-store", headers: { "x-branch-id": String(branchId) } })
+      const data = await response.json()
+      if (sequence !== sequenceRef.current) return
+      if (response.ok && Array.isArray(data)) { setRequests(data); setListError("") }
+      else { setRequests([]); setListError(data.error || tr("تعذر تحميل الطلبات")) }
+    } catch (error: any) {
+      if (sequence === sequenceRef.current) setListError(error.message || tr("تعذر تحميل الطلبات"))
+    } finally {
+      if (sequence === sequenceRef.current) setLoading(false)
+    }
+  }
+
+  useEffect(() => { if (!workflow.loading && allowed) void load(); else if (!workflow.loading) setRequests([]) }, [activeBranchId, step.status, workflow.loading, allowed])
+
+  const visible = useMemo(() => {
+    const term = search.trim().toLowerCase()
+    const rows = requests.filter((request) => !term
+      || String(request.vch_code || "").toLowerCase().includes(term)
+      || String(request.requester_name || "").toLowerCase().includes(term)
+      || workflow.branchName(request.branch_id).toLowerCase().includes(term)
+      || workflow.branchName(request.manufacturing_branch_id).toLowerCase().includes(term)
+      || (request.items || []).some((item: any) => String(item.item_name || "").toLowerCase().includes(term)))
+    return [...rows].sort((left, right) => (oldestFirst ? 1 : -1) * (Number(left.id) - Number(right.id)))
+  }, [requests, search, oldestFirst, workflow.branchName])
+
+  const showDialogMessage = (detail: string, severity: "success" | "error" | "warn" = "error") => {
+    dialogMessagesRef.current?.clear?.()
+    dialogMessagesRef.current?.show?.([{ severity, summary: "", detail, sticky: severity === "error", life: 5000 }])
+  }
+
+  const openRequest = (request: any) => {
+    setSelected(request)
+    setValues(Object.fromEntries((request.items || []).map((item: any) => [item.id, formatQuantity(initialValue(stageKey, item))])))
+    inputRefs.current = []
+    requestAnimationFrame(() => { dialogMessagesRef.current?.clear?.(); inputRefs.current[0]?.focus(); inputRefs.current[0]?.select() })
+  }
+
+  const items: any[] = selected?.items || []
+  const numericValue = (item: any) => Number(values[item.id])
+  const dirty = !!rules.editable && items.some((item) => numericValue(item) !== Number(initialValue(stageKey, item)))
+
+  const validate = () => {
+    if (!rules.editable) return true
+    const invalidIndex = items.findIndex((item) => {
+      const value = numericValue(item)
+      if (String(values[item.id] ?? "").trim() === "" || !Number.isFinite(value)) return true
+      return stageKey === "requestAudit" ? value <= 0 : value < 0 || value > 100000
+    })
+    if (invalidIndex < 0) return true
+    showDialogMessage(stageKey === "requestAudit" ? tr("يجب أن تكون كمية كل صنف أكبر من صفر") : tr("{0} يجب أن تكون بين 0 و100000", COLUMN_LABELS[rules.editable]))
+    ;(inputRefs.current[invalidIndex]?.offsetParent ? inputRefs : mobileInputRefs).current[invalidIndex]?.focus()
+    inputRefs.current[invalidIndex]?.select()
+    return false
+  }
+
+  // تعديل كميات الطلب أثناء تدقيقه يُحفظ عبر نفس مسار تعديل الطلب (PUT).
+  const saveRequestItems = async () => {
+    if (!selected) return false
+    const response = await fetch(`/api/internal-manufacturing-requests/${selected.id}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ branch_id: selected.branch_id, manufacturing_branch_id: selected.manufacturing_branch_id, source_warehouse_id: selected.to_store_id, destination_warehouse_id: selected.destination_warehouse_id, vch_date: String(selected.vch_date).slice(0, 10), items: items.map((item) => ({ product_id: item.item_id, product_name: item.item_name, unit_id: item.unit_id, quantity: numericValue(item), barcode: item.barcode, properties: item.item_properties })) }),
+    })
+    const data = await response.json().catch(() => ({}))
+    if (!response.ok) { showDialogMessage(data.error || tr("تعذر حفظ التعديلات")); return false }
+    return true
+  }
+
+  const saveOnly = async () => {
+    if (!validate()) return
+    setSaving(true)
+    try {
+      if (!(await saveRequestItems())) return
+      showDialogMessage(tr("تم حفظ تعديلات الطلب"), "success")
+      await load()
+      setSelected((current: any) => current && { ...current, items: current.items.map((item: any) => ({ ...item, qnty: numericValue(item) })) })
+    } finally { setSaving(false) }
+  }
+
+  const approve = async () => {
+    if (!selected || !step.action) return
+    if (!validate()) return
+    setSaving(true)
+    try {
+      if (stageKey === "requestAudit" && dirty && !(await saveRequestItems())) return
+      const body: Record<string, unknown> = { action: step.action }
+      if (rules.editable === "prepared_quantity") body.prepared_items = items.map((item) => ({ id: item.id, prepared_quantity: numericValue(item) }))
+      if (rules.editable === "received_quantity") body.received_items = items.map((item) => ({ id: item.id, received_quantity: numericValue(item) }))
+      const response = await fetch(`/api/internal-manufacturing-requests/${selected.id}/actions`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) })
+      const data = await response.json().catch(() => ({}))
+      if (!response.ok) { showDialogMessage(data.error || tr("تعذر اعتماد المرحلة")); return }
+      const next = INTERNAL_STATUS_LABELS[Number(data.status)] || ""
+      setSelected(null)
+      pageMessagesRef.current?.clear?.()
+      pageMessagesRef.current?.show?.([{ severity: "success", summary: "", detail: tr("{0} {1}{2}", autoReceive ? "تم تجهيز الطلب وإنشاء الارسالية الداخلية" : step.done, selected.vch_code, next ? ` — الحالة الآن: ${next}` : ""), life: 5000 }])
+      await Promise.all([load(), workflow.reload()])
+    } catch (error: any) {
+      showDialogMessage(error.message || tr("تعذر اعتماد المرحلة"))
+    } finally { setSaving(false) }
+  }
+
+  const fillAll = () => { if (rules.fill) setValues(Object.fromEntries(items.map((item) => [item.id, formatQuantity(rules.fill!.from(item))]))) }
+  const totals = rules.columns.map((column) => ({ column, value: items.reduce((sum, item) => sum + (column === rules.editable ? (Number.isFinite(numericValue(item)) ? numericValue(item) : 0) : Number(item[column] || 0)), 0) }))
+  // الجوال: كل صنف كبطاقة (الجدول يحتاج 640px) — حقول منفصلة عن حقول الجدول المخفي حتى يعمل Enter للتالي
+  const renderItemCard = (item: any, index: number) => {
+    const value = numericValue(item)
+    const reference = rules.editable === "received_quantity" ? Number(item.prepared_quantity || item.qnty) : Number(item.qnty)
+    const differs = rules.editable && rules.editable !== "qnty" && Number.isFinite(value) && value !== reference
+    return <div key={item.id} className="space-y-2 p-3">
+      <div className="flex items-center gap-3">
+        <span className="w-5 shrink-0 text-center text-xs text-muted-foreground">{index + 1}</span>
+        <InternalItemImage item={item} size="sm" />
+        <div className="min-w-0 flex-1"><div className="truncate font-bold text-blue-700 dark:text-blue-400">{item.item_name || "-"}</div><div className="text-xs text-red-600">{item.unit_name || tr("بدون وحدة")}{item.barcode ? <span className="ms-2 font-mono text-muted-foreground">{item.barcode}</span> : null}</div></div>
+      </div>
+      <div className="grid grid-cols-2 gap-2">
+        {rules.columns.map((column) => <div key={column} className={`rounded-lg border px-2 py-1.5 ${column === rules.editable && allowed ? "col-span-2 border-emerald-300 bg-emerald-50/50 dark:border-emerald-800 dark:bg-emerald-950/30" : "bg-slate-50/60 dark:bg-slate-900/40"}`}>
+          <div className={`text-[11px] ${column === rules.editable ? "font-semibold text-emerald-700 dark:text-emerald-300" : "text-muted-foreground"}`}>{COLUMN_LABELS[column]}</div>
+          {column === rules.editable && allowed
+            ? <Input ref={(element) => { mobileInputRefs.current[index] = element }} aria-label={COLUMN_LABELS[column]} type="number" inputMode="decimal" min="0" className={`mt-1 h-11 text-center text-base font-semibold ${differs ? "border-amber-400 bg-amber-50" : ""}`} value={values[item.id] ?? ""} onFocus={(event) => event.target.select()} onChange={(event) => setValues((current) => ({ ...current, [item.id]: event.target.value }))} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); const nextInput = mobileInputRefs.current[index + 1]; if (nextInput) { nextInput.focus(); nextInput.select() } else void approve() } }} />
+            : <div className="font-semibold">{formatQuantity(item[column])}</div>}
+        </div>)}
+      </div>
+    </div>
+  }
+
+  const header = <InternalPageHeader
+    title={step.title}
+    description={step.description}
+    icon={step.icon}
+    branchLabel={workflow.branchId ? workflow.branchName(workflow.branchId) : undefined}
+    sideLabel={tr("تُنفَّذ من: {0}", SIDE_LABELS[step.side])}
+    actions={<RefreshButton loading={loading} onClick={() => { void load(); void workflow.reload() }} />}
+  />
+
+  if (!workflow.loading && !allowed) {
+    return <div dir={appDir()} className="space-y-4 p-3 md:p-5">{header}<InternalLockedState title={tr("لا توجد صلاحية")} message={workflow.branchId ? tr("لا يوجد لديك صلاحية \"{0}\" في فرع {1}. اختر فرعاً آخر أو اطلب منحك الصلاحية على هذا الفرع.", step.title, workflow.branchName(workflow.branchId)) : tr("اختر الفرع أولاً.")} /></div>
+  }
+
+  return <div dir={appDir()} className="space-y-4 p-3 md:p-5">
+    {header}
+    <Messages innerRef={pageMessagesRef} />
+    {autoReceive && <div className="rounded-lg border border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-800 dark:border-emerald-900 dark:bg-emerald-950/30 dark:text-emerald-300">{tr("\"استلام البضاعة تلقائي\" مفعّل: اعتماد التجهيز ينشئ الارسالية الداخلية بالكميات المجهزة ويُغلق الطلب — لا مراحل بعد التجهيز.")}</div>}
+    {!enabled && <div className="rounded-lg border border-sky-200 bg-sky-50 p-3 text-sm text-sky-800">{tr("هذه المرحلة معطلة في إعدادات طلب بضاعة داخلي؛ تظهر هنا فقط الطلبات التي وصلتها قبل تعطيلها.")}</div>}
+    {listError && <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700">{listError}</div>}
+
+    <div className="flex flex-col gap-2 rounded-xl border bg-white p-3 shadow-sm sm:flex-row sm:items-center dark:bg-slate-950">
+      <div className="relative flex-1"><Search className="absolute start-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" /><Input className="ps-9" value={search} onChange={(event) => setSearch(event.target.value)} placeholder={tr("بحث برقم الطلب، مقدم الطلب، الفرع أو الصنف...")} /></div>
+      <Button variant="outline" onClick={() => setOldestFirst((value) => !value)}><ArrowDownUp className="me-2 h-4 w-4" />{oldestFirst ? tr("الأقدم أولاً") : tr("الأحدث أولاً")}</Button>
+      <span className="rounded-lg bg-emerald-50 px-3 py-2 text-sm font-semibold text-emerald-700">{visible.length}{tr(" طلب")}</span>
+    </div>
+
+    <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">
+      {visible.map((request) => <InternalRequestCard key={request.id} request={request} branchName={workflow.branchName} warehouseName={workflow.warehouseName} actionLabel={approveLabel || tr("فتح الطلب")} onOpen={() => openRequest(request)} highlightBranchId={workflow.branchId} />)}
+    </div>
+    {!loading && !listError && visible.length === 0 && <div className="rounded-xl border-2 border-dashed py-14 text-center text-muted-foreground"><FileText className="mx-auto mb-3 h-10 w-10 text-emerald-600" /><div className="font-semibold text-foreground">{tr("لا توجد طلبات في هذه المرحلة")}</div><div className="mt-1 text-sm">{search ? tr("لا توجد نتائج مطابقة للبحث.") : tr("ستظهر هنا الطلبات فور وصولها لهذه المرحلة.")}</div></div>}
+
+    <Dialog open={!!selected} onOpenChange={(open) => { if (!open && !saving) setSelected(null) }}>
+      <DialogContent dir={appDir()} className="flex h-[min(calc(100%-1.5rem),calc(100dvh-1rem))] max-h-[min(calc(100%-1.5rem),calc(100dvh-1rem))] w-[calc(100vw-1rem)] max-w-5xl flex-col gap-0 overflow-hidden p-0 sm:h-auto sm:max-h-[min(calc(100%-1.5rem),94dvh)]">
+        <DialogHeader className="shrink-0 border-b py-3 pe-14 ps-4 sm:ps-5"><DialogTitle className="flex items-center gap-2 text-start"><step.icon className="h-5 w-5 text-emerald-600" />{step.title}: <span className="font-mono">{selected?.vch_code}</span></DialogTitle></DialogHeader>
+        {selected && <div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-3 py-3 sm:px-5 sm:py-4">
+          <Messages innerRef={dialogMessagesRef} />
+          <InternalStepper settings={workflow.settings} compact requestStatus={Number(selected.internal_status)} />
+          <div className="grid gap-2 rounded-xl border bg-slate-50/60 p-3 text-sm sm:grid-cols-2 lg:grid-cols-3 dark:bg-slate-900/40">
+            <Info label={tr("رقم الطلب")} value={selected.vch_code} />
+            <Info label={tr("تاريخ الطلب")} value={String(selected.vch_date).slice(0, 10)} />
+            <Info label={tr("مقدم الطلب")} value={selected.requester_name || "-"} />
+            <Info label={tr("فرع مقدم الطلب")} value={workflow.branchName(selected.branch_id)} />
+            <Info label={tr("مستودع مقدم الطلب")} value={workflow.warehouseName(selected.to_store_id)} />
+            <Info label={tr("الحالة")} value={INTERNAL_STATUS_LABELS[Number(selected.internal_status)] || "-"} />
+            <Info label={tr("الفرع المطلوب منه البضاعة")} value={workflow.branchName(selected.manufacturing_branch_id)} />
+            <Info label={tr("المستودع المطلوب منه البضاعة")} value={workflow.warehouseName(selected.destination_warehouse_id)} />
+          </div>
+          <div className="overflow-hidden rounded-xl border">
+            <div className="flex flex-wrap items-center justify-between gap-2 border-b bg-slate-50 px-3 py-2 dark:bg-slate-900">
+              <h3 className="font-bold">{tr("الأصناف ")}<span className="text-sm font-normal text-muted-foreground">({items.length})</span></h3>
+              {rules.fill && allowed && <Button size="sm" variant="outline" onClick={fillAll}><Copy className="me-1.5 h-3.5 w-3.5" />{rules.fill.label}</Button>}
+            </div>
+            <div className="divide-y sm:hidden">
+              {items.map((item, index) => renderItemCard(item, index))}
+              <div className="flex flex-wrap gap-x-4 gap-y-1 bg-slate-50 px-3 py-2 text-xs font-bold dark:bg-slate-900">
+                <span>{tr("الإجمالي")}</span>
+                {totals.map((total) => <span key={total.column}>{COLUMN_LABELS[total.column]}: {formatQuantity(total.value)}</span>)}
+              </div>
+            </div>
+            <div className="hidden overflow-x-auto sm:block">
+              <table className="w-full min-w-[640px] text-sm">
+                <thead className="bg-slate-50/60 text-xs text-muted-foreground dark:bg-slate-900/40"><tr>
+                  <th className="w-10 p-2 text-center">#</th>
+                  <th className="p-2 text-start">{tr("الصنف")}</th>
+                  {rules.columns.map((column) => <th key={column} className={`w-36 p-2 text-center ${column === rules.editable ? "text-emerald-700" : ""}`}>{COLUMN_LABELS[column]}</th>)}
+                </tr></thead>
+                <tbody>{items.map((item, index) => {
+                  const value = numericValue(item)
+                  const reference = rules.editable === "received_quantity" ? Number(item.prepared_quantity || item.qnty) : Number(item.qnty)
+                  const differs = rules.editable && rules.editable !== "qnty" && Number.isFinite(value) && value !== reference
+                  return <tr key={item.id} className="border-t">
+                    <td className="p-2 text-center text-muted-foreground">{index + 1}</td>
+                    <td className="p-2"><div className="flex items-center gap-3"><InternalItemImage item={item} size="sm" /><div className="min-w-0"><div className="truncate font-bold text-blue-700 dark:text-blue-400">{item.item_name || "-"}</div><div className="text-xs text-red-600">{item.unit_name || tr("بدون وحدة")}{item.barcode ? <span className="ms-2 font-mono text-muted-foreground">{item.barcode}</span> : null}</div></div></div></td>
+                    {rules.columns.map((column) => <td key={column} className="p-2 text-center">
+                      {column === rules.editable && allowed
+                        ? <Input ref={(element) => { inputRefs.current[index] = element }} aria-label={COLUMN_LABELS[column]} type="number" inputMode="decimal" min="0" className={`h-9 text-center font-semibold ${differs ? "border-amber-400 bg-amber-50" : ""}`} value={values[item.id] ?? ""} onFocus={(event) => event.target.select()} onChange={(event) => setValues((current) => ({ ...current, [item.id]: event.target.value }))} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); const nextInput = inputRefs.current[index + 1]; if (nextInput) { nextInput.focus(); nextInput.select() } else void approve() } }} />
+                        : <span className="font-semibold">{formatQuantity(item[column])}</span>}
+                    </td>)}
+                  </tr>
+                })}</tbody>
+                <tfoot className="border-t bg-slate-50 text-sm font-bold dark:bg-slate-900"><tr>
+                  <td className="p-2" colSpan={2}>{tr("الإجمالي")}</td>
+                  {totals.map((total) => <td key={total.column} className="p-2 text-center">{formatQuantity(total.value)}</td>)}
+                </tr></tfoot>
+              </table>
+            </div>
+          </div>
+        </div>}
+        {selected && <div className="flex shrink-0 flex-col gap-2 border-t bg-slate-50 px-3 py-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] sm:flex-row sm:items-center sm:justify-between sm:px-5 dark:bg-slate-900">
+          <span className="hidden text-xs text-muted-foreground sm:inline">{rules.editable && allowed ? tr("Enter للانتقال للصنف التالي — Enter على آخر صنف للاعتماد.") : tr("مراجعة فقط — لا توجد كميات قابلة للتعديل في هذه المرحلة.")}</span>
+          <div className="grid grid-cols-2 gap-2 sm:flex [&>button:last-child]:col-span-2 sm:[&>button:last-child]:col-span-1">
+            <Button variant="outline" onClick={() => setSelected(null)} disabled={saving}>{tr("إغلاق")}</Button>
+            {stageKey === "requestAudit" && canEditRequest && <Button variant="outline" onClick={() => void saveOnly()} disabled={saving || !dirty}><Save className="me-2 h-4 w-4" />{tr("حفظ التعديلات")}</Button>}
+            <Button className="bg-emerald-600 hover:bg-emerald-700" onClick={() => void approve()} disabled={saving || !allowed}><CheckCircle2 className="me-2 h-4 w-4" />{saving ? tr("جارٍ الحفظ...") : approveLabel}</Button>
+          </div>
+        </div>}
+      </DialogContent>
+    </Dialog>
+  </div>
+}
+
+function Info({ label, value }: { label: string; value: string }) {
+  return <div className="min-w-0"><div className="text-[11px] text-muted-foreground">{label}</div><div className="truncate font-semibold">{value}</div></div>
+}

@@ -1,0 +1,125 @@
+"use client"
+
+import { appDir } from "@/lib/i18n"
+import { Profiler, useEffect, useState, type ReactNode } from "react"
+import { cn } from "@/lib/utils"
+import { useWorkspace, type PaneId, type WorkspaceTab } from "@/contexts/workspace-context"
+import { SECTION_TITLES } from "@/components/sidebar"
+import { TabStrip } from "./tab-strip"
+import { PaneMenu } from "./pane-menu"
+import { WorkspaceDialogProvider } from "@/contexts/workspace-dialog-context"
+import { WorkspaceTabActiveProvider, WorkspaceTabIdProvider, WorkspaceTabSectionProvider } from "@/contexts/workspace-tab-context"
+import { requestGuardedNavigation } from "@/lib/navigation-guard"
+
+interface WorkspacePaneProps {
+  paneId: PaneId
+  showTabStrip: boolean
+  showFocusRing: boolean
+  renderSection: (section: string | null) => ReactNode
+}
+
+export function WorkspacePane({ paneId, showTabStrip, showFocusRing, renderSection }: WorkspacePaneProps) {
+  const { panes, focusedPaneId, activateTab, closeTab, setFocusedPane, openSection } = useWorkspace()
+  const pane = panes.find((p) => p.id === paneId)
+  if (!pane) return null
+
+  const isFocused = focusedPaneId === paneId
+  // شريط الجزء العلوي (تبويبات + زر "فتح صفحة") يظهر متى وُجد أي داعٍ لاستهداف هذا الجزء تحديداً —
+  // إما تبويبات فعلية بداخله أو وجود جزء آخر مجاور (شاشة مقسمة). بلا هذا الأخير تحديداً، الجزء
+  // الثاني بالشاشة المقسمة يبقى بلا أي طريقة مباشرة لفتح صفحة غيرالرئيسية بداخله تحديداً.
+  const showPaneToolbar = showTabStrip || showFocusRing
+
+  return (
+    <div
+      className={cn(
+        "relative flex-1 min-w-0 flex flex-col h-full overflow-hidden transition-shadow",
+        showFocusRing && isFocused && "ring-2 ring-primary/40 rounded-lg",
+      )}
+      onMouseDownCapture={() => setFocusedPane(paneId)}
+    >
+      {showPaneToolbar && (
+        <div className="flex items-center gap-1 bg-muted/30 border-b border-border px-2 py-1" dir={appDir()}>
+          <TabStrip
+            tabs={showTabStrip ? pane.tabs : []}
+            activeTabId={pane.activeTabId}
+            onActivate={(tabId) => activateTab(paneId, tabId)}
+            // إغلاق تبويب يُتلف شاشته — نافذة التحقق من التغييرات أولاً (lib/navigation-guard.ts)
+            onClose={(tabId) => { if (requestGuardedNavigation(() => closeTab(paneId, tabId), [tabId])) closeTab(paneId, tabId) }}
+          />
+          <PaneMenu onOpenSection={(newSection) => openSection(newSection, SECTION_TITLES[newSection] || newSection, paneId)} />
+        </div>
+      )}
+      <div className="relative flex-1 overflow-hidden">
+        {pane.tabs.map((tab) => (
+          <MountedWorkspaceTab
+            key={tab.id}
+            tab={tab}
+            active={tab.id === pane.activeTabId}
+            hotkeysActive={tab.id === pane.activeTabId && (!showFocusRing || isFocused)}
+            renderSection={renderSection}
+          />
+        ))}
+      </div>
+    </div>
+  )
+}
+
+function MountedWorkspaceTab({
+  tab,
+  active,
+  hotkeysActive,
+  renderSection,
+}: {
+  tab: WorkspaceTab
+  active: boolean
+  hotkeysActive: boolean
+  renderSection: (section: string | null) => ReactNode
+}) {
+  const [dialogContainer, setDialogContainer] = useState<HTMLDivElement | null>(null)
+  // Tabs used to mount every page as soon as it was opened, even when hidden.
+  // Defer the page component until its first activation, then keep it mounted
+  // so switching tabs still preserves unsaved form state.
+  const [hasBeenActive, setHasBeenActive] = useState(active)
+
+  useEffect(() => {
+    if (active && !hasBeenActive) setHasBeenActive(true)
+  }, [active, hasBeenActive])
+  const shouldRender = active || hasBeenActive
+
+  return (
+    <div
+      className={cn(
+        "absolute inset-0",
+        active ? "visible z-10" : "invisible z-0 pointer-events-none",
+      )}
+      aria-hidden={!active}
+    >
+      <WorkspaceTabActiveProvider active={hotkeysActive}>
+        <WorkspaceTabIdProvider tabId={tab.id}>
+        <WorkspaceTabSectionProvider section={tab.section || null}>
+          <WorkspaceDialogProvider container={dialogContainer} confined>
+            {shouldRender && (
+              <Profiler
+                id={`workspace:${tab.section || "empty"}`}
+                onRender={(id, phase, actualDuration, baseDuration) => {
+                  if (process.env.NODE_ENV !== "production" && actualDuration >= 50) {
+                    console.info("[perf] Slow page render", {
+                      page: id.replace("workspace:", ""),
+                      phase,
+                      actualDurationMs: Math.round(actualDuration),
+                      baseDurationMs: Math.round(baseDuration),
+                    })
+                  }
+                }}
+              >
+                <div className="h-full overflow-auto">{renderSection(tab.section)}</div>
+              </Profiler>
+            )}
+            <div ref={setDialogContainer} className="pointer-events-none absolute inset-0 z-[100] isolate overflow-visible" />
+          </WorkspaceDialogProvider>
+        </WorkspaceTabSectionProvider>
+        </WorkspaceTabIdProvider>
+      </WorkspaceTabActiveProvider>
+    </div>
+  )
+}

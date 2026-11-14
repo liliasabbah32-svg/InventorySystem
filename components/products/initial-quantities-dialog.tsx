@@ -1,5 +1,7 @@
 "use client"
 
+import { tr, appDir } from "@/lib/i18n"
+import { showAlert } from "@/components/ui/confirm-host"
 import { useState, useEffect } from "react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -142,7 +144,7 @@ export function InitialQuantitiesDialog({
   const handleSave = async () => {
     const errors = validateQuantities()
     if (errors.length > 0) {
-      alert("يرجى تصحيح الأخطاء التالية:\n" + errors.join("\n"))
+      showAlert(tr("يرجى تصحيح الأخطاء التالية:\n") + errors.join("\n"))
       return
     }
 
@@ -189,7 +191,7 @@ export function InitialQuantitiesDialog({
       onOpenChange(false)
     } catch (error) {
       console.error("Error saving initial quantities:", error)
-      alert("حدث خطأ في حفظ الكميات الابتدائية")
+      showAlert(tr("حدث خطأ في حفظ الكميات الابتدائية"))
     } finally {
       setIsSaving(false)
     }
@@ -200,11 +202,11 @@ export function InitialQuantitiesDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-5xl max-h-[90vh] overflow-hidden" dir="rtl">
+      <DialogContent className="max-w-5xl max-h-[90vh] overflow-hidden" dir={appDir()}>
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <Warehouse className="h-5 w-5" />
-            إدخال الكميات الابتدائية - {productName}
+            {tr("إدخال الكميات الابتدائية - ")}{productName}
           </DialogTitle>
         </DialogHeader>
 
@@ -215,7 +217,7 @@ export function InitialQuantitiesDialog({
               <CardContent className="p-4">
                 <div className="flex items-center justify-between">
                   <div>
-                    <p className="text-sm text-muted-foreground">إجمالي الكمية</p>
+                    <p className="text-sm text-muted-foreground">{tr("إجمالي الكمية")}</p>
                     <p className="text-2xl font-bold">{totalQuantity}</p>
                   </div>
                   <Package className="h-8 w-8 text-blue-600" />
@@ -227,7 +229,7 @@ export function InitialQuantitiesDialog({
               <CardContent className="p-4">
                 <div className="flex items-center justify-between">
                   <div>
-                    <p className="text-sm text-muted-foreground">عدد المستودعات</p>
+                    <p className="text-sm text-muted-foreground">{tr("عدد المستودعات")}</p>
                     <p className="text-2xl font-bold">{quantities.length}</p>
                   </div>
                   <Warehouse className="h-8 w-8 text-green-600" />
@@ -239,7 +241,7 @@ export function InitialQuantitiesDialog({
               <CardContent className="p-4">
                 <div className="flex items-center justify-between">
                   <div>
-                    <p className="text-sm text-muted-foreground">إجمالي القيمة</p>
+                    <p className="text-sm text-muted-foreground">{tr("إجمالي القيمة")}</p>
                     <p className="text-2xl font-bold">{totalValue.toFixed(2)}</p>
                   </div>
                   <Hash className="h-8 w-8 text-purple-600" />
@@ -252,12 +254,12 @@ export function InitialQuantitiesDialog({
           <div className="flex gap-2">
             {hasBatchTracking && (
               <Badge variant="secondary" className="bg-blue-100 text-blue-800">
-                تتبع الدفعات مفعل
+                {tr("تتبع الدفعات مفعل")}
               </Badge>
             )}
             {hasExpiryTracking && (
               <Badge variant="secondary" className="bg-orange-100 text-orange-800">
-                تتبع الصلاحية مفعل
+                {tr("تتبع الصلاحية مفعل")}
               </Badge>
             )}
           </div>
@@ -266,7 +268,7 @@ export function InitialQuantitiesDialog({
           <Card>
             <CardHeader className="pb-4">
               <div className="flex items-center justify-between">
-                <CardTitle className="text-lg">الكميات حسب المستودع</CardTitle>
+                <CardTitle className="text-lg">{tr("الكميات حسب المستودع")}</CardTitle>
                 <Button
                   variant="outline"
                   size="sm"
@@ -274,7 +276,7 @@ export function InitialQuantitiesDialog({
                   className="flex items-center gap-2 bg-transparent"
                 >
                   <Plus className="h-4 w-4" />
-                  إضافة مستودع
+                  {tr("إضافة مستودع")}
                 </Button>
               </div>
             </CardHeader>
@@ -283,13 +285,13 @@ export function InitialQuantitiesDialog({
                 <Table>
                   <TableHeader>
                     <TableRow>
-                      <TableHead className="text-right">المستودع</TableHead>
-                      <TableHead className="text-right">الكمية</TableHead>
-                      <TableHead className="text-right">تكلفة الوحدة</TableHead>
-                      {hasBatchTracking && <TableHead className="text-right">رقم الدفعة</TableHead>}
-                      {hasExpiryTracking && <TableHead className="text-right">تاريخ الإنتاج</TableHead>}
-                      {hasExpiryTracking && <TableHead className="text-right">تاريخ الانتهاء</TableHead>}
-                      <TableHead className="text-right">الإجراءات</TableHead>
+                      <TableHead className="text-start">{tr("المستودع")}</TableHead>
+                      <TableHead className="text-start">{tr("الكمية")}</TableHead>
+                      <TableHead className="text-start">{tr("تكلفة الوحدة")}</TableHead>
+                      {hasBatchTracking && <TableHead className="text-start">{tr("رقم الدفعة")}</TableHead>}
+                      {hasExpiryTracking && <TableHead className="text-start">{tr("تاريخ الإنتاج")}</TableHead>}
+                      {hasExpiryTracking && <TableHead className="text-start">{tr("تاريخ الانتهاء")}</TableHead>}
+                      <TableHead className="text-start">{tr("الإجراءات")}</TableHead>
                     </TableRow>
                   </TableHeader>
                   <TableBody>
@@ -301,7 +303,7 @@ export function InitialQuantitiesDialog({
                             onValueChange={(value) => updateQuantity(qty.id, "warehouse_id", value)}
                           >
                             <SelectTrigger>
-                              <SelectValue placeholder="اختر المستودع" />
+                              <SelectValue placeholder={tr("اختر المستودع")} />
                             </SelectTrigger>
                             <SelectContent>
                               {warehouses.map((warehouse) => (
@@ -318,7 +320,7 @@ export function InitialQuantitiesDialog({
                             min="0"
                             value={qty.quantity}
                             onChange={(e) => updateQuantity(qty.id, "quantity", Number(e.target.value) || 0)}
-                            className="text-right"
+                            className="text-start"
                           />
                         </TableCell>
                         <TableCell>
@@ -328,7 +330,7 @@ export function InitialQuantitiesDialog({
                             step="0.01"
                             value={qty.cost_per_unit || ""}
                             onChange={(e) => updateQuantity(qty.id, "cost_per_unit", Number(e.target.value) || 0)}
-                            className="text-right"
+                            className="text-start"
                             placeholder="0.00"
                           />
                         </TableCell>
@@ -337,8 +339,8 @@ export function InitialQuantitiesDialog({
                             <Input
                               value={qty.lot_number || ""}
                               onChange={(e) => updateQuantity(qty.id, "lot_number", e.target.value)}
-                              className="text-right"
-                              placeholder="رقم الدفعة"
+                              className="text-start"
+                              placeholder={tr("رقم الدفعة")}
                             />
                           </TableCell>
                         )}
@@ -348,7 +350,7 @@ export function InitialQuantitiesDialog({
                               type="date"
                               value={qty.manufacturing_date || ""}
                               onChange={(e) => updateQuantity(qty.id, "manufacturing_date", e.target.value)}
-                              className="text-right"
+                              className="text-start"
                             />
                           </TableCell>
                         )}
@@ -358,7 +360,7 @@ export function InitialQuantitiesDialog({
                               type="date"
                               value={qty.expiry_date || ""}
                               onChange={(e) => updateQuantity(qty.id, "expiry_date", e.target.value)}
-                              className="text-right"
+                              className="text-start"
                             />
                           </TableCell>
                         )}
@@ -384,13 +386,13 @@ export function InitialQuantitiesDialog({
           <Alert>
             <Package className="h-4 w-4" />
             <AlertDescription>
-              <strong>تعليمات:</strong>
+              <strong>{tr("تعليمات:")}</strong>
               <ul className="list-disc list-inside mt-2 space-y-1 text-sm">
-                <li>أدخل الكميات الابتدائية لكل مستودع</li>
-                <li>يمكن إدخال تكلفة الوحدة لحساب قيمة المخزون</li>
-                {hasBatchTracking && <li>رقم الدفعة مطلوب لأن تتبع الدفعات مفعل</li>}
-                {hasExpiryTracking && <li>تواريخ الإنتاج والانتهاء مطلوبة لأن تتبع الصلاحية مفعل</li>}
-                <li>سيتم إنشاء دفعات تلقائياً للمنتجات التي تحتوي على تتبع دفعات</li>
+                <li>{tr("أدخل الكميات الابتدائية لكل مستودع")}</li>
+                <li>{tr("يمكن إدخال تكلفة الوحدة لحساب قيمة المخزون")}</li>
+                {hasBatchTracking && <li>{tr("رقم الدفعة مطلوب لأن تتبع الدفعات مفعل")}</li>}
+                {hasExpiryTracking && <li>{tr("تواريخ الإنتاج والانتهاء مطلوبة لأن تتبع الصلاحية مفعل")}</li>}
+                <li>{tr("سيتم إنشاء دفعات تلقائياً للمنتجات التي تحتوي على تتبع دفعات")}</li>
               </ul>
             </AlertDescription>
           </Alert>
@@ -398,16 +400,16 @@ export function InitialQuantitiesDialog({
           {/* Action Buttons */}
           <div className="flex justify-end gap-2 border-t pt-4">
             <Button variant="outline" onClick={() => onOpenChange(false)} disabled={isSaving}>
-              <X className="h-4 w-4 mr-2" />
-              إلغاء
+              <X className="h-4 w-4 ms-2" />
+              {tr("إلغاء")}
             </Button>
             <Button
               onClick={handleSave}
               disabled={isSaving || quantities.length === 0}
               className="bg-primary hover:bg-primary/90"
             >
-              <Save className="h-4 w-4 mr-2" />
-              {isSaving ? "جاري الحفظ..." : "حفظ الكميات"}
+              <Save className="h-4 w-4 ms-2" />
+              {isSaving ? tr("جاري الحفظ...") : tr("حفظ الكميات")}
             </Button>
           </div>
         </div>

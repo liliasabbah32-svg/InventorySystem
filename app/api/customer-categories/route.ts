@@ -1,50 +1,17 @@
 // app/api/customer-categories/route.ts
 import { type NextRequest, NextResponse } from "next/server"
-import { neon } from "@neondatabase/serverless"
-import { Pool } from "pg"
+import sql from "@/lib/database"
+import { runSchemaOnce } from "@/lib/schema-once"
 
-let sql: any = null
-
-try {
-  if (!process.env.DATABASE_URL) {
-    console.error("[v0] DATABASE_URL environment variable is not set")
-  } else {
-    const dbUrl = process.env.DATABASE_URL
-
-    if (dbUrl.includes("localhost") || dbUrl.includes("127.0.0.1")) {
-      const pool = new Pool({ connectionString: dbUrl })
-      sql = async (strings: TemplateStringsArray, ...values: any[]) => {
-        const client = await pool.connect()
-        try {
-          const query =
-            strings.reduce(
-              (prev, curr, i) =>
-                prev + curr + (i < values.length ? `$${i + 1}` : ""),
-              ""
-            )
-          const result = await client.query(query, values)
-          return result.rows
-        } finally {
-          client.release()
-        }
-      }
-    } else {
-      console.log("[v0] Using Neon serverless client")
-      sql = neon(dbUrl)
-    }
-
-    console.log("[v0] Database client initialized successfully")
-  }
-} catch (error) {
-  console.error("[v0] Failed to initialize DB client:", error)
-  sql = null
-}
-
-export default sql
+async function ensureCustomerCategoryStatus() { return runSchemaOnce("app/api/customer-categories/route.ts#ensureCustomerCategoryStatus", async () => {
+  await sql`ALTER TABLE customer_categories ADD COLUMN IF NOT EXISTS status INTEGER NOT NULL DEFAULT 1`
+  await sql`ALTER TABLE customer_categories ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`
+}) }
 
 // GET all customer categories
 export async function GET() {
   try {
+    await ensureCustomerCategoryStatus()
     const categories = await sql`SELECT * FROM customer_categories ORDER BY id`
     return NextResponse.json({ categories })
   } catch (error) {
@@ -56,8 +23,9 @@ export async function GET() {
 // POST a new customer category
 export async function POST(request: NextRequest) {
   try {
+    await ensureCustomerCategoryStatus()
     const body = await request.json()
-    const { name, discount } = body
+    const { name, discount, status } = body
 
     if (!name) {
       return NextResponse.json({ error: "Category name is required" }, { status: 400 })
@@ -69,8 +37,8 @@ export async function POST(request: NextRequest) {
     const newId = lastId + 1
 
     const result = await sql`
-      INSERT INTO customer_categories (id, name, discount)
-      VALUES (${newId}, ${name}, ${discount || 0})
+      INSERT INTO customer_categories (id, name, discount, status)
+      VALUES (${newId}, ${name}, ${discount || 0}, ${status ?? 1})
       RETURNING *
     `
 
@@ -84,7 +52,8 @@ export async function POST(request: NextRequest) {
 // PUT to update an existing category
 export async function PUT(request: NextRequest) {
   try {
-    const { id, name, discount } = await request.json()
+    await ensureCustomerCategoryStatus()
+    const { id, name, discount, status } = await request.json()
 
     if (!id) {
       return NextResponse.json({ error: "Category ID is required" }, { status: 400 })
@@ -95,6 +64,7 @@ export async function PUT(request: NextRequest) {
       SET
         name = COALESCE(${name}, name),
         discount = COALESCE(${discount}, discount),
+        status = COALESCE(${status}, status),
         updated_at = CURRENT_TIMESTAMP
       WHERE id = ${id}
       RETURNING *
@@ -108,5 +78,24 @@ export async function PUT(request: NextRequest) {
   } catch (error) {
     console.error("Error updating customer category:", error)
     return NextResponse.json({ error: "Failed to update customer category" }, { status: 500 })
+  }
+}
+
+export async function DELETE(request: NextRequest) {
+  try {
+    await ensureCustomerCategoryStatus()
+    const id = Number(new URL(request.url).searchParams.get("id"))
+    if (!id) return NextResponse.json({ error: "Category ID is required" }, { status: 400 })
+    // فحص الارتباط قبل الحذف: التصنيف مستخدم في بطاقات العملاء (customers.classification = المعرّف أو الاسم)
+    const usageRow = (await sql`SELECT name FROM customer_categories WHERE id = ${id}`)[0] as any
+    const usedBy = (await sql`SELECT COUNT(*)::int AS count FROM customers WHERE COALESCE(isdeleted, false) = false AND COALESCE(type, 1) = 1 AND BTRIM(COALESCE(classification, '')) IN (${String(id)}, ${String(usageRow?.name || '').trim() || '#none#'})`)[0] as any
+    if (Number(usedBy?.count) > 0) return NextResponse.json({ error: `لا يمكن حذف تصنيف العملاء "${usageRow?.name || ""}" لأنه مستخدم في ${usedBy.count} بطاقة عميل — يمكنك إيقافه بدلاً من حذفه` }, { status: 400 })
+
+    const deleted = await sql`UPDATE customer_categories SET status = 3, updated_at = CURRENT_TIMESTAMP WHERE id = ${id} RETURNING *`
+    if (!deleted.length) return NextResponse.json({ error: "Category not found" }, { status: 404 })
+    return NextResponse.json({ category: deleted[0] })
+  } catch (error) {
+    console.error("Error deleting customer category:", error)
+    return NextResponse.json({ error: "Failed to delete customer category" }, { status: 500 })
   }
 }

@@ -1,16 +1,32 @@
 "use client"
 
+import { tr, appDir } from "@/lib/i18n"
 import type React from "react"
-import { useState, useEffect } from "react"
+import { ReportAccessGate } from "@/components/auth/report-access-gate"
+import { FileAccessGate } from "@/components/auth/file-access-gate"
+import { fileFamilyForSection } from "@/lib/file-permission-definitions"
+import { TransactionAccessGate } from "@/components/auth/transaction-access-gate"
+import { isUserAdminSection, transactionFamilyForSection } from "@/lib/transaction-permission-definitions"
+import { isReportSection } from "@/lib/report-permission-definitions"
+import { Suspense, useState, useEffect, useRef } from "react"
+import { useSearchParams, useRouter } from "next/navigation"
+import { requestGuardedNavigation } from "@/lib/navigation-guard"
 import { ProtectedRoute } from "@/components/auth/protected-route"
 import { ERPLayout } from "@/components/erp-layout"
+import { activateCompany } from "@/lib/tenant-client"
+import { SECTION_TITLES } from "@/components/sidebar"
+// تبويب فُتح من المساعد الذكي (?handoff=): ينقل بياناته إلى sessionStorage قبل تركيب أي شاشة
+import "@/lib/new-tab-handoff"
+import { shouldResumePos } from "@/lib/pos-offline"
+import { appModeSection } from "@/lib/app-mode"
+import { AppModeShell } from "@/components/app-mode-shell"
+import { useWorkspace } from "@/contexts/workspace-context"
+import { WorkspacePane } from "@/components/workspace/workspace-pane"
+import { useBranchReloadKey } from "@/components/auth/use-branch-reload-key"
 
 
 // Import all components
 const Dashboard = dynamic(() => import("@/components/dashboard").then((mod) => mod.Dashboard), { ssr: false })
-import { OrderReports } from "@/components/reports/order-reports"
-import { ProductReports } from "@/components/reports/product-reports"
-
 import dynamic from "next/dynamic"
 
 // Dynamically import heavy client-only components to avoid pulling browser-only
@@ -19,48 +35,202 @@ const SalesOrders = dynamic(() => import("@/components/orders/sales-orders").the
 const SaleInvoices = dynamic(() => import("@/components/orders/sale-invoices").then(mod => mod.SaleInvoices), { ssr: false })
 const Products = dynamic(() => import("@/components/products/products").then(mod => mod.Products), { ssr: false })
 const Services = dynamic(() => import("@/components/products/services").then(mod => mod.Services), { ssr: false })
-import Customers from "@/components/products/customers"
-import ProductGroups from "@/components/products/product-groups"
-import { ExchangeRates } from "@/components/data/exchange-rates"
-import { BatchMovements } from "@/components/inventory/batch-movements"
-import { BatchReports } from "@/components/reports/batch-reports"
-import { BatchLogReport } from "@/components/reports/batch-log-report"
-import { InventoryAnalytics } from "@/components/inventory/inventory-analytics"
-import { AutomatedReorderSystem } from "@/components/inventory/automated-reorder-system"
-import { BarcodeManagement } from "@/components/barcode/barcode-management"
-import { OrderTrackingDashboard } from "@/components/workflow/order-tracking-dashboard"
-import { LotOpener } from "@/components/inventory/lot-opener"
-import { LotStatusManager } from "@/components/inventory/lot-status-manager"
-import { CustomerPortalAdmin } from "@/components/customer-portal/customer-portal-admin"
-import { WhatsAppNotificationSettings } from "@/components/inventory/whatsapp-notification-settings"
-import Accounts from "@/components/accounts"
-import UnifiedAccounts from "@/components/customer/unified-accounts-refactored"
+const lazyNamed = (loader: () => Promise<any>, name: string) => dynamic(() => loader().then((mod) => mod[name]), { ssr: false })
+const lazyDefault = (loader: () => Promise<any>): React.ComponentType<any> => dynamic(loader, { ssr: false })
+const FeatureRequests = lazyDefault(() => import("@/components/tools/feature-requests"))
+const FixedAssetsPage = lazyDefault(() => import("@/app/fixed-assets/page"))
+const OrderReports = lazyNamed(() => import("@/components/reports/order-reports"), "OrderReports")
+const ProductReports = lazyNamed(() => import("@/components/reports/product-reports"), "ProductReports")
+const ItemBalancesReport = lazyNamed(() => import("@/components/reports/item-balances-report"), "ItemBalancesReport")
+const ExpiryBalancesReport = lazyNamed(() => import("@/components/reports/expiry-balances-report"), "ExpiryBalancesReport")
+const ItemsProfitReport = lazyNamed(() => import("@/components/reports/sales-profit-report"), "ItemsProfitReport")
+const PeriodProfitReport = lazyNamed(() => import("@/components/reports/sales-profit-report"), "PeriodProfitReport")
+const InvoiceProfitReport = lazyNamed(() => import("@/components/reports/sales-profit-report"), "InvoiceProfitReport")
+const ItemSalesCostReport = lazyNamed(() => import("@/components/reports/sales-profit-report"), "ItemSalesCostReport")
+const PricingInventoryPage = lazyNamed(() => import("@/components/reports/sales-profit-report"), "PricingInventoryPage")
+const ItemValuationReport = lazyNamed(() => import("@/components/reports/item-valuation-report"), "ItemValuationReport")
+const ItemCardReport = lazyNamed(() => import("@/components/reports/item-card-report"), "ItemCardReport")
+const Customers = lazyDefault(() => import("@/components/products/customers"))
+const ProductGroups = lazyDefault(() => import("@/components/products/product-groups"))
+const BrandTypes = lazyDefault(() => import("@/components/products/brand-types"))
+const Brands = lazyDefault(() => import("@/components/products/brands"))
+const Cars = lazyDefault(() => import("@/components/products/cars"))
+const Drivers = lazyDefault(() => import("@/components/products/drivers"))
+const SalesmenPage = lazyDefault(() => import("@/components/salesmen/salesmen-pages"))
+const SalesmanCommissionPage = lazyDefault(() => import("@/components/salesmen/salesman-commission-page"))
+const ExchangeRates = lazyNamed(() => import("@/components/data/exchange-rates"), "ExchangeRates")
+const ExchangeRatesReport = lazyNamed(() => import("@/components/reports/exchange-rates-report"), "ExchangeRatesReport")
+const BatchMovements = lazyNamed(() => import("@/components/inventory/batch-movements"), "BatchMovements")
+const BatchReports = lazyNamed(() => import("@/components/reports/batch-reports"), "BatchReports")
+const BatchLogReport = lazyNamed(() => import("@/components/reports/batch-log-report"), "BatchLogReport")
+const SerialMovementsReport = lazyNamed(() => import("@/components/reports/serial-movements-report"), "SerialMovementsReport")
+const StockCounts = lazyDefault(() => import("@/components/inventory/stock-counts"))
+const StockCountApproval = lazyDefault(() => import("@/components/inventory/stock-count-approval"))
+const ProductionVouchers = lazyDefault(() => import("@/components/inventory/production-vouchers"))
+const AccountAccess = lazyDefault(() => import("@/components/tools/account-access"))
+const ManagerAttachments = lazyDefault(() => import("@/components/tools/manager-attachments"))
+const ManagerInbox = lazyDefault(() => import("@/components/tools/manager-inbox"))
+const BulkItems = lazyDefault(() => import("@/components/tools/bulk-items"))
+const ManufacturingComponentsImport = lazyDefault(() => import("@/components/tools/manufacturing-components-import"))
+const ReceivablesStatementReport = lazyNamed(() => import("@/components/reports/account-statement-report"), "ReceivablesStatementReport")
+const AccountingStatementReport = lazyNamed(() => import("@/components/reports/account-statement-report"), "AccountingStatementReport")
+const ReceivablesBalancesReport = lazyNamed(() => import("@/components/reports/account-balances-report"), "ReceivablesBalancesReport")
+const ReceivablesAgingReport = lazyNamed(() => import("@/components/reports/receivables-aging-report"), "ReceivablesAgingReport")
+const AccountingBalancesReport = lazyNamed(() => import("@/components/reports/account-balances-report"), "AccountingBalancesReport")
+const VouchersReport = lazyNamed(() => import("@/components/reports/financial-report"), "VouchersReport")
+const TransactionsReport = lazyNamed(() => import("@/components/reports/financial-report"), "TransactionsReport")
+const TrialBalanceReport = lazyNamed(() => import("@/components/reports/financial-report"), "TrialBalanceReport")
+const BalanceSheetReport = lazyNamed(() => import("@/components/reports/financial-report"), "BalanceSheetReport")
+const IncomeStatementReport = lazyNamed(() => import("@/components/reports/financial-report"), "IncomeStatementReport")
+const DeliveriesListReport = lazyNamed(() => import("@/components/reports/deliveries-reports"), "DeliveriesListReport")
+const InternalDeliveriesReport = lazyNamed(() => import("@/components/reports/deliveries-reports"), "InternalDeliveriesReport")
+const ConsignmentInvoicesReport = lazyNamed(() => import("@/components/reports/deliveries-reports"), "ConsignmentInvoicesReport")
+const TaxCalculationReport = lazyNamed(() => import("@/components/reports/tax-reports"), "TaxCalculationReport")
+const TaxSalesStatementReport = lazyNamed(() => import("@/components/reports/tax-reports"), "TaxSalesStatementReport")
+const TaxPurchasesStatementReport = lazyNamed(() => import("@/components/reports/tax-reports"), "TaxPurchasesStatementReport")
+const TaxSalesPurchasesReport = lazyNamed(() => import("@/components/reports/tax-reports"), "TaxSalesPurchasesReport")
+const TaxMaqasaSalesReport = lazyNamed(() => import("@/components/reports/tax-reports"), "TaxMaqasaSalesReport")
+const TaxMaqasaPurchasesReport = lazyNamed(() => import("@/components/reports/tax-reports"), "TaxMaqasaPurchasesReport")
+const CostCenterStatementWithReport = lazyNamed(() => import("@/components/reports/cost-center-reports"), "CostCenterStatementWithReport")
+const CostCenterStatementByReport = lazyNamed(() => import("@/components/reports/cost-center-reports"), "CostCenterStatementByReport")
+const CostCenterAccountsMovementReport = lazyNamed(() => import("@/components/reports/cost-center-reports"), "CostCenterAccountsMovementReport")
+const CostCenterTransactionsReport = lazyNamed(() => import("@/components/reports/cost-center-reports"), "CostCenterTransactionsReport")
+const CostCenterTrialBalanceReport = lazyNamed(() => import("@/components/reports/cost-center-reports"), "CostCenterTrialBalanceReport")
+const CostCenterTrialBalanceAccountsReport = lazyNamed(() => import("@/components/reports/cost-center-reports"), "CostCenterTrialBalanceAccountsReport")
+const CostCenterIncomeStatementReport = lazyNamed(() => import("@/components/reports/cost-center-reports"), "CostCenterIncomeStatementReport")
+const CostCenterBalanceSheetReport = lazyNamed(() => import("@/components/reports/cost-center-reports"), "CostCenterBalanceSheetReport")
+const CostCenterIncomeStatementByReport = lazyNamed(() => import("@/components/reports/cost-center-reports"), "CostCenterIncomeStatementByReport")
+const CostCenterBalanceSheetByReport = lazyNamed(() => import("@/components/reports/cost-center-reports"), "CostCenterBalanceSheetByReport")
+const ChequesPage = lazyNamed(() => import("@/components/accounting/cheques-management"), "ChequesPage")
+const ChequeOperationsPage = lazyNamed(() => import("@/components/accounting/cheques-management"), "ChequeOperationsPage")
+const ChequeDepositBulkPage = lazyNamed(() => import("@/components/accounting/bulk-cheque-operations"), "ChequeDepositBulkPage")
+const VisaCommissionJournalsPage = lazyNamed(() => import("@/components/accounting/auto-journals"), "VisaCommissionJournalsPage")
+const CurrencyTransferJournalPage = lazyNamed(() => import("@/components/accounting/auto-journals"), "CurrencyTransferJournalPage")
+const AccountCurrencyTransferJournalsPage = lazyNamed(() => import("@/components/accounting/auto-journals"), "AccountCurrencyTransferJournalsPage")
+const CurrencyDifferenceJournalsPage = lazyNamed(() => import("@/components/accounting/auto-journals"), "CurrencyDifferenceJournalsPage")
+const ChequeEndorseBulkPage = lazyNamed(() => import("@/components/accounting/bulk-cheque-operations"), "ChequeEndorseBulkPage")
+const OutgoingChequeClearBulkPage = lazyNamed(() => import("@/components/accounting/bulk-cheque-operations"), "OutgoingChequeClearBulkPage")
+const ChequePaymentVouchers = lazyDefault(() => import("@/components/accounting/unified-cheque-payment-voucher"))
+const InventoryAnalytics = lazyNamed(() => import("@/components/inventory/inventory-analytics"), "InventoryAnalytics")
+const AutomatedReorderSystem = lazyNamed(() => import("@/components/inventory/automated-reorder-system"), "AutomatedReorderSystem")
+const PurchasePlanning = lazyNamed(() => import("@/components/inventory/purchase-planning"), "PurchasePlanning")
+const BarcodeManagement = lazyNamed(() => import("@/components/barcode/barcode-management"), "BarcodeManagement")
+const OrderTrackingDashboard = lazyNamed(() => import("@/components/workflow/order-tracking-dashboard"), "OrderTrackingDashboard")
+const LotOpener = lazyNamed(() => import("@/components/inventory/lot-opener"), "LotOpener")
+const LotStatusManager = lazyNamed(() => import("@/components/inventory/lot-status-manager"), "LotStatusManager")
+const CustomerPortalAdmin = lazyNamed(() => import("@/components/customer-portal/customer-portal-admin"), "CustomerPortalAdmin")
+const WhatsAppNotificationSettings = lazyNamed(() => import("@/components/inventory/whatsapp-notification-settings"), "WhatsAppNotificationSettings")
+const Accounts = lazyDefault(() => import("@/components/accounts"))
+const UnifiedAccounts = lazyDefault(() => import("@/components/customer/unified-accounts-refactored"))
+const Banks = lazyDefault(() => import("@/components/admin/banks"))
+const Branches = lazyDefault(() => import("@/components/admin/branches"))
+const BankAccounts = lazyDefault(() => import("@/components/admin/bank-accounts"))
+const Receipts = lazyDefault(() => import("@/components/accounting/receipts"))
+const Journal = lazyDefault(() => import("@/components/accounting/journal"))
+const CreditNote = lazyDefault(() => import("@/components/accounting/credit-note"))
+const CreditCards = lazyDefault(() => import("@/components/admin/credit-cards"))
+const ChequesBooks = lazyDefault(() => import("@/components/admin/cheques-books"))
+const VoucherBookPermissions = lazyDefault(() => import("@/components/settings/voucher-book-permissions"))
+const Warehouses = lazyDefault(() => import("@/components/admin/warehouses"))
+const StockVouchers = dynamic(() => import("@/components/inventory/stock-vouchers"), { ssr: false })
+const SalesDelivery = dynamic(() => import("@/components/sales/sales-delivery"), { ssr: false })
+const PosCashier = dynamic(() => import("@/components/pos/pos-cashier"), { ssr: false })
+const PosPointsSettings = dynamic(() => import("@/components/pos/pos-points-settings"), { ssr: false })
+const Campaigns = dynamic(() => import("@/components/pos/campaigns"), { ssr: false })
+const DiscountCards = dynamic(() => import("@/components/pos/discount-cards"), { ssr: false })
+const RestaurantLocations = dynamic(() => import("@/components/restaurant/restaurant-locations"), { ssr: false })
+const RestaurantTables = dynamic(() => import("@/components/restaurant/restaurant-tables"), { ssr: false })
+const RestaurantPos = dynamic(() => import("@/components/restaurant/restaurant-pos"), { ssr: false })
+const MorningBriefing = dynamic(() => import("@/components/briefing/morning-briefing"), { ssr: false })
+const UnifiedCampaigns = dynamic(() => import("@/components/pos/unified-campaigns"), { ssr: false })
 
-import { AIChat } from "@/components/ai-assistant/ai-chat"
-import { SmartAnalyticsDashboard } from "@/components/ai-analytics/smart-analytics-dashboard"
-import { SmartInventoryRecommendations } from "@/components/ai-recommendations/smart-inventory-recommendations"
-
-// Settings components
-import PrintSettings from "@/components/settings/print-settings"
-import VoucherSettings from "@/components/settings/voucher-settings"
-import DocumentSettings from "@/components/settings/document-settings"
-import Permissions from "@/components/settings/permissions"
-import GeneralSettings from "@/components/settings/general-settings"
-import APISettings from "@/components/settings/api-settings"
-import { SystemSettings } from "@/components/settings/system-settings"
-import { UserSettings } from "@/components/settings/user-settings"
-import { ThemeCustomization } from "@/components/settings/theme-customization"
-import { Definitions } from "@/components/settings/definitions"
-import FontSettings from "@/components/settings/font-settings"
-import QADashboard from "@/components/qa-dashboard"
-import WelcomeDashboard from "@/components/dashboard/welcome-dashboard"
-import PervasiveSettings from "@/app/settings/pervasive/page"
-import { OrderMigrate } from "@/components/Migration/orders-migration"
-import  {OrderManagement} from "@/components/orders/order-management"
+const AIChat = lazyNamed(() => import("@/components/ai-assistant/ai-chat"), "AIChat")
+const SmartAnalyticsDashboard = lazyNamed(() => import("@/components/ai-analytics/smart-analytics-dashboard"), "SmartAnalyticsDashboard")
+const SmartInventoryRecommendations = lazyNamed(() => import("@/components/ai-recommendations/smart-inventory-recommendations"), "SmartInventoryRecommendations")
+const PrintSettings = lazyDefault(() => import("@/components/settings/print-settings"))
+const VoucherSettings = lazyDefault(() => import("@/components/settings/voucher-settings"))
+const DocumentSettings = lazyDefault(() => import("@/components/settings/document-settings"))
+const Permissions = lazyDefault(() => import("@/components/settings/permissions"))
+const JobRoles = lazyDefault(() => import("@/components/settings/job-roles"))
+const RolePermissions = lazyDefault(() => import("@/components/settings/role-permissions"))
+const UserBranchAccessMatrix = lazyDefault(() => import("@/components/settings/user-branch-access-matrix"))
+const GeneralSettings = lazyDefault(() => import("@/components/settings/general-settings"))
+const APISettings = lazyDefault(() => import("@/components/settings/api-settings"))
+const SystemSettings = lazyNamed(() => import("@/components/settings/system-settings"), "SystemSettings")
+const UserSettings = lazyNamed(() => import("@/components/settings/user-settings"), "UserSettings")
+const ThemeCustomization = lazyNamed(() => import("@/components/settings/theme-customization"), "ThemeCustomization")
+const Definitions = lazyNamed(() => import("@/components/settings/definitions"), "Definitions")
+const FontSettings = lazyDefault(() => import("@/components/settings/font-settings"))
+const PageShortcutsSettings = lazyDefault(() => import("@/components/settings/page-shortcuts"))
+const VirtualAccounts = lazyDefault(() => import("@/components/settings/virtual-accounts"))
+const QADashboard = lazyDefault(() => import("@/components/qa-dashboard"))
+const WelcomeDashboard = lazyDefault(() => import("@/components/dashboard/welcome-dashboard"))
+const PersonalAssistantWizard = lazyDefault(() => import("@/components/onboarding/personal-assistant-wizard"))
+const PervasiveSettings = lazyDefault(() => import("@/app/settings/pervasive/page"))
+const OrderMigrate = lazyNamed(() => import("@/components/Migration/orders-migration"), "OrderMigrate")
+const OrderManagement = lazyNamed(() => import("@/components/orders/order-management"), "OrderManagement")
+const TaskOrdersAdminPage = lazyDefault(() => import("@/components/task-orders/task-orders-admin-page"))
+const TaskOrdersBoardPage = lazyDefault(() => import("@/components/task-orders/task-orders-board-page"))
+const TaskOrdersReportPage = lazyDefault(() => import("@/components/task-orders/task-orders-report-page"))
+const TaskOrdersApprovalPage = lazyDefault(() => import("@/components/task-orders/order-approval-page"))
+const DraftOrdersPage = lazyNamed(() => import("@/components/order-drafts/draft-orders-page"), "DraftOrdersPage")
+const OrderConfirmationBoard = lazyNamed(() => import("@/components/order-drafts/order-confirmation-board"), "OrderConfirmationBoard")
+const ChecklistDesigner = lazyNamed(() => import("@/components/order-drafts/checklist-designer"), "ChecklistDesigner")
+const CustomerProductTemplates = lazyDefault(() => import("@/components/products/customer-product-templates"))
+const BankReconciliation = lazyDefault(() => import("@/components/accounting/bank-reconciliation"))
+const Promotions = lazyDefault(() => import("@/components/sales/promotions"))
+const AidProgram = lazyDefault(() => import("@/components/aid/aid-program"))
+const PeriodLocks = lazyDefault(() => import("@/components/accounting/period-locks"))
+const LandedCosts = lazyDefault(() => import("@/components/accounting/landed-costs"))
+const YearEndClosing = lazyDefault(() => import("@/components/accounting/year-end-closing"))
+const VoucherPostingTools = lazyDefault(() => import("@/components/accounting/voucher-posting-tools"))
+const SmsSettings = lazyDefault(() => import("@/components/settings/sms-settings"))
+const VoucherWhatsAppHost = dynamic(() => import("@/components/common/voucher-whatsapp-host"), { ssr: false })
+const PageShortcutsListener = dynamic(() => import("@/components/page-shortcuts-listener").then((mod) => mod.PageShortcutsListener), { ssr: false })
+const InternalManufacturingDashboardPage = lazyNamed(() => import("@/components/manufacturing/internal-manufacturing-pages"), "InternalManufacturingDashboardPage")
+const InternalManufacturingSettingsPage = lazyNamed(() => import("@/components/manufacturing/internal-manufacturing-pages"), "InternalManufacturingSettingsPage")
+const InternalManufacturingRequestPage = lazyNamed(() => import("@/components/manufacturing/internal-manufacturing-pages"), "InternalManufacturingRequestPage")
+const InternalManufacturingRequestAuditPage = lazyNamed(() => import("@/components/manufacturing/internal-manufacturing-pages"), "InternalManufacturingRequestAuditPage")
+const InternalManufacturingReceiveRequestPage = lazyNamed(() => import("@/components/manufacturing/internal-manufacturing-pages"), "InternalManufacturingReceiveRequestPage")
+const InternalManufacturingAuditPage = lazyNamed(() => import("@/components/manufacturing/internal-manufacturing-pages"), "InternalManufacturingAuditPage")
+const InternalManufacturingSendPage = lazyNamed(() => import("@/components/manufacturing/internal-manufacturing-pages"), "InternalManufacturingSendPage")
+const InternalManufacturingReceivePage = lazyNamed(() => import("@/components/manufacturing/internal-manufacturing-pages"), "InternalManufacturingReceivePage")
+const InternalManufacturingPreparationPage = lazyNamed(() => import("@/components/manufacturing/internal-manufacturing-pages"), "InternalManufacturingPreparationPage")
+const InternalManufacturingReadyAuditPage = lazyNamed(() => import("@/components/manufacturing/internal-manufacturing-pages"), "InternalManufacturingReadyAuditPage")
+const InternalManufacturingReceivedAuditPage = lazyNamed(() => import("@/components/manufacturing/internal-manufacturing-pages"), "InternalManufacturingReceivedAuditPage")
+const InternalManufacturingDraftPage = lazyNamed(() => import("@/components/manufacturing/internal-manufacturing-pages"), "InternalManufacturingDraftPage")
+const InternalManufacturingConfirmationPage = lazyNamed(() => import("@/components/manufacturing/internal-manufacturing-pages"), "InternalManufacturingConfirmationPage")
+const InternalRequestsArchiveReport = lazyDefault(() => import("@/components/manufacturing/internal-requests-archive-report"))
+const SalesDraftsArchiveReport = lazyDefault(() => import("@/components/order-drafts/sales-drafts-archive-report"))
+const VoucherAuditReport = lazyDefault(() => import("@/components/reports/voucher-audit-report"))
+const ReportAuditReport = lazyDefault(() => import("@/components/reports/report-audit-report"))
+const EmployeeJobsPage = lazyNamed(() => import("@/components/hr/employee-jobs-page"), "EmployeeJobsPage")
+const DepartmentsPage = lazyNamed(() => import("@/components/hr/departments-page"), "DepartmentsPage")
+const SalaryItemsPage = lazyNamed(() => import("@/components/hr/salary-items-page"), "SalaryItemsPage")
+const TaxRulesPage = lazyNamed(() => import("@/components/hr/tax-rules-page"), "TaxRulesPage")
+const TaxExemptionsPage = lazyNamed(() => import("@/components/hr/tax-exemptions-page"), "TaxExemptionsPage")
+const EmployeesPage = lazyNamed(() => import("@/components/hr/employees-page"), "EmployeesPage")
+const EmployeeSalaryItemsPage = lazyNamed(() => import("@/components/hr/employee-salary-items-page"), "EmployeeSalaryItemsPage")
+const SalaryPeriodsPage = lazyNamed(() => import("@/components/hr/salary-periods-page"), "SalaryPeriodsPage")
+const SalaryJournalPage = lazyNamed(() => import("@/components/hr/salary-journal-page"), "SalaryJournalPage")
+const PayrollPage = lazyNamed(() => import("@/components/hr/payroll-page"), "PayrollPage")
+const AttendanceDevicesPage = lazyNamed(() => import("@/components/hr/attendance-pages"), "AttendanceDevicesPage")
+const AttendanceRecordsPage = lazyNamed(() => import("@/components/hr/attendance-pages"), "AttendanceRecordsPage")
+const AttendanceDetailedReportPage = lazyNamed(() => import("@/components/hr/attendance-reports"), "AttendanceDetailedReportPage")
+const AttendanceSummaryReportPage = lazyNamed(() => import("@/components/hr/attendance-reports"), "AttendanceSummaryReportPage")
+const ShiftRosterPage = lazyNamed(() => import("@/components/hr/shift-roster-page"), "ShiftRosterPage")
+const AttendanceProcessingPage = lazyNamed(() => import("@/components/hr/attendance-workbench"), "AttendanceProcessingPage")
+const AttendanceTransactionsPage = lazyNamed(() => import("@/components/hr/attendance-workbench"), "AttendanceTransactionsPage")
+const SalaryAdvancesPage = lazyNamed(() => import("@/components/hr/salary-deductions-page"), "SalaryAdvancesPage")
+const SalaryLoansPage = lazyNamed(() => import("@/components/hr/salary-deductions-page"), "SalaryLoansPage")
+const CashDeductionsPage = lazyNamed(() => import("@/components/hr/salary-deductions-page"), "CashDeductionsPage")
+const AttendanceEditorPage = lazyNamed(() => import("@/components/hr/attendance-workbench"), "AttendanceEditorPage")
+const OfficialHolidaysPage = lazyNamed(() => import("@/components/hr/official-holidays-page"), "OfficialHolidaysPage")
 const componentMap: Record<string, React.ComponentType<any>> = {
   dashboard: Dashboard,
   "inventory-analytics": InventoryAnalytics,
   "automated-reorder": AutomatedReorderSystem,
+  "purchase-planning": PurchasePlanning,
   "whatsapp-notifications": WhatsAppNotificationSettings,
   "barcode-management": BarcodeManagement,
   "order-tracking": OrderTrackingDashboard,
@@ -68,8 +238,66 @@ const componentMap: Record<string, React.ComponentType<any>> = {
   "lot-status-manager": LotStatusManager,
   "theme-customization": ThemeCustomization,
   "order-reports": OrderReports,
+  "orders-detailed-report": lazyNamed(() => import("@/components/reports/orders-report"), "OrdersDetailedReport"),
+  "orders-total-report": lazyNamed(() => import("@/components/reports/orders-report"), "OrdersTotalReport"),
+  "orders-by-item-report": lazyNamed(() => import("@/components/reports/orders-report"), "OrdersByItemReport"),
+  "orders-by-party-report": lazyNamed(() => import("@/components/reports/orders-report"), "OrdersByPartyReport"),
+  "orders-backlog-report": lazyNamed(() => import("@/components/reports/orders-report"), "OrdersBacklogReport"),
+  "cheques-total-report": lazyNamed(() => import("@/components/reports/cheques-report"), "ChequesTotalReport"),
+  "cheques-detailed-report": lazyNamed(() => import("@/components/reports/cheques-report"), "ChequesDetailedReport"),
+  "orders-by-salesman-report": lazyNamed(() => import("@/components/reports/orders-report"), "OrdersBySalesmanReport"),
+  "restaurant-monitor-report": lazyNamed(() => import("@/components/reports/restaurant-monitor-report"), "default"),
+  "restaurant-tables-report": lazyNamed(() => import("@/components/reports/restaurant-report"), "RestaurantTablesReport"),
+  "restaurant-orders-report": lazyNamed(() => import("@/components/reports/restaurant-report"), "RestaurantOrdersReport"),
+  "restaurant-items-report": lazyNamed(() => import("@/components/reports/restaurant-report"), "RestaurantItemsReport"),
+  "restaurant-waiters-report": lazyNamed(() => import("@/components/reports/restaurant-report"), "RestaurantWaitersReport"),
+  "restaurant-locations-report": lazyNamed(() => import("@/components/reports/restaurant-report"), "RestaurantLocationsReport"),
+  "restaurant-hours-report": lazyNamed(() => import("@/components/reports/restaurant-report"), "RestaurantHoursReport"),
   "product-reports": ProductReports,
+  "item-balances-report": ItemBalancesReport,
+  "expiry-balances-report": ExpiryBalancesReport,
+  "item-valuation-report": ItemValuationReport,
+  "items-profit-report": ItemsProfitReport,
+  "period-profit-report": PeriodProfitReport,
+  "invoice-profit-report": InvoiceProfitReport,
+  "item-sales-cost-report": ItemSalesCostReport,
+  "pricing-inventory": PricingInventoryPage,
+  "item-card-report": ItemCardReport,
   "batch-log-report": BatchLogReport,
+  "serial-movements-report": SerialMovementsReport,
+  "cashier-log-report": lazyNamed(() => import("@/components/reports/cashier-followup-report"), "default"),
+  "pos-custody-report": lazyNamed(() => import("@/components/reports/pos-custody-report"), "default"),
+  "cashier-log-total-report": lazyNamed(() => import("@/components/reports/cashier-total-report"), "default"),
+  "cashier-log-detailed-report": lazyNamed(() => import("@/components/reports/cashier-detailed-report"), "default"),
+  "receivables-statement-report": ReceivablesStatementReport,
+  "accounting-statement-report": AccountingStatementReport,
+  "receivables-balances-report": ReceivablesBalancesReport,
+  "accounting-balances-report": AccountingBalancesReport,
+  "receivables-aging-report": ReceivablesAgingReport,
+  "vouchers-report": VouchersReport,
+  "transactions-report": TransactionsReport,
+  "trial-balance-report": TrialBalanceReport,
+  "balance-sheet-report": BalanceSheetReport,
+  "income-statement-report": IncomeStatementReport,
+  "deliveries-report": DeliveriesListReport,
+  "internal-deliveries-report": InternalDeliveriesReport,
+  "consignment-invoices-report": ConsignmentInvoicesReport,
+  "tax-calculation-report": TaxCalculationReport,
+  "tax-sales-statement-report": TaxSalesStatementReport,
+  "tax-purchases-statement-report": TaxPurchasesStatementReport,
+  "tax-sales-purchases-report": TaxSalesPurchasesReport,
+  "tax-maqasa-sales-report": TaxMaqasaSalesReport,
+  "tax-maqasa-purchases-report": TaxMaqasaPurchasesReport,
+  "cc-statement-with-report": CostCenterStatementWithReport,
+  "cc-statement-by-report": CostCenterStatementByReport,
+  "cc-accounts-movement-report": CostCenterAccountsMovementReport,
+  "cc-transactions-report": CostCenterTransactionsReport,
+  "cc-trial-balance-report": CostCenterTrialBalanceReport,
+  "cc-trial-balance-accounts-report": CostCenterTrialBalanceAccountsReport,
+  "cc-income-statement-report": CostCenterIncomeStatementReport,
+  "cc-balance-sheet-report": CostCenterBalanceSheetReport,
+  "cc-income-statement-by-report": CostCenterIncomeStatementByReport,
+  "cc-balance-sheet-by-report": CostCenterBalanceSheetByReport,
   "batch-reports": BatchReports,
   "sales-orders": SalesOrders,
   "sale-invoices": SaleInvoices,
@@ -79,136 +307,519 @@ const componentMap: Record<string, React.ComponentType<any>> = {
   services: Services,
   customers: Customers,
   suppliers: (props: any) => <Customers {...props} isSupplier={true} />,
+  subscribers: (props: any) => <Customers {...props} isSubscriber={true} />,
+  salesmen: SalesmenPage,
+  "salesman-commissions": SalesmanCommissionPage,
+  cars: Cars,
+  drivers: Drivers,
+  banks: Banks,
+  branches: Branches,
+  "bank-accounts": BankAccounts,
+  "fixed-assets": FixedAssetsPage,
+  // أرقام أنواع السندات هنا مطابقة لـvoucher_types_tbl بعد إعادة ترقيمها (حذف المكرَّرات 3-6 في
+  // 2026-07-30) — لا يمكن استيراد الثوابت الفعلية من app/api/**/_lib.ts مباشرة هنا (هذا ملف "use
+  // client"، وتلك الملفات تستورد sql من lib/database.ts وهو خادمي فقط)، فتُبقى كأرقام حرفية لكن
+  // مطابقة تماماً لما بعد إعادة الترقيم.
+  "receipt-vouchers": (props: any) => <Receipts {...props} voucherType={4} />,
+  "payment-vouchers": (props: any) => <Receipts {...props} voucherType={5} />,
+  "cheque-payment-vouchers": ChequePaymentVouchers,
+  "journal-vouchers": Journal,
+  "credit-notes": (props: any) => <CreditNote {...props} voucherType={6} />,
+  "debit-notes": (props: any) => <CreditNote {...props} voucherType={7} />,
+  "credit-cards": CreditCards,
+  "cheques-books": ChequesBooks,
+  cheques: ChequesPage,
+  "cheque-operations": ChequeOperationsPage,
+  "cheque-deposit-bulk": ChequeDepositBulkPage,
+  "visa-commission-journals": VisaCommissionJournalsPage,
+  "currency-transfer-journal": CurrencyTransferJournalPage,
+  "account-currency-transfer-journals": AccountCurrencyTransferJournalsPage,
+  "currency-difference-journals": CurrencyDifferenceJournalsPage,
+  "cheque-endorse-bulk": ChequeEndorseBulkPage,
+  "outgoing-cheque-clear-bulk": OutgoingChequeClearBulkPage,
+  "voucher-book-permissions": VoucherBookPermissions,
+  warehouses: Warehouses,
+  "stock-in-vouchers": (props: any) => <StockVouchers {...props} voucherType={8} />,
+  "stock-out-vouchers": (props: any) => <StockVouchers {...props} voucherType={9} />,
+  "internal-delivery-vouchers": (props: any) => <StockVouchers {...props} voucherType={10} />,
+  "use-vouchers": (props: any) => <StockVouchers {...props} voucherType={11} />,
+  "stock-counts": StockCounts,
+  "stock-count-approval": StockCountApproval,
+  "production-vouchers": ProductionVouchers,
+  "account-access": AccountAccess,
+  "manager-attachments": ManagerAttachments,
+  "manager-inbox": ManagerInbox,
+  "bulk-items": BulkItems,
+  "manufacturing-components-import": ManufacturingComponentsImport,
+  "production-detailed-report": lazyNamed(() => import("@/components/reports/production-report"), "ProductionDetailedReport"),
+  "production-produced-report": lazyNamed(() => import("@/components/reports/production-report"), "ProductionProducedReport"),
+  "production-raw-report": lazyNamed(() => import("@/components/reports/production-report"), "ProductionRawReport"),
+  "production-vouchers-report": lazyNamed(() => import("@/components/reports/production-report"), "ProductionVouchersReport"),
+  "sales-invoices": (props: any) => <SalesDelivery {...props} voucherType={12} />,
+  "pos-cashier": PosCashier,
+  "pos-points-settings": PosPointsSettings,
+  campaigns: Campaigns,
+  "pos-discount-cards": DiscountCards,
+  "restaurant-locations": RestaurantLocations,
+  "restaurant-tables": RestaurantTables,
+  "restaurant-pos": RestaurantPos,
+  "morning-briefing": MorningBriefing,
+  "customer-portal": CustomerPortalAdmin,
+  "unified-campaigns": UnifiedCampaigns,
+  "sales-delivery": (props: any) => <SalesDelivery {...props} voucherType={13} />,
+  "delivery-consignment-sale": (props: any) => <SalesDelivery {...props} voucherType={14} />,
+  "return-delivery-consignment-sale": (props: any) => <SalesDelivery {...props} voucherType={15} />,
+  "return-sell": (props: any) => <SalesDelivery {...props} voucherType={16} />,
+  "purchase-invoices": (props: any) => <SalesDelivery {...props} voucherType={17} />,
+  "delivery-pay": (props: any) => <SalesDelivery {...props} voucherType={18} />,
+  "return-purchase": (props: any) => <SalesDelivery {...props} voucherType={19} />,
   "product-groups": ProductGroups,
+  "brand-types": BrandTypes,
+  brands: Brands,
   definitions: Definitions,
   accounts: Accounts,
   "unified-accounts": UnifiedAccounts,
   "print-settings": PrintSettings,
+  "sms-settings": SmsSettings,
   "voucher-settings": VoucherSettings,
   "document-settings": DocumentSettings,
   permissions: Permissions,
+  "job-roles": JobRoles,
+  "role-permissions": RolePermissions,
+  "user-branch-access-matrix": UserBranchAccessMatrix,
   "general-settings": GeneralSettings,
+  // "اعدادات عامة" صارت تبويباً داخل إعدادات النظام — الرابط القديم يفتح الصفحة على هذا التبويب
+  "vouchers-general-settings": (props: any) => <SystemSettings {...props} initialSection="general" />,
   "api-settings": APISettings,
   "exchange-rates": ExchangeRates,
   "system-settings": SystemSettings,
   "user-settings": UserSettings,
+  "user-default-accounts": VirtualAccounts,
   "font-settings": FontSettings,
   "qa-dashboard": QADashboard,
   "home-dashboard": WelcomeDashboard,
+  "personal-assistant": PersonalAssistantWizard,
+  "feature-requests": FeatureRequests,
+  "page-shortcuts": PageShortcutsSettings,
   "pervasive-settings": PervasiveSettings,
   "customer-portal-admin": CustomerPortalAdmin,
   "ai-assistant": AIChat,
   "smart-analytics": SmartAnalyticsDashboard,
   "smart-inventory": SmartInventoryRecommendations,
   "orders-migration": OrderMigrate,
-  "order-management": OrderManagement
+  "order-management": OrderManagement,
+  "task-orders-admin": TaskOrdersAdminPage,
+  "task-orders-board": TaskOrdersBoardPage,
+  "task-orders-report": TaskOrdersReportPage,
+  "task-orders-approval": TaskOrdersApprovalPage,
+  "draft-sales-order": DraftOrdersPage,
+  "order-confirmation": OrderConfirmationBoard,
+  "order-checklists": ChecklistDesigner,
+  "customer-product-templates": CustomerProductTemplates,
+  "bank-reconciliation": BankReconciliation,
+  promotions: Promotions,
+  "aid-program": AidProgram,
+  "period-locks": PeriodLocks,
+  "landed-costs": LandedCosts,
+  "year-end-closing": YearEndClosing,
+  "voucher-posting-tools": VoucherPostingTools,
+  "internal-manufacturing-dashboard": InternalManufacturingDashboardPage,
+  "internal-manufacturing-settings": InternalManufacturingSettingsPage,
+  "internal-manufacturing-request": InternalManufacturingRequestPage,
+  "internal-manufacturing-request-audit": InternalManufacturingRequestAuditPage,
+  "internal-manufacturing-receive-request": InternalManufacturingReceiveRequestPage,
+  "internal-manufacturing-audit": InternalManufacturingAuditPage,
+  "internal-manufacturing-send": InternalManufacturingSendPage,
+  "internal-manufacturing-receive": InternalManufacturingReceivePage,
+  "internal-manufacturing-preparation": InternalManufacturingPreparationPage,
+  "internal-manufacturing-ready-audit": InternalManufacturingReadyAuditPage,
+  "internal-manufacturing-received-audit": InternalManufacturingReceivedAuditPage,
+  "internal-manufacturing-draft": InternalManufacturingDraftPage,
+  "internal-manufacturing-confirmation": InternalManufacturingConfirmationPage,
+  "internal-manufacturing-archive-report": InternalRequestsArchiveReport,
+  "sales-drafts-archive-report": SalesDraftsArchiveReport,
+  "voucher-audit-report": VoucherAuditReport,
+  "report-audit-report": ReportAuditReport,
+  "employee-jobs": EmployeeJobsPage,
+  "hr-departments": DepartmentsPage,
+  "salary-items": SalaryItemsPage,
+  "tax-rules": TaxRulesPage,
+  "tax-exemptions": TaxExemptionsPage,
+  employees: EmployeesPage,
+  "employee-salary-items": EmployeeSalaryItemsPage,
+  "salary-periods": SalaryPeriodsPage,
+  "salary-journal": SalaryJournalPage,
+  payroll: PayrollPage,
+  "attendance-devices": AttendanceDevicesPage,
+  "attendance-records": AttendanceRecordsPage,
+  "attendance-processing": AttendanceProcessingPage,
+  "attendance-transactions": AttendanceTransactionsPage,
+  "salary-advances": SalaryAdvancesPage,
+  "salary-loans": SalaryLoansPage,
+  "cash-deductions": CashDeductionsPage,
+  "attendance-editor": AttendanceEditorPage,
+  "attendance-detailed-report": AttendanceDetailedReportPage,
+  "attendance-summary-report": AttendanceSummaryReportPage,
+  shifts: ShiftRosterPage,
+  "official-holidays": OfficialHolidaysPage,
+  "salary-items-report": (props: any) => <PayrollPage {...props} report="items" />,
+  "exchange-rates-report": ExchangeRatesReport,
+  "income-tax-report": (props: any) => <PayrollPage {...props} report="tax" />,
+}
+
+const titleFor = (section: string) => SECTION_TITLES[section] || section
+
+// مُستخرَج من renderContent السابقة بلا تغيير بالمنطق — الفرق الوحيد أنها تأخذ section كمعامل
+// بدل قراءته من حالة activeSection المُغلَقة عليها، لتُستخدم بكل جزء (pane) من مساحة العمل على
+// حدة (انظر WorkspacePane)، بما فيها احتمال وجود قسمين مختلفين مفتوحين بآن واحد بالشاشة المقسمة.
+function resolveSectionNode(section: string | null, onOpenSection: (section: string) => void): React.ReactNode {
+  if (!section || section === "home-dashboard") {
+    return <WelcomeDashboard onOpenSection={onOpenSection} />
+  }
+
+  const Component = componentMap[section]
+  if (Component) {
+    if (typeof Component !== "function") {
+      console.error("[v0] Invalid component type detected for section", section, Component)
+    }
+    if (isReportSection(section)) return <ReportAccessGate section={section}><Component /></ReportAccessGate>
+    if (fileFamilyForSection(section) && transactionFamilyForSection(section)) {
+      return <TransactionAccessGate section={section}><FileAccessGate section={section}><Component /></FileAccessGate></TransactionAccessGate>
+    }
+    if (fileFamilyForSection(section)) return <FileAccessGate section={section}><Component /></FileAccessGate>
+    if (transactionFamilyForSection(section)) return <TransactionAccessGate section={section}><Component /></TransactionAccessGate>
+    // إعدادات المستخدمين والصلاحيات: للمسؤول أو لمن يملك صلاحية إدارة المستخدمين والصلاحيات
+    if (isUserAdminSection(section)) return <TransactionAccessGate section={section}><Component /></TransactionAccessGate>
+    return <Component />
+  }
+
+  if (section === "user-profile") {
+    return (
+      <div className="space-y-6" dir={appDir()}>
+        <div className="bg-gradient-to-r from-blue-600 to-purple-600 rounded-lg p-6 text-white">
+          <h1 className="text-2xl font-bold mb-2">{tr("الملف الشخصي")}</h1>
+          <p className="text-blue-100">{tr("إدارة معلوماتك الشخصية وإعدادات الحساب")}</p>
+        </div>
+        <UserSettings />
+      </div>
+    )
+  }
+
+  return <WelcomeDashboard onOpenSection={onOpenSection} />
 }
 
 export default function HomePage() {
-  const [activeSection, setActiveSection] = useState<string | null>(null)
+  return (
+    <Suspense fallback={null}>
+      <HomePageContent />
+    </Suspense>
+  )
+}
+
+function HomePageContent() {
+  const searchParams = useSearchParams()
+  const router = useRouter()
+  const { openSection, currentSection, focusedPaneId, tabsEnabled, splitEnabled, panes } = useWorkspace()
+  // التبويبات التي سيُتلفها فتح قسم بالجزء المركّز: بلا تبويبات تُستبدل الشاشة الحالية؛ مع التبويبات
+  // يُفتح تبويب جديد (أو يُنشَّط تبويب القسم الموجود) فلا تُفقد أي شاشة.
+  const tabsReplacedByOpen = () => {
+    if (tabsEnabled) return []
+    const pane = panes.find((p) => p.id === focusedPaneId)
+    return pane?.activeTabId ? [pane.activeTabId] : []
+  }
+  const branchReloadKey = useBranchReloadKey()
+  const activeSection = currentSection(focusedPaneId)
+  // وضع التطبيق يُقرأ بعد التركيب فقط (localStorage غير متاح في عرض الخادم)
+  const [appSection, setAppSection] = useState<string | null>(null)
+  useEffect(() => { setAppSection(appModeSection()) }, [])
+
+  // يُعمِّر تبويب البداية بالجزء "a" حسب رابط العنوان — استبدال لما كان سابقاً initializer لـ
+  // useState (نفّذ مرة واحدة عند أول عرض فقط)، الآن عبر workspace بدل حالة activeSection مباشرة.
+  useEffect(() => {
+    // الكاشير كان مفتوحاً عند إغلاق المتصفح/الجهاز (lib/pos-offline.ts POS_RESUME_KEY) ⇐ يُفتح مباشرة عند البدء بلا قسم في الرابط
+    let resumeCashier = false
+    try { resumeCashier = !searchParams.get("section") && shouldResumePos() } catch { /* ignore */ }
+    // مشغّل الكاشير/المطعم (lib/app-mode.ts): بلا قسم في الرابط تُفتح شاشته مباشرة
+    const fromUrl = resumeCashier ? "pos-cashier" : searchParams.get("section") || appModeSection()
+    const resolved =
+      !fromUrl || fromUrl === "home-dashboard" || fromUrl === "dashboard"
+        ? "home-dashboard"
+        : componentMap[fromUrl]
+          ? fromUrl
+          : "home-dashboard"
+    openSection(resolved, titleFor(resolved), "a")
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // مزامنة القسم المعروض مع رابط العنوان عند تنقّل "رجوع"/"تقدّم" بالمتصفح — handleSectionChange
+  // تستخدم router.push الآن (لا replace) فيتراكم سجلّ حقيقي بتاريخ المتصفح لكل قسم، لكن تنقّل history
+  // API (رجوع/تقدّم) يُغيّر searchParams وحده دون إعادة تركيب هذا المكوّن أو إعادة تشغيل الأثر أعلاه
+  // (ذو الاعتماديات []) — فيبقى القسم المعروض كما هو ولا يتبع رابط العنوان الجديد بلا هذا الأثر.
+  // الحارس (resolved === activeSection) يمنع استدعاءً مكرَّراً زائداً بلا داعٍ عند تنقّل بدأناه نحن
+  // أصلاً عبر handleSectionChange (التي تُحدِّث activeSection مباشرة أولاً قبل router.push) — openSection
+  // تصنع تبويباً جديداً في كل استدعاء بوضع "بلا تبويبات" (tabsEnabled=false)، فإعادة تنفيذها لنفس
+  // القسم فعلياً تُعيد تركيب الشاشة وتفقد أي حالة غير محفوظة بلا داعٍ.
+  const didInitialUrlSync = useRef(false)
+  useEffect(() => {
+    // التشغيل الأول عند التركيب مُتكفَّل به بالفعل بالأثر أعلاه (بادئ الجزء "a")؛ هذا الأثر يتعامل
+    // فقط مع تغييرات searchParams اللاحقة (رجوع/تقدّم، أو push ذاتي من handleSectionChange).
+    if (!didInitialUrlSync.current) {
+      didInitialUrlSync.current = true
+      return
+    }
+    const fromUrl = searchParams.get("section")
+    const resolved =
+      !fromUrl || fromUrl === "home-dashboard" || fromUrl === "dashboard"
+        ? "home-dashboard"
+        : componentMap[fromUrl]
+          ? fromUrl
+          : "home-dashboard"
+    if (resolved === activeSection) return
+    // رجوع/تقدّم المتصفح مع تغييرات غير محفوظة: يُعاد الرابط فوراً للشاشة الحالية، ولا يُفتح القسم
+    // الجديد إلا بعد قرار نافذة التحقق (حفظ/عدم حفظ).
+    const replaced = tabsReplacedByOpen()
+    if (replaced.length && !requestGuardedNavigation(() => {
+      openSection(resolved, titleFor(resolved))
+      router.push(resolved === "home-dashboard" ? "/" : `/?section=${resolved}`, { scroll: false })
+    }, replaced)) {
+      router.replace(activeSection && activeSection !== "home-dashboard" ? `/?section=${activeSection}` : "/", { scroll: false })
+      return
+    }
+    openSection(resolved, titleFor(resolved))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchParams])
 
   useEffect(() => {
-    const removeWijmoEval = () => {
-      document.body.querySelectorAll<HTMLElement>("*").forEach((e) => {
-        if (e.innerText?.includes("Wijmo Evaluation")) {
-          e.remove()
-        }
-        if (e.innerText?.includes("Wijmo License")) {
-          e.remove()
-        }
-      });
-    };
-
-    removeWijmoEval();
-
-    // Observe DOM changes under body only
-    const observer = new MutationObserver(removeWijmoEval);
-    observer.observe(document.body, { childList: true, subtree: true });
-
-    return () => observer.disconnect();
-  }, []);
-  const renderContent = () => {
-    if (!activeSection) {
-      return <WelcomeDashboard onOpenSection={handleSectionChange} />
+    // تبويب جديد فُتح برابط يحمل ?company=<id> (لصق الرابط يدوياً، أو فتحه من مكان لا يُورث
+    // sessionStorage للتبويب الأصلي) — يعيد تنفيذ اختيار الشركة لتعمير sessionStorage لهذا
+    // التبويب تحديداً (كوكي tenant_db وحدها لا تكفي لأنها مشتركة بين كل التبويبات). التبويب الذي
+    // نفّذ الاختيار أصلاً من شركاتي يصل هنا وقد عمّر sessionStorage مسبقاً فيتخطى هذا مباشرة.
+    const companyIdParam = searchParams.get("company")
+    if (!companyIdParam) return
+    if (sessionStorage.getItem("active_company_id") === companyIdParam) {
+      // الشركة مختارة لهذا التبويب ⇐ يُزال ?company= من شريط العنوان (مع إبقاء باقي المعاملات كـ section)
+      const params = new URLSearchParams(window.location.search)
+      params.delete("company")
+      const query = params.toString()
+      window.history.replaceState(window.history.state, "", `${window.location.pathname}${query ? `?${query}` : ""}${window.location.hash}`)
+      return
     }
 
-    if (activeSection === "home-dashboard") {
-      return <WelcomeDashboard onOpenSection={handleSectionChange} />
-    }
+    activateCompany(Number(companyIdParam))
+      .then((result) => {
+        if (result.success) window.location.reload()
+      })
+      .catch(() => {
+        // تجاهل — ستتولى ProtectedRoute التحويل لتسجيل دخول الإدارة كالمعتاد إن تعذّر هذا
+      })
+  }, [searchParams])
 
-    if (activeSection) {
-      const Component = componentMap[activeSection]
-      if (Component) {
-        console.log("[v0] Rendering traditional component:", activeSection, { type: typeof Component })
-        if (typeof Component !== 'function') {
-          console.error('[v0] Invalid component type detected for section', activeSection, Component)
+  // عند كل دخول للنظام (تحميل هذا المكوّن مرة واحدة عقب تسجيل الدخول)، إن لم تكن أي عملة معرَّفة
+  // بعد لهذه الشركة (شركة حديثة التزويد مثلاً)، نوجّه المستخدم مباشرة لشاشة تعريف العملات بدل ترك
+  // الشاشات الأخرى (تسعير، فواتير...) تفشل بصمت لغياب عملة أساس.
+  // شركة جديدة (لا أصناف ولا سندات) لم تُكمل البداية السريعة ولم تتجاهلها: تُفتح البداية السريعة مباشرة
+  // بعد الدخول — مرة واحدة لكل جلسة متصفح لكل شركة. وإلا يبقى الفحص القديم: بلا عملات ← شاشة العملات.
+  useEffect(() => {
+    let cancelled = false
+    const run = async () => {
+      // مشغّل الكاشير/المطعم يبقى على شاشته — لا تحويل للبداية السريعة أو العملات
+      if (appModeSection()) return
+      try {
+        const company = sessionStorage.getItem("active_company_id") || localStorage.getItem("active_company_id") || ""
+        const onboardingKey = company ? `onboarding-redirected:${company}` : ""
+        // البداية السريعة تشمل تعريف العملة — شركة جديدة لم تُكملها لا تُحوَّل لشاشة العملات أبداً
+        // (محاولة ثانية عند فشل الطلب الأول، مثلاً أثناء تهيئة جداول الشركة الجديدة)
+        const loadOnboarding = () => fetch("/api/onboarding-assistant").then((res) => (res.ok ? res.json() : null)).catch(() => null)
+        const onboarding = (await loadOnboarding()) || (await loadOnboarding())
+        if (cancelled) return
+        if (onboarding?.shouldShow && onboarding?.isNewCompany) {
+          if (!onboardingKey || !sessionStorage.getItem(onboardingKey)) {
+            if (onboardingKey) sessionStorage.setItem(onboardingKey, "1")
+            handleSectionChange("personal-assistant")
+          }
+          return
         }
-        return <Component />
+        const data = await fetch("/api/exchange-rates").then((res) => (res.ok ? res.json() : null))
+        if (cancelled || !data) return
+        const list = Array.isArray(data?.rates) ? data.rates : []
+        if (list.length === 0) handleSectionChange("exchange-rates")
+      } catch {
+        // تجاهل — ليست فحصاً حرجاً يمنع استخدام النظام
       }
     }
+    void run()
+    return () => {
+      cancelled = true
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
-    if (activeSection === "user-profile") {
-      return (
-        <div className="space-y-6" dir="rtl">
-          <div className="bg-gradient-to-r from-blue-600 to-purple-600 rounded-lg p-6 text-white">
-            <h1 className="text-2xl font-bold mb-2">الملف الشخصي</h1>
-            <p className="text-blue-100">إدارة معلوماتك الشخصية وإعدادات الحساب</p>
-          </div>
-          <UserSettings />
-        </div>
-      )
+  useEffect(() => {
+    let frameId: number | null = null
+    let pendingRoots: HTMLElement[] = []
+
+    const removeLicenseNodes = (root: ParentNode) => {
+      if (root instanceof HTMLElement && root.parentElement === document.body) {
+        const rootText = root.textContent || ""
+        if (rootText.includes("Wijmo License") || rootText.includes("The Wijmo license")) {
+          root.remove()
+          return
+        }
+      }
+
+      const elements = root instanceof HTMLElement
+        ? [root, ...root.querySelectorAll<HTMLElement>("*")]
+        : Array.from(root.querySelectorAll<HTMLElement>("*"))
+      elements.forEach((element) => {
+        const text = element.textContent
+        const isLicenseText = text?.includes("Wijmo Evaluation") || text?.includes("Wijmo License")
+        const hasMatchingChild = Array.from(element.children).some((child) => {
+          const childText = child.textContent
+          return childText?.includes("Wijmo Evaluation") || childText?.includes("Wijmo License")
+        })
+        if (isLicenseText && !hasMatchingChild) element.remove()
+      })
     }
 
-    return <WelcomeDashboard onOpenSection={handleSectionChange} />
-  }
+    const observer = new MutationObserver((records) => {
+      records.forEach((record) => record.addedNodes.forEach((node) => {
+        if (node instanceof HTMLElement) pendingRoots.push(node)
+      }))
+
+      if (frameId !== null || pendingRoots.length === 0) return
+      frameId = window.requestAnimationFrame(() => {
+        const roots = pendingRoots
+        pendingRoots = []
+        frameId = null
+        observer.disconnect()
+        roots.forEach(removeLicenseNodes)
+        observer.observe(document.body, { childList: true, subtree: true })
+      })
+    })
+    observer.observe(document.body, { childList: true, subtree: true })
+
+    return () => {
+      observer.disconnect()
+      pendingRoots = []
+      if (frameId !== null) window.cancelAnimationFrame(frameId)
+    }
+  }, [])
+
   const [user, setUser] = useState<any>(null)
 
   useEffect(() => {
     const storedUser =
-      localStorage.getItem("erp_user") ||
-      sessionStorage.getItem("erp_user")
+      sessionStorage.getItem("erp_user") ||
+      localStorage.getItem("erp_user")
 
     if (storedUser) {
       setUser(JSON.parse(storedUser))
     }
   }, [])
 
+  // الشاشة الافتراضية عند الدخول (اعدادات المستخدم ← dashboard_layout.default_screen): تُفتح مرة واحدة لكل جلسة دخول.
+  // كان الفتح فقط عبر حدث OPEN_DEFAULT_SCREEN بعد 100ms من الدخول فيضيع إن لم تكن الصفحة مركّبة بعد، ولا يُطلق أصلاً عند
+  // الدخول من "شركاتي" — فتُفتح الآن عند أول تركيب للصفحة أيضاً. default_screen_opened تُمسح عند تسجيل الخروج (auth-context).
   useEffect(() => {
-    const handler = () => {
-      const storedUser =
-        localStorage.getItem("erp_user") ||
-        sessionStorage.getItem("erp_user")
-
-      if (!storedUser) return
-
-      const user = JSON.parse(storedUser)
-      const defaultScreen = user?.dashboard_layout?.default_screen
-
-      if (!defaultScreen || defaultScreen === "dashboard") return
-
-      setActiveSection(componentMap[defaultScreen] ? defaultScreen : "home-dashboard")
+    const openDefaultScreen = (fromLogin: boolean) => {
+      try {
+        if (!fromLogin && sessionStorage.getItem("default_screen_opened")) return
+        const storedUser = sessionStorage.getItem("erp_user") || localStorage.getItem("erp_user")
+        if (!storedUser) return
+        sessionStorage.setItem("default_screen_opened", "1")
+        // رابط بقسم محدد (?section=) أو استئناف الكاشير لهما الأولوية على الشاشة الافتراضية
+        if (!fromLogin && (searchParams.get("section") || shouldResumePos())) return
+        const defaultScreen = JSON.parse(storedUser)?.dashboard_layout?.default_screen
+        if (!defaultScreen || defaultScreen === "dashboard" || defaultScreen === "home-dashboard" || !componentMap[defaultScreen]) return
+        openSection(defaultScreen, titleFor(defaultScreen))
+      } catch {
+        // تخزين غير متاح — تبقى الشاشة الرئيسية
+      }
     }
-
+    openDefaultScreen(false)
+    const handler = () => openDefaultScreen(true)
     window.addEventListener("OPEN_DEFAULT_SCREEN", handler)
 
     return () => window.removeEventListener("OPEN_DEFAULT_SCREEN", handler)
-  }, [user])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user, openSection])
+
+  // جسر تنقّل عام بين مكوّنات الأقسام الشقيقة (لا قناة props مباشرة بينها — كل قسم يُصيَّر بلا أي
+  // props عبر componentMap، انظر `<Component />` أدناه) — نفس فكرة OPEN_DEFAULT_SCREEN أعلاه، لكن
+  // بغرض عام. مثال الاستخدام الحالي: زر "تعديل الصلاحيات" بـcomponents/settings/user-settings.tsx
+  // يفتح شاشة الصلاحيات مباشرة بدل تنبيه بديل (alert) كان يعرضه فقط.
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const section = (e as CustomEvent<{ section: string }>).detail?.section
+      if (section && componentMap[section]) {
+        openSection(section, titleFor(section))
+      }
+    }
+    window.addEventListener("OPEN_SECTION", handler)
+    return () => window.removeEventListener("OPEN_SECTION", handler)
+  }, [openSection])
 
   const handleSectionChange = (section: string) => {
     console.log("[v0] Section change requested:", section)
 
-    if (section === "home-dashboard" || section === "dashboard") {
-      setActiveSection("home-dashboard")
-      return
-    }
+    const resolved =
+      section === "home-dashboard" || section === "dashboard"
+        ? "home-dashboard"
+        : componentMap[section]
+          ? section
+          : "home-dashboard"
 
-    setActiveSection(componentMap[section] ? section : "home-dashboard")
+    const navigate = () => {
+      openSection(resolved, titleFor(resolved))
+      // Keep the URL aligned with the selected section and preserve browser history.
+      router.push(resolved === "home-dashboard" ? "/" : `/?section=${resolved}`, { scroll: false })
+    }
+    const navigationRequest = new CustomEvent("pos-cashier:navigate-request", {
+      cancelable: true,
+      detail: { continueNavigation: navigate },
+    })
+    if (!window.dispatchEvent(navigationRequest)) return
+    // بقية الشاشات (سندات/تعريفات): نافذة التحقق من التغييرات للشاشة التي ستُستبدل (lib/navigation-guard.ts)
+    const replaced = tabsReplacedByOpen()
+    if (replaced.length && !requestGuardedNavigation(navigate, replaced)) return
+    navigate()
+  }
+
+  // مشغّل الكاشير/المطعم: شاشته وحدها بلا القائمة والشريط العلوي والتبويبات (components/app-mode-shell.tsx)
+  if (appSection) {
+    return (
+      <ProtectedRoute>
+        <AppModeShell>{resolveSectionNode(appSection, () => undefined)}</AppModeShell>
+      </ProtectedRoute>
+    )
   }
 
   return (
     <ProtectedRoute>
       <ERPLayout activeSection={activeSection || ""} onSectionChange={handleSectionChange}>
-        <div className="flex-1 overflow-auto">{renderContent()}</div>
+        {/* Keyed by the active branch: changing الفرع remounts every open page/tab so each one
+            reloads its data (lists, defaults, permissions) for the new branch. */}
+        <div key={`branch-${branchReloadKey}`} className="flex min-h-0 flex-1 flex-row gap-2 overflow-hidden">
+          <WorkspacePane
+            paneId="a"
+            showTabStrip={tabsEnabled}
+            showFocusRing={splitEnabled}
+            renderSection={(section) => resolveSectionNode(section, handleSectionChange)}
+          />
+          {splitEnabled && <div className="w-px bg-border shrink-0" />}
+          {splitEnabled && (
+            <WorkspacePane
+              paneId="b"
+              showTabStrip={tabsEnabled}
+              showFocusRing={splitEnabled}
+              renderSection={(section) => resolveSectionNode(section, handleSectionChange)}
+            />
+          )}
+        </div>
+        {/* زر واتساب في شريط أدوات الحركات ⇐ نافذة إرسال السند PDF */}
+        <VoucherWhatsAppHost />
+        {/* اختصارات فتح الصفحات المخصّصة (شاشة "اختصارات الصفحات") — تمرّ بنفس حارس التغييرات غير المحفوظة */}
+        <PageShortcutsListener onOpen={handleSectionChange} />
       </ERPLayout>
     </ProtectedRoute>
   )

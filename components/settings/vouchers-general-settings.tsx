@@ -1,0 +1,799 @@
+"use client"
+
+import { tr, appDir } from "@/lib/i18n"
+import { useEffect, useMemo, useRef, useState } from "react"
+import { CalendarRange, ChevronDown } from "lucide-react"
+import { ReportMultiChoice, type ReportOption } from "@/components/reports/account-statement-report"
+import { Card, CardContent } from "@/components/ui/card"
+import { Button } from "@/components/ui/button"
+import { Checkbox } from "@/components/ui/checkbox"
+import { Input } from "@/components/ui/input"
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible"
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip"
+import PrimeDropdown from "@/components/common/FocusDropdown"
+import { useToast } from "@/hooks/use-toast"
+import { SPECIAL_PRICE_CATEGORIES } from "@/components/inventory/unified-stock-voucher"
+import { syncSystemSettingsToLocalStorage } from "@/lib/system-settings-sync"
+
+const CHEQUE_CHECK_MODES = [
+  { value: "no_check", label: tr("عدم التشييك") },
+  { value: "check_on_entry", label: tr("التشييك عند ادخال الشيك") },
+  { value: "check_on_save", label: tr("التشييك عند الحفظ") },
+]
+
+const NEGATIVE_BALANCE_SIGN_OPTIONS = [
+  { value: "credit", label: tr("الرصيد الدائن") },
+  { value: "debit", label: tr("الرصيد المدين") },
+]
+
+const GENERAL_ITEM_COST_METHOD_OPTIONS = [
+  { value: "last_purchase_price", label: tr("اخر سعر شراء") },
+  { value: "average_price", label: tr("متوسط الأسعار") },
+  { value: "fifo", label: tr("الداخل أول خارج أول") },
+]
+
+const DEFAULT_BARCODE_COLUMN_VALUE_OPTIONS = [
+  { value: "none", label: tr("بلا تحديد") },
+  { value: "item_code", label: tr("رقم الصنف") },
+  { value: "main_barcode", label: tr("الباركود الرئيسي") },
+]
+
+const WORKING_MONTH_OPTIONS = [
+  "كانون الثاني", "شباط", "آذار", "نيسان", "أيار", "حزيران",
+  "تموز", "آب", "أيلول", "تشرين الأول", "تشرين الثاني", "كانون الأول",
+].map((name, index): ReportOption => ({ id: index + 1, code: String(index + 1), name }))
+// سنوات العمل المتاحة: من 10 سنوات سابقة حتى 2099
+const LAST_WORKING_YEAR = 2099
+const ALL_WORKING_MONTHS = WORKING_MONTH_OPTIONS.map((month) => month.id)
+
+const normalizeWorkingMonths = (value: unknown): number[] => {
+  const list = Array.isArray(value) ? value : typeof value === "string" && value.trim() ? value.split(",") : []
+  const months = list.map(Number).filter((month) => Number.isInteger(month) && month >= 1 && month <= 12)
+  return [...new Set(months)].sort((a, b) => a - b)
+}
+
+const PRICE_SOURCE_OPTIONS = [
+  { value: "main_relation", label: tr("من العلاقة بالرئيسية") },
+  { value: "unit", label: tr("من الوحدة") },
+]
+
+interface VouchersGeneralSettingsState {
+  fetchChequeNoOnBankAccount: boolean
+  chequeStatusCheckMode: string
+  allowPaymentExceedingCashBalance: boolean
+  disallowManualChequeEntryInPayment: boolean
+  returnedChequeStatusAlwaysRaje: boolean
+  decimalPlacesCount: number
+  showThousandsSeparator: boolean
+  negativeBalanceSign: string
+  itemGroupMandatory: boolean
+  customerIdNumberRequired: boolean
+  customerPhoneRequired: boolean
+  customerEmailRequired: boolean
+  stockVoucherItemCostMethod: number | null
+  generalItemCostMethod: string
+  includePurchaseReturnsInCost: boolean
+  allowNegativeItemBalances: boolean
+  vatOnItemLevel: boolean
+  printOrderByWarehouse: boolean
+  allowOrderConfirmationWithoutProductionMaterials: boolean
+  defaultBarcodeColumnValue: string
+  showZeroQuantityItemsInSearch: boolean
+  serialNumberLength: number
+  serialWarrantyStartsAfterSaleDays: number
+  preventSellingNewerSerialBeforeOlder: boolean
+  autoAssignNextSerialOnPurchase: boolean
+  serialReportDefaultDaysFilter: number
+  priceSource: string
+  workingYear: number
+  workingMonths: number[]
+  // ملاحظة السند لكل نوع سند (voucher_note_rules) — تُفرَض في Trigger السندات (lib/working-period.ts)
+  voucherNoteRules: Record<number, { required: boolean; minLength: number }>
+}
+
+const defaultSettings: VouchersGeneralSettingsState = {
+  fetchChequeNoOnBankAccount: false,
+  chequeStatusCheckMode: "no_check",
+  allowPaymentExceedingCashBalance: false,
+  disallowManualChequeEntryInPayment: false,
+  returnedChequeStatusAlwaysRaje: false,
+  decimalPlacesCount: 3,
+  showThousandsSeparator: false,
+  negativeBalanceSign: "credit",
+  itemGroupMandatory: false,
+  customerIdNumberRequired: false,
+  customerPhoneRequired: false,
+  customerEmailRequired: false,
+  stockVoucherItemCostMethod: null,
+  generalItemCostMethod: "last_purchase_price",
+  includePurchaseReturnsInCost: false,
+  allowNegativeItemBalances: true,
+  vatOnItemLevel: false,
+  printOrderByWarehouse: false,
+  allowOrderConfirmationWithoutProductionMaterials: false,
+  defaultBarcodeColumnValue: "none",
+  showZeroQuantityItemsInSearch: true,
+  serialNumberLength: 15,
+  serialWarrantyStartsAfterSaleDays: 0,
+  preventSellingNewerSerialBeforeOlder: false,
+  autoAssignNextSerialOnPurchase: false,
+  serialReportDefaultDaysFilter: 30,
+  priceSource: "main_relation",
+  workingYear: new Date().getFullYear(),
+  workingMonths: ALL_WORKING_MONTHS,
+  voucherNoteRules: {},
+}
+
+interface VouchersGeneralSettingsProps {
+  /** داخل صفحة "إعدادات النظام" كتبويب: بلا عنوان/زر حفظ خاص — زر حفظ الصفحة يستدعي registerSave */
+  embedded?: boolean
+  registerSave?: (save: () => Promise<boolean>) => void
+}
+
+export default function VouchersGeneralSettings({ embedded = false, registerSave }: VouchersGeneralSettingsProps = {}) {
+  const [receiptPaymentOpen, setReceiptPaymentOpen] = useState(true)
+  const [accountsOpen, setAccountsOpen] = useState(true)
+  const [itemsOpen, setItemsOpen] = useState(true)
+  const [loading, setLoading] = useState(false)
+  const [saving, setSaving] = useState(false)
+  const [settings, setSettings] = useState<VouchersGeneralSettingsState>(defaultSettings)
+  const [priceCategories, setPriceCategories] = useState<{ id: number; name: string }[]>([])
+  const [voucherTypes, setVoucherTypes] = useState<{ id: number; name: string }[]>([])
+  const [voucherNotesOpen, setVoucherNotesOpen] = useState(true)
+  const { toast } = useToast()
+
+  // نفس مصدر "فئة السعر" المستخدم فعلياً في سندات المخزون (unified-stock-voucher.tsx) — القيمة
+  // المختارة هنا هي التي تُطبَّق تلقائياً كفئة سعر افتراضية عند فتح سند ادخال/ اخراج/ استعمال جديد.
+  const combinedPriceCategories = useMemo(
+    () => [...SPECIAL_PRICE_CATEGORIES, ...priceCategories.map((c) => ({ ...c, disabled: false }))],
+    [priceCategories],
+  )
+
+  useEffect(() => {
+    void loadSettings()
+    void loadPriceCategories()
+    fetch("/api/vouchers/voucher-types")
+      .then((response) => (response.ok ? response.json() : []))
+      .then((rows) => setVoucherTypes(Array.isArray(rows) ? rows.map((row: any) => ({ id: Number(row.id), name: String(row.name || "") })) : []))
+      .catch(() => undefined)
+  }, [])
+
+  const loadPriceCategories = async () => {
+    try {
+      const response = await fetch("/api/pricecategory")
+      if (!response.ok) return
+      const data = await response.json()
+      setPriceCategories(Array.isArray(data) ? data.map((c: any) => ({ id: c.id, name: c.name })) : [])
+    } catch (error) {
+      console.error("Failed to load price categories", error)
+    }
+  }
+
+  const loadSettings = async () => {
+    try {
+      setLoading(true)
+      const response = await fetch("/api/settings/system")
+      if (!response.ok) return
+      const data = await response.json()
+      const payload = data?.settings ?? data
+      setSettings((prev) => ({
+        fetchChequeNoOnBankAccount: Boolean(
+          payload.fetch_cheque_no_on_bank_account_receipt ?? prev.fetchChequeNoOnBankAccount,
+        ),
+        chequeStatusCheckMode: payload.cheque_status_check_mode || prev.chequeStatusCheckMode,
+        allowPaymentExceedingCashBalance: Boolean(
+          payload.allow_payment_exceeding_cash_balance ?? prev.allowPaymentExceedingCashBalance,
+        ),
+        disallowManualChequeEntryInPayment: Boolean(
+          payload.disallow_manual_cheque_entry_in_payment ?? prev.disallowManualChequeEntryInPayment,
+        ),
+        returnedChequeStatusAlwaysRaje: Boolean(
+          payload.returned_cheque_status_always_raje ?? prev.returnedChequeStatusAlwaysRaje,
+        ),
+        decimalPlacesCount: Number(payload.decimal_places_count ?? prev.decimalPlacesCount),
+        showThousandsSeparator: Boolean(payload.show_thousands_separator ?? prev.showThousandsSeparator),
+        negativeBalanceSign: payload.negative_balance_sign || prev.negativeBalanceSign,
+        itemGroupMandatory: Boolean(payload.item_group_mandatory ?? prev.itemGroupMandatory),
+        customerIdNumberRequired: Boolean(payload.customer_id_number_required ?? prev.customerIdNumberRequired),
+        customerPhoneRequired: Boolean(payload.customer_phone_required ?? prev.customerPhoneRequired),
+        customerEmailRequired: Boolean(payload.customer_email_required ?? prev.customerEmailRequired),
+        stockVoucherItemCostMethod:
+          payload.stock_voucher_item_cost_method !== undefined && payload.stock_voucher_item_cost_method !== null && payload.stock_voucher_item_cost_method !== ""
+            ? Number(payload.stock_voucher_item_cost_method)
+            : prev.stockVoucherItemCostMethod,
+        generalItemCostMethod: payload.general_item_cost_method || prev.generalItemCostMethod,
+        includePurchaseReturnsInCost: Boolean(
+          payload.include_purchase_returns_in_cost ?? prev.includePurchaseReturnsInCost,
+        ),
+        allowNegativeItemBalances: Boolean(
+          payload.allow_negative_item_balances ?? prev.allowNegativeItemBalances,
+        ),
+        vatOnItemLevel: payload.vat_on_item_level === undefined
+          ? prev.vatOnItemLevel
+          : payload.vat_on_item_level === true || payload.vat_on_item_level === "true" || payload.vat_on_item_level === 1 || payload.vat_on_item_level === "1",
+        printOrderByWarehouse: payload.print_order_by_warehouse === undefined
+          ? prev.printOrderByWarehouse
+          : payload.print_order_by_warehouse === true || payload.print_order_by_warehouse === "true" || payload.print_order_by_warehouse === 1 || payload.print_order_by_warehouse === "1",
+        allowOrderConfirmationWithoutProductionMaterials: Boolean(
+          payload.allow_order_confirmation_without_production_materials ??
+            prev.allowOrderConfirmationWithoutProductionMaterials,
+        ),
+        defaultBarcodeColumnValue: payload.default_barcode_column_value || prev.defaultBarcodeColumnValue,
+        showZeroQuantityItemsInSearch: Boolean(
+          payload.show_zero_quantity_items_in_search ?? prev.showZeroQuantityItemsInSearch,
+        ),
+        serialNumberLength: Number(payload.serial_number_length ?? prev.serialNumberLength),
+        serialWarrantyStartsAfterSaleDays: Number(
+          payload.serial_warranty_starts_after_sale_days ?? prev.serialWarrantyStartsAfterSaleDays,
+        ),
+        preventSellingNewerSerialBeforeOlder: Boolean(
+          payload.prevent_selling_newer_serial_before_older ?? prev.preventSellingNewerSerialBeforeOlder,
+        ),
+        autoAssignNextSerialOnPurchase: Boolean(
+          payload.auto_assign_next_serial_on_purchase ?? prev.autoAssignNextSerialOnPurchase,
+        ),
+        serialReportDefaultDaysFilter: Number(
+          payload.serial_report_default_days_filter ?? prev.serialReportDefaultDaysFilter,
+        ),
+        priceSource: payload.price_source || prev.priceSource,
+        workingYear: Number(payload.working_year) > 0 ? Number(payload.working_year) : prev.workingYear,
+        workingMonths:
+          payload.working_months !== undefined && payload.working_months !== null && payload.working_months !== ""
+            ? normalizeWorkingMonths(payload.working_months)
+            : prev.workingMonths,
+        voucherNoteRules: Array.isArray(payload.voucher_note_rules)
+          ? Object.fromEntries(
+              payload.voucher_note_rules
+                .filter((rule: any) => Number(rule?.vch_type) > 0)
+                .map((rule: any) => [Number(rule.vch_type), { required: Boolean(rule.required), minLength: Number(rule.min_length) || 0 }]),
+            )
+          : prev.voucherNoteRules,
+      }))
+    } catch (error) {
+      console.error("Failed to load general voucher settings", error)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const handleSave = async (): Promise<boolean> => {
+    if (!settings.workingYear) {
+      toast({ title: tr("خطأ"), description: tr("يجب اختيار سنة العمل"), variant: "destructive" })
+      return false
+    }
+    if (settings.workingMonths.length === 0) {
+      toast({ title: tr("خطأ"), description: tr("يجب اختيار شهر عمل واحد على الأقل"), variant: "destructive" })
+      return false
+    }
+    const invalidNoteType = Object.entries(settings.voucherNoteRules).find(([, rule]) => rule.required && !(rule.minLength > 0))
+    if (invalidNoteType) {
+      const typeName = voucherTypes.find((type) => type.id === Number(invalidNoteType[0]))?.name || invalidNoteType[0]
+      toast({ title: tr("خطأ"), description: tr("طول الملاحظة يجب أن يكون أكبر من صفر لـ {0}", typeName), variant: "destructive" })
+      setVoucherNotesOpen(true)
+      return false
+    }
+    setSaving(true)
+    try {
+      const response = await fetch("/api/settings/system", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          fetch_cheque_no_on_bank_account_receipt: settings.fetchChequeNoOnBankAccount,
+          cheque_status_check_mode: settings.chequeStatusCheckMode,
+          allow_payment_exceeding_cash_balance: settings.allowPaymentExceedingCashBalance,
+          disallow_manual_cheque_entry_in_payment: settings.disallowManualChequeEntryInPayment,
+          returned_cheque_status_always_raje: settings.returnedChequeStatusAlwaysRaje,
+          decimal_places_count: settings.decimalPlacesCount,
+          show_thousands_separator: settings.showThousandsSeparator,
+          negative_balance_sign: settings.negativeBalanceSign,
+          item_group_mandatory: settings.itemGroupMandatory,
+          voucher_note_rules: Object.entries(settings.voucherNoteRules)
+            .filter(([, rule]) => rule.required)
+            .map(([type, rule]) => ({ vch_type: Number(type), required: true, min_length: rule.minLength })),
+          customer_id_number_required: settings.customerIdNumberRequired,
+          customer_phone_required: settings.customerPhoneRequired,
+          customer_email_required: settings.customerEmailRequired,
+          stock_voucher_item_cost_method: settings.stockVoucherItemCostMethod,
+          general_item_cost_method: settings.generalItemCostMethod,
+          include_purchase_returns_in_cost: settings.includePurchaseReturnsInCost,
+          allow_negative_item_balances: settings.allowNegativeItemBalances,
+          vat_on_item_level: settings.vatOnItemLevel,
+          print_order_by_warehouse: settings.printOrderByWarehouse,
+          allow_order_confirmation_without_production_materials:
+            settings.allowOrderConfirmationWithoutProductionMaterials,
+          default_barcode_column_value: settings.defaultBarcodeColumnValue,
+          show_zero_quantity_items_in_search: settings.showZeroQuantityItemsInSearch,
+          serial_number_length: settings.serialNumberLength,
+          serial_warranty_starts_after_sale_days: settings.serialWarrantyStartsAfterSaleDays,
+          prevent_selling_newer_serial_before_older: settings.preventSellingNewerSerialBeforeOlder,
+          auto_assign_next_serial_on_purchase: settings.autoAssignNextSerialOnPurchase,
+          serial_report_default_days_filter: settings.serialReportDefaultDaysFilter,
+          price_source: settings.priceSource,
+          working_year: settings.workingYear,
+          working_months: settings.workingMonths,
+        }),
+      })
+      if (!response.ok) throw new Error("Failed to save")
+      // يُعيد تعبئة عدد الخانات العشرية بـlocalStorage فوراً (بدل انتظار إعادة تحميل الصفحة) —
+      // يُطلِق أيضاً حدثاً تلتقطه كل شبكة DataGridView مفتوحة حالياً لإعادة تنسيق خلاياها المعروضة.
+      void syncSystemSettingsToLocalStorage()
+      // ضمن صفحة إعدادات النظام: رسالة النجاح تعرضها الصفحة نفسها مرة واحدة لكل الأقسام
+      if (!embedded) toast({ title: tr("تم الحفظ"), description: tr("تم حفظ الإعدادات العامة بنجاح") })
+      return true
+    } catch (error) {
+      console.error("Failed to save general voucher settings", error)
+      toast({ title: tr("خطأ"), description: tr("فشل حفظ الإعدادات العامة"), variant: "destructive" })
+      return false
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  // أحدث نسخة من handleSave (تقرأ أحدث settings) — تُسجَّل لدى الصفحة الأم عند التضمين
+  const handleSaveRef = useRef(handleSave)
+  handleSaveRef.current = handleSave
+  useEffect(() => {
+    registerSave?.(() => handleSaveRef.current())
+  }, [registerSave])
+
+  const currentYear = new Date().getFullYear()
+  const workingYearOptions = useMemo(() => {
+    const years = new Set<number>()
+    for (let year = currentYear - 10; year <= LAST_WORKING_YEAR; year++) years.add(year)
+    if (settings.workingYear) years.add(settings.workingYear)
+    return [...years].sort((a, b) => a - b).map((year) => ({ value: year, label: String(year) }))
+  }, [currentYear, settings.workingYear])
+
+  return (
+    <div className="space-y-4" dir={appDir()}>
+      {!embedded && (
+        <div className="flex items-center justify-between">
+          <h2 className="text-xl font-semibold">{tr("اعدادات عامة")}</h2>
+          <Button onClick={() => void handleSave()} disabled={saving || loading}>
+            {saving ? tr("جارٍ الحفظ...") : tr("حفظ")}
+          </Button>
+        </div>
+      )}
+
+      <Card className="rounded-2xl border-emerald-100 shadow-sm">
+        <CardContent className="p-4">
+          <div className="mb-3 flex items-center gap-2 text-base font-semibold">
+            <CalendarRange className="h-4 w-4 text-emerald-600" />
+            {tr("فترة العمل")}
+          </div>
+          <div className="grid grid-cols-1 gap-x-6 gap-y-4 md:grid-cols-2">
+            <div className="grid gap-1.5 invoice-currency-dropdown-wrap">
+              <span className="text-sm">{tr("سنة العمل *")}</span>
+              <PrimeDropdown
+                value={settings.workingYear}
+                options={workingYearOptions}
+                optionLabel="label"
+                optionValue="value"
+                filter
+                className="invoice-currency-dropdown w-full"
+                panelClassName="invoice-currency-dropdown-panel"
+                appendTo="self"
+                panelStyle={{ zIndex: 10000 }}
+                onChange={(e: any) => setSettings((s) => ({ ...s, workingYear: Number(e.value) || s.workingYear }))}
+              />
+            </div>
+            {/* نفس مكوّن الاختيار المتعدد المستخدم في التقارير */}
+            <ReportMultiChoice
+              label={tr("شهر العمل *")}
+              options={WORKING_MONTH_OPTIONS}
+              selected={settings.workingMonths}
+              placeholder={tr("اختر أشهر العمل")}
+              onChange={(ids) => setSettings((s) => ({ ...s, workingMonths: normalizeWorkingMonths(ids) }))}
+            />
+          </div>
+        </CardContent>
+      </Card>
+
+      <Card className="rounded-2xl shadow-sm">
+        <CardContent className="p-4">
+          <TooltipProvider>
+            <Collapsible open={receiptPaymentOpen} onOpenChange={setReceiptPaymentOpen}>
+              <CollapsibleTrigger className="flex w-full items-center justify-between text-base font-semibold">
+                <span>{tr("القبض والصرف والقيد")}</span>
+                <ChevronDown className={`h-4 w-4 transition-transform ${receiptPaymentOpen ? "-rotate-180" : ""}`} />
+              </CollapsibleTrigger>
+              <CollapsibleContent className="grid grid-cols-2 gap-x-6 gap-y-4 pt-4">
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <label className="flex w-fit items-center gap-3 cursor-pointer">
+                      <Checkbox
+                        checked={settings.fetchChequeNoOnBankAccount}
+                        onCheckedChange={(checked) =>
+                          setSettings((s) => ({ ...s, fetchChequeNoOnBankAccount: Boolean(checked) }))
+                        }
+                      />
+                      <span>{tr("احضار رقم الشيك بصورة الية في سند الصرف")}</span>
+                    </label>
+                  </TooltipTrigger>
+                  <TooltipContent side="top" className="max-w-xs text-start" dir={appDir()}>
+                    {tr("عند التحقق من وجود شيكات حالتها الحالية راجع لهذا الحساب حسب الخيار المحدد هنا")}
+                  </TooltipContent>
+                </Tooltip>
+
+                <div className="grid gap-1.5 invoice-currency-dropdown-wrap">
+                  <span className="text-sm">{tr("التحقق من وجود شيكات حالتها الحالية راجع لهذا الحساب")}</span>
+                  <PrimeDropdown
+                    value={settings.chequeStatusCheckMode}
+                    options={CHEQUE_CHECK_MODES}
+                    optionLabel="label"
+                    optionValue="value"
+                    className="invoice-currency-dropdown w-full"
+                    panelClassName="invoice-currency-dropdown-panel"
+                    appendTo="self"
+                    panelStyle={{ zIndex: 10000 }}
+                    onChange={(e: any) => setSettings((s) => ({ ...s, chequeStatusCheckMode: e.value }))}
+                  />
+                </div>
+
+                <label className="flex items-center gap-3 cursor-pointer">
+                  <Checkbox
+                    checked={settings.allowPaymentExceedingCashBalance}
+                    onCheckedChange={(checked) =>
+                      setSettings((s) => ({ ...s, allowPaymentExceedingCashBalance: Boolean(checked) }))
+                    }
+                  />
+                  <span>{tr("السماح باصدار سندات صرف بقيم تتجاوز رصيد الصندوق")}</span>
+                </label>
+
+                <label className="flex items-center gap-3 cursor-pointer">
+                  <Checkbox
+                    checked={settings.disallowManualChequeEntryInPayment}
+                    onCheckedChange={(checked) =>
+                      setSettings((s) => ({ ...s, disallowManualChequeEntryInPayment: Boolean(checked) }))
+                    }
+                  />
+                  <span>{tr("عدم السماح بادخال شيكات يدويا في سند الصرف")}</span>
+                </label>
+
+                <label className="flex items-center gap-3 cursor-pointer">
+                  <Checkbox
+                    checked={settings.returnedChequeStatusAlwaysRaje}
+                    onCheckedChange={(checked) =>
+                      setSettings((s) => ({ ...s, returnedChequeStatusAlwaysRaje: Boolean(checked) }))
+                    }
+                  />
+                  <span>{tr("حالة الشيك المجير الذي يتم ارجاعه هي دائما \"راجع\"")}</span>
+                </label>
+              </CollapsibleContent>
+            </Collapsible>
+          </TooltipProvider>
+        </CardContent>
+      </Card>
+
+      <Card className="rounded-2xl shadow-sm">
+        <CardContent className="p-4">
+          <Collapsible open={accountsOpen} onOpenChange={setAccountsOpen}>
+            <CollapsibleTrigger className="flex w-full items-center justify-between text-base font-semibold">
+              <span>{tr("الحسابات")}</span>
+              <ChevronDown className={`h-4 w-4 transition-transform ${accountsOpen ? "-rotate-180" : ""}`} />
+            </CollapsibleTrigger>
+            <CollapsibleContent className="grid grid-cols-2 gap-x-6 gap-y-4 pt-4">
+              <div className="grid gap-1.5 invoice-currency-dropdown-wrap">
+                <span className="text-sm">{tr("عدد الخانات العشرية في الكميات والاسعار والمبالغ")}</span>
+                <Input
+                  type="number"
+                  min={0}
+                  max={6}
+                  value={settings.decimalPlacesCount}
+                  onChange={(e) => setSettings((s) => ({ ...s, decimalPlacesCount: Number(e.target.value) }))}
+                />
+              </div>
+
+              <div className="grid gap-1.5 invoice-currency-dropdown-wrap">
+                <span className="text-sm">{tr("الاشارة السالبة للرصيد")}</span>
+                <PrimeDropdown
+                  value={settings.negativeBalanceSign}
+                  options={NEGATIVE_BALANCE_SIGN_OPTIONS}
+                  optionLabel="label"
+                  optionValue="value"
+                  className="invoice-currency-dropdown w-full"
+                  panelClassName="invoice-currency-dropdown-panel"
+                  appendTo="self"
+                  panelStyle={{ zIndex: 10000 }}
+                  onChange={(e: any) => setSettings((s) => ({ ...s, negativeBalanceSign: e.value }))}
+                />
+              </div>
+
+              <label className="flex items-center gap-3 cursor-pointer">
+                <Checkbox
+                  checked={settings.showThousandsSeparator}
+                  onCheckedChange={(checked) =>
+                    setSettings((s) => ({ ...s, showThousandsSeparator: Boolean(checked) }))
+                  }
+                />
+                <span>{tr("اظهار فواصل الالاف في الكميات والاسعار والمبالغ")}</span>
+              </label>
+            </CollapsibleContent>
+          </Collapsible>
+        </CardContent>
+      </Card>
+
+      <Card className="rounded-2xl shadow-sm">
+        <CardContent className="p-4">
+          <Collapsible open={itemsOpen} onOpenChange={setItemsOpen}>
+            <CollapsibleTrigger className="flex w-full items-center justify-between text-base font-semibold">
+              <span>{tr("الاصناف")}</span>
+              <ChevronDown className={`h-4 w-4 transition-transform ${itemsOpen ? "-rotate-180" : ""}`} />
+            </CollapsibleTrigger>
+            <CollapsibleContent className="grid grid-cols-2 gap-x-6 gap-y-4 pt-4">
+              <label className="flex items-center gap-3 cursor-pointer">
+                <Checkbox
+                  checked={settings.itemGroupMandatory}
+                  onCheckedChange={(checked) =>
+                    setSettings((s) => ({ ...s, itemGroupMandatory: Boolean(checked) }))
+                  }
+                />
+                <span>{tr("مجموعة الصنف اجباري في ملف تعريف الصنف")}</span>
+              </label>
+
+              <div className="grid gap-1.5 invoice-currency-dropdown-wrap">
+                <span className="text-sm">{tr("طريقة احتساب تكلفة الصنف في سندات ادخال/ اخراج/ استعمال")}</span>
+                <PrimeDropdown
+                  value={settings.stockVoucherItemCostMethod}
+                  options={combinedPriceCategories}
+                  optionLabel="name"
+                  optionValue="id"
+                  optionDisabled="disabled"
+                  filter
+                  className="invoice-currency-dropdown w-full"
+                  panelClassName="invoice-currency-dropdown-panel"
+                  appendTo="self"
+                  panelStyle={{ zIndex: 10000 }}
+                  onChange={(e: any) =>
+                    setSettings((s) => ({ ...s, stockVoucherItemCostMethod: e.value ?? null }))
+                  }
+                />
+              </div>
+
+              <div className="grid gap-1.5 invoice-currency-dropdown-wrap">
+                <span className="text-sm">{tr("طريقة احتساب تكلفة الصنف العامة /الانتاج")}</span>
+                <PrimeDropdown
+                  value={settings.generalItemCostMethod}
+                  options={GENERAL_ITEM_COST_METHOD_OPTIONS}
+                  optionLabel="label"
+                  optionValue="value"
+                  className="invoice-currency-dropdown w-full"
+                  panelClassName="invoice-currency-dropdown-panel"
+                  appendTo="self"
+                  panelStyle={{ zIndex: 10000 }}
+                  onChange={(e: any) => setSettings((s) => ({ ...s, generalItemCostMethod: e.value }))}
+                />
+              </div>
+
+              <label className="flex items-center gap-3 cursor-pointer">
+                <Checkbox
+                  checked={settings.includePurchaseReturnsInCost}
+                  onCheckedChange={(checked) =>
+                    setSettings((s) => ({ ...s, includePurchaseReturnsInCost: Boolean(checked) }))
+                  }
+                />
+                <span>{tr("احتساب حركات مردودات المشتريات في حسابات تكلفة الاصناف")}</span>
+              </label>
+
+              <label className="flex items-center gap-3 cursor-pointer">
+                <Checkbox
+                  checked={settings.allowNegativeItemBalances}
+                  onCheckedChange={(checked) =>
+                    setSettings((s) => ({ ...s, allowNegativeItemBalances: Boolean(checked) }))
+                  }
+                />
+                <span>{tr("السماح بكميات سالبة في ارصدة الاصناف")}</span>
+              </label>
+
+              <label className="flex items-center gap-3 cursor-pointer" title={tr("نسبة ضريبة كل سطر = نسبة الصنف (تصنيفه الضريبي)، وضريبة السند = مجموع ضرائب الأسطر — في الإرساليات والفواتير وطلبيات المبيعات")}>
+                <Checkbox
+                  checked={settings.vatOnItemLevel}
+                  onCheckedChange={(checked) =>
+                    setSettings((s) => ({ ...s, vatOnItemLevel: Boolean(checked) }))
+                  }
+                />
+                <span>{tr("الضريبة على مستوى الصنف")}</span>
+              </label>
+
+              <label className="flex items-center gap-3 cursor-pointer" title={tr("يُضاف زر بطلبية المبيعات يوزّع أصنافها على مستودعاتها ويطبع كل مجموعة على الطابعة الافتراضية لمستودعها")}>
+                <Checkbox
+                  checked={settings.printOrderByWarehouse}
+                  onCheckedChange={(checked) =>
+                    setSettings((s) => ({ ...s, printOrderByWarehouse: Boolean(checked) }))
+                  }
+                />
+                <span>{tr("طباعة حسب المستودع في الطلبية")}</span>
+              </label>
+
+              <label className="flex items-center gap-3 cursor-pointer">
+                <Checkbox
+                  checked={settings.allowOrderConfirmationWithoutProductionMaterials}
+                  onCheckedChange={(checked) =>
+                    setSettings((s) => ({
+                      ...s,
+                      allowOrderConfirmationWithoutProductionMaterials: Boolean(checked),
+                    }))
+                  }
+                />
+                <span>{tr("الاستمرار في تأكيد الطلبيات في حال عدم توفر مواد الانتاج")}</span>
+              </label>
+
+              <div className="grid gap-1.5 invoice-currency-dropdown-wrap">
+                <span className="text-sm">{tr("القيمة الافتراضية لبيانات عمود الباركود")}</span>
+                <PrimeDropdown
+                  value={settings.defaultBarcodeColumnValue}
+                  options={DEFAULT_BARCODE_COLUMN_VALUE_OPTIONS}
+                  optionLabel="label"
+                  optionValue="value"
+                  className="invoice-currency-dropdown w-full"
+                  panelClassName="invoice-currency-dropdown-panel"
+                  appendTo="self"
+                  panelStyle={{ zIndex: 10000 }}
+                  onChange={(e: any) => setSettings((s) => ({ ...s, defaultBarcodeColumnValue: e.value }))}
+                />
+              </div>
+
+              <label className="flex items-center gap-3 cursor-pointer">
+                <Checkbox
+                  checked={settings.showZeroQuantityItemsInSearch}
+                  onCheckedChange={(checked) =>
+                    setSettings((s) => ({ ...s, showZeroQuantityItemsInSearch: Boolean(checked) }))
+                  }
+                />
+                <span>{tr("اظهار الاصناف التي كميتها = 0 في بحث الاصناف")}</span>
+              </label>
+
+              <div className="grid gap-1.5 invoice-currency-dropdown-wrap">
+                <span className="text-sm">{tr("طول السيريال")}</span>
+                <Input
+                  type="number"
+                  min={0}
+                  value={settings.serialNumberLength}
+                  onChange={(e) => setSettings((s) => ({ ...s, serialNumberLength: Number(e.target.value) }))}
+                />
+              </div>
+
+              <div className="grid gap-1.5 invoice-currency-dropdown-wrap">
+                <span className="text-sm">{tr("كفالات السيريال تبدأ بعد البيع بـ")}</span>
+                <Input
+                  type="number"
+                  min={0}
+                  value={settings.serialWarrantyStartsAfterSaleDays}
+                  onChange={(e) =>
+                    setSettings((s) => ({ ...s, serialWarrantyStartsAfterSaleDays: Number(e.target.value) }))
+                  }
+                />
+              </div>
+
+              <label className="flex items-center gap-3 cursor-pointer">
+                <Checkbox
+                  checked={settings.preventSellingNewerSerialBeforeOlder}
+                  onCheckedChange={(checked) =>
+                    setSettings((s) => ({ ...s, preventSellingNewerSerialBeforeOlder: Boolean(checked) }))
+                  }
+                />
+                <span>{tr("منع بيع سيريال مع وجود سيريال اقدم غير مباع بعد")}</span>
+              </label>
+
+              <label className="flex items-center gap-3 cursor-pointer">
+                <Checkbox
+                  checked={settings.autoAssignNextSerialOnPurchase}
+                  onCheckedChange={(checked) =>
+                    setSettings((s) => ({ ...s, autoAssignNextSerialOnPurchase: Boolean(checked) }))
+                  }
+                />
+                <span>{tr("اعطاء اخر رقم سيريال متسلسل جديد للصنف عند الشراء")}</span>
+              </label>
+
+              <div className="grid gap-1.5 invoice-currency-dropdown-wrap">
+                <span className="text-sm">
+                  {tr("تقرير الارقام المتسلسلة/ القيمة الافتراضية لفلتر \"عدد الايام قبل\"")}
+                </span>
+                <Input
+                  type="number"
+                  min={0}
+                  value={settings.serialReportDefaultDaysFilter}
+                  onChange={(e) =>
+                    setSettings((s) => ({ ...s, serialReportDefaultDaysFilter: Number(e.target.value) }))
+                  }
+                />
+              </div>
+
+              <div className="grid gap-1.5 invoice-currency-dropdown-wrap">
+                <span className="text-sm">{tr("اعتماد السعر من")}</span>
+                <PrimeDropdown
+                  value={settings.priceSource}
+                  options={PRICE_SOURCE_OPTIONS}
+                  optionLabel="label"
+                  optionValue="value"
+                  className="invoice-currency-dropdown w-full"
+                  panelClassName="invoice-currency-dropdown-panel"
+                  appendTo="self"
+                  panelStyle={{ zIndex: 10000 }}
+                  onChange={(e: any) => setSettings((s) => ({ ...s, priceSource: e.value }))}
+                />
+              </div>
+            </CollapsibleContent>
+          </Collapsible>
+        </CardContent>
+      </Card>
+
+      {/* ملاحظة السند لكل نوع سند: اجبارية + طول أدنى (يجب أن يزيد عن) — تُفرَض على كل السندات في قاعدة البيانات */}
+      <Card className="rounded-2xl shadow-sm">
+        <CardContent className="p-4">
+          <Collapsible open={voucherNotesOpen} onOpenChange={setVoucherNotesOpen}>
+            <CollapsibleTrigger className="flex w-full items-center justify-between text-base font-semibold">
+              <span>{tr("ملاحظة السند")}</span>
+              <ChevronDown className={`h-4 w-4 transition-transform ${voucherNotesOpen ? "-rotate-180" : ""}`} />
+            </CollapsibleTrigger>
+            <CollapsibleContent className="pt-4">
+              <div className="max-h-[420px] overflow-auto rounded-xl border">
+                <table className="w-full text-sm">
+                  <thead className="sticky top-0 bg-muted/80">
+                    <tr>
+                      <th className="px-3 py-2 text-start font-semibold">{tr("نوع السند")}</th>
+                      <th className="px-3 py-2 text-start font-semibold">{tr("ملاحظة السند اجباري")}</th>
+                      <th className="px-3 py-2 text-start font-semibold">{tr("طول الملاحظة يجب ان يزيد عن")}</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {voucherTypes.map((type) => {
+                      const rule = settings.voucherNoteRules[type.id] || { required: false, minLength: 0 }
+                      const setRule = (next: Partial<typeof rule>) =>
+                        setSettings((s) => ({ ...s, voucherNoteRules: { ...s.voucherNoteRules, [type.id]: { ...rule, ...next } } }))
+                      const invalid = rule.required && !(rule.minLength > 0)
+                      return (
+                        <tr key={type.id} className="border-t">
+                          <td className="px-3 py-1.5">{type.name}</td>
+                          <td className="px-3 py-1.5">
+                            <Checkbox
+                              checked={rule.required}
+                              onCheckedChange={(checked) => setRule({ required: Boolean(checked), minLength: checked && !rule.minLength ? 1 : rule.minLength })}
+                            />
+                          </td>
+                          <td className="px-3 py-1.5">
+                            <Input
+                              type="number"
+                              min={1}
+                              step={1}
+                              disabled={!rule.required}
+                              value={rule.required ? rule.minLength : ""}
+                              onChange={(e) => setRule({ minLength: Math.max(0, Math.trunc(Number(e.target.value) || 0)) })}
+                              className={`h-8 w-28 ${invalid ? "border-red-500" : ""}`}
+                            />
+                          </td>
+                        </tr>
+                      )
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </CollapsibleContent>
+          </Collapsible>
+        </CardContent>
+      </Card>
+
+      {/* حقول إجبارية في ملف العملاء — يُتحقَّق منها عند الحفظ والتعديل (الواجهة + /api/customers) */}
+      <Card className="rounded-2xl shadow-sm">
+        <CardContent className="p-4">
+          <div className="text-base font-semibold">{tr("العملاء")}</div>
+          <div className="grid grid-cols-2 gap-x-6 gap-y-4 pt-4">
+            {([
+              ["customerIdNumberRequired", "رقم الهوية اجباري"],
+              ["customerPhoneRequired", "رقم الهاتف اجباري"],
+              ["customerEmailRequired", "الايميل اجباري"],
+            ] as const).map(([key, label]) => (
+              <label key={key} className="flex items-center gap-3 cursor-pointer">
+                <Checkbox
+                  checked={settings[key]}
+                  onCheckedChange={(checked) => setSettings((s) => ({ ...s, [key]: Boolean(checked) }))}
+                />
+                <span>{tr(label)}</span>
+              </label>
+            ))}
+          </div>
+        </CardContent>
+      </Card>
+    </div>
+  )
+}

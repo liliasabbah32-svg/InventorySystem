@@ -1,5 +1,7 @@
-"use client"
+﻿"use client"
 
+import { tr, appDir } from "@/lib/i18n"
+import { VoucherListHero } from "@/components/common/voucher-list-shell"
 import { useState, useEffect, useMemo, useRef } from "react"
 import { useAuth } from "@/components/auth/auth-context"
 import { Button } from "@/components/ui/button"
@@ -77,7 +79,11 @@ interface OrderAnalytics {
 export function SaleInvoices({ isPurchase }: OrdersProps) {
   const { user } = useAuth()
   type ViewType = "grid" | "list" | "kanban";
-  const savedView = localStorage.getItem("currentView") as ViewType | null;
+  const getSavedView = (): ViewType => {
+    if (typeof window === "undefined") return "list"
+    const saved = window.localStorage.getItem("currentView") as ViewType | null
+    return saved === "grid" || saved === "list" || saved === "kanban" ? saved : "list"
+  }
 
   const [state, setState] = useState<{
     fromSearch: boolean | undefined
@@ -105,7 +111,7 @@ export function SaleInvoices({ isPurchase }: OrdersProps) {
     loading: true,
     error: null, // ✅ string or null
     selectedOrder: null,
-    currentView: savedView || "list",
+    currentView: getSavedView(),
     showNewOrderDialog: false,
     filters: {
       search: "",
@@ -258,7 +264,7 @@ export function SaleInvoices({ isPurchase }: OrdersProps) {
       console.log("response  ", response)
       if (!response.ok) {
         throw new Error(
-          !isPurchase ? "فشل في تحميل فواتير المبيعات" : "فشل في تحميل فواتير المشتريات"
+          !isPurchase ? tr("فشل في تحميل فواتير المبيعات") : tr("فشل في تحميل فواتير المشتريات")
         );
       }
 
@@ -274,7 +280,7 @@ export function SaleInvoices({ isPurchase }: OrdersProps) {
     } catch (err) {
       setState(prev => ({
         ...prev,
-        error: err instanceof Error ? err.message : "حدث خطأ غير متوقع",
+        error: err instanceof Error ? err.message : tr("حدث خطأ غير متوقع"),
         salesOrders: [],
       }));
     } finally {
@@ -288,23 +294,23 @@ export function SaleInvoices({ isPurchase }: OrdersProps) {
   const getStatusBadge = (status: string) => {
     const statusConfig = {
       notCompleted: {
-        label: "غير جاهزة",
+        label: tr("غير جاهزة"),
         variant: "secondary",
         className: "bg-amber-100 text-amber-800 border-amber-200",
       },
       Completed: {
-        label: "جاهزة",
+        label: tr("جاهزة"),
         variant: "secondary",
         className: "bg-emerald-100 text-emerald-800 border-emerald-200",
       },
-      cancelled: { label: "ملغاة", variant: "secondary", className: "bg-red-100 text-red-800 border-red-200" },
+      cancelled: { label: tr("ملغاة"), variant: "secondary", className: "bg-red-100 text-red-800 border-red-200" },
       sentPartially: {
-        label: "مرسلة جزئيا",
+        label: tr("مرسلة جزئيا"),
         variant: "secondary",
         className: "bg-blue-100 text-blue-800 border-blue-200",
       },
       sent: {
-        label: "مرسلة كليا",
+        label: tr("مرسلة كليا"),
         variant: "secondary",
         className: "bg-blue-100 text-blue-800 border-blue-200",
       },
@@ -342,9 +348,9 @@ export function SaleInvoices({ isPurchase }: OrdersProps) {
 
   const getFinancialStatusBadge = (status: string) => {
     const statusConfig = {
-      paid: { label: "مدفوع", className: "bg-green-100 text-green-800 border-green-200" },
-      partial: { label: "مدفوع جزئياً", className: "bg-yellow-100 text-yellow-800 border-yellow-200" },
-      unpaid: { label: "غير مدفوع", className: "bg-red-100 text-red-800 border-red-200" },
+      paid: { label: tr("مدفوع"), className: "bg-green-100 text-green-800 border-green-200" },
+      partial: { label: tr("مدفوع جزئياً"), className: "bg-yellow-100 text-yellow-800 border-yellow-200" },
+      unpaid: { label: tr("غير مدفوع"), className: "bg-red-100 text-red-800 border-red-200" },
     }
 
     const config = statusConfig[status as keyof typeof statusConfig] || { label: status, className: "" }
@@ -391,9 +397,9 @@ export function SaleInvoices({ isPurchase }: OrdersProps) {
 
   const getOrderSourceBadge = (source: string) => {
     const sourceConfig = {
-      manual: { label: "إدخال يدوي", className: "bg-blue-100 text-blue-800 border-blue-200" },
-      customer_portal: { label: "من الزبائن", className: "bg-green-100 text-green-800 border-green-200" },
-      api_import: { label: "استيراد API", className: "bg-purple-100 text-purple-800 border-purple-200" },
+      manual: { label: tr("إدخال يدوي"), className: "bg-blue-100 text-blue-800 border-blue-200" },
+      customer_portal: { label: tr("من العملاء"), className: "bg-green-100 text-green-800 border-green-200" },
+      api_import: { label: tr("استيراد API"), className: "bg-purple-100 text-purple-800 border-purple-200" },
     }
 
     const config = sourceConfig[source as keyof typeof sourceConfig] || {
@@ -456,23 +462,16 @@ export function SaleInvoices({ isPurchase }: OrdersProps) {
   useEffect(() => {
     setCurrentPage(1);
   }, [filteredOrders]);
-  if (isPurchase && !Util.checkUserAccess(12)) {
-    return (
-      <div className="flex items-center justify-center h-64">
-        <div className="text-center">
-          <h2 className="text-2xl font-semibold mb-2 text-red-600">لا يوجد صلاحية</h2>
-          <p className="text-muted-foreground">ليس لديك صلاحية للوصول إلى طلبيات المشتريات</p>
-        </div>
-      </div>
-    )
-  }
+  // الدخول لشاشة طلبية المشتريات يفحصه TransactionAccessGate (app/page.tsx) بصلاحية "الدخول لشاشة طلبية مشتريات".
+  // كان هنا فحص قديم بمعرّف الصلاحية 12 ("الدخول لشاشة طلبيات المشتريات") — تحذفه مزامنة الصلاحيات كمكرر
+  // (LEGACY_DUPLICATE_PERMISSION_NAMES) فكان يمنع الجميع من الشاشة.
   if (state.loading) {
     return (
-      <div className="flex items-center justify-center min-h-[400px]" dir="rtl">
+      <div className="flex items-center justify-center min-h-[400px]" dir={appDir()}>
         <div className="text-center">
           <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-primary mx-auto mb-4"></div>
           <p className="text-muted-foreground">
-            {isPurchase ? "جاري تحميل فواتير المشتريات..." : "جاري تحميل فواتير المبيعات..."}
+            {isPurchase ? tr("جاري تحميل فواتير المشتريات...") : tr("جاري تحميل فواتير المبيعات...")}
           </p>
         </div>
       </div>
@@ -480,30 +479,9 @@ export function SaleInvoices({ isPurchase }: OrdersProps) {
   }
 
   return (
-    <div className="space-y-6 p-6 bg-gradient-to-br from-slate-50 to-blue-50 min-h-screen" dir="rtl">
+    <div className="space-y-6 p-6 bg-gradient-to-br from-slate-50 to-blue-50 min-h-screen" dir={appDir()}>
       {/* Header Section */}
-      <div className="flex items-center justify-between">
-        <div>
-          <h1 className="text-4xl font-bold bg-gradient-to-r from-blue-600 to-purple-600 bg-clip-text text-transparent">
-            {isPurchase ? "فواتير المشتريات" : "فواتير المبيعات"}
-          </h1>
-          <p className="text-slate-600 mt-2 text-lg">
-            {isPurchase
-              ? "إدارة وتتبع جميع فواتير المشتريات بكفاءة عالية"
-              : "إدارة وتتبع جميع فواتير المبيعات بكفاءة عالية"}
-          </p>
-        </div>
-        <div className="flex gap-3">
-
-          <Button
-            className="bg-gradient-to-r from-blue-600 to-purple-600 hover:from-blue-700 hover:to-purple-700 shadow-lg"
-            onClick={() => setState((prev) => ({ ...prev, showNewOrderDialog: true, selectedOrder: null, fromSearch: false }))}
-          >
-            <Plus className="ml-2 h-4 w-4" />
-            فاتورة جديدة
-          </Button>
-        </div>
-      </div>
+<VoucherListHero title={isPurchase ? tr("فواتير المشتريات") : tr("فواتير المبيعات")} subtitle={isPurchase ? tr("إدارة وتتبع جميع فواتير المشتريات بكفاءة عالية") : tr("إدارة وتتبع جميع فواتير المبيعات بكفاءة عالية")} icon={FileText} category={tr("الحركات")} onNew={() => setState((prev) => ({ ...prev, showNewOrderDialog: true, selectedOrder: null, fromSearch: false }))} addLabel={tr("فاتورة جديدة")} />
 
       {/* Analytics Dashboard */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
@@ -511,11 +489,11 @@ export function SaleInvoices({ isPurchase }: OrdersProps) {
           <CardContent className="p-6">
             <div className="flex items-center justify-between">
               <div>
-                <p className="text-blue-100 text-sm font-medium">إجمالي الطلبيات</p>
+                <p className="text-blue-100 text-sm font-medium">{tr("إجمالي الطلبيات")}</p>
                 <p className="text-3xl font-bold">{analytics.totalOrders}</p>
                 <div className="flex items-center mt-2">
                   <ArrowUpRight className="h-4 w-4 text-blue-200" />
-                  <span className="text-blue-200 text-sm">+{analytics.weeklyGrowth}% هذا الأسبوع</span>
+                  <span className="text-blue-200 text-sm">+{analytics.weeklyGrowth}{tr("% هذا الأسبوع")}</span>
                 </div>
               </div>
               <div className="h-12 w-12 bg-blue-400 rounded-full flex items-center justify-center">
@@ -529,11 +507,11 @@ export function SaleInvoices({ isPurchase }: OrdersProps) {
           <CardContent className="p-6">
             <div className="flex items-center justify-between">
               <div>
-                <p className="text-amber-100 text-sm font-medium">قيد التنفيذ</p>
+                <p className="text-amber-100 text-sm font-medium">{tr("قيد التنفيذ")}</p>
                 <p className="text-3xl font-bold">{analytics.pendingOrders}</p>
                 <div className="flex items-center mt-2">
                   <Clock className="h-4 w-4 text-amber-200" />
-                  <span className="text-amber-200 text-sm">يحتاج متابعة</span>
+                  <span className="text-amber-200 text-sm">{tr("يحتاج متابعة")}</span>
                 </div>
               </div>
               <div className="h-12 w-12 bg-amber-400 rounded-full flex items-center justify-center">
@@ -547,12 +525,12 @@ export function SaleInvoices({ isPurchase }: OrdersProps) {
           <CardContent className="p-6">
             <div className="flex items-center justify-between">
               <div>
-                <p className="text-emerald-100 text-sm font-medium">مكتملة</p>
+                <p className="text-emerald-100 text-sm font-medium">{tr("مكتملة")}</p>
                 <p className="text-3xl font-bold">{analytics.completedOrders}</p>
                 <div className="flex items-center mt-2">
                   <CheckCircle className="h-4 w-4 text-emerald-200" />
                   <span className="text-emerald-200 text-sm">
-                    معدل الإنجاز {Math.round((analytics.completedOrders / analytics.totalOrders) * 100)}%
+                    {tr("معدل الإنجاز ")}{Math.round((analytics.completedOrders / analytics.totalOrders) * 100)}%
                   </span>
                 </div>
               </div>
@@ -567,11 +545,11 @@ export function SaleInvoices({ isPurchase }: OrdersProps) {
           <CardContent className="p-6">
             <div className="flex items-center justify-between">
               <div>
-                <p className="text-purple-100 text-sm font-medium">إجمالي القيمة</p>
-                <p className="text-3xl font-bold">{analytics.totalValue.toLocaleString()}</p>
+                <p className="text-purple-100 text-sm font-medium">{tr("إجمالي القيمة")}</p>
+                <p className="text-3xl font-bold">{analytics.totalValue.toLocaleString("en-US")}</p>
                 <div className="flex items-center mt-2">
                   <TrendingUp className="h-4 w-4 text-purple-200" />
-                  <span className="text-purple-200 text-sm">متوسط {analytics.avgOrderValue.toLocaleString()} </span>
+                  <span className="text-purple-200 text-sm">{tr("متوسط ")}{analytics.avgOrderValue.toLocaleString("en-US")} </span>
                 </div>
               </div>
               <div className="h-12 w-12 bg-purple-400 rounded-full flex items-center justify-center">
@@ -587,17 +565,17 @@ export function SaleInvoices({ isPurchase }: OrdersProps) {
         <CardHeader>
           <CardTitle className="flex items-center gap-2 text-slate-800">
             <Filter className="h-5 w-5" />
-            البحث والتصفية المتقدمة
+            {tr("البحث والتصفية المتقدمة")}
           </CardTitle>
         </CardHeader>
         <CardContent>
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-7 gap-4">
             <div className="lg:col-span-2">
-              <Label className="text-slate-700 font-medium">البحث الذكي</Label>
+              <Label className="text-slate-700 font-medium">{tr("البحث الذكي")}</Label>
               <div className="relative">
-                <Search className="absolute right-3 top-1/2 transform -translate-y-1/2 h-4 w-4 text-slate-400" />
+                <Search className="absolute start-3 top-1/2 transform -translate-y-1/2 h-4 w-4 text-slate-400" />
                 <Input
-                  placeholder="رقم الفاتورة، اسم الزبون، السند اليدوي , استلمت بواسطة..."
+                  placeholder={tr("رقم الفاتورة، اسم العميل، السند اليدوي , استلمت بواسطة...")}
                   value={state.filters.search}
                   onChange={(e) =>
                     setState((prev) => ({
@@ -605,13 +583,13 @@ export function SaleInvoices({ isPurchase }: OrdersProps) {
                       filters: { ...prev.filters, search: e.target.value },
                     }))
                   }
-                  className="pr-10 bg-white border-slate-200 focus:border-blue-500 focus:ring-blue-500"
+                  className="ps-10 bg-white border-slate-200 focus:border-blue-500 focus:ring-blue-500"
                 />
               </div>
             </div>
 
             <div>
-              <Label className="text-slate-700 font-medium">حالة الطلبية</Label>
+              <Label className="text-slate-700 font-medium">{tr("حالة الطلبية")}</Label>
               <Select
                 value={state.filters.status}
                 onValueChange={(value) =>
@@ -625,12 +603,12 @@ export function SaleInvoices({ isPurchase }: OrdersProps) {
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="0">جميع الحالات</SelectItem>
-                  <SelectItem value="1">غير جاهزة</SelectItem>
-                  <SelectItem value="2">جاهزة</SelectItem>
-                  <SelectItem value="3">مرسلة جزئيا</SelectItem>
-                  <SelectItem value="4">مرسلة كليا</SelectItem>
-                  <SelectItem value="5">ملغاة</SelectItem>
+                  <SelectItem value="0">{tr("جميع الحالات")}</SelectItem>
+                  <SelectItem value="1">{tr("غير جاهزة")}</SelectItem>
+                  <SelectItem value="2">{tr("جاهزة")}</SelectItem>
+                  <SelectItem value="3">{tr("مرسلة جزئيا")}</SelectItem>
+                  <SelectItem value="4">{tr("مرسلة كليا")}</SelectItem>
+                  <SelectItem value="5">{tr("ملغاة")}</SelectItem>
                 </SelectContent>
               </Select>
             </div>
@@ -638,7 +616,7 @@ export function SaleInvoices({ isPurchase }: OrdersProps) {
 
 
             <div>
-              <Label className="text-slate-700 font-medium">قرار الإدارة</Label>
+              <Label className="text-slate-700 font-medium">{tr("قرار الإدارة")}</Label>
               <Select
                 value={state.filters.order_source}
                 onValueChange={(value) =>
@@ -652,18 +630,18 @@ export function SaleInvoices({ isPurchase }: OrdersProps) {
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="0">جميع الحالات</SelectItem>
-                  <SelectItem value="1">مقبول</SelectItem>
-                  <SelectItem value="2">مرفوض</SelectItem>
-                  <SelectItem value="3">مؤجل</SelectItem>
-                  <SelectItem value="4">معتمدة</SelectItem>
-                  <SelectItem value="5">مدققة</SelectItem>
+                  <SelectItem value="0">{tr("جميع الحالات")}</SelectItem>
+                  <SelectItem value="1">{tr("مقبول")}</SelectItem>
+                  <SelectItem value="2">{tr("مرفوض")}</SelectItem>
+                  <SelectItem value="3">{tr("مؤجل")}</SelectItem>
+                  <SelectItem value="4">{tr("معتمدة")}</SelectItem>
+                  <SelectItem value="5">{tr("مدققة")}</SelectItem>
                 </SelectContent>
               </Select>
             </div>
 
             <div>
-              <Label className="text-slate-700 font-medium">من تاريخ</Label>
+              <Label className="text-slate-700 font-medium">{tr("من تاريخ")}</Label>
               <Input
                 type="date"
                 value={state.filters.dateFrom}
@@ -678,7 +656,7 @@ export function SaleInvoices({ isPurchase }: OrdersProps) {
             </div>
 
             <div>
-              <Label className="text-slate-700 font-medium">إلى تاريخ</Label>
+              <Label className="text-slate-700 font-medium">{tr("إلى تاريخ")}</Label>
               <Input
                 type="date"
                 value={state.filters.dateTo}
@@ -700,19 +678,19 @@ export function SaleInvoices({ isPurchase }: OrdersProps) {
                 size="sm"
                 onClick={() => handleViewChange("grid")}
               >
-                شبكة
+                {tr("شبكة")}
               </Button>
               <Button
                 variant={state.currentView === "list" ? "default" : "outline"}
                 size="sm"
                 onClick={() => handleViewChange("list")}
               >
-                قائمة
+                {tr("قائمة")}
               </Button>
             </div>
 
             <Button variant="outline" onClick={resetFilters} className="bg-white">
-              إعادة تعيين
+              {tr("إعادة تعيين")}
             </Button>
           </div>
         </CardContent>
@@ -723,9 +701,9 @@ export function SaleInvoices({ isPurchase }: OrdersProps) {
         <CardHeader>
           <div className="flex justify-between items-center">
             <div>
-              <CardTitle className="text-slate-800">قائمة الطلبيات</CardTitle>
+              <CardTitle className="text-slate-800">{tr("قائمة الطلبيات")}</CardTitle>
               <CardDescription className="text-slate-600">
-                عرض {filteredOrders.length} من أصل {state.salesOrders.length} طلبية
+                {tr("عرض ")}{filteredOrders.length}{tr(" من أصل ")}{state.salesOrders.length}{tr(" طلبية")}
               </CardDescription>
             </div>
             <div className="flex gap-2">
@@ -740,12 +718,12 @@ export function SaleInvoices({ isPurchase }: OrdersProps) {
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="created_at-desc">الأحدث أولاً</SelectItem>
-                  <SelectItem value="created_at-asc">الأقدم أولاً</SelectItem>
-                  <SelectItem value="total_amount-desc">الأعلى قيمة</SelectItem>
-                  <SelectItem value="total_amount-asc">الأقل قيمة</SelectItem>
-                  <SelectItem value="customer_name-asc">اسم الزبون أ-ي</SelectItem>
-                  <SelectItem value="customer_name-desc">اسم الزبون ي-أ</SelectItem>
+                  <SelectItem value="created_at-desc">{tr("الأحدث أولاً")}</SelectItem>
+                  <SelectItem value="created_at-asc">{tr("الأقدم أولاً")}</SelectItem>
+                  <SelectItem value="total_amount-desc">{tr("الأعلى قيمة")}</SelectItem>
+                  <SelectItem value="total_amount-asc">{tr("الأقل قيمة")}</SelectItem>
+                  <SelectItem value="customer_name-asc">{tr("اسم العميل أ-ي")}</SelectItem>
+                  <SelectItem value="customer_name-desc">{tr("اسم العميل ي-أ")}</SelectItem>
                 </SelectContent>
               </Select>
             </div>
@@ -757,9 +735,9 @@ export function SaleInvoices({ isPurchase }: OrdersProps) {
               <div className="mx-auto h-24 w-24 bg-slate-100 rounded-full flex items-center justify-center mb-6">
                 <ShoppingCart className="h-12 w-12 text-slate-400" />
               </div>
-              <h3 className="text-xl font-semibold text-slate-800 mb-2">لا توجد طلبيات</h3>
+              <h3 className="text-xl font-semibold text-slate-800 mb-2">{tr("لا توجد طلبيات")}</h3>
               <p className="text-slate-600 mb-6">
-                لم يتم العثور على أي طلبات تطابق معايير البحث
+                {tr("لم يتم العثور على أي طلبات تطابق معايير البحث")}
               </p>
               <Button
                 className="bg-gradient-to-r from-blue-600 to-purple-600"
@@ -772,8 +750,8 @@ export function SaleInvoices({ isPurchase }: OrdersProps) {
                   }))
                 }
               >
-                <Plus className="ml-2 h-4 w-4" />
-                إنشاء فاتورة جديدة
+                <Plus className="me-2 h-4 w-4" />
+                {tr("إنشاء فاتورة جديدة")}
               </Button>
             </div>
           ) : state.currentView === "grid" ? (
@@ -824,7 +802,7 @@ export function SaleInvoices({ isPurchase }: OrdersProps) {
                               order.total_amount
                             )}`}
                           >
-                            {order.total_amount?.toLocaleString()}{" "}
+                            {order.total_amount?.toLocaleString("en-US")}{" "}
                             {order.currency_code || ""}
                           </span>
                         </div>
@@ -846,7 +824,7 @@ export function SaleInvoices({ isPurchase }: OrdersProps) {
                           <div className="flex items-center gap-2">
                             <Calendar className="h-4 w-4 text-slate-500" />
                             <span className="text-slate-600 text-sm">
-                              تسليم: {formatDateToBritish(order.delivery_datetime)}
+                              {tr("تسليم: ")}{formatDateToBritish(order.delivery_datetime)}
                             </span>
                           </div>
                         )}
@@ -855,7 +833,7 @@ export function SaleInvoices({ isPurchase }: OrdersProps) {
                           <div className="flex items-center gap-2">
                             <Clock className="h-4 w-4 text-slate-500" />
                             <span className="text-slate-600 text-sm">
-                              المرحلة: {order.current_stage}
+                              {tr("المرحلة: ")}{order.current_stage}
                             </span>
                           </div>
                         )}
@@ -896,16 +874,16 @@ export function SaleInvoices({ isPurchase }: OrdersProps) {
                 <table className="w-full">
                   <thead>
                     <tr className="border-b border-slate-200 bg-slate-50">
-                      <th className="text-right p-4">##</th>
-                      <th className="text-right p-4">رقم الفاتورة</th>
-                      <th className="text-right p-4">التاريخ</th>
-                      <th className="text-right p-4">الزبون</th>
-                      <th className="text-right p-4">الحالة</th>
-                      <th className="text-right p-4">السند اليدوي</th>
-                      <th className="text-right p-4">رقم طلبية الزبون</th>
-                      <th className="text-right p-4">المبلغ</th>
-                      <th className="text-right p-4">استلمت بواسطة</th>
-                      <th className="text-center p-4">الإجراءات</th>
+                      <th className="text-start p-4">##</th>
+                      <th className="text-start p-4">{tr("رقم الفاتورة")}</th>
+                      <th className="text-start p-4">{tr("التاريخ")}</th>
+                      <th className="text-start p-4">{tr("العميل")}</th>
+                      <th className="text-start p-4">{tr("الحالة")}</th>
+                      <th className="text-start p-4">{tr("السند اليدوي")}</th>
+                      <th className="text-start p-4">{tr("رقم طلبية العميل")}</th>
+                      <th className="text-start p-4">{tr("المبلغ")}</th>
+                      <th className="text-start p-4">{tr("استلمت بواسطة")}</th>
+                      <th className="text-center p-4">{tr("الإجراءات")}</th>
                     </tr>
                   </thead>
 
@@ -932,7 +910,7 @@ export function SaleInvoices({ isPurchase }: OrdersProps) {
                               order.total_amount
                             )}`}
                           >
-                            {order.total_amount?.toLocaleString()}{" "}
+                            {order.total_amount?.toLocaleString("en-US")}{" "}
                             {order.currency_code || ""}
                           </span>
                         </td>
@@ -972,11 +950,11 @@ export function SaleInvoices({ isPurchase }: OrdersProps) {
                 disabled={currentPage === 1}
                 onClick={() => setCurrentPage((p) => p - 1)}
               >
-                السابق
+                {tr("السابق")}
               </Button>
 
               <div className="text-sm text-slate-600">
-                صفحة {currentPage} من {totalPages}
+                {tr("صفحة ")}{currentPage}{tr(" من ")}{totalPages}
               </div>
 
               <Button
@@ -984,7 +962,7 @@ export function SaleInvoices({ isPurchase }: OrdersProps) {
                 disabled={currentPage === totalPages}
                 onClick={() => setCurrentPage((p) => p + 1)}
               >
-                التالي
+                {tr("التالي")}
               </Button>
             </div>
           )}
@@ -1021,3 +999,6 @@ export function SaleInvoices({ isPurchase }: OrdersProps) {
     </div>
   )
 }
+
+
+

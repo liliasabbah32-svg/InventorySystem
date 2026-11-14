@@ -1,0 +1,328 @@
+"use client"
+
+import { tr, appDir } from "@/lib/i18n"
+import { ReportPage, ReportHeader } from "@/components/reports/report-page"
+
+import { ReportFilters } from "@/components/reports/report-filters"
+
+import { useEffect, useMemo, useState } from "react"
+import { useToast } from "@/hooks/use-toast"
+import { Button } from "@/components/ui/button"
+import { Input } from "@/components/ui/input"
+import { Badge } from "@/components/ui/badge"
+import { Card, CardContent } from "@/components/ui/card"
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog"
+import { ScrollArea } from "@/components/ui/scroll-area"
+import { Separator } from "@/components/ui/separator"
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
+import { Search, RefreshCw, Loader2, User, ListChecks, PlayCircle, CheckCircle2, XCircle, AlarmClock, Clock } from "lucide-react"
+import { cn } from "@/lib/utils"
+import { formatDateTimeToBritish } from "@/lib/utils"
+import type { TaskOrderItemDetail, TaskOrderItemRow, TaskWorkflow } from "./types"
+import { ACTION_LABELS, PRIORITY_LABELS } from "./types"
+import { PRIORITY_BADGE_CLASS, formatDuration } from "./utils"
+
+const ITEM_STATUS_LABELS: Record<string, string> = {
+  in_workflow: tr("جارٍ"),
+  completed: tr("مكتمل"),
+  cancelled: tr("ملغى"),
+}
+const ITEM_STATUS_BADGE_CLASS: Record<string, string> = {
+  in_workflow: "bg-emerald-50 text-emerald-700 border-emerald-200",
+  completed: "bg-blue-50 text-blue-700 border-blue-200",
+  cancelled: "bg-slate-100 text-slate-400 border-slate-200",
+}
+
+export function TaskReport() {
+  const { toast } = useToast()
+  const [workflows, setWorkflows] = useState<TaskWorkflow[]>([])
+  const [items, setItems] = useState<TaskOrderItemRow[]>([])
+  const [loading, setLoading] = useState(false)
+  const [search, setSearch] = useState("")
+  const [statusFilter, setStatusFilter] = useState("all")
+  const [workflowFilter, setWorkflowFilter] = useState("all")
+  const [fromDate, setFromDate] = useState("")
+  const [toDate, setToDate] = useState("")
+
+  const [detailId, setDetailId] = useState<number | null>(null)
+  const [detailItem, setDetailItem] = useState<TaskOrderItemDetail | null>(null)
+  const [detailLoading, setDetailLoading] = useState(false)
+
+  const fetchWorkflows = async () => {
+    try {
+      const res = await fetch("/api/task-orders/workflows")
+      const data = await res.json()
+      setWorkflows(Array.isArray(data) ? data : [])
+    } catch {
+      // صامت — فلتر سير العمل غير أساسي لعمل التقرير
+    }
+  }
+
+  const fetchItems = async () => {
+    setLoading(true)
+    try {
+      const params = new URLSearchParams()
+      if (statusFilter !== "all") params.set("status", statusFilter)
+      if (workflowFilter !== "all") params.set("workflow_id", workflowFilter)
+      if (search.trim()) params.set("search", search.trim())
+      if (fromDate) params.set("from_date", fromDate)
+      if (toDate) params.set("to_date", toDate)
+      const res = await fetch(`/api/task-orders/order-items?${params}`)
+      const data = await res.json()
+      setItems(Array.isArray(data) ? data : [])
+    } catch {
+      toast({ title: tr("خطأ"), description: tr("فشل في جلب تقرير أصناف الطلبية"), variant: "destructive" })
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  useEffect(() => {
+    fetchWorkflows()
+  }, [])
+
+  useEffect(() => {
+    const timeout = setTimeout(fetchItems, 300)
+    return () => clearTimeout(timeout)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [statusFilter, workflowFilter, search, fromDate, toDate])
+
+  const openDetail = async (id: number) => {
+    setDetailId(id)
+    setDetailLoading(true)
+    try {
+      const res = await fetch(`/api/task-orders/order-items/${id}`)
+      if (!res.ok) throw new Error()
+      setDetailItem(await res.json())
+    } catch {
+      toast({ title: tr("خطأ"), description: tr("فشل في جلب تفاصيل الصنف"), variant: "destructive" })
+      setDetailId(null)
+    } finally {
+      setDetailLoading(false)
+    }
+  }
+
+  const summary = useMemo(() => {
+    const total = items.length
+    const inWorkflow = items.filter((i) => i.status === "in_workflow").length
+    const completed = items.filter((i) => i.status === "completed").length
+    const cancelled = items.filter((i) => i.status === "cancelled").length
+    const overdue = items.filter((i) => Number(i.overdue_task_count || 0) > 0).length
+    return { total, inWorkflow, completed, cancelled, overdue }
+  }, [items])
+
+  return (
+    <ReportPage loading={loading}>
+      <ReportHeader title={<>{tr("تقرير متابعة أصناف الطلبية")}</>} description={<>{tr("كل الأصناف بحالاتها ومراحلها الحالية وآخر ملاحظة مسجَّلة عليها")}</>} />
+
+      <div className="grid grid-cols-2 gap-3 lg:grid-cols-5">
+        {[
+          { label: tr("الإجمالي"), value: summary.total, icon: ListChecks, tone: "bg-slate-100 text-slate-600" },
+          { label: tr("جارٍ بسير العمل"), value: summary.inWorkflow, icon: PlayCircle, tone: "bg-emerald-100 text-emerald-700" },
+          { label: tr("مكتمل"), value: summary.completed, icon: CheckCircle2, tone: "bg-sky-100 text-sky-700" },
+          { label: tr("ملغى"), value: summary.cancelled, icon: XCircle, tone: "bg-slate-100 text-slate-400" },
+          { label: tr("متأخر عن SLA"), value: summary.overdue, icon: AlarmClock, tone: "bg-red-100 text-red-600" },
+        ].map((card) => (
+          <div key={card.label} className="flex items-center justify-between rounded-2xl border bg-white p-4 shadow-sm">
+            <div>
+              <p className="text-xs text-slate-500">{card.label}</p>
+              <p className="mt-1 text-2xl font-bold text-slate-800">{card.value}</p>
+            </div>
+            <span className={cn("flex h-10 w-10 items-center justify-center rounded-xl", card.tone)}>
+              <card.icon className="h-5 w-5" />
+            </span>
+          </div>
+        ))}
+      </div>
+
+      <ReportFilters><div className="flex flex-wrap items-center gap-2">
+        <div className="relative w-64">
+          <Search className="pointer-events-none absolute start-2 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+          <Input value={search} onChange={(e) => setSearch(e.target.value)} placeholder={tr("رقم الصنف، العنوان، العميل أو الطلبية")} className="ps-8" />
+        </div>
+        <div className="flex items-center gap-1 text-xs text-slate-500">
+          {tr("من")}
+          <Input type="date" value={fromDate} onChange={(e) => setFromDate(e.target.value)} className="w-40" />
+          {tr("إلى")}
+          <Input type="date" value={toDate} onChange={(e) => setToDate(e.target.value)} className="w-40" />
+        </div>
+        <Select value={statusFilter} onValueChange={setStatusFilter}>
+          <SelectTrigger className="w-40">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">{tr("كل الحالات")}</SelectItem>
+            <SelectItem value="in_workflow">{tr("جارٍ")}</SelectItem>
+            <SelectItem value="completed">{tr("مكتمل")}</SelectItem>
+            <SelectItem value="cancelled">{tr("ملغى")}</SelectItem>
+          </SelectContent>
+        </Select>
+        <Select value={workflowFilter} onValueChange={setWorkflowFilter}>
+          <SelectTrigger className="w-56">
+            <SelectValue placeholder={tr("كل سير العمل")} />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">{tr("كل سير العمل")}</SelectItem>
+            {workflows.map((w) => (
+              <SelectItem key={w.id} value={String(w.id)}>
+                {w.name}
+                {w.version > 1 ? ` v${w.version}` : ""}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        <Button data-report-apply variant="outline" size="icon" onClick={fetchItems} title={tr("تحديث")}>
+          <RefreshCw className={cn("h-4 w-4", loading && "animate-spin")} />
+        </Button>
+      </div></ReportFilters>
+
+      <Card>
+        <CardContent className="p-0">
+          <div className="overflow-x-auto">
+            <Table>
+              <TableHeader className="bg-emerald-100">
+                <TableRow className="hover:bg-emerald-100">
+                  <TableHead className="text-start">{tr("رقم الصنف")}</TableHead>
+                  <TableHead className="text-start">{tr("العنوان")}</TableHead>
+                  <TableHead className="text-start">{tr("الطلبية / العميل")}</TableHead>
+                  <TableHead className="text-start">{tr("سير العمل")}</TableHead>
+                  <TableHead className="text-start">{tr("الحالة")}</TableHead>
+                  <TableHead className="text-start">{tr("المرحلة الحالية")}</TableHead>
+                  <TableHead className="text-start">{tr("الأولوية")}</TableHead>
+                  <TableHead className="text-start">{tr("وقت العمل")}</TableHead>
+                  <TableHead className="text-start">{tr("آخر ملاحظة")}</TableHead>
+                  <TableHead className="text-start">{tr("أنشئ بواسطة")}</TableHead>
+                  <TableHead className="text-start">{tr("تاريخ الإنشاء")}</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {items.map((item) => (
+                  <TableRow key={item.id} className="cursor-pointer hover:bg-emerald-50/40" onClick={() => openDetail(item.id)}>
+                    <TableCell className="font-mono text-xs text-slate-500">{item.item_code}</TableCell>
+                    <TableCell className="max-w-[220px] truncate font-medium">{item.title}</TableCell>
+                    <TableCell className="max-w-[200px] text-xs">
+                      <div className="font-mono text-emerald-700">{item.source_order_number || item.customer_order_code || "-"}</div>
+                      {item.customer_name && <div className="truncate text-slate-500">{item.customer_name}</div>}
+                    </TableCell>
+                    <TableCell className="text-xs text-slate-500">{item.workflow_name}</TableCell>
+                    <TableCell>
+                      <Badge className={cn("border text-[10px]", ITEM_STATUS_BADGE_CLASS[item.status])}>{ITEM_STATUS_LABELS[item.status] || item.status}</Badge>
+                    </TableCell>
+                    <TableCell className="text-xs text-slate-600">
+                      {item.current_steps || (item.status === "in_workflow" ? "-" : "—")}
+                      {Number(item.overdue_task_count || 0) > 0 && (
+                        <span className="ms-1 inline-flex items-center gap-0.5 rounded bg-red-100 px-1 py-0.5 text-[10px] font-semibold text-red-700">
+                          <AlarmClock className="h-3 w-3" />{tr(" متأخر")}
+                        </span>
+                      )}
+                    </TableCell>
+                    <TableCell>
+                      <Badge className={cn("border text-[10px]", PRIORITY_BADGE_CLASS[item.priority])}>{PRIORITY_LABELS[item.priority] || item.priority}</Badge>
+                    </TableCell>
+                    <TableCell className="whitespace-nowrap font-mono text-xs text-slate-600">
+                      <Clock className="me-1 inline h-3 w-3 text-slate-400" />
+                      {formatDuration(Number(item.total_work_seconds || 0))}
+                    </TableCell>
+                    <TableCell className="max-w-[240px] truncate text-xs text-slate-500" title={item.last_note || ""}>
+                      {item.last_note || "-"}
+                    </TableCell>
+                    <TableCell className="text-xs text-slate-500">{item.created_by_name || "-"}</TableCell>
+                    <TableCell className="whitespace-nowrap text-xs text-slate-400">{formatDateTimeToBritish(item.created_at)}</TableCell>
+                  </TableRow>
+                ))}
+                {!loading && items.length === 0 && (
+                  <TableRow>
+                    <TableCell colSpan={11} className="py-10 text-center text-sm text-slate-400">
+                      {tr("لا توجد أصناف مطابقة")}
+                    </TableCell>
+                  </TableRow>
+                )}
+                {loading && (
+                  <TableRow>
+                    <TableCell colSpan={11} className="py-10 text-center">
+                      <Loader2 className="mx-auto h-5 w-5 animate-spin text-slate-400" />
+                    </TableCell>
+                  </TableRow>
+                )}
+              </TableBody>
+            </Table>
+          </div>
+        </CardContent>
+      </Card>
+
+      {/* نافذة عرض تفاصيل صنف — للعرض والتدقيق فقط (بلا أزرار إجراءات)؛ التحكم الفعلي بالمهام من
+          لوحة Kanban، هذه شاشة تقرير/تتبّع تُبرز الحالة والملاحظات وسجلّ الأحداث الكامل. */}
+      <Dialog open={detailId !== null} onOpenChange={(open) => !open && setDetailId(null)}>
+        <DialogContent className="max-w-2xl" dir={appDir()}>
+          {detailLoading || !detailItem ? (
+            <div className="flex items-center justify-center py-16">
+              <Loader2 className="h-6 w-6 animate-spin text-slate-400" />
+            </div>
+          ) : (
+            <>
+              <DialogHeader>
+                <DialogTitle className="flex flex-wrap items-center gap-2">
+                  <span className="font-mono text-sm text-slate-400">{detailItem.item_code}</span>
+                  {detailItem.title}
+                  <Badge className={cn("border", ITEM_STATUS_BADGE_CLASS[detailItem.status])}>{ITEM_STATUS_LABELS[detailItem.status] || detailItem.status}</Badge>
+                </DialogTitle>
+              </DialogHeader>
+
+              <div className="grid grid-cols-2 gap-3 text-sm">
+                <div>
+                  <span className="text-slate-400">{tr("سير العمل: ")}</span>
+                  {detailItem.workflow_name}
+                </div>
+                <div>
+                  <span className="text-slate-400">{tr("أنشئ بواسطة: ")}</span>
+                  {detailItem.created_by_name || "-"}
+                </div>
+              </div>
+              {detailItem.description && <p className="rounded-md bg-slate-50 p-2 text-sm text-slate-600">{detailItem.description}</p>}
+
+              <Separator />
+
+              <div className="space-y-1">
+                <div className="text-sm font-semibold text-slate-600">{tr("مراحل التنفيذ")}</div>
+                {detailItem.instances.map((instance) => (
+                  <div key={instance.id} className="flex items-center justify-between rounded-md border border-slate-200 px-2 py-1.5 text-sm">
+                    <span>
+                      {instance.step_label} <span className="text-xs text-slate-400">({instance.section_name})</span>
+                    </span>
+                    <span className="text-xs text-slate-500">
+                      {instance.claimed_by_name || tr("غير مسند")} · {formatDuration(instance.total_duration_seconds)}
+                    </span>
+                  </div>
+                ))}
+              </div>
+
+              <Separator />
+
+              <div>
+                <div className="mb-2 text-sm font-semibold text-slate-600">{tr("سجلّ الأحداث والملاحظات")}</div>
+                <ScrollArea className="max-h-64">
+                  <div className="space-y-2 pe-2">
+                    {detailItem.logs.map((log) => (
+                      <div key={log.id} className="flex items-start gap-2 text-xs">
+                        <User className="mt-0.5 h-3.5 w-3.5 shrink-0 text-slate-400" />
+                        <div>
+                          <span className="font-medium text-slate-700">{log.user_name || tr("النظام")}</span>{" "}
+                          <span className="text-slate-500">{ACTION_LABELS[log.action] || log.action}</span>
+                          {log.duration_sec > 0 && <span className="text-slate-500"> — {formatDuration(log.duration_sec)}</span>}
+                          {log.note && <div className="mt-0.5 rounded bg-slate-50 p-1.5 text-slate-600">{log.note}</div>}
+                          <div className="text-slate-400">{formatDateTimeToBritish(log.at)}</div>
+                        </div>
+                      </div>
+                    ))}
+                    {detailItem.logs.length === 0 && <div className="text-xs text-slate-400">{tr("لا توجد أحداث بعد")}</div>}
+                  </div>
+                </ScrollArea>
+              </div>
+            </>
+          )}
+        </DialogContent>
+      </Dialog>
+    </ReportPage>
+  )
+}

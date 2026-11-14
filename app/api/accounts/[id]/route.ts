@@ -1,150 +1,226 @@
-import { NextRequest, NextResponse } from "next/server"
+import { findAccountUsages } from "@/lib/delete-guard"
+import { type NextRequest, NextResponse } from "next/server"
 import sql from "@/lib/database"
+import { authorizeFile, authorizeFileRead, projectFileLookup } from "@/lib/file-permissions"
+import { getSessionUser } from "@/lib/tenant-auth"
+import {
+  statusLabelToCode,
+  toBool,
+  toNullableInt,
+  toNullableFloat,
+  ensureAccountsTable,
+  ensureAccountRelatedTables,
+  mapAccountRow,
+  accountFileFamilyForType,
+  validateAccountParentForChild,
+} from "../_lib"
 
-const statusLabelToCode = (status: string): number => {
-  if (status === "موقوف") return 2
-  if (status === "محذوف") return 3
-  return 1
-}
-
-const statusCodeToLabel = (status: number | null | undefined): string => {
-  if (status === 2) return "موقوف"
-  if (status === 3) return "محذوف"
-  return "نشط"
-}
-
-const toBool = (value: unknown, defaultValue = false): boolean => {
-  if (typeof value === "boolean") return value
-  if (typeof value === "number") return value === 1
-  if (typeof value === "string") {
-    const lowered = value.trim().toLowerCase()
-    return ["1", "true", "yes", "y", "نعم"].includes(lowered)
-  }
-  return defaultValue
-}
-
-const toNullableInt = (value: unknown): number | null => {
-  if (value === null || value === undefined || value === "") return null
-  const parsed = Number(value)
-  return Number.isFinite(parsed) ? parsed : null
-}
-
-const toNullableFloat = (value: unknown): number | null => {
-  if (value === null || value === undefined || value === "") return null
-  const parsed = Number(value)
-  return Number.isFinite(parsed) ? parsed : null
-}
-
-const ensureAccountsTable = async () => {
-  await sql`
-    CREATE TABLE IF NOT EXISTS account_tbl (
-      id SERIAL PRIMARY KEY,
-      company_id INTEGER NOT NULL,
-      code VARCHAR(50) NOT NULL,
-      type INTEGER,
-      name VARCHAR(150) NOT NULL,
-      name_lang2 VARCHAR(150),
-      father_id INTEGER REFERENCES account_tbl(id) ON DELETE CASCADE,
-      level_no INTEGER NOT NULL,
-      finanical_list_id INTEGER NOT NULL,
-      finanical_list_assests_id INTEGER,
-      finanical_list_liabilities_id INTEGER,
-      finanical_list_income_id INTEGER,
-      currency_id INTEGER,
-      allow_trans_with_diff_curr INTEGER NOT NULL,
-      iscalc_curr_diff_rates BOOLEAN NOT NULL,
-      transaction_type INTEGER NOT NULL,
-      transaction_type_action INTEGER NOT NULL,
-      max_transaction_amount DOUBLE PRECISION NOT NULL,
-      max_transaction_amount_action INTEGER NOT NULL,
-      max_balance_amount DOUBLE PRECISION NOT NULL,
-      max_balance_action INTEGER,
-      budget_exceeding_perc DOUBLE PRECISION,
-      budget_exceeding_action INTEGER,
-      unified_report_account_no VARCHAR(50),
-      unified_report_group_code VARCHAR(50),
-      notes VARCHAR(70),
-      show_notes_in_transactions_soa BOOLEAN,
-      status INTEGER,
-      insert_date DATE,
-      last_update_date TIMESTAMPTZ,
-      UNIQUE (code)
-    )
-  `
-
-  await sql`
-    DO $$
-    BEGIN
-      IF EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_name = 'account_tbl'
-          AND column_name = 'allow_trans_with_diff_curr'
-          AND data_type = 'boolean'
-      ) THEN
-        ALTER TABLE account_tbl
-        ALTER COLUMN allow_trans_with_diff_curr TYPE INTEGER
-        USING CASE WHEN allow_trans_with_diff_curr THEN 1 ELSE 0 END;
-      END IF;
-    END$$;
-  `
-}
-
-const ensureAccountRelatedTables = async () => {
-  await sql`
-    CREATE TABLE IF NOT EXISTS account_stop_transactions_tbl (
-      id SERIAL PRIMARY KEY,
-      account_id INTEGER NOT NULL REFERENCES account_tbl(id) ON DELETE CASCADE,
-      voucher_types_id INTEGER,
-      stop_date TIMESTAMPTZ
-    )
-  `
-
-  await sql`
-    CREATE TABLE IF NOT EXISTS account_costcenters_tbl (
-      id SERIAL PRIMARY KEY,
-      account_id INTEGER NOT NULL REFERENCES account_tbl(id) ON DELETE CASCADE,
-      cost_center_type_id INTEGER,
-      required_in_transactions INTEGER,
-      default_cost_center_id INTEGER
-    )
-  `
-
-  await sql`
-    CREATE TABLE IF NOT EXISTS account_classifications_tbl (
-      id SERIAL PRIMARY KEY,
-      account_id INTEGER NOT NULL REFERENCES account_tbl(id) ON DELETE CASCADE,
-      classification_id INTEGER NOT NULL
-    )
-  `
-}
-
-const mapAccountRow = (row: any) => ({
-  ...row,
-  status: statusCodeToLabel(Number(row.status ?? 1)),
-  allow_trans_with_diff_curr: row.allow_trans_with_diff_curr != null ? Number(row.allow_trans_with_diff_curr) : 0,
-  iscalc_curr_diff_rates: toBool(row.iscalc_curr_diff_rates),
-  show_notes_in_transactions_soa: toBool(row.show_notes_in_transactions_soa),
-})
-
-export async function PUT(request: NextRequest, { params }: { params: { id: string } }) {
+export async function GET(request: NextRequest) {
   try {
-    await ensureAccountsTable()
-    await ensureAccountRelatedTables()
+    const authorization = await authorizeFileRead(request, ["accounts", "customers", "suppliers", "subscribers", "employees", "items", "services", "bank-accounts", "credit-cards"])
+    if (!authorization.ok) return authorization.response
+    const { searchParams } = new URL(request.url)
+    const code = searchParams.get("code")
 
-    const id = Number.parseInt(params.id, 10)
-    if (Number.isNaN(id)) {
-      return NextResponse.json({ error: "معرف غير صالح" }, { status: 400 })
+    // Try to extract numeric id from the path if present (e.g. /api/accounts/1715)
+    const pathname = new URL(request.url).pathname
+    const pathSegments = pathname.split("/").filter(Boolean)
+    const lastSegment = pathSegments[pathSegments.length - 1]
+    const numericId = lastSegment && /^[0-9]+$/.test(lastSegment) ? Number(lastSegment) : null
+
+    let result
+
+    if (numericId) {
+      // Search by numeric id
+      result = await sql`
+        SELECT
+          a.id,
+          a.company_id,
+          a.code,
+          a.type,
+          a.name,
+          a.name_lang2,
+          a.father_id,
+          EXISTS (SELECT 1 FROM account_tbl ch WHERE ch.father_id = a.id AND COALESCE(ch.status, 1) <> 3) AS has_children,
+          a.level_no,
+          a.finanical_list_id,
+          a.finanical_list_assests_id,
+          a.finanical_list_liabilities_id,
+          a.finanical_list_income_id,
+          a.currency_id,
+          a.allow_trans_with_diff_curr,
+          a.iscalc_curr_diff_rates,
+          a.transaction_type,
+          a.transaction_type_action,
+          a.max_transaction_amount,
+          a.max_transaction_amount_action,
+          a.max_balance_amount,
+          a.max_balance_action,
+          a.budget_exceeding_perc,
+          a.budget_exceeding_action,
+          a.unified_report_account_no,
+          a.unified_report_group_code,
+          a.notes,
+          a.show_notes_in_transactions_soa,
+          a.status,
+          a.insert_date,
+          a.last_update_date
+        FROM account_tbl a
+        WHERE a.id = ${numericId}
+        LIMIT 1
+      `
+    } else {
+      if (!code) {
+        return NextResponse.json({ error: "Code or id is required" }, { status: 400 })
+      }
+
+      // Search for account by code
+      result = await sql`
+        SELECT
+          a.id,
+          a.company_id,
+          a.code,
+          a.type,
+          a.name,
+          a.name_lang2,
+          a.father_id,
+          EXISTS (SELECT 1 FROM account_tbl ch WHERE ch.father_id = a.id AND COALESCE(ch.status, 1) <> 3) AS has_children,
+          a.level_no,
+          a.finanical_list_id,
+          a.finanical_list_assests_id,
+          a.finanical_list_liabilities_id,
+          a.finanical_list_income_id,
+          a.currency_id,
+          a.allow_trans_with_diff_curr,
+          a.iscalc_curr_diff_rates,
+          a.transaction_type,
+          a.transaction_type_action,
+          a.max_transaction_amount,
+          a.max_transaction_amount_action,
+          a.max_balance_amount,
+          a.max_balance_action,
+          a.budget_exceeding_perc,
+          a.budget_exceeding_action,
+          a.unified_report_account_no,
+          a.unified_report_group_code,
+          a.notes,
+          a.show_notes_in_transactions_soa,
+          a.status,
+          a.insert_date,
+          a.last_update_date
+        FROM account_tbl a
+        WHERE a.code = ${code}
+        LIMIT 1
+      `
     }
 
+    if (!result || result.length === 0) {
+      return NextResponse.json({ error: "Account not found" }, { status: 404 })
+    }
+
+    const account = result[0]
+
+    const storedAuthorization = await authorizeFileRead(request, [accountFileFamilyForType(account.type), "accounts", "customers", "suppliers", "subscribers", "employees", "items", "services", "bank-accounts", "credit-cards"])
+    if (!storedAuthorization.ok) return storedAuthorization.response
+    if (account.status === 3) return NextResponse.json({ error: "Account deleted" }, { status: 403 })
+    if (storedAuthorization.lookupOnly) return NextResponse.json(projectFileLookup("accounts", [account])[0])
+
+    const stopRows = await sql`
+      SELECT id, account_id, voucher_types_id, stop_date
+      FROM account_stop_transactions_tbl
+      WHERE account_id = ${account.id}
+      ORDER BY id ASC
+    `
+
+    // If account status is 3 (محذوف - deleted), return 403
+    if (account.status === 3) {
+      return NextResponse.json({ error: "Account deleted" }, { status: 403 })
+    }
+
+    // Return account data
+    return NextResponse.json({
+      id: account.id,
+      code: account.code,
+      name: account.name,
+      name_lang2: account.name_lang2,
+      type: account.type,
+      father_id: account.father_id,
+      has_children: Boolean(account.has_children),
+      level_no: account.level_no,
+      finanical_list_id: account.finanical_list_id,
+      finanical_list_assests_id: account.finanical_list_assests_id,
+      finanical_list_liabilities_id: account.finanical_list_liabilities_id,
+      finanical_list_income_id: account.finanical_list_income_id,
+      currency_id: account.currency_id,
+      allow_trans_with_diff_curr: account.allow_trans_with_diff_curr,
+      iscalc_curr_diff_rates: account.iscalc_curr_diff_rates,
+      transaction_type: account.transaction_type,
+      transaction_type_action: account.transaction_type_action,
+      max_transaction_amount: account.max_transaction_amount,
+      max_transaction_amount_action: account.max_transaction_amount_action,
+      max_balance_amount: account.max_balance_amount,
+      max_balance_action: account.max_balance_action,
+      budget_exceeding_perc: account.budget_exceeding_perc,
+      budget_exceeding_action: account.budget_exceeding_action,
+      unified_report_account_no: account.unified_report_account_no,
+      unified_report_group_code: account.unified_report_group_code,
+      notes: account.notes,
+      show_notes_in_transactions_soa: account.show_notes_in_transactions_soa,
+      status: account.status,
+      stop_transactions: stopRows,
+    })
+  } catch (error) {
+    console.error("Error searching account:", error)
+    return NextResponse.json({ error: "Internal server error" }, { status: 500 })
+  }
+}
+
+// كان هذا المسار بلا PUT إطلاقاً — أي تعديل لحساب موجود كان يصطدم بـ 405 بلا محتوى JSON، ما يُسبب
+// "Unexpected end of JSON input" عند محاولة العميل قراءة رد فارغ كـ JSON. المنطق هنا يطابق POST في
+// route.ts (نفس الحقول والتحقق) لكن كتحديث بدل إدراج، مع استبدال صفوف الجداول التابعة بالكامل.
+export async function PUT(request: NextRequest, { params }: { params: { id: string } }) {
+  try {
+    if (!(await getSessionUser(request))) return NextResponse.json({ error: "يجب تسجيل الدخول" }, { status: 401 })
     const data = await request.json()
-    // Support both naming conventions: account_code/account_name (API) and code/name (frontend)
-    let accountCode = String(data.account_code ?? data.code ?? "").trim()
+    const id = Number(params.id)
+    if (!Number.isInteger(id) || id <= 0) return NextResponse.json({ error: "معرف الحساب غير صالح" }, { status: 400 })
+    const storedAccount = (await sql`SELECT id, type, father_id FROM account_tbl WHERE id = ${id} LIMIT 1`)[0]
+    if (!storedAccount) return NextResponse.json({ error: "الحساب غير موجود" }, { status: 404 })
+    const action = Number(data.status) === 3 || statusLabelToCode(String(data.status ?? "")) === 3 ? "delete" : "update"
+    const authorization = await authorizeFile(request, accountFileFamilyForType(storedAccount.type), action)
+    if (!authorization.ok) return authorization.response
+    if (Number(storedAccount.type) !== 1) {
+      return NextResponse.json({ error: "هذا الحساب تابع لتعريف عميل أو مورد أو مشترك أو موظف، ويتم تعديله من صفحته المخصصة" }, { status: 400 })
+    }
+    await ensureAccountsTable()
+    await ensureAccountRelatedTables()
+    await sql`
+      CREATE TABLE IF NOT EXISTS account_branches (
+        account_id INTEGER NOT NULL REFERENCES account_tbl(id) ON DELETE CASCADE,
+        branch_id INTEGER NOT NULL REFERENCES branches(id) ON DELETE CASCADE,
+        PRIMARY KEY (account_id, branch_id)
+      )
+    `
+
+    if (!id) {
+      return NextResponse.json({ error: "معرف الحساب غير صالح" }, { status: 400 })
+    }
+
+    const existingAccount = await sql`SELECT id FROM account_tbl WHERE id = ${id}`
+    if (existingAccount.length === 0) {
+      return NextResponse.json({ error: "الحساب غير موجود" }, { status: 404 })
+    }
+
+    const accountCode = String(data.account_code ?? data.code ?? "").trim()
+    const normalizedAccountCode = accountCode
+      .replace(/\s+/g, "")
+      .replace(/[^A-Za-z0-9]/g, "")
+      .toUpperCase()
+    const finalAccountCode = normalizedAccountCode.length >= 10 ? normalizedAccountCode.slice(0, 10) : normalizedAccountCode.padEnd(10, "0")
     const accountName = String(data.account_name ?? data.name ?? "").trim()
-    const TypeId = 1
-    const parentAccountId = toNullableInt(data.parent_account_id ?? data.father_id)
-    const companyId = Number(data.company_id ?? 1)
+    const parentCode = String(data.parent_code ?? data.father_code ?? "").trim()
+    let parentAccountId = toNullableInt(data.parent_account_id ?? data.father_id)
     const nameLang2 = String(data.name_lang2 ?? "").trim() || null
-    const levelNo = Number(data.level_no ?? (parentAccountId ? 2 : 1))
     const financialListId = Number(data.finanical_list_id ?? 1)
     const financialAssetsId = toNullableInt(data.finanical_list_assests_id)
     const financialLiabilitiesId = toNullableInt(data.finanical_list_liabilities_id)
@@ -165,10 +241,10 @@ export async function PUT(request: NextRequest, { params }: { params: { id: stri
     const budgetExceedingAction = toNullableInt(data.budget_exceeding_action)
     const unifiedReportAccountNo = String(data.unified_report_account_no ?? "").trim() || null
     const unifiedReportGroupCode = String(data.unified_report_group_code ?? "").trim() || null
-    const description = String(data.description ?? "").trim() || null
+    const description = String(data.description ?? data.notes ?? "").trim() || null
     const showNotesInTransactionsSoa = toBool(data.show_notes_in_transactions_soa, false)
     const statusLabel = String(data.status ?? "نشط").trim()
-    const statusCode = statusLabelToCode(statusLabel)
+    const statusCode = [1, 2, 3].includes(Number(data.status)) ? Number(data.status) : statusLabelToCode(statusLabel)
 
     const stopTransactions = Array.isArray(data.stop_transactions) ? data.stop_transactions : []
     const costCenters = Array.isArray(data.cost_centers) ? data.cost_centers : []
@@ -177,64 +253,47 @@ export async function PUT(request: NextRequest, { params }: { params: { id: stri
     if (!accountCode) {
       return NextResponse.json({ error: "رقم الحساب مطلوب" }, { status: 400 })
     }
-
     if (!accountName) {
       return NextResponse.json({ error: "اسم الحساب مطلوب" }, { status: 400 })
     }
-
-    /*if (!classificationTypeId) {
-      return NextResponse.json({ error: "نوع الحساب مطلوب" }, { status: 400 })
-    }*/
-
-    const existingCode = await sql`SELECT id FROM account_tbl WHERE LOWER(code) = LOWER(${accountCode}) AND id <> ${id}`
-    if (existingCode.length > 0) {
-      // If id is 0 (new record), generate the next sequential code instead of erroring
-      if (id === 0) {
-        // Extract numeric part from code (e.g., "A0000002" -> 2)
-        const match = accountCode.match(/^([A-Za-z]*)(\d+)$/)
-        if (match) {
-          const prefix = match[1]
-          const currentNumber = parseInt(match[2], 10)
-          const nextNumber = currentNumber + 1
-          const numberLength = match[2].length
-          const newCode = prefix + String(nextNumber).padStart(numberLength, '0')
-          accountCode = newCode
-        } else {
-          // If code doesn't have numeric pattern, append _1
-          let counter = 1
-          let newCode = `${accountCode}_${counter}`
-          while (true) {
-            const checkCode = await sql`SELECT id FROM account_tbl WHERE LOWER(code) = LOWER(${newCode})`
-            if (checkCode.length === 0) {
-              accountCode = newCode
-              break
-            }
-            counter++
-          }
-        }
-      } else {
-        return NextResponse.json({ error: "رقم الحساب موجود مسبقاً" }, { status: 400 })
-      }
+    if (accountName.length > 100) {
+      return NextResponse.json({ error: "اسم الحساب يجب ألا يتجاوز 100 حرف" }, { status: 400 })
+    }
+    if (![1, 2, 3].includes(financialListId)) {
+      return NextResponse.json({ error: "القائمة المالية غير صحيحة" }, { status: 400 })
     }
 
-    /*const typeExists = await sql`SELECT id FROM account_classification_types WHERE id = ${classificationTypeId}`
-    if (typeExists.length === 0) {
-      return NextResponse.json({ error: "نوع الحساب غير موجود" }, { status: 400 })
-    }*/
-
-    if (parentAccountId !== null) {
-      const parentExists = await sql`SELECT id FROM account_tbl WHERE id = ${parentAccountId} AND id <> ${id}`
-      if (parentExists.length === 0) {
+    if (parentAccountId === null && parentCode) {
+      const parentByCode = await sql`SELECT id FROM account_tbl WHERE LOWER(code) = LOWER(${parentCode}) LIMIT 1`
+      if (parentByCode.length === 0) {
         return NextResponse.json({ error: "الحساب الرئيسي غير موجود" }, { status: 400 })
       }
+      parentAccountId = Number(parentByCode[0].id)
     }
 
-    const updated = await sql`
-      UPDATE account_tbl
-      SET
-        company_id = ${companyId},
-        code = ${accountCode},
-        type = ${TypeId},
+    if (parentAccountId !== null) {
+      if (parentAccountId === id) {
+        return NextResponse.json({ error: "لا يمكن ان يكون الحساب اب لنفسه" }, { status: 400 })
+      }
+      const storedFatherId = storedAccount.father_id == null ? null : Number(storedAccount.father_id)
+      if (parentAccountId !== storedFatherId) {
+        const parentError = await validateAccountParentForChild(parentAccountId)
+        if (parentError) return NextResponse.json({ error: parentError }, { status: 400 })
+      }
+    }
+
+    const levelNo = Number(data.level_no ?? (parentAccountId ? 2 : 1))
+
+    const codeTaken = await sql`
+      SELECT id FROM account_tbl WHERE LOWER(code) = LOWER(${finalAccountCode}) AND id != ${id} AND status IN (1, 2) LIMIT 1
+    `
+    if (codeTaken.length > 0) {
+      return NextResponse.json({ error: "رقم الحساب مستخدم مسبقاً" }, { status: 400 })
+    }
+
+    await sql`
+      UPDATE account_tbl SET
+        code = ${finalAccountCode},
         name = ${accountName},
         name_lang2 = ${nameLang2},
         father_id = ${parentAccountId},
@@ -261,17 +320,9 @@ export async function PUT(request: NextRequest, { params }: { params: { id: stri
         status = ${statusCode},
         last_update_date = CURRENT_TIMESTAMP
       WHERE id = ${id}
-      RETURNING id
     `
 
-    if (updated.length === 0) {
-      return NextResponse.json({ error: "الحساب غير موجود" }, { status: 404 })
-    }
-
     await sql`DELETE FROM account_stop_transactions_tbl WHERE account_id = ${id}`
-    await sql`DELETE FROM account_costcenters_tbl WHERE account_id = ${id}`
-    await sql`DELETE FROM account_classifications_tbl WHERE account_id = ${id}`
-
     for (const row of stopTransactions) {
       const voucherTypeId = toNullableInt(row?.voucher_types_id)
       if (!voucherTypeId) continue
@@ -282,9 +333,10 @@ export async function PUT(request: NextRequest, { params }: { params: { id: stri
       `
     }
 
+    await sql`DELETE FROM account_costcenters_tbl WHERE account_id = ${id}`
     for (const row of costCenters) {
       const costCenterTypeId = toNullableInt(row?.cost_center_type_id)
-      const requiredInTransactions = toNullableInt(row?.required_in_transactions)
+      const requiredInTransactions = toNullableInt(row?.required_in_transactions ?? row?.status_id)
       const defaultCostCenterId = toNullableInt(row?.default_cost_center_id)
       if (!costCenterTypeId || !defaultCostCenterId) continue
       await sql`
@@ -293,6 +345,7 @@ export async function PUT(request: NextRequest, { params }: { params: { id: stri
       `
     }
 
+    await sql`DELETE FROM account_classifications_tbl WHERE account_id = ${id}`
     for (const row of accountClassifications) {
       const classificationId = toNullableInt(row?.classification_id)
       if (!classificationId) continue
@@ -302,7 +355,20 @@ export async function PUT(request: NextRequest, { params }: { params: { id: stri
       `
     }
 
-    const rows = await sql`
+    // فروع تقييد ظهور الحساب بالبحث (اختياري) — نفس منطق POST: حذف ثم إعادة إدراج.
+    await sql`DELETE FROM account_branches WHERE account_id = ${id}`
+    const branchIds = Array.isArray(data.branch_ids) ? data.branch_ids : []
+    for (const branchId of branchIds) {
+      const numericBranchId = toNullableInt(branchId)
+      if (!numericBranchId) continue
+      await sql`
+        INSERT INTO account_branches (account_id, branch_id)
+        VALUES (${id}, ${numericBranchId})
+        ON CONFLICT DO NOTHING
+      `
+    }
+
+    const updatedRows = await sql`
       SELECT
         a.id,
         a.company_id,
@@ -347,418 +413,101 @@ export async function PUT(request: NextRequest, { params }: { params: { id: stri
     `
 
     const stopRows = await sql`
-      SELECT id, account_id, voucher_types_id, stop_date
-      FROM account_stop_transactions_tbl
-      WHERE account_id = ${id}
-      ORDER BY id ASC
+      SELECT id, account_id, voucher_types_id, stop_date FROM account_stop_transactions_tbl
+      WHERE account_id = ${id} ORDER BY id ASC
     `
-
     const costRows = await sql`
       SELECT id, account_id, cost_center_type_id, required_in_transactions, default_cost_center_id
-      FROM account_costcenters_tbl
-      WHERE account_id = ${id}
-      ORDER BY id ASC
+      FROM account_costcenters_tbl WHERE account_id = ${id} ORDER BY id ASC
     `
-
     const classRows = await sql`
-      SELECT id, account_id, classification_id
-      FROM account_classifications_tbl
-      WHERE account_id = ${id}
-      ORDER BY id ASC
+      SELECT id, account_id, classification_id FROM account_classifications_tbl
+      WHERE account_id = ${id} ORDER BY id ASC
     `
 
-    return NextResponse.json(
-      mapAccountRow({
-        ...rows[0],
-        stop_transactions: stopRows,
-        cost_centers: costRows,
-        account_classifications: classRows,
-      }),
-    )
+    const item = mapAccountRow({
+      ...updatedRows[0],
+      stop_transactions: stopRows,
+      cost_centers: costRows,
+      account_classifications: classRows,
+    })
+
+    return NextResponse.json(item)
   } catch (error) {
     console.error("Error updating account:", error)
     return NextResponse.json({ error: "Failed to update account" }, { status: 500 })
   }
 }
 
-export async function GET(request: NextRequest, { params }: { params: { id: string } }) {
+
+// حذف حساب: لم يكن موجوداً أصلاً (كان الطلب يعود 405 فتظهر "فشل حذف الحساب"). يرفض برسالة واضحة إن كان الحساب:
+// أباً لحسابات أخرى، أو عليه حركات في السندات، أو مرتبطاً بعميل/مورد/مشترك، أو مستخدماً في سجل آخر (قيد مفتاح أجنبي).
+export async function DELETE(request: NextRequest, ctx: { params: Promise<{ id: string }> | { id: string } }) {
   try {
-    await ensureAccountsTable()
-    await ensureAccountRelatedTables()
+    if (!(await getSessionUser(request))) return NextResponse.json({ error: "يجب تسجيل الدخول" }, { status: 401 })
+    const id = Number((await ctx.params).id)
+    if (!Number.isInteger(id) || id <= 0) return NextResponse.json({ error: "معرف الحساب غير صالح" }, { status: 400 })
+    const account = (await sql`SELECT id, code, name, type FROM account_tbl WHERE id = ${id} LIMIT 1`)[0] as any
+    if (!account) return NextResponse.json({ error: "الحساب غير موجود" }, { status: 404 })
+    const authorization = await authorizeFile(request, accountFileFamilyForType(account.type), "delete")
+    if (!authorization.ok) return authorization.response
+    const label = `${account.code} - ${account.name}`
 
-    const id = Number.parseInt(params.id, 10)
-    if (Number.isNaN(id)) {
-      return NextResponse.json({ error: "معرف غير صالح" }, { status: 400 })
+    const children = (await sql`SELECT COUNT(*)::int AS count FROM account_tbl WHERE father_id = ${id}`)[0] as any
+    if (Number(children?.count) > 0) {
+      return NextResponse.json({ error: `لا يمكن حذف الحساب ${label} لأنه حساب أب لـ ${children.count} حساب فرعي — احذف الحسابات الفرعية أو انقلها أولاً` }, { status: 400 })
     }
 
-    const rows = await sql`
-      SELECT
-        a.id,
-        a.company_id,
-        a.code AS account_code,
-        a.type AS classification_type_id,
-        t.name AS classification_type_name,
-        a.name AS account_name,
-        a.name_lang2,
-        a.father_id AS parent_account_id,
-        pa.name AS parent_account_name,
-        a.level_no,
-        a.finanical_list_id,
-        a.finanical_list_assests_id,
-        a.finanical_list_liabilities_id,
-        a.finanical_list_income_id,
-        a.currency_id,
-        a.allow_trans_with_diff_curr,
-        a.iscalc_curr_diff_rates,
-        a.transaction_type,
-        a.transaction_type_action,
-        a.max_transaction_amount,
-        a.max_transaction_amount_action,
-        a.max_balance_amount,
-        a.max_balance_action,
-        a.budget_exceeding_perc,
-        a.budget_exceeding_action,
-        a.unified_report_account_no,
-        a.unified_report_group_code,
-        a.notes AS description,
-        a.show_notes_in_transactions_soa,
-        a.status,
-        a.insert_date AS created_at,
-        a.last_update_date AS updated_at,
-        0::NUMERIC AS opening_balance,
-        0::NUMERIC AS debit_amount,
-        0::NUMERIC AS credit_amount,
-        0::NUMERIC AS balance
-      FROM account_tbl a
-      LEFT JOIN account_classification_types t ON t.id = a.type
-      LEFT JOIN account_tbl pa ON pa.id = a.father_id
-      WHERE a.id = ${id}
-    `
-
-    if (rows.length === 0) {
-      return NextResponse.json({ error: "الحساب غير موجود" }, { status: 404 })
-    }
-
-    const stopRows = await sql`
-      SELECT id, account_id, voucher_types_id, stop_date
-      FROM account_stop_transactions_tbl
-      WHERE account_id = ${id}
-      ORDER BY id ASC
-    `
-
-    const costRows = await sql`
-      SELECT id, account_id, cost_center_type_id, required_in_transactions, default_cost_center_id
-      FROM account_costcenters_tbl
-      WHERE account_id = ${id}
-      ORDER BY id ASC
-    `
-
-    const classRows = await sql`
-      SELECT id, account_id, classification_id
-      FROM account_classifications_tbl
-      WHERE account_id = ${id}
-      ORDER BY id ASC
-    `
-
-    return NextResponse.json(
-      mapAccountRow({
-        ...rows[0],
-        stop_transactions: stopRows,
-        cost_centers: costRows,
-        account_classifications: classRows,
-      }),
-    )
-  } catch (error) {
-    console.error("Error fetching account:", error)
-    return NextResponse.json({ error: "Failed to fetch account" }, { status: 500 })
-  }
-}
-
-export async function POST(request: NextRequest) {
-  try {
-    await ensureAccountsTable()
-    await ensureAccountRelatedTables()
-
-    const data = await request.json()
-    // Support both naming conventions: account_code/account_name (API) and code/name (frontend)
-    let accountCode = String(data.account_code ?? data.code ?? "").trim()
-    const accountName = String(data.account_name ?? data.name ?? "").trim()
-    const classificationTypeId = toNullableInt(data.classification_type_id)
-    const parentAccountId = toNullableInt(data.parent_account_id ?? data.father_id)
-    const companyId = Number(data.company_id ?? 1)
-    const nameLang2 = String(data.name_lang2 ?? "").trim() || null
-    const levelNo = Number(data.level_no ?? (parentAccountId ? 2 : 1))
-    const financialListId = Number(data.finanical_list_id ?? 1)
-    const financialAssetsId = toNullableInt(data.finanical_list_assests_id)
-    const financialLiabilitiesId = toNullableInt(data.finanical_list_liabilities_id)
-    const financialIncomeId = toNullableInt(data.finanical_list_income_id)
-    const currencyId = toNullableInt(data.currency_id)
-    let allowTransWithDiffCurr = Number(data.allow_trans_with_diff_curr ?? 0)
-    if (!Number.isFinite(allowTransWithDiffCurr) || ![0, 1, 2].includes(allowTransWithDiffCurr)) {
-      allowTransWithDiffCurr = 0
-    }
-    const isCalcCurrDiffRates = toBool(data.iscalc_curr_diff_rates, false)
-    const transactionType = Number(data.transaction_type ?? 0)
-    const transactionTypeAction = Number(data.transaction_type_action ?? 0)
-    const maxTransactionAmount = Number(data.max_transaction_amount ?? 0)
-    const maxTransactionAmountAction = Number(data.max_transaction_amount_action ?? 0)
-    const maxBalanceAmount = Number(data.max_balance_amount ?? 0)
-    const maxBalanceAction = toNullableInt(data.max_balance_action)
-    const budgetExceedingPerc = toNullableFloat(data.budget_exceeding_perc)
-    const budgetExceedingAction = toNullableInt(data.budget_exceeding_action)
-    const unifiedReportAccountNo = String(data.unified_report_account_no ?? "").trim() || null
-    const unifiedReportGroupCode = String(data.unified_report_group_code ?? "").trim() || null
-    const description = String(data.description ?? "").trim() || null
-    const showNotesInTransactionsSoa = toBool(data.show_notes_in_transactions_soa, false)
-    const statusLabel = String(data.status ?? "نشط").trim()
-    const statusCode = statusLabelToCode(statusLabel)
-
-    const stopTransactions = Array.isArray(data.stop_transactions) ? data.stop_transactions : []
-    const costCenters = Array.isArray(data.cost_centers) ? data.cost_centers : []
-    const accountClassifications = Array.isArray(data.account_classifications) ? data.account_classifications : []
-
-    if (!accountCode) {
-      return NextResponse.json({ error: "رقم الحساب مطلوب" }, { status: 400 })
-    }
-
-    if (!accountName) {
-      return NextResponse.json({ error: "اسم الحساب مطلوب" }, { status: 400 })
-    }
-
-    // Check if code already exists
-    const existingCode = await sql`SELECT id FROM account_tbl WHERE LOWER(code) = LOWER(${accountCode})`
-    if (existingCode.length > 0) {
-      // Generate the next sequential code instead of erroring
-      const match = accountCode.match(/^([A-Za-z]*)(\d+)$/)
-      if (match) {
-        const prefix = match[1]
-        const currentNumber = parseInt(match[2], 10)
-        const nextNumber = currentNumber + 1
-        const numberLength = match[2].length
-        const newCode = prefix + String(nextNumber).padStart(numberLength, '0')
-        accountCode = newCode
-      } else {
-        // If code doesn't have numeric pattern, append _1
-        let counter = 1
-        let newCode = `${accountCode}_${counter}`
-        while (true) {
-          const checkCode = await sql`SELECT id FROM account_tbl WHERE LOWER(code) = LOWER(${newCode})`
-          if (checkCode.length === 0) {
-            accountCode = newCode
-            break
-          }
-          counter++
-        }
-      }
-    }
-
-    if (parentAccountId !== null) {
-      const parentExists = await sql`SELECT id FROM account_tbl WHERE id = ${parentAccountId}`
-      if (parentExists.length === 0) {
-        return NextResponse.json({ error: "الحساب الرئيسي غير موجود" }, { status: 400 })
-      }
-    }
-
-    const inserted = await sql`
-      INSERT INTO account_tbl (
-        company_id,
-        code,
-        type,
-        name,
-        name_lang2,
-        father_id,
-        level_no,
-        finanical_list_id,
-        finanical_list_assests_id,
-        finanical_list_liabilities_id,
-        finanical_list_income_id,
-        currency_id,
-        allow_trans_with_diff_curr,
-        iscalc_curr_diff_rates,
-        transaction_type,
-        transaction_type_action,
-        max_transaction_amount,
-        max_transaction_amount_action,
-        max_balance_amount,
-        max_balance_action,
-        budget_exceeding_perc,
-        budget_exceeding_action,
-        unified_report_account_no,
-        unified_report_group_code,
-        notes,
-        show_notes_in_transactions_soa,
-        status,
-        insert_date,
-        last_update_date
+    const usage = (await sql`
+      SELECT COUNT(DISTINCT vh.id)::int AS count,
+        (ARRAY_AGG(vh.vch_code ORDER BY vh.vch_date DESC, vh.id DESC))[1] AS last_code
+      FROM voucher_header_tbl vh
+      WHERE COALESCE(vh.status, 1) <> 3 AND vh.id IN (
+        SELECT voucher_id FROM voucher_journal_detail_tbl WHERE account_id = ${id}
+        UNION SELECT id FROM voucher_header_tbl WHERE account_id = ${id}
       )
-      VALUES (
-        ${companyId},
-        ${accountCode},
-        ${classificationTypeId},
-        ${accountName},
-        ${nameLang2},
-        ${parentAccountId},
-        ${levelNo},
-        ${financialListId},
-        ${financialAssetsId},
-        ${financialLiabilitiesId},
-        ${financialIncomeId},
-        ${currencyId},
-        ${allowTransWithDiffCurr},
-        ${isCalcCurrDiffRates},
-        ${transactionType},
-        ${transactionTypeAction},
-        ${maxTransactionAmount},
-        ${maxTransactionAmountAction},
-        ${maxBalanceAmount},
-        ${maxBalanceAction},
-        ${budgetExceedingPerc},
-        ${budgetExceedingAction},
-        ${unifiedReportAccountNo},
-        ${unifiedReportGroupCode},
-        ${description},
-        ${showNotesInTransactionsSoa},
-        ${statusCode},
-        CURRENT_DATE,
-        CURRENT_TIMESTAMP
-      )
-      RETURNING id
-    `
-
-    const id = inserted[0].id
-
-    for (const row of stopTransactions) {
-      const voucherTypeId = toNullableInt(row?.voucher_types_id)
-      if (!voucherTypeId) continue
-      const stopDateValue = row?.stop_date ? String(row.stop_date) : null
-      await sql`
-        INSERT INTO account_stop_transactions_tbl (account_id, voucher_types_id, stop_date)
-        VALUES (${id}, ${voucherTypeId}, ${stopDateValue})
-      `
+    `)[0] as any
+    if (Number(usage?.count) > 0) {
+      return NextResponse.json({ error: `لا يمكن حذف الحساب ${label} لوجود ${usage.count} سند عليه (آخرها ${usage.last_code || "—"}) — يمكنك إيقافه بدلاً من حذفه` }, { status: 400 })
     }
 
-    for (const row of costCenters) {
-      const costCenterTypeId = toNullableInt(row?.cost_center_type_id)
-      const requiredInTransactions = toNullableInt(row?.required_in_transactions)
-      const defaultCostCenterId = toNullableInt(row?.default_cost_center_id)
-      if (!costCenterTypeId && !defaultCostCenterId) continue
-      await sql`
-        INSERT INTO account_costcenters_tbl (account_id, cost_center_type_id, required_in_transactions, default_cost_center_id)
-        VALUES (${id}, ${costCenterTypeId}, ${requiredInTransactions}, ${defaultCostCenterId})
-      `
+    let party: any = null
+    try {
+      party = (await sql`SELECT name, type FROM customers WHERE account_id = ${id} AND COALESCE(isdeleted, false) = false LIMIT 1`)[0]
+    } catch { /* جدول العملاء غير موجود في هذه القاعدة */ }
+    if (party) {
+      const kind = Number(party.type) === 2 ? "المورد" : Number(party.type) === 3 ? "المشترك" : "العميل"
+      return NextResponse.json({ error: `لا يمكن حذف الحساب ${label} لأنه مرتبط بـ${kind} "${party.name}" — احذفه من شاشة ${kind === "المورد" ? "الموردين" : kind === "المشترك" ? "المشتركين" : "العملاء"}` }, { status: 400 })
     }
 
-    for (const row of accountClassifications) {
-      const classificationId = toNullableInt(row?.classification_id)
-      if (!classificationId) continue
-      await sql`
-        INSERT INTO account_classifications_tbl (account_id, classification_id)
-        VALUES (${id}, ${classificationId})
-      `
+    // الطلبيات تحفظ حساب العميل/المورد في customer_id
+    try {
+      const orders = (await sql`SELECT COUNT(*)::int AS count, (ARRAY_AGG(order_number ORDER BY id DESC))[1] AS last_code FROM orders WHERE customer_id = ${id} AND COALESCE(deleted, false) = false`)[0] as any
+      if (Number(orders?.count) > 0) {
+        return NextResponse.json({ error: `لا يمكن حذف الحساب ${label} لوجود ${orders.count} طلبية عليه (آخرها ${orders.last_code || "—"})` }, { status: 400 })
+      }
+    } catch { /* لا يوجد جدول طلبيات */ }
+
+    // أي ارتباط آخر: كل عمود يشير لحساب في أي جدول (…account_id، حسابات الأصناف/البنوك/نقاط البيع/الإعدادات…)
+    // عبر lib/delete-guard: يتجاهل الصفوف المحذوفة (حساب بنكي/بطاقة/صنف status = 3 أو deleted) فلا تمنع الحذف
+    const related = await findAccountUsages(id)
+    if (related.length) {
+      return NextResponse.json({ error: `لا يمكن حذف الحساب ${label} لارتباطه بـ: ${related.slice(0, 6).join("، ")}${related.length > 6 ? "…" : ""} — يمكنك إيقافه بدلاً من حذفه` }, { status: 400 })
     }
 
-    const rows = await sql`
-      SELECT
-        a.id,
-        a.company_id,
-        a.code AS account_code,
-        a.type AS classification_type_id,
-        t.name AS classification_type_name,
-        a.name AS account_name,
-        a.name_lang2,
-        a.father_id AS parent_account_id,
-        pa.name AS parent_account_name,
-        a.level_no,
-        a.finanical_list_id,
-        a.finanical_list_assests_id,
-        a.finanical_list_liabilities_id,
-        a.finanical_list_income_id,
-        a.currency_id,
-        a.allow_trans_with_diff_curr,
-        a.iscalc_curr_diff_rates,
-        a.transaction_type,
-        a.transaction_type_action,
-        a.max_transaction_amount,
-        a.max_transaction_amount_action,
-        a.max_balance_amount,
-        a.max_balance_action,
-        a.budget_exceeding_perc,
-        a.budget_exceeding_action,
-        a.unified_report_account_no,
-        a.unified_report_group_code,
-        a.notes AS description,
-        a.show_notes_in_transactions_soa,
-        a.status,
-        a.insert_date AS created_at,
-        a.last_update_date AS updated_at,
-        0::NUMERIC AS opening_balance,
-        0::NUMERIC AS debit_amount,
-        0::NUMERIC AS credit_amount,
-        0::NUMERIC AS balance
-      FROM account_tbl a
-      LEFT JOIN account_classification_types t ON t.id = a.type
-      LEFT JOIN account_tbl pa ON pa.id = a.father_id
-      WHERE a.id = ${id}
-    `
-
-    const stopRows = await sql`
-      SELECT id, account_id, voucher_types_id, stop_date
-      FROM account_stop_transactions_tbl
-      WHERE account_id = ${id}
-      ORDER BY id ASC
-    `
-
-    const costRows = await sql`
-      SELECT id, account_id, cost_center_type_id, required_in_transactions, default_cost_center_id
-      FROM account_costcenters_tbl
-      WHERE account_id = ${id}
-      ORDER BY id ASC
-    `
-
-    const classRows = await sql`
-      SELECT id, account_id, classification_id
-      FROM account_classifications_tbl
-      WHERE account_id = ${id}
-      ORDER BY id ASC
-    `
-
-    return NextResponse.json(
-      mapAccountRow({
-        ...rows[0],
-        stop_transactions: stopRows,
-        cost_centers: costRows,
-        account_classifications: classRows,
-      }),
-    )
-  } catch (error) {
-    console.error("Error creating account:", error)
-    return NextResponse.json({ error: "Failed to create account" }, { status: 500 })
-  }
-}
-
-export async function DELETE(_: NextRequest, { params }: { params: { id: string } }) {
-  try {
-    await ensureAccountsTable()
-
-    const id = Number.parseInt(params.id, 10)
-    if (Number.isNaN(id)) {
-      return NextResponse.json({ error: "معرف غير صالح" }, { status: 400 })
-    }
-
-    const result = await sql`
-      UPDATE account_tbl
-      SET status = 3, last_update_date = CURRENT_TIMESTAMP
-      WHERE id = ${id}
-      RETURNING id
-    `
-
-    if (result.length === 0) {
-      return NextResponse.json({ error: "الحساب غير موجود" }, { status: 404 })
-    }
-
+    await sql`DELETE FROM account_stop_transactions_tbl WHERE account_id = ${id}`
+    await sql`DELETE FROM account_costcenters_tbl WHERE account_id = ${id}`
+    await sql`DELETE FROM account_classifications_tbl WHERE account_id = ${id}`
+    try { await sql`DELETE FROM account_branches WHERE account_id = ${id}` } catch { /* لا يوجد جدول فروع الحساب */ }
+    await sql`DELETE FROM account_tbl WHERE id = ${id}`
     return NextResponse.json({ success: true })
-  } catch (error) {
+  } catch (error: any) {
+    // استخدام في جدول آخر لم يُفحص أعلاه (حساب بنكي، بطاقة، إعدادات افتراضية…)
+    if (error?.code === "23503") {
+      const table = String(error?.table || error?.detail || "").replace(/_tbl$/, "")
+      return NextResponse.json({ error: `لا يمكن حذف الحساب لأنه مستخدم في سجلات أخرى${table ? ` (${table})` : ""} — يمكنك إيقافه بدلاً من حذفه` }, { status: 400 })
+    }
     console.error("Error deleting account:", error)
-    return NextResponse.json({ error: "Failed to delete account" }, { status: 500 })
+    return NextResponse.json({ error: "تعذر حذف الحساب" }, { status: 500 })
   }
 }

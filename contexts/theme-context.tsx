@@ -1,6 +1,8 @@
 "use client"
 
-import { createContext, useContext, useEffect, useState, type ReactNode } from "react"
+import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from "react"
+import { isEnglish } from "@/lib/i18n"
+import { reapplyUserFont } from "@/lib/user-font"
 import { useTheme } from "next-themes"
 import { useAuth } from "@/components/auth/auth-context"
 
@@ -26,6 +28,7 @@ export interface ThemeSettings {
   rtl_support: boolean
   card_style: "flat" | "elevated" | "outlined"
   button_style: "rounded" | "square" | "pill"
+  toolbar_style: "modern" | "gradient" | "compact" | "classic"
   animation_speed: "slow" | "normal" | "fast"
   compact_mode: boolean
   high_contrast: boolean
@@ -36,7 +39,8 @@ export interface ThemeSettings {
 export interface ThemeContextType {
   settings: ThemeSettings
   updateSettings: (newSettings: Partial<ThemeSettings>) => void
-  saveSettings: () => Promise<void>
+  /** overrides: قيم تُحفظ فوراً (updateSettings لا تكون قد طُبِّقت على الحالة بعد عند استدعاء الحفظ مباشرة) */
+  saveSettings: (overrides?: Partial<ThemeSettings>) => Promise<void>
   resetToDefaults: () => void
   applyTheme: () => void
   loading: boolean
@@ -63,6 +67,7 @@ const defaultSettings: ThemeSettings = {
   rtl_support: true,
   card_style: "elevated",
   button_style: "rounded",
+  toolbar_style: "modern",
   animation_speed: "normal",
   compact_mode: false,
   high_contrast: false,
@@ -84,12 +89,15 @@ interface ThemeSettingsProviderProps {
 
 export function ThemeSettingsProvider({ children }: ThemeSettingsProviderProps) {
   const [settings, setSettings] = useState<ThemeSettings>(defaultSettings)
+  // true بعد تحميل إعدادات المستخدم من الخادم — قبلها لا يُحفظ شيء فوق الإعدادات المحفوظة بقيم افتراضية
+  const loadedRef = useRef(false)
+  const cacheKey = (userId: unknown) => `theme-settings:${String(userId || "")}`
   const [loading, setLoading] = useState(false) // Start with false to prevent blocking
   const [previewMode, setPreviewMode] = useState(false)
   const { setTheme } = useTheme()
   const { user } = useAuth()
 
-  const fetchSettings = async () => {
+  const fetchSettings = async (): Promise<ThemeSettings | null> => {
     try {
 
       const url = new URL("/api/settings/theme", window.location.origin)
@@ -99,7 +107,7 @@ export function ThemeSettingsProvider({ children }: ThemeSettingsProviderProps) 
       url.searchParams.set("organization_id", "1")
 
       const controller = new AbortController()
-      const timeoutId = setTimeout(() => controller.abort(), 5000)
+      const timeoutId = setTimeout(() => controller.abort(), 15000)
 
       const response = await fetch(url.toString(), {
         signal: controller.signal,
@@ -119,17 +127,20 @@ export function ThemeSettingsProvider({ children }: ThemeSettingsProviderProps) 
           theme_name: data.theme_name || defaultSettings.theme_name,
           primary_color: data.primary_color || defaultSettings.primary_color,
           font_family: data.font_family || defaultSettings.font_family,
+          toolbar_style: ["modern", "gradient", "compact", "classic"].includes(data.toolbar_style)
+            ? data.toolbar_style
+            : defaultSettings.toolbar_style,
           rtl_support: data.rtl_support !== undefined ? data.rtl_support : defaultSettings.rtl_support,
         }
         setSettings(loadedSettings)
-      } else {
-        setSettings(defaultSettings)
+        loadedRef.current = true
+        try { localStorage.setItem(cacheKey(user?.id), JSON.stringify(loadedSettings)) } catch { /* التخزين المحلي غير متاح */ }
+        return loadedSettings
       }
-    } catch (error) {
-      if (error instanceof Error && error.name === "AbortError") {
-      } else {
-      }
-      setSettings(defaultSettings)
+      // فشل التحميل: تبقى الإعدادات الحالية (المخزّنة محلياً) بدل الرجوع للافتراضي
+      return null
+    } catch {
+      return null
     }
   }
 
@@ -137,20 +148,24 @@ export function ThemeSettingsProvider({ children }: ThemeSettingsProviderProps) 
     setSettings((prev) => ({ ...prev, ...newSettings }))
   }
 
-  const saveSettings = async () => {
+  const saveSettings = async (overrides: Partial<ThemeSettings> = {}) => {
     try {
       console.log("[v0] Saving theme settings for user:", user?.id)
       console.log("[v0] Settings to save:", settings)
 
+      // لم تُحمَّل إعدادات المستخدم بعد (مثلاً زر الوضع الداكن فور فتح الصفحة): تُحمَّل أولاً حتى لا تُكتب
+      // القيم الافتراضية (مثل شكل شريط الأدوات) فوق إعداداته المحفوظة
+      const base = loadedRef.current ? settings : (await fetchSettings()) ?? settings
       const settingsToSave = {
-        ...settings,
+        ...base,
+        ...overrides,
         user_id: user?.id,
-        organization_id: settings.organization_id || 1,
+        organization_id: base.organization_id || 1,
       }
 
       console.log("[v0] Final settings payload:", settingsToSave)
 
-      const method = settings.id ? "PUT" : "POST"
+      const method = base.id ? "PUT" : "POST"
       console.log("[v0] Using HTTP method:", method)
 
       const response = await fetch("/api/settings/theme", {
@@ -167,6 +182,8 @@ export function ThemeSettingsProvider({ children }: ThemeSettingsProviderProps) 
       if (response.ok) {
         const savedData = await response.json()
         console.log("[v0] Theme settings saved successfully:", savedData)
+        loadedRef.current = true
+        try { localStorage.setItem(cacheKey(user?.id), JSON.stringify({ ...settingsToSave, id: savedData.id })) } catch { /* التخزين المحلي غير متاح */ }
 
         setSettings((prev) => ({
           ...prev,
@@ -212,23 +229,30 @@ export function ThemeSettingsProvider({ children }: ThemeSettingsProviderProps) 
     root.style.setProperty("--secondary-foreground", "#ffffff")
     root.style.setProperty("--accent", settings.accent_color)
     root.style.setProperty("--accent-foreground", "#ffffff")
-    root.style.setProperty("--background", settings.background_color)
-    root.style.setProperty("--foreground", settings.text_color)
+    // الوضع الداكن: ألوان الخلفية/النص/البطاقات/الحدود تأتي من رموز .dark في globals.css — لا تُكتب فوقها
+    // ألوان الوضع الفاتح المحفوظة كقيم مضمّنة (inline) وإلا تبقى الخلفيات بيضاء رغم تفعيل الداكن.
+    const darkOwned = ["--background", "--foreground", "--muted", "--muted-foreground", "--border", "--input", "--card", "--card-foreground"]
+    if (settings.dark_mode) darkOwned.forEach((name) => root.style.removeProperty(name))
+    if (!settings.dark_mode) root.style.setProperty("--background", settings.background_color)
+    if (!settings.dark_mode) root.style.setProperty("--foreground", settings.text_color)
 
     // Apply muted colors based on primary
     const primaryRgb = hexToRgb(settings.primary_color)
-    if (primaryRgb) {
+    if (primaryRgb && !settings.dark_mode) {
       root.style.setProperty("--muted", `rgb(${primaryRgb.r} ${primaryRgb.g} ${primaryRgb.b} / 0.1)`)
       root.style.setProperty("--muted-foreground", settings.text_color)
     }
 
     // Apply border and card colors
-    root.style.setProperty("--border", settings.dark_mode ? "#374151" : "#e5e7eb")
-    root.style.setProperty("--input", settings.dark_mode ? "#374151" : "#e5e7eb")
+    if (!settings.dark_mode) {
+      root.style.setProperty("--border", "#e5e7eb")
+      root.style.setProperty("--input", "#e5e7eb")
+    }
     root.style.setProperty("--ring", settings.primary_color)
 
-    // Card styling based on card_style
-    switch (settings.card_style) {
+    // Card styling based on card_style (الداكن: بطاقات من رموز .dark)
+    if (settings.dark_mode) root.style.setProperty("--card-shadow", "0 4px 6px -1px rgb(0 0 0 / 0.3)")
+    else switch (settings.card_style) {
       case "flat":
         root.style.setProperty("--card", settings.background_color)
         root.style.setProperty("--card-foreground", settings.text_color)
@@ -257,6 +281,7 @@ export function ThemeSettingsProvider({ children }: ThemeSettingsProviderProps) 
     root.style.setProperty("--border-radius-custom", `${settings.border_radius}px`)
     root.style.setProperty("--sidebar-width-custom", `${settings.sidebar_width}px`)
     root.style.setProperty("--header-height-custom", `${settings.header_height}px`)
+    root.dataset.toolbarStyle = settings.toolbar_style
 
     // Apply animation speed
     const animationDuration = {
@@ -286,18 +311,16 @@ export function ThemeSettingsProvider({ children }: ThemeSettingsProviderProps) 
       root.classList.remove("dark")
     }
 
-    // Apply RTL support
-    if (settings.rtl_support) {
-      root.setAttribute("dir", "rtl")
-    } else {
-      root.setAttribute("dir", "ltr")
-    }
+    // الاتجاه تحدده لغة الواجهة (lib/i18n.ts): الإنجليزية دائماً LTR، والعربية حسب إعداد rtl_support
+    root.setAttribute("dir", isEnglish() ? "ltr" : settings.rtl_support ? "rtl" : "ltr")
 
     // Apply to body
     document.body.style.fontSize = `${settings.font_size}px`
     document.body.style.fontFamily = settings.font_family
     document.body.style.lineHeight = settings.line_height.toString()
     document.body.style.letterSpacing = `${settings.letter_spacing}em`
+    // خط المستخدم (اعدادات الخطوط) يفوز دائماً على خط الثيم — وإلا يفوز آخر ما يُحمَّل فيظهر الخط "أحياناً" خطأ
+    reapplyUserFont()
   }
 
   // Helper function to convert hex to RGB
@@ -316,9 +339,13 @@ export function ThemeSettingsProvider({ children }: ThemeSettingsProviderProps) 
     // Apply default theme immediately
     applyTheme()
 
-    // Then try to fetch user settings in the background
+    // Then try to fetch user settings in the background (cached copy first so the page doesn't flip styles)
     if (user?.id) {
-      fetchSettings()
+      try {
+        const cached = localStorage.getItem(cacheKey(user.id))
+        if (cached) setSettings({ ...defaultSettings, ...JSON.parse(cached) })
+      } catch { /* تخزين محلي غير متاح أو تالف */ }
+      void fetchSettings()
     }
   }, [user])
 

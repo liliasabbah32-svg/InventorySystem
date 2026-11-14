@@ -1,14 +1,17 @@
+import { normalizeArabicSearch } from "@/lib/arabic-search"
+import { authorizeProductLookupScope } from "@/app/api/inventory/products/_permissions"
 
 import { type NextRequest, NextResponse } from "next/server"
-import { neon } from "@neondatabase/serverless"
-
-const sql = neon(process.env.DATABASE_URL!)
-
+import sql from "@/lib/database"
 export async function GET(request: NextRequest) {
   try {
+    const scope = await authorizeProductLookupScope(request)
+    if (!scope.ok) return scope.response
     const { searchParams } = new URL(request.url)
     const barcode = searchParams.get("barcode")
     const query = searchParams.get("q")
+    // بحث عربي متسامح (أ/إ/آ=ا، ة=ه، ى=ي...) — lib/arabic-search.ts
+    const arabicLike = `%${normalizeArabicSearch(String(query ?? "").trim())}%`
     const hasBarcode = searchParams.get("has_barcode")
 
     let products
@@ -31,6 +34,14 @@ export async function GET(request: NextRequest) {
         FROM products p
         LEFT JOIN product_stock ps ON p.id = ps.product_id
         WHERE p.barcode = ${barcode}
+          AND (
+            p.status IS NULL
+            OR p.status = 1
+            OR p.status = 'نشط'
+            OR p.status = 'active'
+            OR p.status = 'ACTIVE'
+          )
+          AND COALESCE(p.type, 1) = ANY(${scope.types}::int[])
         LIMIT 1
       `
     } else if (hasBarcode === "true") {
@@ -51,7 +62,16 @@ export async function GET(request: NextRequest) {
         FROM products p
         LEFT JOIN product_stock ps ON p.id = ps.product_id
         WHERE p.barcode IS NOT NULL AND p.barcode != ''
+          AND (
+            p.status IS NULL
+            OR p.status = 1
+            OR p.status = 'نشط'
+            OR p.status = 'active'
+            OR p.status = 'ACTIVE'
+          )
+          AND COALESCE(p.type, 1) = ANY(${scope.types}::int[])
         ORDER BY p.product_name
+          AND COALESCE(p.type, 1) = ANY(${scope.types}::int[])
         LIMIT 100
       `
     } else if (query) {
@@ -71,10 +91,19 @@ export async function GET(request: NextRequest) {
           COALESCE(ps.reorder_level, 0) as reorder_level
         FROM products p
         LEFT JOIN product_stock ps ON p.id = ps.product_id
-        WHERE 
-          p.product_name ILIKE ${`%${query}%`} OR
+        WHERE (
+          translate(lower(COALESCE(p.product_name, '')), 'أإآٱةىؤئ', 'ااااهيوي') LIKE ${arabicLike} OR
           p.product_code ILIKE ${`%${query}%`} OR
           p.barcode ILIKE ${`%${query}%`}
+        )
+          AND (
+            p.status IS NULL
+            OR p.status = 1
+            OR p.status = 'نشط'
+            OR p.status = 'active'
+            OR p.status = 'ACTIVE'
+          )
+          AND COALESCE(p.type, 1) = ANY(${scope.types}::int[])
         ORDER BY p.product_name
         LIMIT 50
       `

@@ -1,60 +1,63 @@
-
 import { type NextRequest, NextResponse } from "next/server"
-import { neon } from "@neondatabase/serverless"
+import { findUsages, usageMessage } from "@/lib/delete-guard"
+import sql from "../../../../lib/database"
 
-import { Pool } from "pg"
-
-let sql: any = null
-
-try {
-  if (!process.env.DATABASE_URL) {
-    console.error("[v0] DATABASE_URL environment variable is not set")
-  } else {
-    const dbUrl = process.env.DATABASE_URL
-
-    if (dbUrl.includes("localhost") || dbUrl.includes("127.0.0.1")) {
-      const pool = new Pool({ connectionString: dbUrl })
-      sql = async (strings: TemplateStringsArray, ...values: any[]) => {
-        const client = await pool.connect()
-        try {
-          const query =
-            strings.reduce(
-              (prev, curr, i) =>
-                prev + curr + (i < values.length ? `$${i + 1}` : ""),
-              ""
-            )
-          const result = await client.query(query, values)
-          return result.rows
-        } finally {
-          client.release()
-        }
-      }
-    } else {
-      console.log("[v0] Using Neon serverless client")
-      sql = neon(dbUrl)
-    }
-
-    console.log("[v0] Database client initialized successfully")
-  }
-} catch (error) {
-  console.error("[v0] Failed to initialize DB client:", error)
-  sql = null
+function getDatabaseErrorResponse() {
+  return NextResponse.json({ error: "قاعدة البيانات غير متاحة" }, { status: 500 })
 }
 
-export default sql
-export async function PUT(request: NextRequest) {
+export async function GET(request: NextRequest) {
+  if (!sql) return getDatabaseErrorResponse()
   try {
-    const data = await request.json()
+    await sql`ALTER TABLE cities ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`
+    await sql`ALTER TABLE cities ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`
 
-    if (!data.id || !data.name) {
-      return NextResponse.json({ error: "معرف المدينة واسمها مطلوبان" }, { status: 400 })
+    const url = new URL(request.url)
+    const id = Number(url.pathname.split("/").pop())
+    if (!id) {
+      return NextResponse.json({ error: "معرف المدينة مطلوب" }, { status: 400 })
     }
 
     const result = await sql`
+      SELECT id, name, status, created_at, updated_at
+      FROM cities
+      WHERE id = ${id}
+    `
+
+    if (result.length === 0) {
+      return NextResponse.json({ error: "المدينة غير موجودة" }, { status: 404 })
+    }
+
+    return NextResponse.json(result[0])
+  } catch (error) {
+    console.error("Error fetching city:", error)
+    return NextResponse.json({ error: "Failed to fetch city" }, { status: 500 })
+  }
+}
+
+export async function PUT(request: NextRequest) {
+  if (!sql) return getDatabaseErrorResponse()
+
+  try {
+    await sql`ALTER TABLE cities ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`
+    await sql`ALTER TABLE cities ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`
+
+    const url = new URL(request.url)
+    const id = Number(url.pathname.split("/").pop())
+    const data = await request.json()
+
+    if (!id || !data.name) {
+      return NextResponse.json({ error: "معرف المدينة واسمها مطلوبان" }, { status: 400 })
+    }
+
+    const status = Number(data.status)
+    const normalizedStatus = status === 2 ? 2 : status === 3 ? 3 : 1
+
+    const result = await sql`
       UPDATE cities
-      SET name = ${data.name}
-      WHERE id = ${data.id}
-      RETURNING *
+      SET name = ${data.name}, status = ${normalizedStatus}, updated_at = CURRENT_TIMESTAMP
+      WHERE id = ${id}
+      RETURNING id, name, status, created_at, updated_at
     `
 
     if (result.length === 0) {
@@ -67,3 +70,40 @@ export async function PUT(request: NextRequest) {
     return NextResponse.json({ error: "Failed to update city" }, { status: 500 })
   }
 }
+
+export async function DELETE(request: NextRequest) {
+  if (!sql) return getDatabaseErrorResponse()
+
+  try {
+    await sql`ALTER TABLE cities ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`
+    await sql`ALTER TABLE cities ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`
+
+    const url = new URL(request.url)
+    const id = Number(url.pathname.split("/").pop())
+    if (!id) {
+      return NextResponse.json({ error: "معرف المدينة مطلوب" }, { status: 400 })
+    }
+
+    // فحص الارتباط قبل الحذف: لا يُحذف تعريف مستخدم في تعريفات أخرى أو حركات (lib/delete-guard.ts)
+    const usageRow = (await sql`SELECT * FROM cities WHERE id = ${id}`)[0] as any
+    const usages = await findUsages(id, { idColumns: /^city_id$/, textColumns: /^city$/, excludeTables: ["cities"], textValues: [usageRow?.name, id] })
+    if (usages.length) return NextResponse.json({ error: usageMessage("المدينة", String(usageRow?.name || ""), usages) }, { status: 400 })
+
+    const result = await sql`
+      UPDATE cities
+      SET status = 3, updated_at = CURRENT_TIMESTAMP
+      WHERE id = ${id}
+      RETURNING id
+    `
+
+    if (result.length === 0) {
+      return NextResponse.json({ error: "المدينة غير موجودة" }, { status: 404 })
+    }
+
+    return NextResponse.json({ success: true })
+  } catch (error) {
+    console.error("Error deleting city:", error)
+    return NextResponse.json({ error: "Failed to delete city" }, { status: 500 })
+  }
+}
+

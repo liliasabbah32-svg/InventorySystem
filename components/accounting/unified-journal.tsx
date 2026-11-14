@@ -1,0 +1,1454 @@
+"use client"
+
+import { tr, appDir } from "@/lib/i18n"
+import { useEffect, useMemo, useRef, useState } from "react"
+import { armVoucherWhatsApp } from "@/lib/voucher-print/whatsapp-share"
+import { Plus, ListPlus, Paperclip, FileText } from "lucide-react"
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog"
+import { useWorkspace } from "@/contexts/workspace-context"
+import { Input } from "@/components/ui/input"
+import { Label } from "@/components/ui/label"
+import { Button } from "@/components/ui/button"
+import { Textarea } from "@/components/ui/textarea"
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
+import { UniversalToolbar } from "@/components/ui/universal-toolbar"
+import ConfirmDialogYesNo from "@/components/ui/ConfirmDialogYesNo"
+import Messages from "@/components/common/Messages"
+import ProgressSpinner from "@/components/ProgressSpinner/ProgressSpinner"
+import DataGridView from "@/components/common/DataGridView"
+import DateTimeControl from "@/components/common/date-time-control"
+import PostVoucherDialog, { type PostVoucherAction } from "@/components/common/post-voucher-dialog"
+import AccountSearchDialog, { type AccountItem, isParentAccount, PARENT_ACCOUNT_MESSAGE } from "@/components/customer/account-search-dialog"
+import AccountCostCenters, { type JournalCostCenterSelection } from "@/components/customer/account-cost-centers"
+import Util from "@/components/common/Util"
+import { useToast } from "@/hooks/use-toast"
+import { CellRange, KeyAction } from "@grapecity/wijmo.grid"
+import PrimeDropdown from "@/components/common/FocusDropdown"
+import TransactionBranchField from "@/components/common/transaction-branch-field"
+import { useWorkspaceTabActive } from "@/contexts/workspace-tab-context"
+import { useNavigationGuard } from "@/lib/navigation-guard"
+import { keepDialogOpenOnEscape } from "@/lib/dialog-escape"
+import { VoucherSearchButton, VoucherSearchDialog } from "@/components/common/voucher-search-dialog"
+import { useTransactionSuccessMessages } from "@/lib/transaction-success"
+
+const voucherTabTriggerClass =
+  "data-[state=active]:bg-gradient-to-r data-[state=active]:from-emerald-500 data-[state=active]:to-teal-600 data-[state=active]:text-white data-[state=active]:shadow-md"
+
+export interface JournalEntryRow {
+  account_id: number | null
+  account_code: string
+  account_name: string
+  debit: number | null
+  credit: number | null
+  note: string
+  cost_centers: JournalCostCenterSelection[]
+}
+
+export interface JournalNoteRow {
+  note: string
+}
+
+export interface JournalVoucherRecord {
+  id: number
+  vch_code: string
+  vch_date: string
+  vch_book_id: number | null
+  branch_id: number | null
+  currency_id: number | null
+  rate: number
+  amount?: number
+  manual_voucher: string
+  manual_date: string
+  payment_classification_id: number | null
+  salesman_id: number | null
+  note: string
+  status: number
+  is_printed?: number
+  journal: JournalEntryRow[]
+  notes: JournalNoteRow[]
+}
+
+interface CurrencyOption {
+  currency_id?: number
+  id?: number
+  currency_name?: string
+  currency_code?: string
+}
+
+interface LookupOption {
+  id: number
+  name: string
+}
+
+interface UnifiedJournalProps {
+  dialogOpen: boolean
+  currentIndex: number
+  totalRecords: number
+  currencies?: CurrencyOption[]
+  voucherBooks?: LookupOption[]
+  salesmen?: LookupOption[]
+  paymentClassifications?: LookupOption[]
+  form: JournalVoucherRecord
+  isSaving: boolean
+  showDeleteConfirm?: boolean
+  onOpenChange: (open: boolean) => void
+  onNew?: () => void
+  onSave: (action?: PostVoucherAction) => void
+  onValidateSave?: () => string | null
+  onDelete?: () => void
+  onClone?: () => void
+  onPrint?: () => void
+  onNavigateRecord?: (record: JournalVoucherRecord) => void
+  onFormChange: (field: string, value: string | number | null) => void
+  onBookChange?: (bookId: number | null) => void
+  onCodeResolved?: (id: number) => void
+  onCodeNotFound?: (code: string) => void
+  onJournalChange: (journal: JournalEntryRow[]) => void
+  onNotesChange: (notes: JournalNoteRow[]) => void
+  onConfirmDelete?: () => void
+  onCancelDelete?: () => void
+  canSave?: boolean
+  isFirstRecord?: boolean
+  isLastRecord?: boolean
+  isNewMode?: boolean
+  errorMessages?: string[]
+}
+
+const emptyJournalRow: JournalEntryRow = {
+  account_id: null,
+  account_code: "",
+  account_name: "",
+  debit: null,
+  credit: null,
+  note: "",
+  cost_centers: [],
+}
+
+// بصمة "ما أدخله المستخدم" للتحقق من التغييرات — بدل مقارنة النموذج كاملاً بـ JSON: الحقول التي تُعبّأ
+// آلياً بعد فتح النافذة (رقم السند ودفتره وصياغته، العملة وسعرها الافتراضيان، أسطر فارغة تضيفها الشبكة،
+// null مقابل 0) كانت تُظهر "تم تعديل البيانات" دون أن يلمس المستخدم شيئاً. الأسطر الفارغة تماماً تُهمَل.
+const journalDirtySignature = (form: { [key: string]: any }) => {
+  const amount = (value: unknown) => Math.round(Number(value || 0) * 1000) / 1000
+  const rows = (Array.isArray(form.journal) ? form.journal : [])
+    .map((row: any) => ({
+      account: Number(row.account_id) || null,
+      debit: amount(row.debit),
+      credit: amount(row.credit),
+      note: String(row.note || "").trim(),
+      centers: (Array.isArray(row.cost_centers) ? row.cost_centers : []).map((center: any) => Number(center?.cost_center_id) || 0).filter(Boolean),
+    }))
+    .filter((row: any) => row.account || row.debit || row.credit || row.note || row.centers.length)
+  const notes = (Array.isArray(form.notes) ? form.notes : []).map((row: any) => String(row?.note || "").trim()).filter(Boolean)
+  return JSON.stringify({
+    id: Number(form.id) || 0,
+    date: String(form.vch_date || "").slice(0, 10),
+    manualVoucher: String(form.manual_voucher || "").trim(),
+    manualDate: String(form.manual_date || "").slice(0, 10),
+    note: String(form.note || "").trim(),
+    salesman: Number(form.salesman_id) || null,
+    classification: Number(form.payment_classification_id) || null,
+    rows,
+    notes,
+  })
+}
+
+const normalizeVoucherCode = (value: string) => value.toUpperCase().replace(/[^A-Z0-9-]/g, "").slice(0, 10)
+const numberValue = (value: number | null | undefined) => (value === null || value === undefined ? "" : String(value))
+
+const selectCell = (grid: any, row: number, colName: string) => {
+  if (!grid || !grid.columns) return
+  const colIndex = grid.columns.findIndex((c: any) => c.binding === colName)
+  if (colIndex >= 0) grid.select(new CellRange(row, colIndex))
+}
+
+// بعد التبديل إلى تبويب "الحسابات" قد يُعاد إنشاء الشبكة (Radix يُلغي تركيب التبويبات غير
+// النشطة)، فيتأخر جاهزية gridRef.current قليلاً — نعيد المحاولة بدل الاعتماد على مهلة ثابتة
+// قد تسبق اكتمال إعادة التركيب فتترك grid كائناً قديماً بلا columns.
+const waitForGridReady = (getGrid: () => any, onReady: (grid: any) => void, attempts = 10) => {
+  const grid = getGrid()
+  if (grid && grid.columns) {
+    onReady(grid)
+    return
+  }
+  if (attempts <= 0) return
+  setTimeout(() => waitForGridReady(getGrid, onReady, attempts - 1), 50)
+}
+
+const blockNonNumericKey = (e: React.KeyboardEvent<HTMLInputElement>) => {
+  const controlKeys = ["Backspace", "Delete", "Tab", "Enter", "ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End"]
+  if (e.ctrlKey || e.metaKey || e.altKey || controlKeys.includes(e.key)) return
+  if (e.key.length === 1 && !/[0-9.]/.test(e.key)) e.preventDefault()
+}
+
+const ACCOUNT_CODE_LENGTH = 10
+
+// "c1" -> "C000000001", "1" -> "0000000001" — يُكمَّل الجزء الرقمي بأصفار حتى الطول القياسي لرقم
+// الحساب (مطابق لـ Util.adjustCode في النظام المرجعي)، دون تقصير رمز مكتمل الطول أصلاً.
+const adjustAccountCode = (raw: string): string => {
+  const upper = raw.trim().toUpperCase()
+  const match = upper.match(/^([A-Z]*)(\d+)$/)
+  if (!match) return upper
+  const [, prefix, digits] = match
+  const digitsLength = Math.max(1, ACCOUNT_CODE_LENGTH - prefix.length)
+  if (digits.length >= digitsLength) return upper
+  return prefix + digits.padStart(digitsLength, "0")
+}
+
+const FOCUSABLE_SELECTOR =
+  'input:not([disabled]):not([type="hidden"]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+
+const focusNextInContainer = (container: HTMLElement, current: HTMLElement) => {
+  // PrimeReact Dropdown يُدرج <select tabIndex={-1}> مخفياً (توافق نماذج/تعبئة تلقائية) يقع مباشرة
+  // بعد حقل التركيز الحقيقي بالـDOM — يطابقه "select:not([disabled])" بمحدد FOCUSABLE_SELECTOR رغم
+  // tabIndex=-1 (المحدد لا يفحصه لعناصر <select>)، فيسرق التركيز عند Enter بدل الحقل التالي الفعلي.
+  // استبعاد tabIndex=-1 صراحةً هنا يُصلح ذلك دون المساس بحقل الإدخال الحقيقي (tabIndex=0).
+  const focusable = Array.from(container.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)).filter(
+    (el) => el.offsetParent !== null && el.tabIndex !== -1 && !el.closest(".wj-flexgrid"),
+  )
+  const currentIndex = focusable.indexOf(current)
+  if (currentIndex === -1) return
+  focusable[currentIndex + 1]?.focus()
+}
+
+// السماح بالـ Enter للتنقّل كـ Tab بين حقول الرأس (خارج شبكة الحسابات وقوائم الاختيار، التي
+// لها منطقها الخاص أدناه).
+const handleFormEnterAsTab = (event: React.KeyboardEvent<HTMLDivElement>) => {
+  if (event.key !== "Enter") return
+  const target = event.target as HTMLElement
+  if (target.tagName === "TEXTAREA" || target.tagName === "BUTTON") return
+  if (target.closest(".wj-flexgrid")) return
+  event.preventDefault()
+  focusNextInContainer(event.currentTarget, target)
+}
+
+// تنقّل بالأسهم في قوائم الاختيار (PrimeDropdown) دون فتح لوحة الخيارات — يغيّر القيمة مباشرة
+// كأنه <select> عادي، ويمنع فتح اللوحة عند Enter (يتصرف بدلاً منها كـ Tab للحقل التالي).
+// يُلتقط في مرحلة الالتقاط (capture) ليسبق معالجة PrimeReact الداخلية للسهمين/Enter.
+const createDropdownKeyHandler = (
+  options: any[],
+  optionValueKey: string,
+  currentValue: any,
+  onSelect: (value: any) => void,
+) => (event: React.KeyboardEvent<HTMLDivElement>) => {
+  if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+    event.preventDefault()
+    event.stopPropagation()
+    if (!options.length) return
+    const currentIndex = options.findIndex((opt) => opt[optionValueKey] === currentValue)
+    const nextIndex =
+      event.key === "ArrowDown"
+        ? currentIndex < 0
+          ? 0
+          : Math.min(currentIndex + 1, options.length - 1)
+        : currentIndex < 0
+          ? options.length - 1
+          : Math.max(currentIndex - 1, 0)
+    onSelect(options[nextIndex][optionValueKey])
+  } else if (event.key === "Enter") {
+    event.preventDefault()
+    event.stopPropagation()
+    const target = event.target as HTMLElement
+    const container = target.closest<HTMLElement>('[data-enter-tab-root="true"]')
+    if (container) focusNextInContainer(container, target)
+  }
+}
+
+const mapAccount = (item: any): AccountItem => ({
+  id: Number(item.id),
+  has_children: item.has_children == null ? undefined : Boolean(item.has_children),
+  code: String(item.code || item.account_code || ""),
+  name: String(item.name || item.account_name || ""),
+  name_lang2: item.name_lang2 ?? null,
+  level_no: Number(item.level_no || 1),
+  finanical_list_id: Number(item.finanical_list_id || 1),
+  currency_id: item.currency_id != null ? Number(item.currency_id) : null,
+  allow_trans_with_diff_curr: Number(item.allow_trans_with_diff_curr || 0),
+  iscalc_curr_diff_rates: Boolean(item.iscalc_curr_diff_rates),
+  transaction_type: Number(item.transaction_type || 0),
+  transaction_type_action: Number(item.transaction_type_action || 0),
+  max_transaction_amount: Number(item.max_transaction_amount || 0),
+  max_transaction_amount_action: Number(item.max_transaction_amount_action || 0),
+  max_balance_amount: Number(item.max_balance_amount || 0),
+  show_notes_in_transactions_soa: Boolean(item.show_notes_in_transactions_soa),
+  status: item.status || "نشط",
+  cost_centers: Array.isArray(item.cost_centers) ? item.cost_centers : [],
+})
+
+export default function UnifiedJournal({
+  dialogOpen,
+  currentIndex,
+  totalRecords,
+  currencies = [],
+  voucherBooks = [],
+  salesmen = [],
+  paymentClassifications = [],
+  form,
+  isSaving,
+  showDeleteConfirm = false,
+  onOpenChange,
+  onNew,
+  onSave,
+  onValidateSave,
+  onDelete,
+  onClone,
+  onPrint,
+  onNavigateRecord,
+  onFormChange,
+  onBookChange,
+  onCodeResolved,
+  onCodeNotFound,
+  onJournalChange,
+  onNotesChange,
+  onConfirmDelete = () => undefined,
+  onCancelDelete = () => undefined,
+  canSave,
+  isFirstRecord,
+  isLastRecord,
+  isNewMode,
+  errorMessages = [],
+}: UnifiedJournalProps) {
+  const workspaceTabActive = useWorkspaceTabActive()
+  const { fullscreenEnabled } = useWorkspace()
+  const dateInputRef = useRef<HTMLInputElement | null>(null)
+  const messagesRef = useRef<any>(null)
+  // "تمت العملية بنجاح" بعد حفظ السند (lib/transaction-success.ts)
+  useTransactionSuccessMessages(messagesRef)
+  const { toast } = useToast()
+  const [activeTab, setActiveTab] = useState("journal")
+  const [voucherCodeDraft, setVoucherCodeDraft] = useState(form.vch_code || "")
+  const [navLoading, setNavLoading] = useState(false)
+  const [accountsList, setAccountsList] = useState<AccountItem[]>([])
+  const [journalSearchOpen, setJournalSearchOpen] = useState(false)
+  const [journalSearchRow, setJournalSearchRow] = useState<number | null>(null)
+  const openJournalAccountSearch = (row: number) => {
+    setJournalSearchRow(row)
+    setJournalSearchOpen(true)
+  }
+  const [costCenterOpen, setCostCenterOpen] = useState(false)
+  const [costCenterAccount, setCostCenterAccount] = useState<AccountItem | null>(null)
+  const [costCenterRow, setCostCenterRow] = useState<number | null>(null)
+  const gridRef = useRef<any>(null)
+  const pendingJournalFocusRef = useRef<{ row: number; colName: string } | null>(null)
+  // يميّز نافذة بحث الحساب بين "تم الاختيار" (ينتقل التركيز إلى مدين) و"إلغاء/إغلاق دون اختيار"
+  // (يعود التركيز إلى رقم الحساب) — كلا المسارين يُغلقان النافذة عبر onOpenChange نفسه.
+  const accountJustSelectedRef = useRef(false)
+  const accountsListRef = useRef<AccountItem[]>([])
+  const accountsFetchRef = useRef<Promise<AccountItem[]> | null>(null)
+  const [postDialogOpen, setPostDialogOpen] = useState(false)
+  // سند مُرحَّل (status=2): مقفل بالكامل، لا يُعدَّل إلا عبر إلغائه منطقياً (زر حذف).
+  const isPosted = form.status === 2
+  // مقفل بالكامل (نموذج + شبكة الحسابات للقراءة فقط) لكلا الحالتين: مُرحَّل (2) أو ملغي منطقياً
+  // (3) — لا فرق بينهما من ناحية إمكانية التعديل، الفرق فقط في نص رسالة تأكيد الحذف أدناه.
+  const isLocked = form.status === 2 || form.status === 3
+  // شارة الحالة في عنوان النافذة: ملغي منطقياً (status=3) تطغى على أي شيء آخر؛ خلاف ذلك
+  // "مرحل" وحدها إن لم تُطبع بعد، أو "مرحل - مطبوع" إن طُبعت (is_printed=1) بعد الترحيل.
+  const statusBadge =
+    form.status === 3 ? "ملغي منطقياً" : form.status === 2 ? (form.is_printed === 1 ? "معتمد - مطبوع" : "معتمد") : ""
+
+  useEffect(() => {
+    setVoucherCodeDraft(form.vch_code || "")
+  }, [form.id, form.vch_code])
+
+  // يضمن اكتمال جلب الحسابات قبل أي محاولة مطابقة رقم حساب — بدونه، الضغط على Enter بسرعة
+  // فور فتح النافذة (قبل اكتمال fetch الأولي) يُظهر "لا يوجد حساب بهذا الرقم" رغم وجوده فعلياً.
+  const ensureAccountsLoaded = (): Promise<AccountItem[]> => {
+    if (accountsListRef.current.length > 0) return Promise.resolve(accountsListRef.current)
+    if (!accountsFetchRef.current) {
+      accountsFetchRef.current = fetch("/api/accounts")
+        .then((r) => (r.ok ? r.json() : []))
+        .then((data) => {
+          const mapped = Array.isArray(data) ? data.map(mapAccount) : []
+          accountsListRef.current = mapped
+          setAccountsList(mapped)
+          return mapped
+        })
+        .catch(() => {
+          accountsListRef.current = []
+          setAccountsList([])
+          return []
+        })
+    }
+    return accountsFetchRef.current
+  }
+
+  useEffect(() => {
+    if (!dialogOpen) return
+    void ensureAccountsLoaded()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dialogOpen])
+
+  useEffect(() => {
+    if (errorMessages.length > 0) {
+      messagesRef.current?.clear?.()
+      messagesRef.current?.show(
+        errorMessages.map((detail) => ({ severity: "error", summary: "", detail, sticky: false, life: 5000 })),
+      )
+    }
+  }, [errorMessages])
+
+  const latestFormRef = useRef(form)
+  latestFormRef.current = form
+  const initialSnapshotRef = useRef<string>(journalDirtySignature(form))
+  const [showUnsavedConfirm, setShowUnsavedConfirm] = useState(false)
+  const pendingActionRef = useRef<(() => void) | null>(null)
+
+  useEffect(() => {
+    const snapshotTimer = window.setTimeout(() => {
+      initialSnapshotRef.current = journalDirtySignature(latestFormRef.current)
+    }, 0)
+    setActiveTab("journal")
+    return () => window.clearTimeout(snapshotTimer)
+    // form.vch_code يتغيّر أيضاً عند إعادة تصفير النموذج لمسودة جديدة بعد حفظ ناجح (id يبقى 0 في
+    // الحالتين) — بدونه تبقى initialSnapshotRef محتفظة بلقطة المسودة القديمة (قبل الحفظ)، فتُقارَن
+    // المسودة الجديدة الفارغة بها وتظهر "تم تعديل البيانات، هل تريد الحفظ؟" رغم عدم لمس المستخدم لها.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dialogOpen, form.id, form.vch_code, isNewMode, isSaving])
+
+  const isFormDirty = () => journalDirtySignature(form) !== initialSnapshotRef.current
+
+  const guardedAction = (action: () => void) => {
+    if ([2, 3].includes(Number(form.status))) { action(); return }
+    if (showUnsavedConfirm) return
+    if (isLocked) {
+      action()
+      return
+    }
+    if (isFormDirty()) {
+      pendingActionRef.current = action
+      setShowUnsavedConfirm(true)
+    } else {
+      action()
+    }
+  }
+  // تبديل الشاشة من القائمة/إغلاق التبويب/رجوع المتصفح/تحديث الصفحة مع تغييرات غير محفوظة ⇐ نفس نافذة
+  // التحقق من التغييرات (حفظ/عدم حفظ/إلغاء) — كما في كاشير نقطة البيع (lib/navigation-guard.ts)
+  useNavigationGuard(
+    () => dialogOpen && ![2, 3].includes(Number(form.status)) && !isLocked && isFormDirty(),
+    (continueNavigation) => guardedAction(continueNavigation),
+  )
+
+  // بحث السندات (زر بجانب رقم السند): اختيار سند يمرّ بنافذة التحقق من التغييرات ثم يعرضه
+  const [voucherSearchOpen, setVoucherSearchOpen] = useState(false)
+  const openSearchedVoucher = (voucherId: number) => guardedAction(async () => {
+    const response = await fetch(`/api/journal-vouchers/${voucherId}`, { cache: "no-store" })
+    const record = await response.json().catch(() => null)
+    if (!response.ok || !record?.id) {
+      messagesRef.current?.show?.([{ severity: "error", summary: "", detail: record?.error || tr("تعذر عرض السند"), life: 3000 }])
+      return
+    }
+    onNavigateRecord?.(record)
+  })
+
+
+  // يتحقق من صحة السند قبل عرض نافذة "كيف تريد الحفظ؟" — لا فائدة من تخيير المستخدم بين حفظ/ترحيل/طباعة
+  // لسند غير صالح أصلاً (رقم ناقص، قيد غير متوازن...)؛ رسالة الخطأ تظهر مباشرة بدل فتح النافذة.
+  const requestSaveRef = useRef<() => void>(() => {})
+  const handleRequestSave = () => {
+    if (isLocked) return
+    const liveGrid = getGrid()
+    if (liveGrid?.activeEditor) liveGrid.finishEditing()
+    // الحفظ من تبويب آخر (بيانات اضافية/ملاحظات) يفتح تبويب الحسابات أولاً ثم يتابع الحفظ.
+    if (activeTab !== "journal") {
+      setActiveTab("journal")
+      requestAnimationFrame(() => requestAnimationFrame(() => requestSaveRef.current()))
+      return
+    }
+    const error = onValidateSave?.()
+    if (error) {
+      messagesRef.current?.clear?.()
+      messagesRef.current?.show?.([{ severity: "error", summary: "", detail: error, sticky: false, life: 4000 }])
+      return
+    }
+    setPostDialogOpen(true)
+  }
+  requestSaveRef.current = handleRequestSave
+
+  // F3 حفظ / F9 حذف / F4 نسخ / F5 جديد / Ctrl+P طباعة: يتولاها UniversalToolbar (lib/hotkeys.ts)
+
+  useEffect(() => {
+    if (typeof window === "undefined" || !dialogOpen) return
+    const t = setTimeout(() => dateInputRef.current?.focus(), 120)
+    return () => clearTimeout(t)
+    // form.vch_code يتغيّر أيضاً عند الضغط على "جديد" مرتين متتاليتين قبل الحفظ (id يبقى 0 في
+    // الحالتين)، لذا نعتمد عليه أيضاً حتى تعمل إعادة تركيز التاريخ في هذه الحالة أيضاً.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dialogOpen, form.id, form.vch_code, isNewMode])
+
+  const navigationPending = useRef(false)
+  const handleNavigate = async (direction: "first" | "previous" | "next" | "last") => {
+    if (navigationPending.current || isSaving) return
+    navigationPending.current = true
+    setNavLoading(true)
+    try {
+      const currentId = form.id > 0 ? form.id : 0
+      const isNewRecord = form.id <= 0
+      const effectiveDirection =
+        direction === "previous" && isNewRecord ? "last" : direction === "next" && isNewRecord ? "first" : direction
+
+      const query = new URLSearchParams()
+      if (effectiveDirection === "previous" || effectiveDirection === "next") query.set("currentId", String(currentId))
+
+      const response = await fetch(`/api/journal-vouchers/navigation/${effectiveDirection}?${query.toString()}`, { cache: "no-store" })
+      if (!response.ok) return
+
+      const record = await response.json()
+      if (record?.id) onNavigateRecord?.(record)
+    } catch (error) {
+      console.error("Failed to navigate journal voucher", error)
+    } finally {
+      navigationPending.current = false
+      setNavLoading(false)
+    }
+  }
+
+  // كتابة يدوية في رقم السند تُعاد صياغتها دائماً كـ {بادئة}{رمز الدفتر}{تسلسل مبطّن} عبر
+  // /resolve-code، ثم يُعرض السند إن كان موجوداً بهذا الرقم، أو تُصفَّر الحقول لسند جديد بهذا الرقم.
+  const handleCodeBlur = async (draftValue = voucherCodeDraft) => {
+    const normalizedDraft = normalizeVoucherCode(draftValue)
+    if (normalizedDraft !== form.vch_code) onFormChange("vch_code", normalizedDraft)
+    const raw = normalizedDraft.trim()
+    if (!raw) return
+    try {
+      const query = new URLSearchParams({ raw })
+      if (form.vch_book_id) query.set("vch_book_id", String(form.vch_book_id))
+      if ((form as any).branch_id) query.set("branch_id", String((form as any).branch_id))
+      const response = await fetch(`/api/journal-vouchers/resolve-code?${query.toString()}`)
+      const data = await response.json()
+      if (!response.ok) {
+        messagesRef.current?.show?.([{ severity: "error", summary: "", detail: data.error || tr("تعذر تحديد رقم السند"), life: 3000 }])
+        return
+      }
+      if (data.code && data.code !== form.vch_code) onFormChange("vch_code", data.code)
+      if (data.exists && data.id) {
+        if (data.id === form.id) return
+        await onCodeResolved?.(data.id)
+      } else if (!data.exists && data.code) {
+        onCodeNotFound?.(data.code)
+      }
+    } catch (error) {
+      console.error("Failed to resolve journal voucher code", error)
+    }
+  }
+
+  // ---- الحسابات (مدين/دائن) ----
+  const journal = form.journal || []
+  const totalDebit = journal.reduce((sum, row) => sum + Number(row.debit || 0), 0)
+  const totalCredit = journal.reduce((sum, row) => sum + Number(row.credit || 0), 0)
+  const journalDiff = Math.round((totalDebit - totalCredit) * 100) / 100
+
+  const journalRef = useRef(journal)
+  journalRef.current = journal
+
+  // gridRef يحمل غلاف React لـ FlexGrid عند التركيب، والـ control نفسه بعد أول مفتاح — نتعامل مع الحالتين
+  const getGrid = () => {
+    const current = gridRef.current
+    return current?.control ?? current
+  }
+
+  // سبب قفز المؤشر لأول صف: كل تعديل على سطر كان يُنشئ مصفوفة أسطر جديدة ⇐ Wijmo يعيد ربط itemsSource
+  // ويُصفّر التحديد للصف الأول (مع إبقاء العمود — فيظهر "الصف الأول/مدين")، ثم تحاول مؤقّتات التركيز
+  // إعادته فتسبقها أحياناً. الآن: تعديل سطر قائم يُطبَّق على كائن السطر المربوط نفسه + invalidate، فلا
+  // تُستبدل المصفوفة ولا يتغير التحديد. المصفوفة تُعاد بناؤها فقط عند تغيّر بنيوي (إضافة/حذف/تحميل سند).
+  const buildJournalGridRows = (rows: JournalEntryRow[]) => rows.map((row, i) => ({ ...row, ser: i + 1 }))
+  const emittedJournalRef = useRef<JournalEntryRow[] | null>(null)
+  const [journalGridData, setJournalGridData] = useState(() => buildJournalGridRows(journal))
+  const journalGridDataRef = useRef(journalGridData)
+  journalGridDataRef.current = journalGridData
+  useEffect(() => {
+    if (journal === emittedJournalRef.current) return
+    setJournalGridData(buildJournalGridRows(journal))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [journal])
+
+  // يعيد تركيز الشبكة (وتحديد خلية بعينها) بعد إغلاق نافذة منبثقة فُتحت من سطر في الشبكة (بحث
+  // حساب، مراكز تكلفة) أو بعد حذف/اختيار سطر — دون هذا يبقى التركيز عالقاً على الزر الذي فتح
+  // النافذة. هناك سباقان منفصلان يجب تجاوزهما معاً، وليس أحدهما فقط:
+  // (١) مصيدة تركيز Radix (FocusScope) الخاصة بالنافذة المُغلقة قد لا تكون أُزيلت من الـ DOM بعد
+  //     لحظة استدعاء onOpenChange(false)، فتسحب grid.focus() الفوري إلى داخلها بدل الشبكة.
+  // (٢) تغيّر مصفوفة journal (بعد اختيار حساب مثلاً) يُعيد ربط itemsSource في Wijmo بمصفوفة
+  //     جديدة، وWijmo يُصفّر التحديد إلى الخلية (0,0) عند إعادة الربط — وقد يحدث هذا التصفير في
+  //     دورة رسم لاحقة وليس بالضرورة بشكل متزامن مع تحديث React، فيتغلب على أي selectCell سابق.
+  // لذا: انتظار دورتي رسم (لتجاوز الأول)، ثم إعادة فرض التحديد مرة أخرى بعد مهلة أطول قليلاً
+  // (لتجاوز الثاني إن حدث متأخراً) بدل الاكتفاء بمحاولة واحدة قد يسبقها كلا السباقين.
+  const applyPendingJournalFocus = () => {
+    const target = pendingJournalFocusRef.current
+    if (!target) return
+    waitForGridReady(
+      () => getGrid(),
+      (grid) => {
+        const place = () => {
+          const live = getGrid() || grid
+          if (!live?.rows?.length) return
+          const safeRow = Math.max(0, Math.min(target.row, live.rows.length - 1))
+          const colIndex = live.columns.findIndex((column: any) => column.binding === target.colName)
+          // لا يُعاد الفرض إن انتقل المستخدم بنفسه لخلية أخرى منذ ذلك الحين (هدف تركيز أحدث)
+          if (pendingJournalFocusRef.current && pendingJournalFocusRef.current !== target) return
+          if (live.selection?.row === safeRow && live.selection?.col === colIndex) return
+          selectCell(live, safeRow, target.colName)
+          live.focus()
+        }
+        place()
+        // Wijmo يُصفّر التحديد إلى الصف الأول عند إعادة ربط itemsSource بدورة لاحقة — يُعاد الفرض بعدها
+        window.setTimeout(place, 120)
+        window.setTimeout(() => {
+          place()
+          if (pendingJournalFocusRef.current === target) pendingJournalFocusRef.current = null
+        }, 320)
+      },
+    )
+  }
+
+  const focusGridCell = (row: number, colName: string) => {
+    pendingJournalFocusRef.current = { row, colName }
+    // المسار الأساسي يتم بعد إعادة رسم dataSource في useEffect أدناه. هذه المحاولة الاحتياطية
+    // تغطي التنقل الذي لا يغيّر بيانات الصف (مثل Enter على خلية لم تتغير).
+    setTimeout(() => {
+      if (pendingJournalFocusRef.current) applyPendingJournalFocus()
+    }, 160)
+  }
+
+  useEffect(() => {
+    if (!pendingJournalFocusRef.current) return
+    const frame = requestAnimationFrame(() => {
+      requestAnimationFrame(() => applyPendingJournalFocus())
+    })
+    return () => cancelAnimationFrame(frame)
+    // يجب التنفيذ بعد أن يعيد React ربط بيانات شبكة الحسابات.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [form.journal, activeTab])
+
+  const patchJournalRow = (index: number, patch: Partial<JournalEntryRow>) => {
+    if (isLocked) return
+    const next = journalRef.current.map((row, i) => (i === index ? { ...row, ...patch } : row))
+    journalRef.current = next
+    const boundRow = journalGridDataRef.current[index]
+    if (boundRow && journalGridDataRef.current.length === next.length) {
+      Object.assign(boundRow, next[index], { ser: index + 1 })
+      emittedJournalRef.current = next
+      getGrid()?.invalidate?.()
+    }
+    onJournalChange(next)
+  }
+  const addJournalRow = () => {
+    if (isLocked) return journalRef.current
+    const next = [...journalRef.current, { ...emptyJournalRow }]
+    journalRef.current = next
+    onJournalChange(next)
+    return next
+  }
+  const deleteJournalRow = (index: number) => {
+    if (isLocked) return
+    const filtered = journalRef.current.filter((_, i) => i !== index)
+    const next = filtered.length > 0 ? filtered : [{ ...emptyJournalRow }]
+    journalRef.current = next
+    onJournalChange(next)
+    focusGridCell(Math.min(index, next.length - 1), "account_code")
+  }
+
+  // فحص توافق عملة الحساب مع عملة السند عند اختيار حساب في شبكة "الحسابات" — لا علاقة له بحسابات
+  // أخرى في السند (كحساب المندوب مثلاً). allow_trans_with_diff_curr (إعداد الحساب "السماح بعمل
+  // حركة على الحساب بغير عملته"): 0 = مسموح بدون تنبيه، 1 = مسموح مع تنبيه (Toast تحذيري لكن
+  // يُقبل الاختيار)، 2 = ممنوع (يُرفض الاختيار تماماً).
+  const checkAccountCurrencyCompatibility = (account: AccountItem): boolean => {
+    if (account.currency_id == null || form.currency_id == null || account.currency_id === form.currency_id) {
+      return true
+    }
+    const diffCurrMode = Number(account.allow_trans_with_diff_curr)
+    if (diffCurrMode === 2) {
+      toast({
+        title: tr("تعذر اختيار الحساب"),
+        description: tr("عملة السند تختلف عن عملة الحساب لا يمكن اختياره"),
+        variant: "destructive",
+      })
+      return false
+    }
+    if (diffCurrMode === 1) {
+      toast({ title: tr("تنبيه"), description: tr("عملة السند تختلف عن عملة الحساب") })
+    }
+    return true
+  }
+
+  // async (تنتظر ensureAccountsLoaded) — أي selectCell متزامن يُنفَّذ فور استدعائها (كما في معالج
+  // Tab/Enter) يسبق فعلياً تحديث journal هنا، فيصل تصفير Wijmo لتحديد الشبكة (بعد إعادة ربط
+  // itemsSource) لاحقاً ويُبطل ذلك التحديد. لذا focusGridCell تُستدعى هنا صراحة بعد أن تُعرف
+  // النتيجة الفعلية، لا يُكتفى بالتنقّل المتزامن في معالج المفاتيح.
+  const resolveJournalAccountByCode = async (index: number, rawCode: string) => {
+    const code = adjustAccountCode(rawCode)
+    if (!code) {
+      patchJournalRow(index, { account_id: null, account_code: "", account_name: "", cost_centers: [] })
+      return
+    }
+    const list = await ensureAccountsLoaded()
+    const match = list.find((a) => a.code.toUpperCase() === code)
+    if (match && isParentAccount(match)) {
+      patchJournalRow(index, { account_id: null, account_code: "", account_name: "", cost_centers: [] })
+      focusGridCell(index, "account_code")
+      messagesRef.current?.show?.([{ severity: "error", summary: "", detail: `${PARENT_ACCOUNT_MESSAGE}: ${match.code} - ${match.name}`, life: 3500 }])
+      return
+    }
+    if (match) {
+      if (!checkAccountCurrencyCompatibility(match)) {
+        patchJournalRow(index, { account_id: null, account_code: "", account_name: "", cost_centers: [] })
+        focusGridCell(index, "account_code")
+        return
+      }
+      patchJournalRow(index, { account_id: match.id, account_code: match.code, account_name: match.name, cost_centers: [] })
+      focusGridCell(index, "debit")
+    } else {
+      patchJournalRow(index, { account_id: null, account_code: "", account_name: "", cost_centers: [] })
+      focusGridCell(index, "account_code")
+      messagesRef.current?.show?.([{ severity: "error", summary: "", detail: tr("لا يوجد حساب بهذا الرقم: {0}", code), life: 3000 }])
+    }
+  }
+
+  const openJournalCostCenter = (index: number) => {
+    const row = journal[index]
+    if (!row?.account_id) {
+      messagesRef.current?.show?.([{ severity: "error", summary: "", detail: tr("يجب تحديد الحساب أولاً"), life: 3000 }])
+      return
+    }
+    const account = accountsListRef.current.find((a) => a.id === row.account_id) || null
+    setCostCenterAccount(account)
+    setCostCenterOpen(true)
+    setCostCenterRow(index)
+  }
+
+  // يوازن السطر الحالي ليكمّل الفرق بين مجموع المدين ومجموع الدائن (مطابق لاختصار "=" في
+  // النظام المرجعي: يملأ الخانة تلقائياً بالفرق المتبقي لموازنة القيد).
+  // "=" بأي خلية من السطر: فرق مجموع بقية الأسطر يوضع بالجهة التي تُوازن السند — مدين إن كان الدائن
+  // أكبر، ودائن إن كان المدين أكبر — ويُنقل المؤشر لتلك الخلية. سند متوازن أصلاً ⇐ رسالة فقط.
+  const applyBalanceShortcut = (index: number) => {
+    const rows = journalRef.current
+    let debitSum = 0
+    let creditSum = 0
+    rows.forEach((row, i) => {
+      if (i === index) return
+      debitSum += Number(row.debit || 0)
+      creditSum += Number(row.credit || 0)
+    })
+    const difference = Math.round((creditSum - debitSum) * 1000) / 1000
+    if (Math.abs(difference) < 0.0005) {
+      messagesRef.current?.show?.([{ severity: "info", summary: "", detail: tr("السند متوازن — لا يوجد فرق لإضافته"), life: 2500 }])
+      return
+    }
+    if (difference > 0) {
+      patchJournalRow(index, { debit: difference, credit: null })
+      focusGridCell(index, "debit")
+    } else {
+      patchJournalRow(index, { credit: -difference, debit: null })
+      focusGridCell(index, "credit")
+    }
+  }
+
+  // يتحقق من اكتمال السطر (حساب + مبلغ) قبل مغادرته عبر Enter/Tab من عمود "ملاحظات" — سواء
+  // كانت المغادرة للانتقال لسطر تالٍ موجود أو لإضافة سطر جديد.
+  const validateRowComplete = (index: number): boolean => {
+    const row = journalRef.current[index]
+    if (!row?.account_id) {
+      messagesRef.current?.show?.([{ severity: "error", summary: "", detail: tr("يجب ادخال الحساب اولا"), life: 3000 }])
+      focusGridCell(index, "account_code")
+      return false
+    }
+    if (!(Number(row.debit || 0) > 0) && !(Number(row.credit || 0) > 0)) {
+      messagesRef.current?.show?.([{ severity: "error", summary: "", detail: tr("يجب ادخال قيمة المدين او الدائن"), life: 3000 }])
+      focusGridCell(index, "debit")
+      return false
+    }
+    return true
+  }
+
+  // تعريف الأعمدة يُبنى فقط عند تغيّر القفل: كان يُعاد بناؤه مع كل تعديل على الأسطر ([journal, accountsList])
+  // فيُعيد DataGridView إنشاء الأعمدة ويُصفّر Wijmo التحديد للصف الأول — فيقفز المؤشر لأول صف بعد إدخال
+  // حساب صحيح. أزرار الأعمدة تستدعي أحدث المعالجات عبر ref بدل الاعتماد على إعادة البناء.
+  const schemeHandlersRef = useRef({ openCostCenter: openJournalCostCenter, deleteRow: deleteJournalRow })
+  schemeHandlersRef.current = { openCostCenter: openJournalCostCenter, deleteRow: deleteJournalRow }
+
+  const journalScheme = useMemo(
+    () => ({
+      name: "JournalEntryScheme",
+      filter: false,
+      showFooter: false,
+      sortable: false,
+      columns: [
+        { header: "#", name: "ser", width: 50, isReadOnly: true },
+        { header: tr("رقم الحساب"), name: "account_code", width: 130, minWidth: 110, maxLength: ACCOUNT_CODE_LENGTH, isReadOnly: isLocked },
+        {
+          name: "btnSearch",
+          header: " ",
+          width: 50,
+          buttonBody: "button",
+          align: "center",
+          title: tr("بحث عن حساب (F10)"),
+          iconType: "search",
+          isReadOnly: true,
+          onClick: (e: any, ctx: any) => {
+            if (isLocked) return
+            setJournalSearchRow(ctx.row.index)
+            setJournalSearchOpen(true)
+          },
+          visible: !isLocked,
+        },
+        { header: tr("اسم الحساب"), name: "account_name", width: "*", minWidth: 180, isReadOnly: true },
+        { header: tr("مدين"), name: "debit", width: 120, minWidth: 110, dataType: "Number", maxLength: 30, isReadOnly: isLocked },
+        { header: tr("دائن"), name: "credit", width: 120, minWidth: 110, dataType: "Number", maxLength: 30, isReadOnly: isLocked },
+        { header: tr("ملاحظات"), name: "note", width: 220, minWidth: 180, maxLength: 100, isReadOnly: isLocked },
+        {
+          name: "btnCostCenter",
+          header: tr("مراكز التكلفة"),
+          width: 150,
+          buttonBody: "button",
+          align: "center",
+          title: tr("مراكز التكلفة"),
+          iconType: "money",
+          isReadOnly: true,
+          onClick: (e: any, ctx: any) => schemeHandlersRef.current.openCostCenter(ctx.row.index),
+          visible: true,
+        },
+        {
+          name: "btnDelete",
+          header: " ",
+          width: 50,
+          buttonBody: "button",
+          align: "center",
+          title: tr("حذف السطر (F7)"),
+          iconType: "delete",
+          isReadOnly: true,
+          onClick: (e: any, ctx: any) => schemeHandlersRef.current.deleteRow(ctx.row.index),
+          visible: !isLocked,
+        },
+      ],
+    }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [isLocked],
+  )
+
+
+  const handleJournalCellEditEnded = (grid: any, e: any) => {
+    gridRef.current = grid
+    const row = e.row
+    const colName = grid?.columns?.[e.col]?.binding
+    if (colName === "account_code") {
+      const value = String(grid.getCellData(row, e.col, false) ?? "")
+      if (Util.isSpaceOrSymbols(value) || Util.isArabic(value) || !Util.isCodeFormat(value)) {
+        messagesRef.current?.show?.([{ severity: "error", summary: "", detail: tr("رقم الحساب يجب أن يكون أحرف/أرقام إنجليزية فقط بدون مسافات"), life: 3000 }])
+        return
+      }
+      resolveJournalAccountByCode(row, value)
+    } else if (colName === "debit") {
+      const value = grid.getCellData(row, e.col, false)
+      const debit = value === "" || value === null ? null : Number(value)
+      patchJournalRow(row, { debit, credit: debit && debit > 0 ? null : journalRef.current[row]?.credit ?? null })
+    } else if (colName === "credit") {
+      const value = grid.getCellData(row, e.col, false)
+      const credit = value === "" || value === null ? null : Number(value)
+      patchJournalRow(row, { credit, debit: credit && credit > 0 ? null : journalRef.current[row]?.debit ?? null })
+    } else if (colName === "note") {
+      const value = grid.getCellData(row, e.col, false)
+      patchJournalRow(row, { note: String(value ?? "") })
+    }
+  }
+
+  // F10 على "رقم الحساب" يفتح بحث الحسابات — بمرحلة الالتقاط لأن محرر خلية Wijmo يبتلع المفتاح أثناء
+  // الكتابة قبل أن يصل لمعالج onKeyDown (مرحلة الفقاعة)، فكان F10 لا يعمل داخل الخلية.
+  const handleJournalKeyDownCapture = (grid: any, e: any) => {
+    if (!grid?.selection || isLocked) return
+    if (e.key === "=") {
+      const row = grid.selection.row
+      if (row < 0) return
+      e.preventDefault()
+      e.stopPropagation()
+      const colName = grid.columns[grid.selection.col]?.binding
+      // تحرير جارٍ: رقم الحساب/الملاحظة يُثبَّت (لا يضيع ما كُتب)، ومدين/دائن يُلغى لأن قيمتهما ستُستبدل
+      if (grid.activeEditor) grid.finishEditing(colName === "debit" || colName === "credit")
+      applyBalanceShortcut(row)
+      return
+    }
+    // F7 يحذف السطر الحالي من أي خلية (حتى أثناء التحرير) — سند فعال غير مرحّل أو جديد لم يُحفظ
+    if (e.key === "F7") {
+      const row = grid.selection.row
+      if (row < 0) return
+      e.preventDefault()
+      e.stopPropagation()
+      if (grid.activeEditor) grid.finishEditing(true)
+      if (form.status === 1 || form.id === 0) deleteJournalRow(row)
+      return
+    }
+    if (e.key !== "F10") return
+    const row = grid.selection.row
+    if (row < 0 || grid.columns[grid.selection.col]?.binding !== "account_code") return
+    e.preventDefault()
+    e.stopPropagation()
+    if (grid.activeEditor) grid.finishEditing(true)
+    openJournalAccountSearch(row)
+  }
+
+  const handleJournalKeyDown = (grid: any, e: any) => {
+    gridRef.current = grid
+    if (!grid || !grid.selection) return
+    const row = grid.selection.row
+    const col = grid.selection.col
+    if (row < 0 || col < 0) return
+    const colName = grid.columns[col]?.binding
+
+    if (colName === "debit" || colName === "credit") {
+      if (e.key && e.key.length === 1 && !/[0-9.]/.test(e.key)) {
+        e.preventDefault()
+        return
+      }
+    }
+
+
+    // F7 يحذف السطر الحالي — يُتاح فقط لسند فعال غير مرحّل (status=1) أو مسودة جديدة لم تُحفظ
+    // بعد (id=0)؛ deleteJournalRow نفسها تمنع الحذف أصلاً إن كان السند مقفلاً (isLocked).
+    if (e.key === "F7") {
+      e.preventDefault()
+      if (form.status === 1 || form.id === 0) deleteJournalRow(row)
+      return
+    }
+
+    // F8 يفتح مراكز التكلفة للسطر الحالي — openJournalCostCenter نفسها تمنع الفتح إن لم يكن
+    // للسطر حساب محدد بعد (account_id فارغ) أو كان السند مقفلاً.
+    if (e.key === "F8") {
+      e.preventDefault()
+      openJournalCostCenter(row)
+      return
+    }
+
+    if (e.key === "Tab" || e.key === "Enter") {
+      e.preventDefault()
+      e.stopPropagation()
+      const isLastRow = row === journalRef.current.length - 1
+      if (colName === "account_code") {
+        const liveCode = String(grid.activeEditor?.value ?? grid.getCellData(row, col, false) ?? "").trim()
+        if (!liveCode) {
+          if (grid.activeEditor) grid.finishEditing()
+          if (!journalRef.current[row]?.account_id && !isLocked) {
+            openJournalAccountSearch(row)
+            return
+          }
+          messagesRef.current?.show?.([{ severity: "error", summary: "", detail: tr("يجب ادخال الحساب اولا"), life: 3000 }])
+          focusGridCell(row, "account_code")
+          return
+        }
+
+        // إنهاء التحرير يشغّل cellEditEnded بشكل متزامن، والذي يحل رقم الحساب ثم ينقل التركيز
+        // إلى مدين بعد اكتمال تحديث dataSource.
+        if (grid.activeEditor) {
+          grid.finishEditing()
+          return
+        }
+
+        if (journalRef.current[row]?.account_id) focusGridCell(row, "debit")
+        else void resolveJournalAccountByCode(row, liveCode)
+      } else if (colName === "debit" || colName === "credit" || colName === "note") {
+        if (!journalRef.current[row]?.account_id) {
+          if (grid.activeEditor) grid.finishEditing()
+          messagesRef.current?.show?.([{ severity: "error", summary: "", detail: tr("يجب ادخال الحساب اولا"), life: 3000 }])
+          focusGridCell(row, "account_code")
+          return
+        }
+
+        // في آخر خلية يجب تثبيت قيمة المحرر قبل التحقق، ثم يبقى هدف التركيز محفوظاً خلال
+        // إعادة ربط بيانات الشبكة عند فشل التحقق أو إضافة صف جديد.
+        const noteEditFinished = colName === "note" && grid.activeEditor
+          ? grid.finishEditing() !== false
+          : false
+        if (colName === "note" && !validateRowComplete(row)) return
+
+        const target = colName === "debit"
+          ? { row, colName: "credit" }
+          : colName === "credit"
+            ? { row, colName: "note" }
+            : { row: row + 1, colName: "account_code" }
+
+        // احفظ وجهة Enter قبل finishEditing؛ لأن cellEditEnded يحدّث React وWijmo يعيد
+        // التحديد مؤقتاً إلى أول صف عند استبدال itemsSource.
+        pendingJournalFocusRef.current = target
+        if (!noteEditFinished && grid.activeEditor && grid.finishEditing() === false) {
+          pendingJournalFocusRef.current = null
+          return
+        }
+        if (colName === "note" && isLastRow) addJournalRow()
+        focusGridCell(target.row, target.colName)
+      }
+    }
+  }
+
+  // ---- ملاحظات ----
+  const notes = form.notes || []
+  const addNoteRow = () => onNotesChange([...(notes || []), { note: "" }])
+  const updateNoteRow = (index: number, value: string) => {
+    const next = notes.map((row, i) => (i === index ? { ...row, note: value } : row))
+    onNotesChange(next)
+  }
+  const removeNoteRow = (index: number) => onNotesChange(notes.filter((_, i) => i !== index))
+
+  const currencyOptions = useMemo(
+    () =>
+      currencies.map((c) => ({
+        label: c.currency_name || c.currency_code || tr("غير محدد"),
+        value: Number(c.currency_id ?? c.id),
+      })),
+    [currencies],
+  )
+
+  // عملة الأساس في النظام = أصغر معرّف عملة، وسعر صرفها دائماً 1 (نفس قاعدة سند القبض/الصرف).
+  const baseCurrencyId = useMemo(
+    () =>
+      currencies.reduce<number | null>((min, c) => {
+        const id = Number(c.currency_id ?? c.id)
+        if (!Number.isFinite(id)) return min
+        return min === null || id < min ? id : min
+      }, null),
+    [currencies],
+  )
+
+  const handleCurrencyChange = async (newCurrencyId: number | null) => {
+    onFormChange("currency_id", newCurrencyId)
+    if (!newCurrencyId) return
+
+    if (newCurrencyId === baseCurrencyId) {
+      onFormChange("rate", 1)
+      return
+    }
+    try {
+      const query = new URLSearchParams({
+        currency_id: String(newCurrencyId),
+        date: form.vch_date ? form.vch_date.slice(0, 10) : "",
+      })
+      const response = await fetch(`/api/exchange-rates/lookup?${query.toString()}`)
+      const data = response.ok ? await response.json() : null
+      onFormChange("rate", data?.rate ?? 1)
+    } catch (error) {
+      console.error("Failed to fetch exchange rate", error)
+      onFormChange("rate", 1)
+    }
+  }
+
+  return (
+    <>
+      {/* الإغلاق (ESC أو زر X) يمر بالتحقق من التغييرات */}
+      <Dialog open={dialogOpen} onOpenChange={(open) => (open ? onOpenChange(true) : guardedAction(() => onOpenChange(false)))}>
+        <DialogContent
+          inline={fullscreenEnabled && dialogOpen}
+          className="journal-voucher-form voucher-form flex h-[calc(100dvh-1rem)] max-h-[96vh] w-[calc(100vw-0.5rem)] max-w-[1700px] min-w-0 flex-col overflow-hidden p-0 text-[13px] transition-shadow sm:w-[98vw] [&_label]:text-xs [&_input:not([type=checkbox])]:h-8 [&_input:not([type=checkbox])]:px-2.5 [&_select]:h-8 [&_select]:rounded-md [&_.p-dropdown]:min-h-8 [&_.p-dropdown-label]:py-1.5 [&_.p-calendar]:h-8 [&_.p-calendar_input]:h-8"
+          dir={appDir()}
+          onPointerDownOutside={(event) => event.preventDefault()}
+          onInteractOutside={(event) => event.preventDefault()}
+          onEscapeKeyDown={(event) => {
+            keepDialogOpenOnEscape(event, [showUnsavedConfirm, showDeleteConfirm, journalSearchOpen, costCenterOpen, postDialogOpen, voucherSearchOpen])
+          }}
+        >
+          <UniversalToolbar
+            currentRecord={currentIndex + 1}
+            totalRecords={totalRecords}
+            onNew={() => onNew?.()}
+            onSave={handleRequestSave}
+            onDelete={onDelete}
+            onClone={onClone}
+            onPrint={onPrint}
+            onWhatsApp={onPrint ? () => { armVoucherWhatsApp(null); onPrint() } : undefined}
+            onFirst={() => guardedAction(() => void handleNavigate("first"))}
+            onPrevious={() => guardedAction(() => void handleNavigate("previous"))}
+            onNext={() => guardedAction(() => void handleNavigate("next"))}
+            onLast={() => guardedAction(() => void handleNavigate("last"))}
+            isLoading={navLoading}
+            isSaving={isSaving}
+            canSave={canSave && form.status !== 2 && form.status !== 3}
+            canDelete={form.id > 0 && form.status !== 3 && !isSaving}
+            canClone={form.id > 0}
+            canPrint={form.id > 0 && form.status !== 3}
+            isNewRecord={form.id <= 0}
+            isFirstRecord={isFirstRecord}
+            isLastRecord={isLastRecord}
+          />
+
+          <div
+            className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-y-auto rounded-b-3xl bg-slate-50/60 px-2 py-2 sm:px-4 sm:py-3 [&::-webkit-scrollbar]:w-0"
+            style={{ scrollbarWidth: "none", msOverflowStyle: "none" as any }}
+            onKeyDown={handleFormEnterAsTab}
+            data-enter-tab-root="true"
+          >
+            <ProgressSpinner loading={isSaving || navLoading} />
+
+            <DialogHeader className="mb-3 shrink-0 overflow-hidden rounded-2xl bg-gradient-to-l from-emerald-600 via-emerald-600 to-teal-600 px-5 py-3 shadow-lg">
+              <DialogTitle className="flex flex-wrap items-center gap-2 text-lg font-extrabold tracking-tight text-white sm:text-xl">
+                <FileText className="h-5 w-5" />
+                {tr("سند قيد")}
+                {form.id > 0 ? (
+                  <span className="rounded-full bg-white/15 px-2.5 py-0.5 text-xs font-semibold ring-1 ring-white/30">{form.vch_code}</span>
+                ) : (
+                  <span className="rounded-full bg-white/15 px-2.5 py-0.5 text-xs font-semibold ring-1 ring-white/30">{tr("مسودة")}</span>
+                )}
+                {statusBadge && (
+                  <span
+                    className={`rounded-full px-2.5 py-0.5 text-xs font-semibold ring-1 ${
+                      form.status === 3 ? "!px-4 !py-1 !text-base !font-extrabold bg-red-600 text-white ring-2 ring-white/70 shadow-lg" : "bg-amber-400/20 text-amber-50 ring-amber-200/40"
+                    }`}
+                  >
+                    {statusBadge}
+                  </span>
+                )}
+              </DialogTitle>
+            </DialogHeader>
+
+            <Messages innerRef={messagesRef} />
+
+            <fieldset className="contents min-w-0">
+            <div className="grid shrink-0 gap-2 rounded-2xl border border-slate-200 bg-white p-3 shadow-sm sm:p-4">
+              <div className="flex items-center gap-2 text-sm font-bold text-emerald-700">
+                <span className="flex h-7 w-7 items-center justify-center rounded-lg bg-emerald-50 ring-1 ring-emerald-100">
+                  <FileText className="h-3.5 w-3.5" />
+                </span>
+                {tr("تفاصيل السند")}
+              </div>
+              <div className="journal-voucher-field-grid grid gap-4 md:grid-cols-4">
+                <div
+                  className="grid gap-1.5"
+                  onKeyDownCapture={createDropdownKeyHandler(voucherBooks, "id", form.vch_book_id, (value) =>
+                    onBookChange ? onBookChange(value) : onFormChange("vch_book_id", value),
+                  )}
+                >
+                  <Label>{tr("دفتر السندات *")}</Label>
+                  <PrimeDropdown
+                    value={form.vch_book_id}
+                    options={voucherBooks}
+                    optionLabel="name"
+                    optionValue="id"
+                    placeholder={tr("اختر")}
+                    filter
+                    disabled={isLocked}
+                    className="invoice-currency-dropdown w-full"
+                    panelClassName="invoice-currency-dropdown-panel"
+                    appendTo="self"
+                    panelStyle={{ zIndex: 10000 }}
+                    onChange={(e: any) => (onBookChange ? onBookChange(e.value ?? null) : onFormChange("vch_book_id", e.value ?? null))}
+                  />
+                </div>
+                <div className="grid gap-1.5">
+                  <Label htmlFor="vch-code">{tr("رقم السند *")}</Label>
+                  <div className="flex min-w-0 items-center gap-1.5">
+                    <Input
+                      id="vch-code"
+                      value={voucherCodeDraft}
+                      onChange={(e) => setVoucherCodeDraft(normalizeVoucherCode(e.target.value))}
+                      onBlur={(e) => void handleCodeBlur(e.currentTarget.value)}
+                      maxLength={10}
+                      disabled={isLocked}
+                    />
+                    <VoucherSearchButton onClick={() => setVoucherSearchOpen(true)} />
+                  </div>
+                </div>
+                <div className="grid gap-1.5">
+                  <Label htmlFor="vch-date">{tr("تاريخ السند *")}</Label>
+                  <DateTimeControl
+                    id="vch-date"
+                    ref={dateInputRef}
+                    value={form.vch_date ? form.vch_date.slice(0, 10) : ""}
+                    disabled={isLocked}
+                    onChange={(value) => {
+                      onFormChange("vch_date", value)
+                      if (!form.manual_date) onFormChange("manual_date", value)
+                    }}
+                  />
+                </div>
+                <TransactionBranchField voucherType={1} action={form.id ? "update" : "create"} value={form.branch_id} onChange={(id) => onFormChange("branch_id", id)} disabled={isLocked} />
+              </div>
+
+              <div className="journal-voucher-field-grid grid gap-4 md:grid-cols-3">
+                <div
+                  className="grid gap-1.5 invoice-currency-dropdown-wrap"
+                  onKeyDownCapture={createDropdownKeyHandler(currencyOptions, "value", form.currency_id, (value) =>
+                    void handleCurrencyChange(value),
+                  )}
+                >
+                  <Label>{tr("العملة *")}</Label>
+                  <PrimeDropdown
+                    value={form.currency_id}
+                    options={currencyOptions}
+                    optionLabel="label"
+                    optionValue="value"
+                    placeholder={tr("اختر العملة")}
+                    filter
+                    disabled={isLocked}
+                    className="invoice-currency-dropdown w-full"
+                    panelClassName="invoice-currency-dropdown-panel"
+                    appendTo="self"
+                    panelStyle={{ zIndex: 10000 }}
+                    onChange={(e: any) => void handleCurrencyChange(e.value ?? null)}
+                  />
+                </div>
+                <div className="grid gap-1.5">
+                  <Label htmlFor="vch-rate">{tr("سعر الصرف *")}</Label>
+                  <Input
+                    id="vch-rate"
+                    type="number"
+                    value={numberValue(form.rate)}
+                    onKeyDown={blockNonNumericKey}
+                    onChange={(e) => onFormChange("rate", e.target.value ? Number(e.target.value) : 1)}
+                    disabled={isLocked || (form.currency_id != null && form.currency_id === baseCurrencyId)}
+                  />
+                </div>
+                <div className="grid gap-1.5">
+                  <Label htmlFor="manual-voucher">{tr("سند يدوي")}</Label>
+                  <Input
+                    id="manual-voucher"
+                    value={form.manual_voucher}
+                    onChange={(e) => onFormChange("manual_voucher", e.target.value)}
+                    maxLength={30}
+                    disabled={isLocked}
+                  />
+                </div>
+              </div>
+
+              <div className="journal-voucher-field-grid grid gap-4 md:grid-cols-3">
+                <div className="grid gap-1.5">
+                  <Label htmlFor="manual-date">{tr("تاريخ السند اليدوي")}</Label>
+                  <DateTimeControl
+                    id="manual-date"
+                    value={form.manual_date ? form.manual_date.slice(0, 10) : ""}
+                    disabled={isLocked}
+                    onChange={(value) => onFormChange("manual_date", value)}
+                  />
+                </div>
+                <div className="journal-voucher-note grid gap-1.5 md:col-span-2">
+                  <Label htmlFor="vch-note">{tr("الملاحظة")}</Label>
+                  <Input
+                    id="vch-note"
+                    value={form.note}
+                    onChange={(e) => onFormChange("note", e.target.value)}
+                    maxLength={200}
+                    disabled={isLocked}
+                    onKeyDown={(e) => {
+                      if (e.key !== "Tab" && e.key !== "Enter") return
+                      e.preventDefault()
+                      e.stopPropagation()
+                      setActiveTab("journal")
+                      focusGridCell(0, "account_code")
+                    }}
+                  />
+                </div>
+              </div>
+            </div>
+
+            <Tabs value={activeTab} onValueChange={setActiveTab} className="flex min-h-0 min-w-0 flex-1 flex-col pt-3">
+              <TabsList className="flex h-auto flex-wrap justify-start gap-1 bg-slate-100 p-1">
+                <TabsTrigger value="journal" className={voucherTabTriggerClass}>{tr("الحسابات")}</TabsTrigger>
+                <TabsTrigger value="extra-data" className={voucherTabTriggerClass}>{tr("بيانات اضافية")}</TabsTrigger>
+                <TabsTrigger value="notes" className={voucherTabTriggerClass}>{tr("ملاحظات")}</TabsTrigger>
+                <TabsTrigger value="attachments" className={voucherTabTriggerClass}>{tr("المرفقات")}</TabsTrigger>
+              </TabsList>
+
+              <TabsContent value="journal" className="mt-3 flex flex-none flex-col gap-3 rounded-2xl border border-slate-200 bg-white p-3 shadow-sm sm:p-4">
+                <div className="journal-voucher-summary flex flex-wrap items-center justify-between gap-2">
+                  <div
+                    className={`text-sm font-semibold ${journalDiff === 0 ? "text-emerald-700" : "text-rose-600"}`}
+                  >
+                    {tr("إجمالي المدين: ")}{totalDebit.toLocaleString("en-US")}{tr(" — إجمالي الدائن: ")}{totalCredit.toLocaleString("en-US")}
+                    {journalDiff !== 0 && tr(" — الفرق: {0}", journalDiff.toLocaleString("en-US"))}
+                  </div>
+                  <Button type="button" variant="outline" size="sm" disabled={isLocked} onClick={() => addJournalRow()}>
+                    <Plus className="me-1 h-4 w-4" />
+                    {tr("إضافة سطر")}
+                  </Button>
+                </div>
+                <div className="h-[clamp(240px,38vh,440px)] min-h-0 w-full max-w-full overflow-auto">
+                  <DataGridView
+                    innerRef={gridRef}
+                    containerStyle={{ height: "100%", minHeight: 0, width: "100%", maxWidth: "100%", overflow: "auto" }}
+                    style={{ height: "100%", minHeight: 0, width: "100%", maxWidth: "100%" }}
+                    scheme={journalScheme}
+                    dataSource={journalGridData}
+                    idProperty="ser"
+                    isReport={false}
+                    isReadOnly={false}
+                    showContextMenu={false}
+                    cellEditEnded={handleJournalCellEditEnded}
+                    onKeyDown={handleJournalKeyDown}
+                    onKeyDownCapture={handleJournalKeyDownCapture}
+                    keyActionEnter={KeyAction.None}
+                    keyActionTab={KeyAction.None}
+                    dontConvertToCards={true}
+
+                  />
+                </div>
+              </TabsContent>
+
+              <TabsContent value="extra-data" className="mt-3 min-h-0 flex-1 space-y-4 overflow-y-auto rounded-2xl border border-slate-200 bg-white p-4 shadow-sm sm:p-5">
+                <div className="grid gap-4 md:grid-cols-2">
+                  <div
+                    className="grid gap-1.5 invoice-currency-dropdown-wrap"
+                    onKeyDownCapture={createDropdownKeyHandler(salesmen, "id", form.salesman_id, (value) =>
+                      onFormChange("salesman_id", value),
+                    )}
+                  >
+                    <Label>{tr("المندوب")}</Label>
+                    <PrimeDropdown
+                      value={form.salesman_id}
+                      options={salesmen}
+                      optionLabel="name"
+                      optionValue="id"
+                      placeholder={tr("اختر")}
+                      filter
+                      showClear
+                      disabled={isLocked}
+                      className="invoice-currency-dropdown w-full"
+                      panelClassName="invoice-currency-dropdown-panel"
+                      appendTo="self"
+                      panelStyle={{ zIndex: 10000 }}
+                      onChange={(e: any) => onFormChange("salesman_id", e.value ?? null)}
+                    />
+                  </div>
+                  <div
+                    className="grid gap-1.5 invoice-currency-dropdown-wrap"
+                    onKeyDownCapture={createDropdownKeyHandler(
+                      paymentClassifications,
+                      "id",
+                      form.payment_classification_id,
+                      (value) => onFormChange("payment_classification_id", value),
+                    )}
+                  >
+                    <Label>{tr("تصنيف الدفعة")}</Label>
+                    <PrimeDropdown
+                      value={form.payment_classification_id}
+                      options={paymentClassifications}
+                      optionLabel="name"
+                      optionValue="id"
+                      placeholder={tr("اختر")}
+                      filter
+                      showClear
+                      disabled={isLocked}
+                      className="invoice-currency-dropdown w-full"
+                      panelClassName="invoice-currency-dropdown-panel"
+                      appendTo="self"
+                      panelStyle={{ zIndex: 10000 }}
+                      onChange={(e: any) => onFormChange("payment_classification_id", e.value ?? null)}
+                    />
+                  </div>
+                </div>
+              </TabsContent>
+
+              <TabsContent value="notes" className="mt-3 min-h-0 flex-1 space-y-4 overflow-y-auto rounded-2xl border border-slate-200 bg-white p-4 shadow-sm sm:p-5">
+                <div className="flex items-center justify-end">
+                  <Button type="button" variant="outline" size="sm" onClick={addNoteRow}>
+                    <ListPlus className="me-1 h-4 w-4" />
+                    {tr("إضافة ملاحظة")}
+                  </Button>
+                </div>
+                <div className="space-y-2">
+                  {notes.map((row, index) => (
+                    <div key={index} className="flex items-start gap-2">
+                      <span className="mt-2 w-5 shrink-0 text-center text-xs text-slate-400">{index + 1}</span>
+                      <Textarea
+                        value={row.note}
+                        onChange={(e) => updateNoteRow(index, e.target.value)}
+                        maxLength={150}
+                        rows={2}
+                      />
+                      <Button type="button" variant="ghost" size="icon" onClick={() => removeNoteRow(index)}>
+                        ×
+                      </Button>
+                    </div>
+                  ))}
+                  {notes.length === 0 && <p className="py-4 text-center text-sm text-slate-400">{tr("لا توجد ملاحظات")}</p>}
+                </div>
+              </TabsContent>
+
+              <TabsContent value="attachments" className="mt-3 min-h-0 flex-1 overflow-y-auto rounded-2xl border border-slate-200 bg-white p-4 shadow-sm sm:p-5">
+                <div className="flex flex-col items-center justify-center gap-2 rounded-lg border border-dashed border-slate-300 bg-slate-50 py-10 text-slate-400">
+                  <Paperclip className="h-6 w-6" />
+                  <p className="text-sm">{tr("رفع المرفقات غير متاح بعد في هذا الإصدار")}</p>
+                </div>
+              </TabsContent>
+            </Tabs>
+            </fieldset>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      <AccountSearchDialog
+        open={journalSearchOpen}
+        onOpenChange={(open) => {
+          setJournalSearchOpen(open)
+          if (!open && journalSearchRow !== null) {
+            focusGridCell(journalSearchRow, accountJustSelectedRef.current ? "debit" : "account_code")
+            accountJustSelectedRef.current = false
+          }
+        }}
+        accounts={accountsList}
+        onSelect={(account) => {
+          if (journalSearchRow !== null && checkAccountCurrencyCompatibility(account)) {
+            patchJournalRow(journalSearchRow, { account_id: account.id, account_code: account.code, account_name: account.name, cost_centers: [] })
+            accountJustSelectedRef.current = true
+          }
+        }}
+      />
+
+      <AccountCostCenters
+        open={costCenterOpen}
+        onOpenChange={(open) => {
+          setCostCenterOpen(open)
+          if (!open && costCenterRow !== null) focusGridCell(costCenterRow, "btnCostCenter")
+        }}
+        account={costCenterAccount}
+        value={costCenterRow !== null ? journal[costCenterRow]?.cost_centers : undefined}
+        onChange={(selection) => {
+          if (costCenterRow !== null) patchJournalRow(costCenterRow, { cost_centers: selection })
+        }}
+      />
+
+      <ConfirmDialogYesNo
+        visible={showDeleteConfirm}
+        useAppDialog
+        busy={isSaving}
+        confirmLabel={tr("نعم")}
+        cancelLabel={tr("لا")}
+        message={isPosted ? tr("السند معتمد هل تريد الغاؤه منطقياً؟") : tr("هل تريد حذف سند القيد هذا؟")}
+        onConfirm={onConfirmDelete}
+        onCancel={onCancelDelete}
+      />
+
+      <VoucherSearchDialog
+        open={voucherSearchOpen}
+        onOpenChange={setVoucherSearchOpen}
+        vchType={3}
+        title={tr("سندات القيد")}
+        accountLabel={tr("الحساب")}
+        onSelect={(voucherId) => void openSearchedVoucher(voucherId)}
+      />
+      <ConfirmDialogYesNo
+        visible={showUnsavedConfirm}
+        useAppDialog
+        title={tr("التحقق من التغييرات")}
+        message={tr("تم تعديل البيانات، هل تريد الحفظ؟")}
+        confirmLabel={tr("نعم")}
+        cancelLabel={tr("لا")}
+        backLabel={tr("رجوع")}
+        onDismiss={() => setShowUnsavedConfirm(false)}
+        showBack
+        onConfirm={() => {
+          setShowUnsavedConfirm(false)
+          pendingActionRef.current = null
+          onSave("save")
+        }}
+        onCancel={() => {
+          setShowUnsavedConfirm(false)
+          const action = pendingActionRef.current
+          pendingActionRef.current = null
+          action?.()
+        }}
+        onBack={() => setShowUnsavedConfirm(false)}
+      />
+
+      <PostVoucherDialog
+        visible={postDialogOpen}
+        isSaving={isSaving}
+        onSelect={(action) => {
+          setPostDialogOpen(false)
+          onSave(action)
+        }}
+        onCancel={() => setPostDialogOpen(false)}
+      />
+    </>
+  )
+}

@@ -1,51 +1,32 @@
 // app/api/customer-categories/route.ts
 import { type NextRequest, NextResponse } from "next/server"
-import { neon } from "@neondatabase/serverless"
-import { Pool } from "pg"
+import sql from "@/lib/database"
+import { runSchemaOnce } from "@/lib/schema-once"
 
-let sql: any = null
-
-try {
-  if (!process.env.DATABASE_URL) {
-    console.error("[v0] DATABASE_URL environment variable is not set")
-  } else {
-    const dbUrl = process.env.DATABASE_URL
-
-    if (dbUrl.includes("localhost") || dbUrl.includes("127.0.0.1")) {
-      console.log("[v0] Using local PostgreSQL with pg Pool")
-      const pool = new Pool({ connectionString: dbUrl })
-      sql = async (strings: TemplateStringsArray, ...values: any[]) => {
-        const client = await pool.connect()
-        try {
-          const query =
-            strings.reduce(
-              (prev, curr, i) =>
-                prev + curr + (i < values.length ? `$${i + 1}` : ""),
-              ""
-            )
-          const result = await client.query(query, values)
-          return result.rows
-        } finally {
-          client.release()
-        }
-      }
-    } else {
-      console.log("[v0] Using Neon serverless client")
-      sql = neon(dbUrl)
-    }
-
-    console.log("[v0] Database client initialized successfully")
-  }
-} catch (error) {
-  console.error("[v0] Failed to initialize DB client:", error)
-  sql = null
-}
-
-export default sql
+async function ensureSupplierCategoriesTable() { return runSchemaOnce("app/api/supplier-categories/route.ts#ensureSupplierCategoriesTable", async () => {
+  await sql`
+    CREATE TABLE IF NOT EXISTS supplier_categories (
+      id SERIAL PRIMARY KEY,
+      name VARCHAR(100) NOT NULL,
+      paymentterms VARCHAR(200) NOT NULL DEFAULT '',
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `
+  await sql`ALTER TABLE supplier_categories ADD COLUMN IF NOT EXISTS paymentterms VARCHAR(200) NOT NULL DEFAULT ''`
+  await sql`ALTER TABLE supplier_categories ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`
+  await sql`ALTER TABLE supplier_categories ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`
+  await sql`ALTER TABLE supplier_categories ADD COLUMN IF NOT EXISTS status INTEGER NOT NULL DEFAULT 1`
+  await sql`CREATE SEQUENCE IF NOT EXISTS supplier_categories_id_seq`
+  await sql`ALTER SEQUENCE supplier_categories_id_seq OWNED BY supplier_categories.id`
+  await sql`ALTER TABLE supplier_categories ALTER COLUMN id SET DEFAULT nextval('supplier_categories_id_seq')`
+  await sql`SELECT setval('supplier_categories_id_seq', COALESCE((SELECT MAX(id) FROM supplier_categories), 1), COALESCE((SELECT MAX(id) FROM supplier_categories), 0) > 0)`
+}) }
 
 // GET all customer categories
 export async function GET() {
   try {
+    await ensureSupplierCategoriesTable()
     const categories = await sql`SELECT * FROM supplier_categories ORDER BY id`
     return NextResponse.json({ categories })
   } catch (error) {
@@ -57,35 +38,32 @@ export async function GET() {
 // POST a new customer category
 export async function POST(request: NextRequest) {
   try {
+    await ensureSupplierCategoriesTable()
     const body = await request.json()
-    const { name, paymentTerms } = body
+    const { name, paymentTerms, paymentterms, status } = body
 
     if (!name) {
       return NextResponse.json({ error: "Category name is required" }, { status: 400 })
     }
 
-    // Get last ID
-    const lastIdRow = await sql`SELECT MAX(id) AS max_id FROM supplier_categories`
-    const lastId = lastIdRow[0]?.max_id ?? 0
-    const newId = lastId + 1
-
     const result = await sql`
-      INSERT INTO supplier_categories (id, name, paymentTerms)
-      VALUES (${newId}, ${name}, ${paymentTerms})
+      INSERT INTO supplier_categories (name, paymentterms, status)
+      VALUES (${name}, ${paymentTerms ?? paymentterms ?? ""}, ${status ?? 1})
       RETURNING *
     `
 
     return NextResponse.json({ category: result[0] }, { status: 201 })
-  } catch (error) {
+  } catch (error: any) {
     console.error("Error creating supplier category:", error)
-    return NextResponse.json({ error: "Failed to create supplier category" }, { status: 500 })
+    return NextResponse.json({ error: error?.message || "Failed to create supplier category" }, { status: 500 })
   }
 }
 
 // PUT to update an existing category
 export async function PUT(request: NextRequest) {
   try {
-    const { id, name, paymentTerms } = await request.json()
+    await ensureSupplierCategoriesTable()
+    const { id, name, paymentTerms, paymentterms, status } = await request.json()
 
     if (!id) {
       return NextResponse.json({ error: "Category ID is required" }, { status: 400 })
@@ -95,7 +73,8 @@ export async function PUT(request: NextRequest) {
       UPDATE supplier_categories
       SET
         name = COALESCE(${name}, name),
-        paymentTerms = COALESCE(${paymentTerms}, paymentTerms),
+        paymentterms = COALESCE(${paymentTerms ?? paymentterms}, paymentterms),
+        status = COALESCE(${status}, status),
         updated_at = CURRENT_TIMESTAMP
       WHERE id = ${id}
       RETURNING *
@@ -109,5 +88,24 @@ export async function PUT(request: NextRequest) {
   } catch (error) {
     console.error("Error updating supplier category:", error)
     return NextResponse.json({ error: "Failed to update supplier category" }, { status: 500 })
+  }
+}
+
+export async function DELETE(request: NextRequest) {
+  try {
+    await ensureSupplierCategoriesTable()
+    const id = Number(new URL(request.url).searchParams.get("id"))
+    if (!id) return NextResponse.json({ error: "Category ID is required" }, { status: 400 })
+    // فحص الارتباط قبل الحذف: التصنيف مستخدم في بطاقات الموردين (customers.classification = المعرّف أو الاسم)
+    const usageRow = (await sql`SELECT name FROM supplier_categories WHERE id = ${id}`)[0] as any
+    const usedBy = (await sql`SELECT COUNT(*)::int AS count FROM customers WHERE COALESCE(isdeleted, false) = false AND COALESCE(type, 1) = 2 AND BTRIM(COALESCE(classification, '')) IN (${String(id)}, ${String(usageRow?.name || '').trim() || '#none#'})`)[0] as any
+    if (Number(usedBy?.count) > 0) return NextResponse.json({ error: `لا يمكن حذف تصنيف الموردين "${usageRow?.name || ""}" لأنه مستخدم في ${usedBy.count} بطاقة مورد — يمكنك إيقافه بدلاً من حذفه` }, { status: 400 })
+
+    const deleted = await sql`UPDATE supplier_categories SET status = 3, updated_at = CURRENT_TIMESTAMP WHERE id = ${id} RETURNING *`
+    if (!deleted.length) return NextResponse.json({ error: "Category not found" }, { status: 404 })
+    return NextResponse.json({ category: deleted[0] })
+  } catch (error: any) {
+    console.error("Error deleting supplier category:", error)
+    return NextResponse.json({ error: error?.message || "Failed to delete supplier category" }, { status: 500 })
   }
 }

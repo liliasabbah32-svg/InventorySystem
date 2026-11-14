@@ -1,0 +1,1385 @@
+import sql, { memoInTransaction } from "@/lib/database"
+import { withBranchSymbol } from "@/lib/branch-symbol"
+import { ensureTables as ensureCreditCardTables } from "../credit-cards/_lib"
+import { getSystemSettingValue } from "@/lib/system-settings"
+import { buildVoucherCode, normalizeVoucherPrefix } from "@/lib/voucher-code"
+import { runSchemaOnce } from "@/lib/schema-once"
+import { validateLeafAccounts } from "@/lib/leaf-accounts"
+
+export { buildVoucherCode, normalizeVoucherPrefix }
+
+// Shared schema + persistence helpers for سند قبض / سند صرف (voucher_header_tbl and its
+// related tables). Used by route.ts, [id]/route.ts and navigation/[navigationType]/route.ts
+// so the three endpoints can never drift out of sync with each other.
+
+// ترقيم journal_type_id موحّد لكامل النظام المحاسبي (voucher_journal_type_caption_tbl، 1-15) —
+// هذه الثوابت هي الأنواع المستخدمة فعلياً في سند القبض/الصرف وسند القيد فقط؛ الباقي (1=أخرى،
+// 6-15=مبيعات/مشتريات/بنك/...) محجوز لموديولات أخرى لا تستخدم هذا الملف.
+export const JOURNAL_TYPE_CASH = 2
+export const JOURNAL_TYPE_CHEQUE = 3
+export const JOURNAL_TYPE_CARD = 4
+export const JOURNAL_TYPE_COUNTER_ACCOUNT = 5
+
+export const ensureTables = async () => { return runSchemaOnce("app/api/receipts/_lib.ts#ensureTables", async () => {
+  await sql`
+    CREATE TABLE IF NOT EXISTS voucher_header_tbl (
+      id SERIAL PRIMARY KEY,
+      vch_type INTEGER NOT NULL,
+      vch_code VARCHAR(30) NOT NULL,
+      vch_date TIMESTAMP WITHOUT TIME ZONE NOT NULL,
+      currency_id INTEGER,
+      rate DOUBLE PRECISION DEFAULT 1,
+      amount DOUBLE PRECISION DEFAULT 0,
+      note VARCHAR(200),
+      status INTEGER DEFAULT 1,
+      insert_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      last_update_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE (vch_type, vch_code)
+    )
+  `
+  // إعادة تسمية على تنصيب قائم من قبل هذا التغيير (تنصيب جديد ينشئ الأعمدة بالاسم الجديد مباشرة
+  // عبر CREATE TABLE أعلاه، فلا تجد هذه الكتلة شيئاً لتُعيد تسميته).
+  await sql`
+    DO $$
+    BEGIN
+      IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'voucher_header_tbl' AND column_name = 'created_at') THEN
+        ALTER TABLE voucher_header_tbl RENAME COLUMN created_at TO insert_date;
+      END IF;
+      IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'voucher_header_tbl' AND column_name = 'updated_at') THEN
+        ALTER TABLE voucher_header_tbl RENAME COLUMN updated_at TO last_update_date;
+      END IF;
+      IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'voucher_header_tbl' AND column_name = 'printed') THEN
+        ALTER TABLE voucher_header_tbl RENAME COLUMN printed TO is_printed;
+      END IF;
+      IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'voucher_header_tbl' AND column_name = 'customer_account_id') THEN
+        ALTER TABLE voucher_header_tbl RENAME COLUMN customer_account_id TO account_id;
+      END IF;
+      IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'voucher_header_tbl' AND column_name = 'insert_user_id') THEN
+        ALTER TABLE voucher_header_tbl RENAME COLUMN insert_user_id TO insert_user;
+      END IF;
+    END$$;
+  `
+  await sql`ALTER TABLE voucher_header_tbl ALTER COLUMN vch_code TYPE VARCHAR(30)`
+  // تغيير نوع vch_date يفشل إن كان عمود في تعريف trigger (حارس فترة العمل voucher_working_period_trigger
+  // يراقب UPDATE OF vch_date — lib/working-period.ts) — فكان يُسقط بقية تهيئة الجداول (ومنها
+  // branch_id) لشركة جديدة يُنشأ فيها الحارس قبل التحويل ⇐ "تعذر تحميل بيانات لوحة المعلومات".
+  // تُحفظ تعريفات الـtriggers وتُحذف مؤقتاً ثم يُعاد إنشاؤها كما هي بنفس الكتلة (معاملة واحدة).
+  await sql`DO $$
+    DECLARE
+      trigger_defs TEXT[];
+      trigger_names TEXT[];
+      i INTEGER;
+    BEGIN
+      IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'voucher_header_tbl' AND column_name = 'vch_date' AND data_type <> 'timestamp without time zone') THEN
+        SELECT array_agg(pg_get_triggerdef(t.oid)), array_agg(t.tgname::text)
+          INTO trigger_defs, trigger_names
+        FROM pg_trigger t
+        WHERE t.tgrelid = 'voucher_header_tbl'::regclass AND NOT t.tgisinternal;
+        IF trigger_names IS NOT NULL THEN
+          FOR i IN 1 .. array_length(trigger_names, 1) LOOP
+            EXECUTE format('DROP TRIGGER IF EXISTS %I ON voucher_header_tbl', trigger_names[i]);
+          END LOOP;
+        END IF;
+        ALTER TABLE voucher_header_tbl ALTER COLUMN vch_date TYPE TIMESTAMP WITHOUT TIME ZONE
+        USING CASE
+          WHEN vch_date IS NULL THEN NULL
+          WHEN regexp_replace(vch_date::text, '[^0-9]', '', 'g') ~ '^[0-9]{8}$' THEN to_date(vch_date::text, 'YYYYMMDD')::timestamp
+          ELSE vch_date::text::timestamp
+        END;
+        IF trigger_defs IS NOT NULL THEN
+          FOR i IN 1 .. array_length(trigger_defs, 1) LOOP
+            EXECUTE trigger_defs[i];
+          END LOOP;
+        END IF;
+      END IF;
+    END $$`
+
+  await sql`ALTER TABLE voucher_header_tbl ADD COLUMN IF NOT EXISTS vch_book_id INTEGER`
+  await sql`ALTER TABLE voucher_header_tbl ADD COLUMN IF NOT EXISTS shift_guid UUID`
+  await sql`CREATE INDEX IF NOT EXISTS idx_voucher_header_shift_guid ON voucher_header_tbl(shift_guid) WHERE shift_guid IS NOT NULL`
+  await sql`ALTER TABLE voucher_header_tbl ADD COLUMN IF NOT EXISTS branch_id INTEGER`
+  // account_id: الحساب/الزبون الرئيسي للسند (سُمِّي customer_account_id سابقاً؛ أُعيدت تسميته
+  // أعلاه ليطابق المرجع). to_account_id يبقى منفصلاً عمداً (لم يُدمَج فيه) — الاثنان يُدخَلان
+  // فعلياً بحقلين مستقلين في الواجهة وقد يختلفان (مثال: القبض من زبون لكن الإقفال على حساب
+  // مقابل مختلف)، فدمجهما كان سيُفقد بيانات حقيقية موجودة اليوم.
+  await sql`ALTER TABLE voucher_header_tbl ADD COLUMN IF NOT EXISTS account_id INTEGER`
+  await sql`ALTER TABLE voucher_header_tbl ADD COLUMN IF NOT EXISTS customer_name VARCHAR(150)`
+  await sql`ALTER TABLE voucher_header_tbl ADD COLUMN IF NOT EXISTS to_account_id INTEGER`
+  await sql`ALTER TABLE voucher_header_tbl ADD COLUMN IF NOT EXISTS payment_classification_id INTEGER`
+  await sql`ALTER TABLE voucher_header_tbl ADD COLUMN IF NOT EXISTS salesman_id INTEGER`
+  await sql`ALTER TABLE voucher_header_tbl ADD COLUMN IF NOT EXISTS manual_voucher VARCHAR(30)`
+  await sql`ALTER TABLE voucher_header_tbl ADD COLUMN IF NOT EXISTS manual_date DATE`
+  // ترحيل السند: يُطبع عند "ترحيل وطباعة" فيصبح is_printed=1 — لا علاقة له بحالة السند (status).
+  await sql`ALTER TABLE voucher_header_tbl ADD COLUMN IF NOT EXISTS is_printed INTEGER DEFAULT 0`
+  // Per-card fields moved to voucher_cards_detail_tbl (a voucher can carry more than one card).
+  await sql`ALTER TABLE voucher_header_tbl DROP COLUMN IF EXISTS credit_card_type`
+  await sql`ALTER TABLE voucher_header_tbl DROP COLUMN IF EXISTS credit_card_code`
+  await sql`ALTER TABLE voucher_header_tbl DROP COLUMN IF EXISTS credit_card_expiry_date`
+  // bank_amount/bank_account_id لم يُستخدما فعلياً في أي مسار حفظ أو نموذج — أعمدة ميتة من تصميم
+  // سابق، خلافاً لـ cash_amount/cash_account_id (تبويب "نقدي") التي تبقى مستخدمة فعلياً.
+  await sql`ALTER TABLE voucher_header_tbl DROP COLUMN IF EXISTS bank_amount`
+  await sql`ALTER TABLE voucher_header_tbl DROP COLUMN IF EXISTS bank_account_id`
+  // المستخدم الذي أنشأ السند — يُسجَّل مرة واحدة عند الإدراج (POST) فقط، ولا يتغيّر مع أي تعديل
+  // لاحق. اسمه insert_user (وليس insert_user_id، أُعيدت تسميته أعلاه) مطابقةً للمرجع؛ لا FK هنا
+  // لأن جدول مستخدمين حقيقي (users_tbl) غير موجود في هذه القاعدة (المصادقة مُدارة خارجياً).
+  await sql`ALTER TABLE voucher_header_tbl ADD COLUMN IF NOT EXISTS insert_user INTEGER`
+  await sql`ALTER TABLE voucher_header_tbl ADD COLUMN IF NOT EXISTS update_user INTEGER`
+
+  // vch_status: درافت=1 / مرحل=2 فقط (حالة الترحيل تحديداً) — status يبقى بمعناه الحالي
+  // (١=فعال ٢=مرحل ٣=محذوف/ملغي منطقياً، مرجعاً إلى voucher_status_tbl) ولا يزال المصدر الوحيد
+  // الذي يعتمد عليه isLocked/canSave/canDelete ونص نسخة الطباعة في الواجهة. vch_status عمود
+  // إضافي يُبقي القيمتين الحيتين (١/٢) متزامنتين مع status لمطابقة اسم العمود في المرجع فقط.
+  await sql`ALTER TABLE voucher_header_tbl ADD COLUMN IF NOT EXISTS vch_status INTEGER`
+  await sql`UPDATE voucher_header_tbl SET vch_status = CASE WHEN status = 2 THEN 2 ELSE 1 END WHERE vch_status IS NULL`
+
+  // الحقول التالية محجوزة لموديولات لم تُبنَ بعد في هذا التطبيق (ضريبة، مقاصة، مخازن، تسعير...)
+  // — أُضيفت فقط لمطابقة شكل الجدول المرجعي، دون أي منطق تطبيقي يقرأها أو يكتبها حالياً. لا FK
+  // على أي منها لأن الجداول المرجعية (companies_tbl, stores_tbl, vat_*, ...) غير موجودة هنا.
+  await sql`ALTER TABLE voucher_header_tbl ADD COLUMN IF NOT EXISTS company_id INTEGER`
+  await sql`ALTER TABLE voucher_header_tbl ADD COLUMN IF NOT EXISTS discount DOUBLE PRECISION`
+  await sql`ALTER TABLE voucher_header_tbl ADD COLUMN IF NOT EXISTS updated_vch_id INTEGER REFERENCES voucher_header_tbl(id)`
+  await sql`ALTER TABLE voucher_header_tbl ADD COLUMN IF NOT EXISTS payment_type_id INTEGER`
+  await sql`ALTER TABLE voucher_header_tbl ADD COLUMN IF NOT EXISTS approved INTEGER`
+  await sql`ALTER TABLE voucher_header_tbl ADD COLUMN IF NOT EXISTS location_id INTEGER`
+  await sql`ALTER TABLE voucher_header_tbl ADD COLUMN IF NOT EXISTS internal_voucher_id INTEGER`
+  await sql`ALTER TABLE voucher_header_tbl ADD COLUMN IF NOT EXISTS language_id INTEGER`
+  await sql`ALTER TABLE voucher_header_tbl ADD COLUMN IF NOT EXISTS print_setting_id INTEGER`
+  await sql`ALTER TABLE voucher_header_tbl ADD COLUMN IF NOT EXISTS print_attachment_id INTEGER`
+  await sql`ALTER TABLE voucher_header_tbl ADD COLUMN IF NOT EXISTS phone VARCHAR(30)`
+  await sql`ALTER TABLE voucher_header_tbl ADD COLUMN IF NOT EXISTS vat_reg VARCHAR(16)`
+  await sql`ALTER TABLE voucher_header_tbl ADD COLUMN IF NOT EXISTS vat_duedate DATE`
+  await sql`ALTER TABLE voucher_header_tbl ADD COLUMN IF NOT EXISTS vat_type_id INTEGER`
+  await sql`ALTER TABLE voucher_header_tbl ADD COLUMN IF NOT EXISTS vat_classification_id INTEGER`
+  await sql`ALTER TABLE voucher_header_tbl ADD COLUMN IF NOT EXISTS vat_included BOOLEAN`
+  await sql`ALTER TABLE voucher_header_tbl ADD COLUMN IF NOT EXISTS vat DOUBLE PRECISION`
+  await sql`ALTER TABLE voucher_header_tbl ADD COLUMN IF NOT EXISTS invoice_type INTEGER`
+  await sql`ALTER TABLE voucher_header_tbl ADD COLUMN IF NOT EXISTS is_maqasa BOOLEAN`
+  await sql`ALTER TABLE voucher_header_tbl ADD COLUMN IF NOT EXISTS maqasa_type INTEGER`
+  await sql`ALTER TABLE voucher_header_tbl ADD COLUMN IF NOT EXISTS to_store_id INTEGER`
+  await sql`ALTER TABLE voucher_header_tbl ADD COLUMN IF NOT EXISTS vat_percent DOUBLE PRECISION`
+  await sql`ALTER TABLE voucher_header_tbl ADD COLUMN IF NOT EXISTS cheq_operation_id INTEGER`
+  await sql`ALTER TABLE voucher_header_tbl ADD COLUMN IF NOT EXISTS is_breakpoint BOOLEAN DEFAULT false`
+  await sql`ALTER TABLE voucher_header_tbl ADD COLUMN IF NOT EXISTS pricing_way_id INTEGER`
+  await sql`ALTER TABLE voucher_header_tbl ADD COLUMN IF NOT EXISTS exit_time TIMESTAMP`
+  await sql`ALTER TABLE voucher_header_tbl ADD COLUMN IF NOT EXISTS returnedable_voucher_id INTEGER REFERENCES voucher_header_tbl(id)`
+  await sql`ALTER TABLE voucher_header_tbl ADD COLUMN IF NOT EXISTS due_date DATE`
+  await sql`ALTER TABLE voucher_header_tbl ADD COLUMN IF NOT EXISTS is_exported_sales BOOLEAN`
+  await sql`ALTER TABLE voucher_header_tbl ADD COLUMN IF NOT EXISTS draft_code VARCHAR(30)`
+  await sql`ALTER TABLE voucher_header_tbl ADD COLUMN IF NOT EXISTS twins_vch_id INTEGER`
+
+  // جدول تصنيف أنواع أسطر القيد موحّد لكامل النظام المحاسبي (وليس خاصاً بسند القبض/الصرف فقط)،
+  // لذا يحمل رقم النوع فقط؛ التسميات منفصلة في voucher_journal_type_caption_tbl (متعددة اللغات).
+  // الأنواع 6-15 غير مستخدمة بعد في هذا التطبيق (مبيعات/مشتريات/بنك/...) لكنها محجوزة لموديولات
+  // مستقبلية تشارك نفس التصنيف.
+  await sql`
+    CREATE TABLE IF NOT EXISTS voucher_journal_type_tbl (
+      id INTEGER PRIMARY KEY
+    )
+  `
+  await sql`ALTER TABLE voucher_journal_type_tbl DROP COLUMN IF EXISTS name`
+  await sql`
+    INSERT INTO voucher_journal_type_tbl (id) VALUES
+      (1),(2),(3),(4),(5),(6),(7),(8),(9),(10),(11),(12),(13),(14),(15)
+    ON CONFLICT (id) DO NOTHING
+  `
+
+  await sql`
+    CREATE TABLE IF NOT EXISTS voucher_journal_type_caption_tbl (
+      id SERIAL PRIMARY KEY,
+      journal_type_id INTEGER REFERENCES voucher_journal_type_tbl(id) ON DELETE CASCADE,
+      language_id INTEGER,
+      name VARCHAR(30)
+    )
+  `
+  await sql`
+    CREATE INDEX IF NOT EXISTS idx_voucher_journal_type_caption_tbl_type
+    ON voucher_journal_type_caption_tbl(journal_type_id)
+  `
+  await sql`
+    INSERT INTO voucher_journal_type_caption_tbl (id, journal_type_id, language_id, name) VALUES
+      (1, 1, 1, 'أخرى'),
+      (2, 2, 1, 'نقدا'),
+      (3, 3, 1, 'شيكات'),
+      (4, 4, 1, 'بطاقات'),
+      (5, 5, 1, 'حساب الزبون/المورد'),
+      (6, 6, 1, 'المبيعات'),
+      (7, 7, 1, 'ضريبة المبيعات'),
+      (8, 8, 1, 'الخصم بالإشعار المدين'),
+      (9, 9, 1, 'المشتريات'),
+      (10, 10, 1, 'ضريبة المشتريات'),
+      (11, 11, 1, 'الخصم المكتسب بالإشعار الدائن'),
+      (12, 12, 1, 'حساب بنك'),
+      (13, 13, 1, 'تحويل عملة'),
+      (14, 14, 1, 'حساب المصروف سند الاستعمال'),
+      (15, 15, 1, 'إقفال أرصدة حسابات الميزانية')
+    ON CONFLICT (id) DO NOTHING
+  `
+  await sql`
+    SELECT setval(
+      pg_get_serial_sequence('voucher_journal_type_caption_tbl', 'id'),
+      (SELECT COALESCE(MAX(id), 1) FROM voucher_journal_type_caption_tbl)
+    )
+  `
+
+  // voucher_journal_detail_tbl mirrors the real accounting schema: every voucher
+  // must produce a balanced double-entry (sum(debit) == sum(credit), >= 2 rows).
+  await sql`
+    CREATE TABLE IF NOT EXISTS voucher_journal_detail_tbl (
+      id SERIAL PRIMARY KEY,
+      voucher_id INTEGER NOT NULL REFERENCES voucher_header_tbl(id) ON DELETE CASCADE,
+      order_no INTEGER DEFAULT 1,
+      journal_type_id INTEGER,
+      account_id INTEGER NOT NULL,
+      credit_debit INTEGER NOT NULL,
+      amount DOUBLE PRECISION DEFAULT 0,
+      currency_id INTEGER,
+      rate DOUBLE PRECISION DEFAULT 1,
+      base_curr_amount DOUBLE PRECISION DEFAULT 0,
+      note VARCHAR(70)
+    )
+  `
+  // account_currency_id/account_rate/account_amount: the account's own-currency view of the
+  // line (distinct from currency_id/rate/base_curr_amount, which are the voucher's currency).
+  // balance_id/contract_id: reserved for future budget/contract linking (per source schema).
+  // Added via ALTER (not the CREATE above) since this table may already exist from before —
+  // no FK here because the column may be backfilled against pre-existing rows.
+  await sql`ALTER TABLE voucher_journal_detail_tbl ADD COLUMN IF NOT EXISTS account_currency_id INTEGER`
+  await sql`ALTER TABLE voucher_journal_detail_tbl ADD COLUMN IF NOT EXISTS account_rate DOUBLE PRECISION DEFAULT 1`
+  await sql`ALTER TABLE voucher_journal_detail_tbl ADD COLUMN IF NOT EXISTS account_amount DOUBLE PRECISION DEFAULT 0`
+  await sql`ALTER TABLE voucher_journal_detail_tbl ADD COLUMN IF NOT EXISTS balance_id INTEGER`
+  await sql`ALTER TABLE voucher_journal_detail_tbl ADD COLUMN IF NOT EXISTS contract_id INTEGER`
+  // Cost centers now live in voucher_costcenter_tbl (a line can carry more than one).
+  await sql`ALTER TABLE voucher_journal_detail_tbl DROP COLUMN IF EXISTS cost_center_id`
+
+  // ترحيل بيانات: ترقيم journal_type_id في هذا التطبيق كان محلياً (1=نقدي، 2=شيكات، 3=بطاقات،
+  // 4=حساب مقابل/سطر سند قيد)، وبعد التوحيد مع voucher_journal_type_caption_tbl أصبح 2=نقدا،
+  // 3=شيكات، 4=بطاقات، 5=حساب الزبون/المورد. الإصلاح يعتمد على عمود note (ثابت لا يتغيّر عبر أي
+  // ترقيم) بدل "إزاحة +1 على القيمة الحالية" — تلك الطريقة السابقة كانت خطأً: ensureTables تُستدعى
+  // في كل طلب، وإزاحة قائمة على القيمة الحالية تُعيد إزاحة صفوف رُحِّلت بالفعل في كل استدعاء لاحق
+  // (بطاقات مثلاً ينتهي بها المطاف عند 5 بدل 4 بعد استدعاءين). الاعتماد على note آمن ويُعطي نفس
+  // النتيجة بغضّ النظر عن عدد مرات التشغيل: buildJournalRows يضع دائماً note='نقدي'/'شيكات'/
+  // 'بطاقات' لهذه الأنواع الثلاثة تحديداً (وليس أي سطر آخر)، وأي سطر آخر (حساب مقابل لسند قبض/صرف
+  // أو سطر سند قيد) هو دائماً النوع 5.
+  await sql`UPDATE voucher_journal_detail_tbl vjd SET journal_type_id = ${JOURNAL_TYPE_CASH} FROM voucher_header_tbl vh WHERE vh.id = vjd.voucher_id AND vh.vch_type IN (4, 5) AND vjd.note = 'نقدي' AND vjd.journal_type_id IS DISTINCT FROM ${JOURNAL_TYPE_CASH}`
+  await sql`UPDATE voucher_journal_detail_tbl vjd SET journal_type_id = ${JOURNAL_TYPE_CHEQUE} FROM voucher_header_tbl vh WHERE vh.id = vjd.voucher_id AND vh.vch_type IN (4, 5) AND vjd.note = 'شيكات' AND vjd.journal_type_id IS DISTINCT FROM ${JOURNAL_TYPE_CHEQUE}`
+  await sql`UPDATE voucher_journal_detail_tbl vjd SET journal_type_id = ${JOURNAL_TYPE_CARD} FROM voucher_header_tbl vh WHERE vh.id = vjd.voucher_id AND vh.vch_type IN (4, 5) AND vjd.note = 'بطاقات' AND vjd.journal_type_id IS DISTINCT FROM ${JOURNAL_TYPE_CARD}`
+  await sql`
+    UPDATE voucher_journal_detail_tbl vjd SET journal_type_id = ${JOURNAL_TYPE_COUNTER_ACCOUNT}
+    FROM voucher_header_tbl vh
+    WHERE vh.id = vjd.voucher_id AND vh.vch_type IN (4, 5)
+      AND (vjd.note IS NULL OR vjd.note NOT IN ('نقدي', 'شيكات', 'بطاقات'))
+      AND vjd.journal_type_id IS DISTINCT FROM ${JOURNAL_TYPE_COUNTER_ACCOUNT}
+  `
+
+  // One-time migration from the six legacy payment columns on voucher_header_tbl.
+  // Each payment method is now represented exclusively by its journal_type_id row.
+  await sql`
+    DO $$
+    BEGIN
+      IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = current_schema() AND table_name = 'voucher_header_tbl' AND column_name = 'cash_amount'
+      ) THEN
+        INSERT INTO voucher_journal_detail_tbl (
+          voucher_id, order_no, journal_type_id, account_id, credit_debit,
+          amount, currency_id, rate, base_curr_amount, account_currency_id, account_rate, account_amount, note
+        )
+        SELECT h.id, COALESCE((SELECT MAX(j.order_no) + 1 FROM voucher_journal_detail_tbl j WHERE j.voucher_id = h.id), 1),
+          2, h.cash_account_id, CASE WHEN h.vch_type = 4 THEN 1 ELSE 2 END,
+          h.cash_amount, h.currency_id, COALESCE(h.rate, 1), h.cash_amount * COALESCE(h.rate, 1),
+          h.currency_id, COALESCE(h.rate, 1), h.cash_amount, 'نقدي'
+        FROM voucher_header_tbl h
+        WHERE COALESCE(h.cash_amount, 0) > 0 AND h.cash_account_id IS NOT NULL
+          AND NOT EXISTS (SELECT 1 FROM voucher_journal_detail_tbl j WHERE j.voucher_id = h.id AND j.journal_type_id = 2);
+
+        INSERT INTO voucher_journal_detail_tbl (
+          voucher_id, order_no, journal_type_id, account_id, credit_debit,
+          amount, currency_id, rate, base_curr_amount, account_currency_id, account_rate, account_amount, note
+        )
+        SELECT h.id, COALESCE((SELECT MAX(j.order_no) + 1 FROM voucher_journal_detail_tbl j WHERE j.voucher_id = h.id), 1),
+          3, h.check_account_id, CASE WHEN h.vch_type = 4 THEN 1 ELSE 2 END,
+          h.check_amount, h.currency_id, COALESCE(h.rate, 1), h.check_amount * COALESCE(h.rate, 1),
+          h.currency_id, COALESCE(h.rate, 1), h.check_amount, 'شيكات'
+        FROM voucher_header_tbl h
+        WHERE COALESCE(h.check_amount, 0) > 0 AND h.check_account_id IS NOT NULL
+          AND NOT EXISTS (SELECT 1 FROM voucher_journal_detail_tbl j WHERE j.voucher_id = h.id AND j.journal_type_id = 3);
+
+        INSERT INTO voucher_journal_detail_tbl (
+          voucher_id, order_no, journal_type_id, account_id, credit_debit,
+          amount, currency_id, rate, base_curr_amount, account_currency_id, account_rate, account_amount, note
+        )
+        SELECT h.id, COALESCE((SELECT MAX(j.order_no) + 1 FROM voucher_journal_detail_tbl j WHERE j.voucher_id = h.id), 1),
+          4, h.credit_card_account_id, CASE WHEN h.vch_type = 4 THEN 1 ELSE 2 END,
+          h.credit_card_amount, h.currency_id, COALESCE(h.rate, 1), h.credit_card_amount * COALESCE(h.rate, 1),
+          h.currency_id, COALESCE(h.rate, 1), h.credit_card_amount, 'بطاقات'
+        FROM voucher_header_tbl h
+        WHERE COALESCE(h.credit_card_amount, 0) > 0 AND h.credit_card_account_id IS NOT NULL
+          AND NOT EXISTS (SELECT 1 FROM voucher_journal_detail_tbl j WHERE j.voucher_id = h.id AND j.journal_type_id = 4);
+      END IF;
+    END $$
+  `
+  await sql`ALTER TABLE voucher_header_tbl DROP COLUMN IF EXISTS cash_amount`
+  await sql`ALTER TABLE voucher_header_tbl DROP COLUMN IF EXISTS cash_account_id`
+  await sql`ALTER TABLE voucher_header_tbl DROP COLUMN IF EXISTS check_amount`
+  await sql`ALTER TABLE voucher_header_tbl DROP COLUMN IF EXISTS check_account_id`
+  await sql`ALTER TABLE voucher_header_tbl DROP COLUMN IF EXISTS credit_card_amount`
+  await sql`ALTER TABLE voucher_header_tbl DROP COLUMN IF EXISTS credit_card_account_id`
+
+  await sql`
+    CREATE TABLE IF NOT EXISTS voucher_costcenter_tbl (
+      id SERIAL PRIMARY KEY,
+      voucher_journal_id INTEGER NOT NULL REFERENCES voucher_journal_detail_tbl(id) ON DELETE CASCADE,
+      cost_center_id INTEGER NOT NULL REFERENCES cost_centers(id) ON DELETE CASCADE
+    )
+  `
+  await sql`CREATE INDEX IF NOT EXISTS idx_voucher_costcenter_tbl_journal ON voucher_costcenter_tbl(voucher_journal_id)`
+
+  await sql`
+    CREATE TABLE IF NOT EXISTS voucher_notes_tbl (
+      id SERIAL PRIMARY KEY,
+      voucher_id INTEGER NOT NULL REFERENCES voucher_header_tbl(id) ON DELETE CASCADE,
+      note VARCHAR(150),
+      order_no INTEGER DEFAULT 1
+    )
+  `
+
+  await sql`
+    CREATE TABLE IF NOT EXISTS voucher_related_vch_tbl (
+      id SERIAL PRIMARY KEY,
+      type INTEGER,
+      voucher_id INTEGER REFERENCES voucher_header_tbl(id) ON DELETE CASCADE,
+      related_vch_id INTEGER REFERENCES voucher_header_tbl(id) ON DELETE CASCADE
+    )
+  `
+
+  await sql`
+    CREATE TABLE IF NOT EXISTS voucher_status_tbl (
+      id INTEGER PRIMARY KEY,
+      name VARCHAR(30)
+    )
+  `
+  await sql`
+    INSERT INTO voucher_status_tbl (id, name) VALUES (1, 'فعال'), (2, 'معتمد'), (3, 'محذوف')
+    ON CONFLICT (id) DO NOTHING
+  `
+
+  // جداول أرشيف السندات المحذوفة (status=1 فقط، أي مسودة لم تُرحَّل بعد): السند يُنسخ إليها
+  // قبل حذفه فعلياً من الجداول الحقيقية، بحيث لا تضيع الحركة نهائياً بل يبقى أثر لها. عمود
+  // serial (وليس id الأصلي) هو المفتاح الأساسي هنا لأن نفس id قد يُؤرشَف أكثر من مرة إن أُعيد
+  // إنشاء سند بنفس الرقم لاحقاً، وheader_serial في جداول التفاصيل يربط كل سطر بحدث الحذف الصحيح.
+  await sql`
+    CREATE TABLE IF NOT EXISTS voucher_header_log_tbl (
+      serial SERIAL PRIMARY KEY,
+      id INTEGER NOT NULL,
+      vch_type INTEGER,
+      vch_code VARCHAR(30),
+      vch_date TIMESTAMP WITHOUT TIME ZONE,
+      currency_id INTEGER,
+      rate DOUBLE PRECISION,
+      cash_amount DOUBLE PRECISION,
+      cash_account_id INTEGER,
+      amount DOUBLE PRECISION,
+      note VARCHAR(200),
+      status INTEGER,
+      vch_book_id INTEGER,
+      customer_name VARCHAR(150),
+      to_account_id INTEGER,
+      check_amount DOUBLE PRECISION,
+      check_account_id INTEGER,
+      credit_card_amount DOUBLE PRECISION,
+      credit_card_account_id INTEGER,
+      payment_classification_id INTEGER,
+      salesman_id INTEGER,
+      manual_voucher VARCHAR(30),
+      manual_date DATE,
+      insert_date TIMESTAMP,
+      last_update_date TIMESTAMP,
+      deleted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `
+  await sql`ALTER TABLE voucher_header_log_tbl ALTER COLUMN vch_date TYPE TIMESTAMP WITHOUT TIME ZONE USING vch_date::timestamp`
+  // نفس عمليات إعادة التسمية/الإضافة المطبَّقة على voucher_header_tbl أعلاه — الجدولان يجب أن
+  // يبقيا متطابقين في البنية دائماً (أرشفة تنسخ صفاً كاملاً من الأول إلى الثاني حرفياً).
+  await sql`
+    DO $$
+    BEGIN
+      IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'voucher_header_log_tbl' AND column_name = 'created_at') THEN
+        ALTER TABLE voucher_header_log_tbl RENAME COLUMN created_at TO insert_date;
+      END IF;
+      IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'voucher_header_log_tbl' AND column_name = 'updated_at') THEN
+        ALTER TABLE voucher_header_log_tbl RENAME COLUMN updated_at TO last_update_date;
+      END IF;
+      IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'voucher_header_log_tbl' AND column_name = 'printed') THEN
+        ALTER TABLE voucher_header_log_tbl RENAME COLUMN printed TO is_printed;
+      END IF;
+      IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'voucher_header_log_tbl' AND column_name = 'customer_account_id') THEN
+        ALTER TABLE voucher_header_log_tbl RENAME COLUMN customer_account_id TO account_id;
+      END IF;
+      IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'voucher_header_log_tbl' AND column_name = 'insert_user_id') THEN
+        ALTER TABLE voucher_header_log_tbl RENAME COLUMN insert_user_id TO insert_user;
+      END IF;
+    END$$;
+  `
+  await sql`ALTER TABLE voucher_header_log_tbl ALTER COLUMN vch_code TYPE VARCHAR(30)`
+  await sql`ALTER TABLE voucher_header_log_tbl ADD COLUMN IF NOT EXISTS account_id INTEGER`
+  await sql`ALTER TABLE voucher_header_log_tbl ADD COLUMN IF NOT EXISTS is_printed INTEGER`
+  await sql`ALTER TABLE voucher_header_log_tbl DROP COLUMN IF EXISTS bank_amount`
+  await sql`ALTER TABLE voucher_header_log_tbl DROP COLUMN IF EXISTS bank_account_id`
+  await sql`ALTER TABLE voucher_header_log_tbl ADD COLUMN IF NOT EXISTS insert_user INTEGER`
+  await sql`ALTER TABLE voucher_header_log_tbl ADD COLUMN IF NOT EXISTS update_user INTEGER`
+  await sql`ALTER TABLE voucher_header_log_tbl ADD COLUMN IF NOT EXISTS vch_status INTEGER`
+  await sql`ALTER TABLE voucher_header_log_tbl ADD COLUMN IF NOT EXISTS company_id INTEGER`
+  await sql`ALTER TABLE voucher_header_log_tbl ADD COLUMN IF NOT EXISTS discount DOUBLE PRECISION`
+  await sql`ALTER TABLE voucher_header_log_tbl ADD COLUMN IF NOT EXISTS updated_vch_id INTEGER`
+  await sql`ALTER TABLE voucher_header_log_tbl ADD COLUMN IF NOT EXISTS payment_type_id INTEGER`
+  await sql`ALTER TABLE voucher_header_log_tbl ADD COLUMN IF NOT EXISTS approved INTEGER`
+  await sql`ALTER TABLE voucher_header_log_tbl ADD COLUMN IF NOT EXISTS location_id INTEGER`
+  await sql`ALTER TABLE voucher_header_log_tbl ADD COLUMN IF NOT EXISTS internal_voucher_id INTEGER`
+  await sql`ALTER TABLE voucher_header_log_tbl ADD COLUMN IF NOT EXISTS language_id INTEGER`
+  await sql`ALTER TABLE voucher_header_log_tbl ADD COLUMN IF NOT EXISTS print_setting_id INTEGER`
+  await sql`ALTER TABLE voucher_header_log_tbl ADD COLUMN IF NOT EXISTS print_attachment_id INTEGER`
+  await sql`ALTER TABLE voucher_header_log_tbl ADD COLUMN IF NOT EXISTS phone VARCHAR(30)`
+  await sql`ALTER TABLE voucher_header_log_tbl ADD COLUMN IF NOT EXISTS vat_reg VARCHAR(16)`
+  await sql`ALTER TABLE voucher_header_log_tbl ADD COLUMN IF NOT EXISTS vat_duedate DATE`
+  await sql`ALTER TABLE voucher_header_log_tbl ADD COLUMN IF NOT EXISTS vat_type_id INTEGER`
+  await sql`ALTER TABLE voucher_header_log_tbl ADD COLUMN IF NOT EXISTS vat_classification_id INTEGER`
+  await sql`ALTER TABLE voucher_header_log_tbl ADD COLUMN IF NOT EXISTS vat_included BOOLEAN`
+  await sql`ALTER TABLE voucher_header_log_tbl ADD COLUMN IF NOT EXISTS vat DOUBLE PRECISION`
+  await sql`ALTER TABLE voucher_header_log_tbl ADD COLUMN IF NOT EXISTS invoice_type INTEGER`
+  await sql`ALTER TABLE voucher_header_log_tbl ADD COLUMN IF NOT EXISTS is_maqasa BOOLEAN`
+  await sql`ALTER TABLE voucher_header_log_tbl ADD COLUMN IF NOT EXISTS maqasa_type INTEGER`
+  await sql`ALTER TABLE voucher_header_log_tbl ADD COLUMN IF NOT EXISTS to_store_id INTEGER`
+  await sql`ALTER TABLE voucher_header_log_tbl ADD COLUMN IF NOT EXISTS vat_percent DOUBLE PRECISION`
+  await sql`ALTER TABLE voucher_header_log_tbl ADD COLUMN IF NOT EXISTS cheq_operation_id INTEGER`
+  await sql`ALTER TABLE voucher_header_log_tbl ADD COLUMN IF NOT EXISTS is_breakpoint BOOLEAN`
+  await sql`ALTER TABLE voucher_header_log_tbl ADD COLUMN IF NOT EXISTS pricing_way_id INTEGER`
+  await sql`ALTER TABLE voucher_header_log_tbl ADD COLUMN IF NOT EXISTS exit_time TIMESTAMP`
+  await sql`ALTER TABLE voucher_header_log_tbl ADD COLUMN IF NOT EXISTS returnedable_voucher_id INTEGER`
+  await sql`ALTER TABLE voucher_header_log_tbl ADD COLUMN IF NOT EXISTS due_date DATE`
+  await sql`ALTER TABLE voucher_header_log_tbl ADD COLUMN IF NOT EXISTS is_exported_sales BOOLEAN`
+  await sql`ALTER TABLE voucher_header_log_tbl ADD COLUMN IF NOT EXISTS draft_code VARCHAR(30)`
+  await sql`ALTER TABLE voucher_header_log_tbl ADD COLUMN IF NOT EXISTS twins_vch_id INTEGER`
+  await sql`CREATE INDEX IF NOT EXISTS idx_voucher_header_log_tbl_id ON voucher_header_log_tbl(id)`
+
+  await sql`
+    CREATE TABLE IF NOT EXISTS voucher_journal_detail_log_tbl (
+      serial SERIAL PRIMARY KEY,
+      header_serial INTEGER NOT NULL REFERENCES voucher_header_log_tbl(serial) ON DELETE CASCADE,
+      id INTEGER,
+      voucher_id INTEGER,
+      order_no INTEGER,
+      journal_type_id INTEGER,
+      account_id INTEGER,
+      credit_debit INTEGER,
+      amount DOUBLE PRECISION,
+      currency_id INTEGER,
+      rate DOUBLE PRECISION,
+      base_curr_amount DOUBLE PRECISION,
+      account_currency_id INTEGER,
+      account_rate DOUBLE PRECISION,
+      account_amount DOUBLE PRECISION,
+      note VARCHAR(70)
+    )
+  `
+  // إصلاح بيانات مؤجَّل من أعلى هذه الدالة (نفس منطق إعادة الترقيم القائم على note، وليس على
+  // القيمة الحالية) — مؤجَّل إلى هنا لأن الجدول لا يكون موجوداً بعد عند أول تشغيلة على تنصيب جديد.
+  await sql`UPDATE voucher_journal_detail_log_tbl SET journal_type_id = ${JOURNAL_TYPE_CASH} WHERE note = 'نقدي' AND journal_type_id IS DISTINCT FROM ${JOURNAL_TYPE_CASH}`
+  await sql`UPDATE voucher_journal_detail_log_tbl SET journal_type_id = ${JOURNAL_TYPE_CHEQUE} WHERE note = 'شيكات' AND journal_type_id IS DISTINCT FROM ${JOURNAL_TYPE_CHEQUE}`
+  await sql`UPDATE voucher_journal_detail_log_tbl SET journal_type_id = ${JOURNAL_TYPE_CARD} WHERE note = 'بطاقات' AND journal_type_id IS DISTINCT FROM ${JOURNAL_TYPE_CARD}`
+  await sql`
+    UPDATE voucher_journal_detail_log_tbl SET journal_type_id = ${JOURNAL_TYPE_COUNTER_ACCOUNT}
+    WHERE (note IS NULL OR note NOT IN ('نقدي', 'شيكات', 'بطاقات'))
+      AND journal_type_id IS DISTINCT FROM ${JOURNAL_TYPE_COUNTER_ACCOUNT}
+  `
+
+  await sql`
+    CREATE TABLE IF NOT EXISTS voucher_costcenter_log_tbl (
+      serial SERIAL PRIMARY KEY,
+      header_serial INTEGER NOT NULL REFERENCES voucher_header_log_tbl(serial) ON DELETE CASCADE,
+      id INTEGER,
+      voucher_journal_id INTEGER,
+      cost_center_id INTEGER
+    )
+  `
+
+  await sql`
+    CREATE TABLE IF NOT EXISTS voucher_notes_log_tbl (
+      serial SERIAL PRIMARY KEY,
+      header_serial INTEGER NOT NULL REFERENCES voucher_header_log_tbl(serial) ON DELETE CASCADE,
+      id INTEGER,
+      voucher_id INTEGER,
+      note VARCHAR(150),
+      order_no INTEGER
+    )
+  `
+
+  // voucher_types_tbl itself (the real one, migrated from legacy voucher_types) is owned by
+  // app/api/voucher-book-permissions/_lib.ts — nothing here needs to join against it, only the
+  // raw vch_type ints.
+  // One-time migration: this table used to store 1 (قبض) / 2 (صرف) before vch_type was
+  // aligned to voucher_types_tbl's real ids (8/9). No-op once already migrated.
+  await sql`UPDATE voucher_header_tbl SET vch_type = ${RECEIPT_VCH_TYPE} WHERE vch_type = 1`
+  await sql`UPDATE voucher_header_tbl SET vch_type = ${PAYMENT_VCH_TYPE} WHERE vch_type = 2`
+
+  // Superseded by the real cheques_tbl below.
+  await sql`DROP TABLE IF EXISTS voucher_cheques_tbl`
+
+  await sql`
+    CREATE TABLE IF NOT EXISTS cheques_type_tbl (
+      id INTEGER PRIMARY KEY,
+      name VARCHAR(50),
+      name_lang2 VARCHAR(50)
+    )
+  `
+  await sql`
+    INSERT INTO cheques_type_tbl (id, name, name_lang2) VALUES
+      (1, 'شيكات واردة', 'In Cheques'), (2, 'شيكات صادرة', 'Out Cheques')
+    ON CONFLICT (id) DO NOTHING
+  `
+
+  await sql`
+    CREATE TABLE IF NOT EXISTS cheque_status_tbl (
+      id INTEGER PRIMARY KEY,
+      name VARCHAR(50)
+    )
+  `
+  await sql`
+    INSERT INTO cheque_status_tbl (id, name) VALUES
+      (1, 'مستحق'), (2, 'غير مستحق'), (3, 'مؤجل'), (4, 'تم ايداعه'), (5, 'راجع'),
+      (6, 'اعيد للمصدر'), (7, 'مجير'), (8, 'برسم التحصيل'), (9, 'ملغي')
+    ON CONFLICT (id) DO NOTHING
+  `
+
+  // Full column set from the real cheques_tbl schema. Only the columns needed to record a
+  // cheque on a سند قبض/سند صرف are populated here — the rest (return/hold/pay dates, log_id,
+  // cheq_source_id, cheq_book_id, payment_order_id, attachments...) belong to future cheque
+  // operation screens (deposit/return/transfer) and stay NULL/default until that's built.
+  await sql`
+    CREATE TABLE IF NOT EXISTS cheques_tbl (
+      id SERIAL PRIMARY KEY,
+      voucher_id INTEGER REFERENCES voucher_header_tbl(id) ON DELETE RESTRICT,
+      cheq_type INTEGER REFERENCES cheques_type_tbl(id),
+      bank_account VARCHAR(20),
+      cheq_num VARCHAR(20),
+      bank_id INTEGER REFERENCES banks(id),
+      branch_id INTEGER REFERENCES branches(id),
+      amount DOUBLE PRECISION,
+      currency_id INTEGER,
+      rate DOUBLE PRECISION,
+      received_date TIMESTAMP,
+      trans_date TIMESTAMP,
+      due_date TIMESTAMP,
+      pay_date TIMESTAMP,
+      return_date TIMESTAMP,
+      hold_date TIMESTAMP,
+      first_due_date TIMESTAMP,
+      customer_id INTEGER,
+      rec_cheq_account_id INTEGER,
+      current_account_id INTEGER,
+      bank_account_id INTEGER,
+      salesman_id INTEGER,
+      log_id INTEGER,
+      last_voucher_id INTEGER,
+      cheq_source_id INTEGER,
+      cheq_holder_id INTEGER,
+      cheq_owner_name VARCHAR(70),
+      status_id INTEGER REFERENCES cheque_status_tbl(id),
+      cheq_book_id INTEGER,
+      return_count INTEGER DEFAULT 0,
+      previous_year INTEGER,
+      manual_insert INTEGER DEFAULT 0,
+      payment_order_id INTEGER,
+      is_printed INTEGER DEFAULT 0,
+      front_attach_id INTEGER,
+      back_attach_id INTEGER,
+      last_update_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      update_user_id INTEGER,
+      old_status_id INTEGER,
+      order_no INTEGER DEFAULT 1
+    )
+  `
+  await sql`CREATE INDEX IF NOT EXISTS idx_cheques_tbl_voucher_id ON cheques_tbl(voucher_id)`
+
+  // credit_cards_types_tbl's real schema (بطاقات الائتمان admin screen) is owned there —
+  // ensure it here too since سند قبض/سند صرف's card tab references it via FK.
+  await ensureCreditCardTables()
+
+  await sql`
+    CREATE TABLE IF NOT EXISTS voucher_cards_detail_tbl (
+      id SERIAL PRIMARY KEY,
+      card_type_id INTEGER REFERENCES credit_cards_types_tbl(id),
+      card_no VARCHAR(50),
+      expire_date TIMESTAMP,
+      voucher_id INTEGER REFERENCES voucher_header_tbl(id) ON DELETE CASCADE,
+      account_id INTEGER,
+      amount DOUBLE PRECISION DEFAULT 0,
+      bank_amount DOUBLE PRECISION DEFAULT 0,
+      net_amount DOUBLE PRECISION DEFAULT 0,
+      currency_id INTEGER,
+      bank_currency_id INTEGER,
+      card_currency_id INTEGER,
+      fees_voucher_id INTEGER REFERENCES voucher_header_tbl(id),
+      order_no INTEGER DEFAULT 1
+    )
+  `
+  await sql`CREATE INDEX IF NOT EXISTS idx_voucher_cards_detail_tbl_voucher_id ON voucher_cards_detail_tbl(voucher_id)`
+  // بيانات جهاز الدفع (PinPad) عند تحصيل البطاقة عبر الجهاز — lib/pinpad.ts
+  await sql`ALTER TABLE voucher_cards_detail_tbl ADD COLUMN IF NOT EXISTS card_entry VARCHAR(10)`
+  await sql`ALTER TABLE voucher_cards_detail_tbl ADD COLUMN IF NOT EXISTS pinpad_machine_id INTEGER`
+  await sql`ALTER TABLE voucher_cards_detail_tbl ADD COLUMN IF NOT EXISTS card_auth_code VARCHAR(40)`
+  await sql`ALTER TABLE voucher_cards_detail_tbl ADD COLUMN IF NOT EXISTS card_trans_id VARCHAR(60)`
+  await sql`ALTER TABLE voucher_cards_detail_tbl ADD COLUMN IF NOT EXISTS card_terminal_id VARCHAR(60)`
+  await sql`ALTER TABLE voucher_cards_detail_tbl ADD COLUMN IF NOT EXISTS card_merchant VARCHAR(120)`
+}) }
+
+// vch_type values on voucher_header_tbl, per voucher_types_tbl.
+export const RECEIPT_VCH_TYPE = 4
+export const PAYMENT_VCH_TYPE = 5
+
+// رقم السند = بادئة (من إعدادات النظام) + رمز دفتر السندات + رقم تسلسلي مبطّن بأصفار
+// (مثال: RE + F + 00001 = REF00001). يُقرأ عبر طلب داخلي لنفس منطق /api/settings/system
+// بدل تكرار معالجة المخطط القديم/الجديد لجدول system_settings هناك.
+export const getVoucherNumberSettings = async (
+  requestUrl: string,
+  vchType: number,
+): Promise<{ prefix: string; startNumber: number }> => {
+  const isReceipt = vchType === RECEIPT_VCH_TYPE
+  const defaultPrefix = isReceipt ? "R" : "P"
+  try {
+    // مباشرة من القاعدة بدل طلب HTTP داخلي لـ/api/settings/system: ذلك الطلب لا يحمل كوكي الشركة (فيقرأ
+    // الإعدادات الافتراضية لا إعدادات الشركة)، وعلى Cloudflare هو طلب Worker إضافي كامل مع كل توليد رقم.
+    void requestUrl
+    const { loadStoredSettings } = await import("@/app/api/settings/system/route")
+    const settings = await loadStoredSettings()
+    const prefixRaw = String(settings?.[isReceipt ? "receipt_prefix" : "payment_prefix"] || defaultPrefix).trim().toUpperCase()
+    const prefix = /^[A-Z]{1,3}$/.test(prefixRaw) ? prefixRaw : defaultPrefix
+    const startNumber = Number(settings?.[isReceipt ? "receipt_start" : "payment_start"]) || 1
+    return { prefix, startNumber }
+  } catch (error) {
+    console.error("Failed to load voucher numbering settings, using defaults:", error)
+    return { prefix: defaultPrefix, startNumber: 1 }
+  }
+}
+
+// الرقم التسلسلي التالي ضمن تركيبة (نوع السند + البادئة + رمز الدفتر) هذه تحديداً — تغيير
+// الدفتر يبدّل رمزه ضمن الكود فيُعاد حساب الأقصى من جديد لتلك التركيبة، كما لو أنها ترقيم منفصل.
+export const nextVoucherSequence = async (vchType: number, codePrefix: string, startNumber: number): Promise<number> => {
+  // أعلى رقم تسلسلي يُحسب داخل قاعدة البيانات (صف واحد) بدل جلب كل أكواد النوع/البادئة للخادم مع كل حفظ —
+  // نفس القاعدة: ما بعد البادئة = حرف اختياري ثم أرقام
+  const rows = await sql`
+    SELECT COALESCE(MAX((regexp_match(substr(vch_code, ${codePrefix.length + 1}::int), '^[A-Za-z]?([0-9]+)$'))[1]::numeric), 0) AS max_number
+    FROM voucher_header_tbl WHERE vch_type = ${vchType} AND vch_code LIKE ${codePrefix + "%"}
+  `
+  const maxNumber = Number((rows as any[])[0]?.max_number || 0)
+  return maxNumber >= startNumber ? maxNumber + 1 : startNumber
+}
+
+// جزء الكود الذي يلي بادئة السند: رمز الفرع (إن مُرّر branchId) + رمز دفتر السندات، مثل "AD".
+export const resolveVoucherBookName = async (bookId: number | null, branchId?: number | null): Promise<string> => {
+  if (!bookId) return ""
+  // داخل معاملة (حفظ فاتورة الكاشير مثلاً) تُقرأ مرة واحدة (memoInTransaction في lib/database.ts)
+  const rows = await memoInTransaction(`voucher-book-name:${bookId}`, () => sql`SELECT name FROM voucher_books_tbl WHERE id = ${bookId}` as Promise<any[]>)
+  return withBranchSymbol(String(rows[0]?.name || ""), branchId)
+}
+
+// Debit (credit_debit=1) / Credit (credit_debit=2) — matches the reference C# system
+// (VoucherJournalDetail: "case when credit_debit=1 then amount else 0 end as debit").
+// سند قبض: cash/check/card accounts are debited, the counter account(s) are credited.
+// سند صرف: the reverse.
+export const buildJournalRows = (data: any, vchType: number) => {
+  const isReceipt = vchType === RECEIPT_VCH_TYPE
+  const paymentSide = isReceipt ? 1 : 2
+  const counterSide = isReceipt ? 2 : 1
+  const currencyId = data.currency_id || null
+  const rate = Number(data.rate || 1)
+
+  const rows: any[] = []
+  let orderNo = 1
+
+  const cashAmount = Number(data.cash_amount || 0)
+  if (cashAmount > 0 && data.cash_account_id) {
+    rows.push({
+      journal_type_id: JOURNAL_TYPE_CASH,
+      account_id: Number(data.cash_account_id),
+      credit_debit: paymentSide,
+      amount: cashAmount,
+      note: "نقدي",
+      cost_centers: Array.isArray(data.cash_account_cost_centers) ? data.cash_account_cost_centers : [],
+      order_no: orderNo++,
+    })
+  }
+
+  const checkAmount = Number(data.check_amount || 0)
+  if (checkAmount > 0 && data.check_account_id) {
+    rows.push({
+      journal_type_id: JOURNAL_TYPE_CHEQUE,
+      account_id: Number(data.check_account_id),
+      credit_debit: paymentSide,
+      amount: checkAmount,
+      note: "شيكات",
+      cost_centers: Array.isArray(data.check_account_cost_centers) ? data.check_account_cost_centers : [],
+      order_no: orderNo++,
+    })
+  }
+
+  const creditCardAmount = Number(data.credit_card_amount || 0)
+  if (creditCardAmount > 0 && data.credit_card_account_id) {
+    rows.push({
+      journal_type_id: JOURNAL_TYPE_CARD,
+      account_id: Number(data.credit_card_account_id),
+      credit_debit: paymentSide,
+      amount: creditCardAmount,
+      note: "بطاقات",
+      cost_centers: Array.isArray(data.credit_card_account_cost_centers) ? data.credit_card_account_cost_centers : [],
+      order_no: orderNo++,
+    })
+  }
+
+  const journalRows = (Array.isArray(data.journal) ? data.journal : []).filter(
+    (row: any) => row?.account_id && Number(row?.amount || 0) > 0,
+  )
+
+  if (journalRows.length > 0) {
+    for (const row of journalRows) {
+      rows.push({
+        journal_type_id: JOURNAL_TYPE_COUNTER_ACCOUNT,
+        account_id: Number(row.account_id),
+        credit_debit: counterSide,
+        amount: Number(row.amount),
+        note: row.note || "",
+        cost_centers: Array.isArray(row.cost_centers) ? row.cost_centers : [],
+        order_no: orderNo++,
+      })
+    }
+  } else if (data.to_account_id) {
+    rows.push({
+      journal_type_id: JOURNAL_TYPE_COUNTER_ACCOUNT,
+      account_id: Number(data.to_account_id),
+      credit_debit: counterSide,
+      amount: Number(data.amount || 0),
+      note: "",
+      cost_centers: [],
+      order_no: orderNo++,
+    })
+  }
+
+  return rows.map((row) => ({
+    ...row,
+    currency_id: currencyId,
+    rate,
+    base_curr_amount: Math.round(row.amount * rate * 100) / 100,
+  }))
+}
+
+// خط دفاع ثانٍ خلف فحص الواجهة (checkAccountCurrencyCompatibility في unified-journal.tsx /
+// unified-receipt-voucher.tsx) — إعداد الحساب allow_trans_with_diff_curr: 0 = مسموح بدون تنبيه،
+// 1 = مسموح مع تنبيه (لا يُرفض هنا، التنبيه تكفّلت به الواجهة)، 2 = ممنوع تماماً فيُرفض الحفظ.
+export const validateJournalAccountCurrencies = async (
+  journalRows: { account_id: number }[],
+  voucherCurrencyId: number | null,
+): Promise<string | null> => {
+  const accountIds = Array.from(new Set(journalRows.map((row) => Number(row.account_id)).filter((id) => id > 0)))
+  if (accountIds.length === 0) return null
+  // كل الحركات تمر من هنا قبل الحفظ: الحساب الرئيسي (له حسابات فرعية) لا يُقبل في أي سطر قيد
+  const parentError = await validateLeafAccounts(accountIds)
+  if (parentError) return parentError
+  if (voucherCurrencyId == null) return null
+
+  const accounts = await sql`
+    SELECT id, code, name, currency_id, allow_trans_with_diff_curr
+    FROM account_tbl
+    WHERE id = ANY(${accountIds}::int[])
+  `
+
+  for (const account of accounts) {
+    if (account.currency_id == null || Number(account.currency_id) === Number(voucherCurrencyId)) continue
+    if (Number(account.allow_trans_with_diff_curr) === 2) {
+      return `عملة السند تختلف عن عملة الحساب لا يمكن اختياره: ${account.code} - ${account.name}`
+    }
+  }
+
+  return null
+}
+
+// مركز التكلفة الإجباري: حساب له نوع مركز تكلفة "اجباري" (account_costcenters_tbl.required_in_transactions = 2)
+// لا يُقبل سطره في السند إلا بمركز من ذلك النوع — من السطر نفسه، أو مركز الحساب الافتراضي الذي يُضاف آلياً
+// عند الحفظ إن لم يُحدد للسطر أي مركز (saveJournalRows).
+export const validateJournalCostCenters = async (journalRows: { account_id: number; cost_centers?: any[] }[]): Promise<string | null> => {
+  const accountIds = Array.from(new Set(journalRows.map((row) => Number(row.account_id)).filter((id) => id > 0)))
+  if (accountIds.length === 0) return null
+  const ready = await sql`SELECT to_regclass('account_costcenters_tbl') IS NOT NULL AS ok`
+  if (!(ready as any[])[0]?.ok) return null
+  const settings = (await sql`
+    SELECT acc.account_id, acc.cost_center_type_id, acc.required_in_transactions, acc.default_cost_center_id, a.code, a.name
+    FROM account_costcenters_tbl acc
+    JOIN account_tbl a ON a.id = acc.account_id
+    WHERE acc.account_id = ANY(${accountIds}::int[])
+      AND (acc.required_in_transactions = 2 OR acc.default_cost_center_id IS NOT NULL)
+  `) as any[]
+  if (!settings.some((row) => Number(row.required_in_transactions) === 2)) return null
+  const ownIds = Array.from(new Set(journalRows.flatMap((row) => (Array.isArray(row.cost_centers) ? row.cost_centers : [])
+    .map((item: any) => Number(item?.cost_center_id)).filter((id: number) => id > 0))))
+  const centerTypes = new Map<number, number>()
+  if (ownIds.length) {
+    const centers = await sql`SELECT id, cost_type_id FROM cost_centers WHERE id = ANY(${ownIds}::int[]) AND COALESCE(status, 1) <> 3`
+    for (const center of centers as any[]) centerTypes.set(Number(center.id), Number(center.cost_type_id))
+  }
+  for (const row of journalRows) {
+    const accountSettings = settings.filter((item) => Number(item.account_id) === Number(row.account_id))
+    const required = accountSettings.filter((item) => Number(item.required_in_transactions) === 2)
+    if (!required.length) continue
+    const own = (Array.isArray(row.cost_centers) ? row.cost_centers : []).map((item: any) => Number(item?.cost_center_id)).filter((id: number) => id > 0)
+    // نفس قاعدة الحفظ: مراكز السطر تحل محل الافتراضية كلياً، وبدونها تُستخدم مراكز الحساب الافتراضية
+    const types = new Set<number>(own.length
+      ? own.map((id: number) => centerTypes.get(id)).filter((type: number | undefined): type is number => type !== undefined)
+      : accountSettings.filter((item) => item.default_cost_center_id != null).map((item) => Number(item.cost_center_type_id)))
+    if (required.some((item) => !types.has(Number(item.cost_center_type_id)))) {
+      return `الحساب ${required[0].code} - ${required[0].name} بحاجة الى مركز تكلفة لا يمكن حفظ السند`
+    }
+  }
+  return null
+}
+
+export const saveJournalRows = async (voucherId: number, journalRows: any[]) => {
+  await sql`DELETE FROM voucher_journal_detail_tbl WHERE voucher_id = ${voucherId}`
+
+  if (!journalRows.length) return []
+
+  // دفعة واحدة بدل 2-4 رحلات لكل سطر (عملة الحساب، الإدراج، مراكز التكلفة الافتراضية، كل مركز تكلفة) —
+  // مع قاعدة بعيدة كان حفظ فاتورة كاشير بعشرة أسطر قيد يعني عشرات الرحلات المتتالية. النتيجة مطابقة تماماً.
+  const accountIds = [...new Set(journalRows.map((row) => Number(row.account_id)).filter((id) => Number.isInteger(id) && id > 0))]
+  const accountRows = accountIds.length
+    ? await sql`SELECT id, currency_id FROM account_tbl WHERE id = ANY(${accountIds}::int[])`
+    : []
+  const accountCurrencyById = new Map<number, number | null>(accountRows.map((row: any) => [Number(row.id), row.currency_id ?? null]))
+
+  const accountsNeedingDefaults = [...new Set(journalRows
+    .filter((row) => !(Array.isArray(row.cost_centers) && row.cost_centers.some((item: any) => item?.cost_center_id)))
+    .map((row) => Number(row.account_id)))]
+  const defaultRows = accountsNeedingDefaults.length
+    ? await sql`
+        SELECT account_id, cost_center_type_id, default_cost_center_id AS cost_center_id
+        FROM account_costcenters_tbl
+        WHERE account_id = ANY(${accountsNeedingDefaults}::int[]) AND default_cost_center_id IS NOT NULL
+        ORDER BY id
+      `
+    : []
+  const defaultCostCentersByAccount = new Map<number, any[]>()
+  for (const row of defaultRows) {
+    const list = defaultCostCentersByAccount.get(Number(row.account_id)) || []
+    list.push(row)
+    defaultCostCentersByAccount.set(Number(row.account_id), list)
+  }
+
+  // v1 simplification: no cross-rate table exists yet, so the account's own-currency
+  // amount mirrors the voucher's amount/rate even when the account's currency differs.
+  const column = <T,>(pick: (row: any) => T) => journalRows.map(pick)
+  const inserted = await sql`
+    INSERT INTO voucher_journal_detail_tbl (
+      voucher_id, order_no, journal_type_id, account_id, credit_debit,
+      amount, currency_id, rate, base_curr_amount, account_currency_id, account_rate, account_amount, note
+    )
+    SELECT ${voucherId}, r.order_no, r.journal_type_id, r.account_id, r.credit_debit,
+           r.amount, r.currency_id, r.rate, r.base_curr_amount, r.account_currency_id, r.account_rate, r.account_amount, r.note
+    FROM unnest(
+      ${column((row) => row.order_no ?? null)}::int[],
+      ${column((row) => row.journal_type_id ?? null)}::int[],
+      ${column((row) => row.account_id ?? null)}::int[],
+      ${column((row) => row.credit_debit ?? null)}::int[],
+      ${column((row) => row.amount ?? null)}::float8[],
+      ${column((row) => row.currency_id ?? null)}::int[],
+      ${column((row) => row.rate ?? null)}::float8[],
+      ${column((row) => row.base_curr_amount ?? null)}::float8[],
+      ${column((row) => accountCurrencyById.get(Number(row.account_id)) ?? row.currency_id ?? null)}::int[],
+      ${column((row) => row.rate ?? null)}::float8[],
+      ${column((row) => row.amount ?? null)}::float8[],
+      ${column((row) => String(row.note || ""))}::text[]
+    ) WITH ORDINALITY AS r(order_no, journal_type_id, account_id, credit_debit, amount, currency_id, rate,
+                           base_curr_amount, account_currency_id, account_rate, account_amount, note, ord)
+    ORDER BY r.ord
+    RETURNING id
+  `
+  // المعرّفات تُولَّد بترتيب الإدراج (ORDER BY ord) فترتيبها تصاعدياً يعيد ترتيب الأسطر المُرسلة نفسه
+  const insertedIds = inserted.map((row: any) => Number(row.id)).sort((a: number, b: number) => a - b)
+
+  const costCenterJournalIds: number[] = []
+  const costCenterIds: number[] = []
+  journalRows.forEach((row, index) => {
+    const own = Array.isArray(row.cost_centers) ? row.cost_centers.filter((item: any) => item?.cost_center_id) : []
+    const rowCostCenters = own.length ? own : defaultCostCentersByAccount.get(Number(row.account_id)) || []
+    for (const costCenter of rowCostCenters) {
+      if (!costCenter?.cost_center_id) continue
+      costCenterJournalIds.push(insertedIds[index])
+      costCenterIds.push(Number(costCenter.cost_center_id))
+    }
+  })
+  if (costCenterIds.length) {
+    await sql`
+      INSERT INTO voucher_costcenter_tbl (voucher_journal_id, cost_center_id)
+      SELECT * FROM unnest(${costCenterJournalIds}::int[], ${costCenterIds}::int[])
+    `
+  }
+  return insertedIds
+}
+
+// خط دفاع ثانٍ خلف تحقق الحقول المطلوبة في الواجهة — نفس الشيك (رقم الشيك + رقم الحساب معاً، وليس
+// أحدهما بمفرده) قد يُدخَل فعلياً في سندين مختلفين لو أُنشئ السندان في نفس اللحظة تقريباً (سباق)
+// أو عبر استدعاء مباشر لواجهة الـ API. voucherId يُستثنى من المطابقة (تعديل نفس السند لا يُعتبر
+// تكراراً)؛ عند سند جديد (voucherId = null) لا يوجد استثناء فيُقارَن مع كل السندات المحفوظة.
+export const validateChequeDuplicates = async (voucherId: number | null, cheques: any[]): Promise<string | null> => {
+  const rows = (Array.isArray(cheques) ? cheques : []).filter((row) => row?.cheq_num && row?.bank_account)
+  const seen = new Set<string>()
+
+  for (const row of rows) {
+    const cheqNum = String(row.cheq_num).trim()
+    const bankAccount = String(row.bank_account).trim()
+    const duplicateKey = `${bankAccount}\u0000${cheqNum}`
+    if (seen.has(duplicateKey)) {
+      return `رقم الشيك ${cheqNum} مكرر لنفس الحساب البنكي داخل السند`
+    }
+    seen.add(duplicateKey)
+    const matches = await sql`
+      SELECT vh.vch_code
+      FROM cheques_tbl c
+      JOIN voucher_header_tbl vh ON vh.id = c.voucher_id
+      WHERE c.cheq_num = ${cheqNum} AND c.bank_account = ${bankAccount}
+        AND vh.status <> 3
+        AND c.voucher_id IS DISTINCT FROM ${voucherId ?? -1}
+      LIMIT 1
+    `
+    if (matches.length > 0) {
+      return `رقم الشيك ${cheqNum} مدخل في سند آخر رقم السند ${matches[0].vch_code} - لا يمكن الاستمرار`
+    }
+  }
+
+  return null
+}
+
+// إعداد "عدم السماح بادخال شيكات يدويا في سند الصرف" (vouchers-general-settings.tsx) — عند
+// تفعيله يجب أن يأتي كل سطر شيك من ورقة محجوزة ضمن دفتر شيكات (cheque_book_cheque_id)، لا كتابة حرة.
+export const validateManualChequeEntry = async (vchType: number, cheques: any[]): Promise<string | null> => {
+  if (vchType !== PAYMENT_VCH_TYPE) return null
+  const disallowManual = await getSystemSettingValue<boolean>("disallow_manual_cheque_entry_in_payment", false)
+  if (!disallowManual) return null
+
+  const rows = (Array.isArray(cheques) ? cheques : []).filter((row) => row?.cheq_num || row?.bank_account)
+  for (const row of rows) {
+    if (!row.cheque_book_cheque_id) {
+      return "غير مسموح بإدخال شيكات يدوياً في سند الصرف - يجب اختيار الشيك من دفتر الشيكات"
+    }
+  }
+  return null
+}
+
+// رقم الحساب في سند الصرف يجب أن يطابق حساباً بنكياً فعلياً (bank_accounts)، وجميع شيكات نفس
+// السند يجب أن تكون من نفس الحساب البنكي (لا يجوز خلط حسابات بنكية ضمن سند واحد).
+export const validateChequeBankAccounts = async (vchType: number, cheques: any[]): Promise<string | null> => {
+  if (vchType !== PAYMENT_VCH_TYPE) return null
+  const rows = (Array.isArray(cheques) ? cheques : []).filter((row) => row?.cheq_num || row?.bank_account)
+  if (rows.length === 0) return null
+
+  const codes = Array.from(new Set(rows.map((row) => String(row.bank_account || "").trim()).filter(Boolean)))
+  if (codes.length > 0) {
+    const accounts = await sql`SELECT code FROM bank_accounts WHERE code = ANY(${codes}::text[])`
+    const existingCodes = new Set(accounts.map((a: any) => a.code))
+    for (const code of codes) {
+      if (!existingCodes.has(code)) {
+        return "الحساب البنكي المدخل غير موجود"
+      }
+    }
+  }
+
+  const distinctAccounts = new Set(rows.map((row) => String(row.bank_account || "").trim()).filter(Boolean))
+  if (distinctAccounts.size > 1) {
+    return "يجب أن تكون جميع الشيكات من نفس الحساب البنكي"
+  }
+  return null
+}
+
+// خط دفاع ثانٍ خلف تحقق الواجهة (validateVoucher في receipts.tsx) — وجود مبلغ شيكات يستلزم حساب
+// صندوق شيكات؛ في سند الصرف يصل check_account_id معبَّأً بالفعل بـ jary_account_id الخاص
+// بالحساب البنكي المختار في شبكة الشيكات (تُزامنه الواجهة تلقائياً في unified-receipt-voucher.tsx).
+export const validateCheckAccount = (checkAmount: number, checkAccountId: number | null): string | null => {
+  if (checkAmount > 0 && !checkAccountId) {
+    return "يجب ادخال حساب صندوق الشيكات"
+  }
+  return null
+}
+
+// خط دفاع ثانٍ خلف تحقق الواجهة (validateVoucher في receipts.tsx) — إجمالي مبالغ أسطر تبويب
+// الشيكات يجب أن يساوي مبلغ الشيكات (check_amount) في رأس السند.
+export const validateChequesTotal = (checkAmount: number, cheques: any[]): string | null => {
+  if (checkAmount <= 0) return null
+  const validCheques = (Array.isArray(cheques) ? cheques : []).filter((row) => row?.cheq_num && Number(row?.amount || 0) > 0)
+  const chequesTotal = validCheques.reduce((sum, row) => sum + Number(row.amount || 0), 0)
+  if (Math.round((chequesTotal - checkAmount) * 100) / 100 !== 0) {
+    return "مبلغ الشيكات غير مساوي لاجمالي مبالغ الشيكات"
+  }
+  return null
+}
+
+// يمنع سباق التزامن: ورقة حُجزت من مستخدم آخر بين لحظة اختيارها في الواجهة ولحظة الحفظ الفعلي.
+export const validateChequeBookLeaves = async (voucherId: number | null, cheques: any[]): Promise<string | null> => {
+  const leafIds = (Array.isArray(cheques) ? cheques : [])
+    .map((row) => (row?.cheque_book_cheque_id ? Number(row.cheque_book_cheque_id) : null))
+    .filter((id): id is number => Boolean(id))
+  if (leafIds.length === 0) return null
+
+  const rows = await sql`SELECT id, cheque_code, status, voucher_id FROM cheque_book_cheque_tbl WHERE id = ANY(${leafIds}::int[])`
+  for (const leafId of leafIds) {
+    const row = rows.find((r: any) => Number(r.id) === leafId)
+    if (!row) return "الشيك المحدد من دفتر الشيكات غير موجود"
+    if (Number(row.status) === 2) {
+      return `الشيك رقم ${row.cheque_code} من دفتر الشيكات تالف ولا يمكن استخدامه`
+    }
+    if (Number(row.status) === 3 && row.voucher_id != null && Number(row.voucher_id) !== Number(voucherId ?? -1)) {
+      return `الشيك رقم ${row.cheque_code} من دفتر الشيكات مستخدم مسبقاً في سند آخر`
+    }
+  }
+  return null
+}
+
+// يُطلق أي أوراق شيكات كانت محجوزة لهذا السند (متوفر=1) — يُستخدم عند الإلغاء المنطقي والحذف
+// الفعلي، وكخطوة أولى قبل إعادة الحجز عند كل حفظ (consumeChequeBookLeaves) حتى تعكس الحجوزات
+// آخر حالة للسند بدل تراكم حجوزات قديمة لم تعد ضمن أسطر الشيكات الحالية.
+export const releaseChequeBookLeaves = async (voucherId: number) => {
+  await sql`
+    UPDATE cheque_book_cheque_tbl SET status = 1, voucher_id = NULL, voucher_date = NULL
+    WHERE voucher_id = ${voucherId}
+  `
+}
+
+// "ChangeStatus" المكافئ لهذا المخطط: الحجز هنا على مستوى الورقة الفردية (cheque_book_cheque_tbl)
+// لا الدفتر ذاته، لأن الدفتر يحتوي عشرات الأوراق ولا يصح اعتباره كله "غير متوفر" لاستخدام ورقة واحدة.
+export const consumeChequeBookLeaves = async (voucherId: number, vchDate: string, cheques: any[]) => {
+  await releaseChequeBookLeaves(voucherId)
+  const leafIds = (Array.isArray(cheques) ? cheques : [])
+    .map((row) => (row?.cheque_book_cheque_id ? Number(row.cheque_book_cheque_id) : null))
+    .filter((id): id is number => Boolean(id))
+
+  for (const leafId of leafIds) {
+    await sql`
+      UPDATE cheque_book_cheque_tbl SET status = 3, voucher_id = ${voucherId}, voucher_date = ${vchDate}
+      WHERE id = ${leafId}
+    `
+  }
+}
+
+interface ChequeContext {
+  vchType: number
+  currencyId: number | null
+  rate: number
+  vchDate: string
+  checkAccountId: number | null
+}
+
+// صور الشيكات من قارئ الشيكات (وجه/ظهر، base64) — جدول مستقل بمفتاح (السند، رقم الشيك، البنك) لأن
+// أسطر cheques_tbl تُحذف ويُعاد إدراجها مع كل حفظ فتتغير معرّفاتها.
+export const ensureChequeImagesTable = () => runSchemaOnce("app/api/receipts/_lib#ensureChequeImagesTable", async () => {
+  await sql`
+    CREATE TABLE IF NOT EXISTS cheque_images_tbl (
+      id SERIAL PRIMARY KEY,
+      voucher_id INTEGER NOT NULL,
+      cheq_num TEXT NOT NULL,
+      bank_id INTEGER NOT NULL DEFAULT 0,
+      front_image TEXT,
+      back_image TEXT,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE (voucher_id, cheq_num, bank_id)
+    )
+  `
+})
+
+const imageText = (value: unknown) => {
+  const text = String(value || "").trim()
+  if (!text) return null
+  // يُقبل base64 خام أو data URL لصورة فقط
+  const raw = text.startsWith("data:image/") ? text.slice(text.indexOf(",") + 1) : text
+  return /^[A-Za-z0-9+/=\s]+$/.test(raw) ? raw.replace(/\s+/g, "") : null
+}
+
+const saveChequeImages = async (voucherId: number, rows: any[]) => {
+  await ensureChequeImagesTable()
+  const keep: string[] = []
+  for (const row of rows) {
+    const cheqNum = String(row.cheq_num || "").trim()
+    if (!cheqNum) continue
+    const bankId = Number(row.bank_id) || 0
+    keep.push(`${cheqNum}#${bankId}`)
+    const front = imageText(row.front_image)
+    const back = imageText(row.back_image)
+    if (!front && !back) continue
+    await sql`
+      INSERT INTO cheque_images_tbl (voucher_id, cheq_num, bank_id, front_image, back_image)
+      VALUES (${voucherId}, ${cheqNum}, ${bankId}, ${front}, ${back})
+      ON CONFLICT (voucher_id, cheq_num, bank_id) DO UPDATE SET
+        front_image = COALESCE(EXCLUDED.front_image, cheque_images_tbl.front_image),
+        back_image = COALESCE(EXCLUDED.back_image, cheque_images_tbl.back_image)
+    `
+  }
+  // صور شيكات حُذفت من السند
+  await sql`DELETE FROM cheque_images_tbl WHERE voucher_id = ${voucherId} AND NOT ((cheq_num || '#' || bank_id::text) = ANY(${keep}::text[]))`
+}
+
+export const saveChequeRows = async (voucherId: number, cheques: any[], ctx: ChequeContext) => {
+  await sql`DELETE FROM cheques_tbl WHERE voucher_id = ${voucherId}`
+  const rows = (Array.isArray(cheques) ? cheques : []).filter((row) => row?.cheq_num || row?.bank_account)
+  await saveChequeImages(voucherId, rows)
+  // cheques_type_tbl: 1 = شيكات واردة (in, سند قبض), 2 = شيكات صادرة (out, سند صرف)
+  const cheqType = ctx.vchType === RECEIPT_VCH_TYPE ? 1 : 2
+
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i]
+    await sql`
+      INSERT INTO cheques_tbl (
+        voucher_id, cheq_type, bank_account, bank_account_id, cheq_num, bank_id, branch_id, amount,
+        currency_id, rate, received_date, trans_date, due_date, cheq_owner_name,
+        customer_id, rec_cheq_account_id, current_account_id, status_id, manual_insert, cheq_book_id, is_printed, order_no
+      ) VALUES (
+        ${voucherId}, ${cheqType}, ${row.bank_account || ""}, ${row.bank_account_id || null}, ${row.cheq_num || ""}, ${row.bank_id || null}, ${row.branch_id || null},
+        ${Number(row.amount || 0)}, ${ctx.currencyId}, ${ctx.rate}, ${ctx.vchDate}, ${ctx.vchDate}, ${row.due_date || null},
+        ${row.cheq_owner_name || ""}, (SELECT account_id FROM voucher_header_tbl WHERE id=${voucherId}),
+        ${ctx.checkAccountId}, ${ctx.checkAccountId}, 1, ${row.cheque_book_cheque_id ? 0 : 1}, ${row.cheque_book_cheque_id || null}, 0, ${i + 1}
+      )
+    `
+  }
+}
+
+export const saveCardRows = async (voucherId: number, cards: any[], defaultCurrencyId: number | null) => {
+  // البطاقات التي أُنشئ لها قيد عمولة (fees_voucher_id — شاشة قيود عمولة الفيزا) يجب ألا تعود
+  // "غير معالجة" لمجرد إعادة حفظ السند (الحذف وإعادة الإدراج أدناه كانا يمحوان الربط فتُحتسَب
+  // العمولة مرتين). يُنقل الربط إلى السطر الجديد المطابق (نفس النوع والرقم والمبلغ والعملة).
+  const processed = await sql`
+    SELECT card_type_id, card_no, amount, currency_id, fees_voucher_id FROM voucher_cards_detail_tbl
+    WHERE voucher_id = ${voucherId} AND COALESCE(fees_voucher_id, 0) > 0
+  `
+  const cardKey = (typeId: unknown, cardNo: unknown, amount: unknown, currencyId: unknown) =>
+    `${Number(typeId) || 0}|${String(cardNo || "")}|${Number(amount || 0).toFixed(2)}|${Number(currencyId) || 0}`
+  const processedByKey = new Map<string, number[]>()
+  for (const row of processed) {
+    const key = cardKey(row.card_type_id, row.card_no, row.amount, row.currency_id)
+    processedByKey.set(key, [...(processedByKey.get(key) || []), Number(row.fees_voucher_id)])
+  }
+
+  await sql`DELETE FROM voucher_cards_detail_tbl WHERE voucher_id = ${voucherId}`
+  const rows = (Array.isArray(cards) ? cards : []).filter((row) => row?.card_no || Number(row?.amount || 0) > 0)
+
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i]
+    const amount = Number(row.amount || 0)
+    const bankAmount = Number(row.bank_amount || 0)
+    const netAmount = row.net_amount !== null && row.net_amount !== undefined && row.net_amount !== ""
+      ? Number(row.net_amount)
+      : amount - bankAmount
+    // Each card has its own currency (drives which نوع البطاقة options are offered),
+    // separate from the voucher header's currency.
+    const cardCurrencyId = row.currency_id || defaultCurrencyId
+    const feesVoucherId = processedByKey.get(cardKey(row.card_type_id, row.card_no, amount, cardCurrencyId))?.shift() ?? null
+
+    await sql`
+      INSERT INTO voucher_cards_detail_tbl (
+        voucher_id, card_type_id, card_no, expire_date, account_id, amount, bank_amount, net_amount,
+        currency_id, bank_currency_id, card_currency_id, order_no, fees_voucher_id,
+        card_entry, pinpad_machine_id, card_auth_code, card_trans_id, card_terminal_id, card_merchant
+      ) VALUES (
+        ${voucherId}, ${row.card_type_id || null}, ${row.card_no || ""}, ${row.expire_date || null}, ${row.account_id || null},
+        ${amount}, ${bankAmount}, ${netAmount}, ${cardCurrencyId}, ${cardCurrencyId}, ${cardCurrencyId}, ${i + 1}, ${feesVoucherId},
+        ${row.card_entry === "pinpad" ? "pinpad" : row.card_no ? "manual" : null}, ${Number(row.pinpad_machine_id) || null},
+        ${String(row.card_auth_code || "").slice(0, 40) || null}, ${String(row.card_trans_id || "").slice(0, 60) || null},
+        ${String(row.card_terminal_id || "").slice(0, 60) || null}, ${String(row.card_merchant || "").slice(0, 120) || null}
+      )
+    `
+  }
+}
+
+export const saveNoteRows = async (voucherId: number, notes: any[]) => {
+  await sql`DELETE FROM voucher_notes_tbl WHERE voucher_id = ${voucherId}`
+  const rows = (Array.isArray(notes) ? notes : []).filter((row) => row?.note && row.note.trim())
+  for (let i = 0; i < rows.length; i++) {
+    await sql`
+      INSERT INTO voucher_notes_tbl (voucher_id, note, order_no)
+      VALUES (${voucherId}, ${rows[i].note}, ${i + 1})
+    `
+  }
+}
+
+export const fetchDetails = async (voucherId: number) => {
+  await ensureChequeImagesTable()
+  const [journalRaw, cashCheckCardRows, costCenterRows, cheques, notes, cards] = await Promise.all([
+    // نقدي/شيكات/بطاقات (JOURNAL_TYPE_CASH/CHEQUE/CARD) هي أسطر تركيبية تعكس حقول الرئيسية
+    // المخصصة (cash_amount/check_amount/credit_card_amount) وليست جزءاً من تبويب "الحسابات" —
+    // فقط JOURNAL_TYPE_COUNTER_ACCOUNT (الحساب المقابل الفعلي الذي يُدخله المستخدم في تلك
+    // الشبكة) يجب أن يُعرض فيها، وإلا تظهر أسطر نقدي/شيكات/بطاقات مكرَّرة مع سطر الحساب الحقيقي.
+    // vjd.* لا يحمل رقم/اسم الحساب (voucher_journal_detail_tbl يخزّن account_id فقط) — لذا
+    // يُنضمّ إلى account_tbl هنا، وإلا تظهر شبكة الحسابات فارغة الحقول عند عرض سند محفوظ سابقاً.
+    sql`
+      SELECT vjd.*, acc.code AS account_code, acc.name AS account_name
+      FROM voucher_journal_detail_tbl vjd
+      LEFT JOIN account_tbl acc ON acc.id = vjd.account_id
+      WHERE vjd.voucher_id = ${voucherId} AND vjd.journal_type_id = ${JOURNAL_TYPE_COUNTER_ACCOUNT}
+      ORDER BY vjd.order_no, vjd.id
+    `,
+    sql`
+      SELECT id, journal_type_id, account_id, amount FROM voucher_journal_detail_tbl
+      WHERE voucher_id = ${voucherId}
+        AND journal_type_id = ANY(${[JOURNAL_TYPE_CASH, JOURNAL_TYPE_CHEQUE, JOURNAL_TYPE_CARD]}::int[])
+    `,
+    sql`
+      SELECT vc.id, vc.voucher_journal_id, vc.cost_center_id, cc.cost_type_id AS cost_center_type_id, cc.name AS cost_center_name
+      FROM voucher_costcenter_tbl vc
+      INNER JOIN voucher_journal_detail_tbl vjd ON vjd.id = vc.voucher_journal_id
+      LEFT JOIN cost_centers cc ON cc.id = vc.cost_center_id
+      WHERE vjd.voucher_id = ${voucherId}
+    `,
+    sql`
+      SELECT c.*, b.bank_code AS bank_no, b.bank_name, br.branch_code AS branch_no, br.branch_name,
+        EXISTS (SELECT 1 FROM cheque_images_tbl ci WHERE ci.voucher_id = c.voucher_id AND ci.cheq_num = c.cheq_num AND ci.bank_id = COALESCE(c.bank_id, 0)) AS has_image
+      FROM cheques_tbl c
+      LEFT JOIN banks b ON b.id = c.bank_id
+      LEFT JOIN branches br ON br.id = c.branch_id
+      WHERE c.voucher_id = ${voucherId}
+      ORDER BY c.order_no, c.id
+    `,
+    sql`SELECT * FROM voucher_notes_tbl WHERE voucher_id = ${voucherId} ORDER BY order_no, id`,
+    sql`SELECT * FROM voucher_cards_detail_tbl WHERE voucher_id = ${voucherId} ORDER BY order_no, id`,
+  ])
+
+  const costCentersByJournalId = new Map<number, any[]>()
+  for (const row of costCenterRows) {
+    const list = costCentersByJournalId.get(row.voucher_journal_id) || []
+    list.push({
+      cost_center_id: row.cost_center_id,
+      cost_center_type_id: row.cost_center_type_id,
+      cost_center_name: row.cost_center_name,
+    })
+    costCentersByJournalId.set(row.voucher_journal_id, list)
+  }
+
+  const journal = journalRaw.map((row: any) => ({
+    ...row,
+    cost_centers: costCentersByJournalId.get(row.id) || [],
+  }))
+
+  // نقدي/شيكات/بطاقات ليست أسطراً في تبويب "الحسابات" (انظر التعليق أعلاه) لذا تُعاد مراكز
+  // تكلفتها كحقول مستقلة على مستوى السند بدل ضمن `journal`.
+  const cashCheckCardCostCenters = new Map<number, any[]>()
+  for (const row of cashCheckCardRows) {
+    cashCheckCardCostCenters.set(row.journal_type_id, costCentersByJournalId.get(row.id) || [])
+  }
+
+  const paymentRowByType = new Map<number, any>()
+  for (const row of cashCheckCardRows) paymentRowByType.set(Number(row.journal_type_id), row)
+  const cashRow = paymentRowByType.get(JOURNAL_TYPE_CASH)
+  const chequeRow = paymentRowByType.get(JOURNAL_TYPE_CHEQUE)
+  const cardRow = paymentRowByType.get(JOURNAL_TYPE_CARD)
+
+  return {
+    journal,
+    cheques,
+    notes,
+    cards,
+    cash_amount: cashRow?.amount == null ? null : Number(cashRow.amount),
+    cash_account_id: cashRow?.account_id == null ? null : Number(cashRow.account_id),
+    check_amount: chequeRow?.amount == null ? null : Number(chequeRow.amount),
+    check_account_id: chequeRow?.account_id == null ? null : Number(chequeRow.account_id),
+    credit_card_amount: cardRow?.amount == null ? null : Number(cardRow.amount),
+    credit_card_account_id: cardRow?.account_id == null ? null : Number(cardRow.account_id),
+    cash_account_cost_centers: cashCheckCardCostCenters.get(JOURNAL_TYPE_CASH) || [],
+    check_account_cost_centers: cashCheckCardCostCenters.get(JOURNAL_TYPE_CHEQUE) || [],
+    credit_card_account_cost_centers: cashCheckCardCostCenters.get(JOURNAL_TYPE_CARD) || [],
+  }
+}
+
+// الحذف الفعلي متاح فقط لسند بحالة "فعال" (status=1، لم يُرحَّل بعد) — سند مُرحَّل (status=2)
+// يُلغى منطقياً (status=3) بدل حذفه، فيبقى مؤرشفاً في voucher_header_tbl نفسها. هنا فقط نؤرشف
+// نسخة كاملة من السند (رأسية + حسابات + مراكز تكلفة + ملاحظات) إلى جداول الـ log قبل حذفه فعلياً
+// حتى لا تضيع الحركة نهائياً. الشيكات وتفاصيل البطاقات تُحذف دون أرشفة (خارج نطاق هذه الميزة حالياً).
+export const archiveAndDeleteVoucher = async (voucherId: number): Promise<{ error?: string }> => {
+  const headerRows = await sql`SELECT * FROM voucher_header_tbl WHERE id = ${voucherId}`
+  if (headerRows.length === 0) return { error: "السند غير موجود" }
+  const voucher = headerRows[0]
+  if (Number(voucher.status) !== 1) {
+    return { error: "لا يمكن الحذف الفعلي إلا لسند بحالة فعال (غير معتمد)" }
+  }
+
+  const loggedHeader = await sql`
+    INSERT INTO voucher_header_log_tbl (
+      id, vch_type, vch_code, vch_date, currency_id, rate, cash_amount, cash_account_id,
+      amount, note, status, vch_status, vch_book_id, account_id,
+      customer_name, to_account_id, check_amount, check_account_id, credit_card_amount,
+      credit_card_account_id, payment_classification_id, salesman_id, manual_voucher,
+      manual_date, is_printed, insert_user, update_user, insert_date, last_update_date,
+      company_id, discount, updated_vch_id, payment_type_id, approved, location_id,
+      internal_voucher_id, language_id, print_setting_id, print_attachment_id, phone,
+      vat_reg, vat_duedate, vat_type_id, vat_classification_id, vat_included, vat,
+      invoice_type, is_maqasa, maqasa_type, to_store_id, vat_percent, cheq_operation_id,
+      is_breakpoint, pricing_way_id, exit_time, returnedable_voucher_id, due_date,
+      is_exported_sales, draft_code, twins_vch_id
+    )
+    SELECT
+      id, vch_type, vch_code, vch_date, currency_id, rate, 0, NULL,
+      amount, note, status, vch_status, vch_book_id, account_id,
+      customer_name, to_account_id, 0, NULL, 0,
+      NULL, payment_classification_id, salesman_id, manual_voucher,
+      manual_date, is_printed, insert_user, update_user, insert_date, last_update_date,
+      company_id, discount, updated_vch_id, payment_type_id, approved, location_id,
+      internal_voucher_id, language_id, print_setting_id, print_attachment_id, phone,
+      vat_reg, vat_duedate, vat_type_id, vat_classification_id, vat_included, vat,
+      invoice_type, is_maqasa, maqasa_type, to_store_id, vat_percent, cheq_operation_id,
+      is_breakpoint, pricing_way_id, exit_time, returnedable_voucher_id, due_date,
+      is_exported_sales, draft_code, twins_vch_id
+    FROM voucher_header_tbl WHERE id = ${voucherId}
+    RETURNING serial
+  `
+  const headerSerial = loggedHeader[0].serial
+
+  await sql`
+    INSERT INTO voucher_journal_detail_log_tbl (
+      header_serial, id, voucher_id, order_no, journal_type_id, account_id, credit_debit,
+      amount, currency_id, rate, base_curr_amount, account_currency_id, account_rate, account_amount, note
+    )
+    SELECT
+      ${headerSerial}, id, voucher_id, order_no, journal_type_id, account_id, credit_debit,
+      amount, currency_id, rate, base_curr_amount, account_currency_id, account_rate, account_amount, note
+    FROM voucher_journal_detail_tbl WHERE voucher_id = ${voucherId}
+  `
+
+  await sql`
+    INSERT INTO voucher_costcenter_log_tbl (header_serial, id, voucher_journal_id, cost_center_id)
+    SELECT ${headerSerial}, vc.id, vc.voucher_journal_id, vc.cost_center_id
+    FROM voucher_costcenter_tbl vc
+    INNER JOIN voucher_journal_detail_tbl vjd ON vjd.id = vc.voucher_journal_id
+    WHERE vjd.voucher_id = ${voucherId}
+  `
+
+  await sql`
+    INSERT INTO voucher_notes_log_tbl (header_serial, id, voucher_id, note, order_no)
+    SELECT ${headerSerial}, id, voucher_id, note, order_no
+    FROM voucher_notes_tbl WHERE voucher_id = ${voucherId}
+  `
+
+  // تحرير أي أوراق شيكات كانت محجوزة من دفتر شيكات لهذا السند قبل حذفه فعلياً.
+  await releaseChequeBookLeaves(voucherId)
+
+  // cheques_tbl.voucher_id هو ON DELETE RESTRICT (وليس CASCADE) — يجب حذفها صراحة قبل حذف
+  // الرأسية وإلا يفشل الحذف بخرق قيد مرجعي. غير مؤرشفة هنا (خارج النطاق المطلوب).
+  await sql`DELETE FROM cheques_tbl WHERE voucher_id = ${voucherId}`
+  await ensureChequeImagesTable()
+  await sql`DELETE FROM cheque_images_tbl WHERE voucher_id = ${voucherId}`
+
+  await sql`DELETE FROM voucher_header_tbl WHERE id = ${voucherId}`
+
+  return {}
+}
+
+// يُستدعى عند ضغط زر الطباعة (وليس ضمن حفظ عادي) — لا يمر عبر PUT الرئيسي لأن ذاك يرفض أي
+// تعديل على سند مُرحَّل (status=2) بخلاف إلغائه. مقيَّد بـ status=2 لأن is_printed علامة "طُبع
+// كسند مرحّل" فقط؛ طباعة سند فعال (status=1) تُعتبر "نسخة للتدقيق" ولا تُسجَّل هنا.
+export const markVoucherPrinted = async (voucherId: number): Promise<{ error?: string }> => {
+  const result = await sql`
+    UPDATE voucher_header_tbl SET is_printed = 1 WHERE id = ${voucherId} AND status = 2
+    RETURNING id
+  `
+  if (result.length === 0) return { error: "السند غير موجود أو غير معتمد" }
+  return {}
+}

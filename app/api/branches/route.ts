@@ -1,68 +1,78 @@
 import { type NextRequest, NextResponse } from "next/server"
-import { neon } from "@neondatabase/serverless"
+import sql from "@/lib/database"
+import { authorizeFile, authorizeFileRead, projectFileLookup } from "@/lib/file-permissions"
+import { isSystemAdmin } from "@/lib/permissions"
+import { ensureBranchSymbolColumn, validateBranchSymbol } from "@/lib/branch-symbol"
+import { assertLicenseAllows, licenseErrorResponseBody } from "@/lib/company-license"
 
-import { Pool } from "pg"
-
-let sql: any = null
-
-try {
-  if (!process.env.DATABASE_URL) {
-    console.error("[v0] DATABASE_URL environment variable is not set")
-  } else {
-    const dbUrl = process.env.DATABASE_URL
-
-    if (dbUrl.includes("localhost") || dbUrl.includes("127.0.0.1")) {
-      const pool = new Pool({ connectionString: dbUrl })
-      sql = async (strings: TemplateStringsArray, ...values: any[]) => {
-        const client = await pool.connect()
-        try {
-          const query =
-            strings.reduce(
-              (prev, curr, i) =>
-                prev + curr + (i < values.length ? `$${i + 1}` : ""),
-              ""
-            )
-          const result = await client.query(query, values)
-          return result.rows
-        } finally {
-          client.release()
-        }
-      }
-    } else {
-      console.log("[v0] Using Neon serverless client")
-      sql = neon(dbUrl)
-    }
-
-    console.log("[v0] Database client initialized successfully")
-  }
-} catch (error) {
-  console.error("[v0] Failed to initialize DB client:", error)
-  sql = null
-}
-
-export default sql
-
-export async function GET() {
+export async function GET(request: NextRequest) {
   try {
-    // Create table if not exists
+    const authorization = await authorizeFileRead(request, ["branches", "banks", "bank-accounts", "accounts", "customers", "suppliers", "employees", "items", "services"])
+    if (!authorization.ok) return authorization.response
+    // Create table if not exists and migrate existing schema if necessary
     await sql`
       CREATE TABLE IF NOT EXISTS branches (
         id SERIAL PRIMARY KEY,
         branch_code VARCHAR(20) UNIQUE NOT NULL,
         branch_name VARCHAR(100) NOT NULL,
+        bank_id INTEGER,
         address TEXT,
         manager VARCHAR(100),
         phone VARCHAR(20),
-        is_active BOOLEAN DEFAULT true,
+        status INTEGER DEFAULT 1,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
     `
 
-    const branches = await sql`
-      SELECT * FROM branches
-      ORDER BY branch_name
-    `
+    await sql`ALTER TABLE branches ADD COLUMN IF NOT EXISTS bank_id INTEGER`
+    await sql`ALTER TABLE branches ADD COLUMN IF NOT EXISTS status INTEGER DEFAULT 1`
+    await ensureBranchSymbolColumn()
+
+    const { searchParams } = new URL(request.url)
+    const bankIdParam = searchParams.get("bank_id")
+    const bankId = bankIdParam ? Number(bankIdParam) : undefined
+
+    // فروع الشركة افتراضياً؛ kind=bank لشاشة فروع البنوك وحسابات البنوك، kind=all لما يحتاج الاثنين (السندات)
+    const kind = searchParams.get("kind") === "bank" || (bankId !== undefined && !Number.isNaN(bankId)) ? "bank" : searchParams.get("kind") === "all" ? "all" : "company"
+    const branches = (bankId !== undefined && !Number.isNaN(bankId)
+      ? await sql`
+          SELECT id, branch_code, branch_name, branch_symbol, bank_id, address, manager, phone, status, COALESCE(is_bank_branch, false) AS is_bank_branch
+          FROM branches
+          WHERE status != 3 AND bank_id = ${bankId}
+          ORDER BY branch_code ASC NULLS LAST, id ASC
+        `
+      : await sql`
+          SELECT id, branch_code, branch_name, branch_symbol, bank_id, address, manager, phone, status, COALESCE(is_bank_branch, false) AS is_bank_branch
+          FROM branches
+          WHERE status != 3
+          ORDER BY branch_code ASC NULLS LAST, id ASC
+        `).filter((row: any) => kind === "all" || (kind === "bank") === Boolean(row.is_bank_branch))
+    // فروع البنوك: ترتيب برقم البنك ثم رقم الفرع (جدول banks يُنشأ عند فتح شاشة البنوك فقط — قد لا يوجد)
+    if (kind !== "company") {
+      const bankCodes = new Map<number, string>()
+      try {
+        for (const bank of await sql`SELECT id, bank_code FROM banks`) bankCodes.set(Number(bank.id), String(bank.bank_code ?? ""))
+      } catch {}
+      const bankKey = (row: any) => (row.bank_id != null && bankCodes.has(Number(row.bank_id)) ? bankCodes.get(Number(row.bank_id))! : "￿")
+      branches.sort((a: any, b: any) => bankKey(a).localeCompare(bankKey(b), "en", { numeric: true }) || String(a.branch_code ?? "").localeCompare(String(b.branch_code ?? ""), "en", { numeric: true }))
+    }
+
+    // scope=mine (قائمة فرع رأس الصفحة): دائماً فروع عضوية المستخدم فقط (بلا صفوف = كل الفروع)، حتى لمن يملك صلاحية ملف الفروع
+    if (searchParams.get("scope") === "mine") {
+      // مسؤول النظام يرى كل الفروع
+      const mine = (await isSystemAdmin(authorization.userId)) ? [] : await sql`SELECT branch_id FROM user_branches WHERE user_id::text = ${String(authorization.userId)}`
+      const mineIds = new Set(mine.map((row: any) => Number(row.branch_id)))
+      const myBranches = mine.length ? branches.filter((row: any) => mineIds.has(Number(row.id))) : branches
+      return NextResponse.json(authorization.lookupOnly ? projectFileLookup("branches", myBranches) : myBranches)
+    }
+
+    if (authorization.lookupOnly) {
+      const memberships = await sql`SELECT branch_id FROM user_branches WHERE user_id = ${authorization.userId}`
+      const allowedIds = new Set(memberships.map((row: any) => Number(row.branch_id)))
+      const visibleBranches = memberships.length ? branches.filter((row: any) => allowedIds.has(Number(row.id))) : branches
+      return NextResponse.json(projectFileLookup("branches", visibleBranches))
+    }
     return NextResponse.json(branches)
   } catch (error) {
     console.error("Error fetching branches:", error)
@@ -72,28 +82,64 @@ export async function GET() {
 
 export async function POST(request: NextRequest) {
   try {
+    const authorization = await authorizeFile(request, "branches", "create")
+    if (!authorization.ok) return authorization.response
     const data = await request.json()
-
-    if (!data.branch_name || !data.branch_code) {
-      return NextResponse.json({ error: "اسم الفرع ورمزه مطلوبان" }, { status: 400 })
+    // البنك إلزامي لفرع البنك فقط (bank_branch: true من شاشة فروع البنوك)، واختياري لفرع الشركة
+    const bankId = Number(data.bank_id)
+    const hasBank = Number.isInteger(bankId) && bankId > 0
+    if (data.bank_branch === true && !hasBank) {
+      return NextResponse.json({ error: "يجب اختيار البنك" }, { status: 400 })
+    }
+    // Quick setup generates the branch code automatically.
+    const quick = data.quick === true
+    let branchCode = String(data.branch_code || "").trim()
+    if (quick && !branchCode) {
+      const row = (await sql`SELECT COALESCE(MAX(branch_code::int), 0) + 1 AS next, COALESCE(MAX(LENGTH(branch_code)), 4) AS width FROM branches WHERE branch_code ~ '^[0-9]{1,4}$'`)[0]
+      // نفس تنسيق الأرقام القائمة (مثل 0001 ← 0002)؛ الافتراضي 4 خانات.
+      branchCode = String(row?.next || 1).padStart(Math.min(4, Number(row?.width) || 4), "0")
     }
 
+    if (!/^\d{1,4}$/.test(branchCode)) {
+      return NextResponse.json({ error: quick ? "لا يوجد رقم فرع متاح (1-9999)" : "رقم الفرع مطلوب ويجب أن يتكون من 1 إلى 4 أرقام فقط" }, { status: 400 })
+    }
+    if (!String(data.branch_name || "").trim()) {
+      return NextResponse.json({ error: "اسم الفرع مطلوب" }, { status: 400 })
+    }
+    // فرع البنك: بلا رمز فرع (الرمز لترقيم سندات فروع الشركة) ولا يُحسب من ترخيص الفروع
+    const bankBranch = data.bank_branch === true
+    await ensureBranchSymbolColumn()
+    const symbolCheck = bankBranch ? { symbol: null, error: null } : await validateBranchSymbol(data.branch_symbol)
+    if (symbolCheck.error) return NextResponse.json({ error: symbolCheck.error }, { status: 400 })
+    if (!bankBranch) try {
+      await assertLicenseAllows("branches")
+    } catch (error) {
+      const body = licenseErrorResponseBody(error)
+      if (body) return NextResponse.json(body, { status: 409 })
+      throw error
+    }
     const result = await sql`
-      INSERT INTO branches (branch_code, branch_name, address, manager, phone, is_active)
+      INSERT INTO branches (branch_code, branch_name, branch_symbol, bank_id, address, manager, phone, status, is_bank_branch)
       VALUES (
-        ${data.branch_code},
-        ${data.branch_name},
+        ${branchCode.padStart(4, "0")},
+        ${String(data.branch_name).trim()},
+        ${symbolCheck.symbol},
+        ${hasBank ? bankId : null},
         ${data.address || ""},
         ${data.manager || ""},
         ${data.phone || ""},
-        ${data.is_active !== false}
+        ${Number(data.status || 1)},
+        ${bankBranch}
       )
-      RETURNING *
+      RETURNING id, branch_code, branch_name, branch_symbol, bank_id, address, manager, phone, status
     `
 
     return NextResponse.json(result[0], { status: 201 })
   } catch (error) {
     console.error("Error creating branch:", error)
+    if ((error as { code?: string })?.code === "23505") {
+      return NextResponse.json({ error: "رقم الفرع مستخدم بالفعل" }, { status: 409 })
+    }
     return NextResponse.json({ error: "Failed to create branch" }, { status: 500 })
   }
 }
@@ -101,22 +147,45 @@ export async function POST(request: NextRequest) {
 export async function PUT(request: NextRequest) {
   try {
     const data = await request.json()
+    const authorization = await authorizeFile(request, "branches", Number(data.status) === 3 ? "delete" : "update")
+    if (!authorization.ok) return authorization.response
+    const branchCode = String(data.branch_code || "").trim()
 
     if (!data.id) {
       return NextResponse.json({ error: "معرف الفرع مطلوب" }, { status: 400 })
     }
+    if (!/^\d{1,4}$/.test(branchCode)) {
+      return NextResponse.json({ error: "رقم الفرع مطلوب ويجب أن يتكون من 1 إلى 4 أرقام فقط" }, { status: 400 })
+    }
+    if (!String(data.branch_name || "").trim()) {
+      return NextResponse.json({ error: "اسم الفرع مطلوب" }, { status: 400 })
+    }
+    const putBankId = Number(data.bank_id)
+    const putHasBank = Number.isInteger(putBankId) && putBankId > 0
+    if (data.bank_branch === true && !putHasBank) {
+      return NextResponse.json({ error: "يجب اختيار البنك" }, { status: 400 })
+    }
+    await ensureBranchSymbolColumn()
+    const existing = (await sql`SELECT COALESCE(is_bank_branch, false) AS is_bank_branch FROM branches WHERE id = ${Number(data.id)}`)[0]
+    const bankBranch = data.bank_branch === true || Boolean(existing?.is_bank_branch)
+    const symbolCheck = bankBranch ? { symbol: null, error: null } : await validateBranchSymbol(data.branch_symbol, Number(data.id))
+    if (symbolCheck.error) return NextResponse.json({ error: symbolCheck.error }, { status: 400 })
 
     const result = await sql`
       UPDATE branches
-      SET 
-        branch_name = ${data.branch_name},
+      SET
+        branch_code = ${branchCode.padStart(4, "0")},
+        branch_name = ${String(data.branch_name).trim()},
+        branch_symbol = ${symbolCheck.symbol},
+        is_bank_branch = ${bankBranch},
+        bank_id = CASE WHEN ${data.bank_id === undefined}::boolean THEN bank_id ELSE ${putHasBank ? putBankId : null}::int END,
         address = ${data.address || ""},
         manager = ${data.manager || ""},
         phone = ${data.phone || ""},
-        is_active = ${data.is_active !== false},
+        status = ${Number(data.status || 1)},
         updated_at = CURRENT_TIMESTAMP
       WHERE id = ${data.id}
-      RETURNING *
+      RETURNING id, branch_code, branch_name, branch_symbol, bank_id, address, manager, phone, status
     `
 
     if (result.length === 0) {
@@ -126,6 +195,36 @@ export async function PUT(request: NextRequest) {
     return NextResponse.json(result[0])
   } catch (error) {
     console.error("Error updating branch:", error)
+    if ((error as { code?: string })?.code === "23505") {
+      return NextResponse.json({ error: "رقم الفرع مستخدم بالفعل" }, { status: 409 })
+    }
     return NextResponse.json({ error: "Failed to update branch" }, { status: 500 })
+  }
+}
+
+export async function DELETE(request: NextRequest) {
+  try {
+    const authorization = await authorizeFile(request, "branches", "delete")
+    if (!authorization.ok) return authorization.response
+    const data = await request.json()
+
+    if (!data.id) {
+      return NextResponse.json({ error: "معرف الفرع مطلوب" }, { status: 400 })
+    }
+
+    const result = await sql`
+      DELETE FROM branches
+      WHERE id = ${data.id}
+      RETURNING id
+    `
+
+    if (result.length === 0) {
+      return NextResponse.json({ error: "الفرع غير موجود" }, { status: 404 })
+    }
+
+    return NextResponse.json({ success: true })
+  } catch (error) {
+    console.error("Error deleting branch:", error)
+    return NextResponse.json({ error: "Failed to delete branch" }, { status: 500 })
   }
 }
