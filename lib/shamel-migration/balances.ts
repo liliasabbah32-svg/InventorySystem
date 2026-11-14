@@ -159,6 +159,21 @@ export async function processStockBalances(rows: Row[], ctx: StepContext, last: 
       if (previous.length) {
         const postedItems = new Set(((await sql`SELECT DISTINCT item_id FROM voucher_items_tbl WHERE voucher_id = ANY(${previous}::int[])`) as any[]).map((row) => Number(row.item_id)))
         const fresh = lines.filter((line) => !postedItems.has(Number(line.product_id)))
+        // أسطر رُحِّلت سابقاً بسعر 0 (كان السعر من «Market price» الفارغ غالباً) ⇐ سعر التكلفة B.Price، ومجموع السند
+        const priced = lines.filter((line) => postedItems.has(Number(line.product_id)) && line.price > 0)
+        if (priced.length) {
+          const updated = await sql`
+            UPDATE voucher_items_tbl vi SET price = v.price
+            FROM unnest(${priced.map((line) => Number(line.product_id))}::int[], ${priced.map((line) => line.price)}::float8[]) AS v(item_id, price)
+            WHERE vi.voucher_id = ANY(${previous}::int[]) AND vi.item_id = v.item_id AND COALESCE(vi.price, 0) = 0
+            RETURNING vi.id`
+          if (updated.length) {
+            await sql`
+              UPDATE voucher_header_tbl h SET amount = COALESCE((SELECT SUM(vi.qnty * vi.price) FROM voucher_items_tbl vi WHERE vi.voucher_id = h.id), 0)
+              WHERE h.id = ANY(${previous}::int[])`
+            ctx.info(`تحديث سعر ${updated.length} سطر من كميات أول المدة المرحّلة سابقاً بسعر التكلفة (B.Price)`)
+          }
+        }
         ctx.stats.skipped += lines.length - fresh.length
         lines = fresh
       }

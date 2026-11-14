@@ -1,6 +1,7 @@
 import type { MigrationRun, StepContext } from "@/lib/shamel-migration/core"
 import * as defs from "@/lib/shamel-migration/definitions"
 import { processAccountBalances, processStockBalances } from "@/lib/shamel-migration/balances"
+import { previousChequesSql, processPreviousCheques } from "@/lib/shamel-migration/cheques"
 import { SHAMEL_VOUCHER_TYPES, processVoucherItems, processVoucherLines, voucherItemsSql, voucherLinesSql } from "@/lib/shamel-migration/vouchers"
 
 // خطوات الترحيل بالترتيب: لكل خطوة استعلام Pervasive SQL ينفّذه معالج الترحيل على جهاز العميل (الأسماء المستعارة
@@ -153,8 +154,13 @@ const STEPS: MigrationStep[] = [
     process: (rows, ctx, last) => processAccountBalances(rows, ctx, last),
   },
   {
+    key: "prev_cheques", title: "شيكات السنوات السابقة (سند قبض/صرف + قيد عكسي)", group: "balances", batchSize: 50,
+    sql: () => previousChequesSql(),
+    process: (rows, ctx) => processPreviousCheques(rows, ctx),
+  },
+  {
     key: "stock_balances", title: "كميات أول المدة (سند ادخال/اخراج بضاعة)", group: "balances", batchSize: 2000,
-    sql: () => `select si."Code" as code, si."Store" as store_pos, sum(si."St Qnty") as start_balance, sum(si."Qnty") as qnty, max(s."Market price") as cost
+    sql: () => `select si."Code" as code, si."Store" as store_pos, sum(si."St Qnty") as start_balance, sum(si."Qnty") as qnty, max(s."B.Price") as cost
       from "sitems" si inner join "stock" s on s."StockID"=si."Code" where s."Type"<6 group by si."Code", si."Store"`,
     process: (rows, ctx, last) => processStockBalances(rows, ctx, last),
   },
