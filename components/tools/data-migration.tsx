@@ -25,6 +25,7 @@ type SummaryRow = { step: string; level: string; message: string; count: number;
 
 const WIZARD_URL = "/downloads/NoonERP-ShamelMigration.exe"
 const STEP_TITLES: Record<string, string> = {
+  reset: "حذف التعريفات المساعدة",
   lookups: "القوائم المساعدة", currencies: "العملات", rates: "أسعار الصرف", stores: "المستودعات", cost_centers: "مراكز التكلفة",
   accounts: "دليل الحسابات", salesmen: "المندوبون", customers: "العملاء والموردون", banks: "البنوك", bank_branches: "فروع البنوك",
   bank_accounts: "الحسابات البنكية", item_groups: "مجموعات الأصناف", items: "الأصناف", item_barcodes: "باركودات الوحدات",
@@ -48,6 +49,7 @@ export default function DataMigration() {
   const [mode, setMode] = useState<"definitions" | "full">("definitions")
   const [selectedTypes, setSelectedTypes] = useState<Set<string>>(new Set())
   const [balanceDate, setBalanceDate] = useState(today())
+  const [resetLookups, setResetLookups] = useState(true)
   const [token, setToken] = useState("")
   const [copied, setCopied] = useState(false)
   const [loading, setLoading] = useState(true)
@@ -105,7 +107,7 @@ export default function DataMigration() {
       const response = await fetch("/api/shamel-migration", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ mode, voucher_types: [...selectedTypes], balance_date: balanceDate }),
+        body: JSON.stringify({ mode, voucher_types: [...selectedTypes], balance_date: balanceDate, reset_lookups: resetLookups }),
       })
       const data = await response.json()
       if (!response.ok) throw new Error(data?.error || tr("تعذر إنشاء رمز الترحيل"))
@@ -210,6 +212,14 @@ export default function DataMigration() {
             <Label htmlFor="shamel-balance-date">{tr(mode === "full" ? "تاريخ رصيد أول المدة" : "تاريخ الأرصدة الافتتاحية")}</Label>
             <Input id="shamel-balance-date" type="date" value={balanceDate} onChange={(event) => setBalanceDate(event.target.value)} />
           </div>
+
+          <label className="flex cursor-pointer items-start gap-2 rounded-xl border p-3 text-sm">
+            <Checkbox className="mt-1" checked={resetLookups} onCheckedChange={(checked) => setResetLookups(checked === true)} />
+            <span>
+              <span className="font-semibold">{tr("حذف التعريفات المساعدة الحالية قبل الترحيل")}</span>
+              <span className="mt-1 block text-xs text-muted-foreground">{tr("المستودعات، الوحدات، فئات الأسعار، المدن، تصنيفات العملاء، مراكز التكلفة وأنواعها، مجموعات الأصناف، المندوبون، البنوك وفروعها — تحل محلها تعريفات الشامل. السجل المستخدم في حركات أو أصناف أو إعدادات لا يُحذف.")}</span>
+            </span>
+          </label>
 
           <div className="rounded-xl bg-amber-50 p-3 text-xs leading-6 text-amber-900 dark:bg-amber-950/30 dark:text-amber-200">
             {tr("يُفضّل الترحيل إلى شركة جديدة فارغة. سجل موجود بنفس الرقم (حساب، عميل، صنف...) يُربط ولا يُكرَّر، وإعادة تشغيل الترحيل تكمل من حيث توقف دون تكرار. حدّد الحسابات الافتراضية (حساب الأب للعملاء والموردين) ودفاتر السندات قبل البدء.")}

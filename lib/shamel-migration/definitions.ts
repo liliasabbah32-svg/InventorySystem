@@ -487,18 +487,31 @@ export async function processItems(rows: Row[], ctx: StepContext) {
   })
 }
 
-/** جدول units بالشامل: باركودات إضافية لكل وحدة (num = ترتيب الوحدة 0..5) */
+/**
+ * جدول units بالشامل: باركودات كل وحدة — ShamelUnit = ترتيب الوحدة (0 الأولى، 1 الثانية...)، num = تسلسل الباركود
+ * داخل نفس الوحدة (للوحدة عدة باركودات). يُعاد تشغيلها بأمان: باركود موجود لنفس الوحدة لا يتكرر.
+ */
 export async function processItemBarcodes(rows: Row[], ctx: StepContext) {
   const items = await mapGet("item", rows.map((r) => text(r.code)))
   await eachRow(rows, ctx, (r) => `${text(r.code)} ${text(r.barcode)}`, async (r) => {
-    const productId = items.get(text(r.code))
+    const shamelCode = text(r.code)
+    const productId = items.get(shamelCode)
     const barcode = text(r.barcode)
-    if (!productId || !barcode) return "skipped"
-    const unitId = (await mapOne("item_unit", `${text(r.code)}|${num(r.pos)}`)) || (await mapOne("item_unit", `${text(r.code)}|0`))
-    const productUnit = unitId ? ((await sql`SELECT id FROM product_units WHERE product_id = ${productId} AND unit_id = ${unitId} LIMIT 1`)[0] as any) : null
-    if (!productUnit) return "skipped"
-    const taken = await sql`SELECT 1 FROM product_unit_barcodes WHERE TRIM(barcode) = ${barcode} LIMIT 1`
-    if (taken.length) return "skipped"
+    if (!barcode) return "skipped"
+    if (!productId) { ctx.warn(shamelCode, `الصنف غير موجود — لم يُضف الباركود ${barcode}`); return "skipped" }
+    const unitPos = num(r.unit_pos)
+    const unitId = await mapOne("item_unit", `${shamelCode}|${unitPos}`)
+    if (!unitId) { ctx.warn(shamelCode, `الوحدة ${unitPos + 1} غير معرّفة للصنف — لم يُضف الباركود ${barcode}`); return "skipped" }
+    const productUnit = (await sql`SELECT id FROM product_units WHERE product_id = ${productId} AND unit_id = ${unitId} LIMIT 1`)[0] as any
+    if (!productUnit) { ctx.warn(shamelCode, `الوحدة ${unitPos + 1} غير موجودة بالصنف — لم يُضف الباركود ${barcode}`); return "skipped" }
+    const owner = (await sql`
+      SELECT b.product_id, b.unit_id, p.product_code FROM product_unit_barcodes b LEFT JOIN products p ON p.id = b.product_id
+      WHERE TRIM(b.barcode) = ${barcode} LIMIT 1`)[0] as any
+    if (owner) {
+      if (Number(owner.product_id) === productId && Number(owner.unit_id) === Number(productUnit.id)) return "skipped"
+      ctx.warn(shamelCode, `الباركود ${barcode} مستخدم مسبقاً للصنف ${text(owner.product_code)} — لم يُكرَّر`)
+      return "skipped"
+    }
     await sql`INSERT INTO product_unit_barcodes (product_id, unit_id, barcode) VALUES (${productId}, ${Number(productUnit.id)}, ${barcode}) ON CONFLICT DO NOTHING`
     return "created"
   })

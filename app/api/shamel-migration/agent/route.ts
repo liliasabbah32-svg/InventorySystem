@@ -1,7 +1,8 @@
 import { type NextRequest, NextResponse } from "next/server"
 import sql, { isPortalTenantDb, withTenantDb } from "@/lib/database"
 import { parsePortalToken, sha256Hex } from "@/lib/customer-portal"
-import { StepContext, addStepProgress, ensureShamelMigrationTables, runFromRow, type MigrationRun } from "@/lib/shamel-migration/core"
+import { StepContext, addStepProgress, ensureShamelMigrationResetColumns, runFromRow, type MigrationRun } from "@/lib/shamel-migration/core"
+import { resetLookups } from "@/lib/shamel-migration/reset"
 import { findStep, stepsForRun } from "@/lib/shamel-migration/steps"
 import { enabledModulesForDb } from "@/lib/company-modules"
 
@@ -20,9 +21,9 @@ async function withRun<T>(request: NextRequest, fn: (run: MigrationRun) => Promi
   if (!parsed || !(await isPortalTenantDb(parsed.dbName))) throw new AgentError("رمز الترحيل غير صالح", 401)
   if (!(await enabledModulesForDb(parsed.dbName)).includes("data_migration")) throw new AgentError("وحدة ترحيل البيانات غير مفعّلة لهذه الشركة — تواصل مع إدارة النظام", 403)
   return withTenantDb(parsed.dbName, async () => {
-    await ensureShamelMigrationTables()
+    await ensureShamelMigrationResetColumns()
     const row = (await sql`
-      SELECT id, mode, voucher_types, from_date::text AS from_date, balance_date::text AS balance_date, branch_id, created_by, status
+      SELECT id, mode, voucher_types, from_date::text AS from_date, balance_date::text AS balance_date, branch_id, created_by, status, reset_lookups, reset_done
       FROM shamel_migration_runs
       WHERE token_hash = ${await sha256Hex(parsed.secret)} AND status IN ('pending', 'running') AND expires_at > NOW()
     `)[0]
@@ -69,6 +70,15 @@ export async function POST(request: NextRequest) {
       if (!step || !stepsForRun(run).some((item) => item.key === step.key)) throw new AgentError("خطوة غير معروفة")
       const rows = Array.isArray(body.rows) ? body.rows.filter((row: unknown) => row && typeof row === "object") : []
       const last = body.last === true
+      // حذف التعريفات المساعدة الحالية مرة واحدة قبل أول دفعة (حجز ذري: دفعتان متزامنتان لا تحذفان مرتين)
+      if (run.reset_lookups && !run.reset_done) {
+        const claimed = await sql`UPDATE shamel_migration_runs SET reset_done = true WHERE id = ${run.id} AND reset_done = false RETURNING id`
+        if (claimed.length) {
+          const resetCtx = new StepContext(run, "reset")
+          try { await resetLookups(resetCtx) } catch (error) { resetCtx.error("", error instanceof Error ? error.message : String(error)) }
+          await resetCtx.flush()
+        }
+      }
       const ctx = new StepContext(run, step.key)
       try {
         await step.process(rows, ctx, last)

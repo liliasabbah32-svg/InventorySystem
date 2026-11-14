@@ -17,6 +17,8 @@ export type MigrationRun = {
   branch_id: number
   created_by: string
   status: string
+  reset_lookups: boolean
+  reset_done: boolean
 }
 
 export async function ensureShamelMigrationTables() { return runSchemaOnce("lib/shamel-migration/core.ts#ensureShamelMigrationTables", async () => {
@@ -60,6 +62,13 @@ export async function ensureShamelMigrationTables() { return runSchemaOnce("lib/
     )
   `
   await sql`CREATE INDEX IF NOT EXISTS idx_shamel_migration_log_run ON shamel_migration_log(run_id, id DESC)`
+}) }
+
+// حذف التعريفات المساعدة قبل الترحيل (lib/shamel-migration/reset.ts) — مرة واحدة لكل تشغيل
+export async function ensureShamelMigrationResetColumns() { return runSchemaOnce("lib/shamel-migration/core.ts#resetColumns", async () => {
+  await ensureShamelMigrationTables()
+  await sql`ALTER TABLE shamel_migration_runs ADD COLUMN IF NOT EXISTS reset_lookups BOOLEAN NOT NULL DEFAULT false`
+  await sql`ALTER TABLE shamel_migration_runs ADD COLUMN IF NOT EXISTS reset_done BOOLEAN NOT NULL DEFAULT false`
 }) }
 
 // ---------- قيم الشامل ----------
@@ -207,4 +216,6 @@ export const runFromRow = (row: any): MigrationRun => ({
   branch_id: Number(row.branch_id),
   created_by: String(row.created_by),
   status: String(row.status),
+  reset_lookups: row.reset_lookups === true,
+  reset_done: row.reset_done === true,
 })

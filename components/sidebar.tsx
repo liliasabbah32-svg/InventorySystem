@@ -178,11 +178,11 @@ export const menuItems: MenuItem[] = [
         icon: Users,
         submenu: [
           { title: tr("المستودعات"), section: "warehouses", icon: Building },
-          { title: tr("الأصناف"), section: "products", icon: Package },
-          { title: tr("الخدمات"), section: "services", icon: Package },
           { title: tr("مجموعات الأصناف"), section: "product-groups", icon: Package },
           { title: tr("أنواع العلامات التجارية"), section: "brand-types", icon: Package },
           { title: tr("العلامات التجارية"), section: "brands", icon: Package },
+          { title: tr("الأصناف"), section: "products", icon: Package },
+          { title: tr("الخدمات"), section: "services", icon: Package },
         ],
       },
     ],

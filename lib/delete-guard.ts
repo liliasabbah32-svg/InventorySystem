@@ -136,6 +136,44 @@ export async function findUsages(id: number, rule: UsageRule): Promise<string[]>
   return [...found]
 }
 
+/**
+ * مثل findUsages لكن لعدة سجلات دفعة واحدة (استعلام لكل عمود مطابق بدل استعلام لكل عمود لكل سجل) — لحذف جماعي.
+ * textsById: النصوص (اسم/رمز) التي قد تُحفظ بدل المعرّف لكل سجل. يعيد المعرّف ⇐ أسماء الجداول المستخدمة له.
+ */
+export async function findUsedIds(ids: number[], rule: Omit<UsageRule, "textValues"> & { textsById?: Map<number, string[]> }): Promise<Map<number, string[]>> {
+  const used = new Map<number, Set<string>>()
+  if (!ids.length) return new Map()
+  const mark = (id: number, table: string) => { if (!used.has(id)) used.set(id, new Set()); used.get(id)!.add(label(table)) }
+  const idsByText = new Map<string, number[]>()
+  for (const [id, values] of rule.textsById || []) {
+    for (const value of values) {
+      const text = String(value ?? "").trim()
+      if (text) idsByText.set(text, [...(idsByText.get(text) || []), id])
+    }
+  }
+  const texts = [...idsByText.keys()]
+  const columns = await schemaColumns()
+  const exclude = new Set(rule.excludeTables || [])
+  const excludeCols = new Set(rule.excludeColumns || [])
+  for (const col of columns) {
+    const { table_name: table, column_name: column, data_type: type } = col
+    if (exclude.has(table) || IGNORED_TABLE.test(table) || excludeCols.has(`${table}.${column}`)) continue
+    if (!SAFE.test(table) || !SAFE.test(column)) continue
+    const numeric = ["integer", "smallint", "bigint", "numeric"].includes(type)
+    const textual = ["character varying", "text", "character"].includes(type)
+    try {
+      if (numeric && rule.idColumns?.test(column)) {
+        const rows = await sql.unsafe(`SELECT DISTINCT "${column}"::bigint AS v FROM "${table}" WHERE "${column}" = ANY($1::bigint[])${liveCondition(table, columns)}`, [ids])
+        for (const row of rows as any[]) mark(Number(row.v), table)
+      } else if (textual && texts.length && rule.textColumns?.test(column)) {
+        const rows = await sql.unsafe(`SELECT DISTINCT BTRIM("${column}") AS v FROM "${table}" WHERE BTRIM("${column}") = ANY($1::text[])${liveCondition(table, columns)}`, [texts])
+        for (const row of rows as any[]) for (const id of idsByText.get(String(row.v)) || []) mark(id, table)
+      }
+    } catch { /* جدول/عمود غير متوافق — يُتجاهل */ }
+  }
+  return new Map([...used].map(([id, tables]) => [id, [...tables]]))
+}
+
 /** أماكن استخدام حساب (account_tbl.id) — كل عمود ينتهي بـ account_id/…_account وما شابه. */
 export function findAccountUsages(accountId: number, excludeTables: string[] = []) {
   return findUsages(accountId, {

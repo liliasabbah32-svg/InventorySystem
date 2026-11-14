@@ -3,7 +3,7 @@ import sql, { resolveCurrentDbName } from "@/lib/database"
 import { authorizeUserAdmin } from "@/lib/user-admin-access"
 import { moduleDeniedResponse } from "@/lib/company-modules"
 import { newPortalSecret, portalToken, sha256Hex } from "@/lib/customer-portal"
-import { ensureShamelMigrationTables } from "@/lib/shamel-migration/core"
+import { ensureShamelMigrationResetColumns } from "@/lib/shamel-migration/core"
 import { SHAMEL_VOUCHER_TYPES, cleanVoucherTypes } from "@/lib/shamel-migration/vouchers"
 
 // شاشة «ترحيل من الشامل» (مسؤول النظام فقط): إنشاء رمز تشغيل لمعالج الترحيل، متابعة التقدم، وسجل الأخطاء.
@@ -14,7 +14,7 @@ export async function GET(request: NextRequest) {
   const denied = await moduleDeniedResponse("data_migration")
   if (denied) return denied
   try {
-    await ensureShamelMigrationTables()
+    await ensureShamelMigrationResetColumns()
     const runId = Number(request.nextUrl.searchParams.get("run_id") || 0)
     if (runId > 0) {
       const level = request.nextUrl.searchParams.get("level") || ""
@@ -35,7 +35,7 @@ export async function GET(request: NextRequest) {
         WHERE run_id = ${runId} AND (${level}::text = '' OR level = ${level}::text) AND (${step}::text = '' OR step = ${step}::text)`
       return NextResponse.json({ log, summary, total: Number((total as any)?.n || 0) })
     }
-    const runs = await sql`SELECT id, mode, voucher_types, from_date::text AS from_date, balance_date::text AS balance_date, status, current_step, progress, message, created_at, last_seen_at, finished_at, expires_at FROM shamel_migration_runs ORDER BY id DESC LIMIT 20`
+    const runs = await sql`SELECT id, mode, voucher_types, from_date::text AS from_date, balance_date::text AS balance_date, status, current_step, progress, message, created_at, last_seen_at, finished_at, expires_at, reset_lookups FROM shamel_migration_runs ORDER BY id DESC LIMIT 20`
     const counts = await sql`
       SELECT run_id, COUNT(*) FILTER (WHERE level = 'error')::int AS errors, COUNT(*) FILTER (WHERE level = 'warn')::int AS warnings
       FROM shamel_migration_log WHERE run_id = ANY(${runs.map((run: any) => Number(run.id))}::int[]) GROUP BY run_id`
@@ -56,7 +56,7 @@ export async function POST(request: NextRequest) {
   const denied = await moduleDeniedResponse("data_migration")
   if (denied) return denied
   try {
-    await ensureShamelMigrationTables()
+    await ensureShamelMigrationResetColumns()
     const body = await request.json().catch(() => ({}))
     const mode = body?.mode === "full" ? "full" : "definitions"
     const voucherTypes = mode === "full" ? cleanVoucherTypes(body?.voucher_types) : []
@@ -69,9 +69,9 @@ export async function POST(request: NextRequest) {
     await sql`UPDATE shamel_migration_runs SET status = 'cancelled', finished_at = NOW() WHERE status IN ('pending', 'running')`
     const secret = newPortalSecret()
     const [run] = await sql`
-      INSERT INTO shamel_migration_runs (token_hash, mode, voucher_types, balance_date, branch_id, created_by, expires_at)
-      VALUES (${await sha256Hex(secret)}, ${mode}, ${voucherTypes}::text[], ${balanceDate}, ${Number(branch.id)}, ${admin.userId}, NOW() + INTERVAL '3 days')
-      RETURNING id, mode, voucher_types, from_date::text AS from_date, balance_date::text AS balance_date, status, current_step, progress, message, created_at, last_seen_at, finished_at, expires_at`
+      INSERT INTO shamel_migration_runs (token_hash, mode, voucher_types, balance_date, branch_id, created_by, expires_at, reset_lookups)
+      VALUES (${await sha256Hex(secret)}, ${mode}, ${voucherTypes}::text[], ${balanceDate}, ${Number(branch.id)}, ${admin.userId}, NOW() + INTERVAL '3 days', ${body?.reset_lookups !== false})
+      RETURNING id, mode, voucher_types, from_date::text AS from_date, balance_date::text AS balance_date, status, current_step, progress, message, created_at, last_seen_at, finished_at, expires_at, reset_lookups`
     return NextResponse.json({ run, token: portalToken(await resolveCurrentDbName(), secret) }, { status: 201 })
   } catch (error) {
     console.error("shamel migration POST failed:", error)
@@ -84,7 +84,7 @@ export async function DELETE(request: NextRequest) {
   if (!admin.ok) return admin.response
   const denied = await moduleDeniedResponse("data_migration")
   if (denied) return denied
-  await ensureShamelMigrationTables()
+  await ensureShamelMigrationResetColumns()
   const id = Number(request.nextUrl.searchParams.get("id") || 0)
   await sql`UPDATE shamel_migration_runs SET status = 'cancelled', finished_at = NOW() WHERE id = ${id} AND status IN ('pending', 'running')`
   return NextResponse.json({ ok: true })

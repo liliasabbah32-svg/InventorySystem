@@ -143,7 +143,7 @@ const STEPS: MigrationStep[] = [
   },
   {
     key: "item_barcodes", title: "باركودات الوحدات", group: "definitions", batchSize: 1000,
-    sql: () => `select "Code" as code, "Barcode" as barcode, "num" as pos from "units" where ltrim("Barcode")<>''`,
+    sql: () => `select "Code" as code, "Barcode" as barcode, "ShamelUnit" as unit_pos, "num" as seq from "units" where ltrim("Barcode")<>'' order by "Code", "ShamelUnit", "num"`,
     process: (rows, ctx) => defs.processItemBarcodes(rows, ctx),
   },
   {
