@@ -1,3 +1,4 @@
+import { ensureVoucherIndexes } from "@/lib/voucher-indexes"
 import { type NextRequest, NextResponse } from "next/server"
 import { withVoucherAudit } from "@/lib/voucher-audit"
 import sql from "@/lib/database"
@@ -17,6 +18,7 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
   try {
     await ensureTables()
     const id = Number((await params).id)
+    await ensureVoucherIndexes()
     if (!id) {
       return NextResponse.json({ error: "معرف السند غير صالح" }, { status: 400 })
     }

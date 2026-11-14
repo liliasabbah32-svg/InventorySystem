@@ -1,3 +1,4 @@
+import { ensureVoucherIndexes } from "@/lib/voucher-indexes"
 import { type NextRequest, NextResponse } from "next/server"
 import sql, { isPortalTenantDb, withTenantDb } from "@/lib/database"
 import { parsePortalToken, sha256Hex } from "@/lib/customer-portal"
@@ -59,6 +60,8 @@ export async function POST(request: NextRequest) {
     if (!body || typeof body !== "object") throw new AgentError("طلب غير صالح")
     return await withRun(request, async (run) => {
       if (body.action === "finish") {
+        // بعد ترحيل آلاف السندات والأصناف: فهارس فتح السندات وكشوف الحسابات
+        await ensureVoucherIndexes().catch(() => undefined)
         const failed = body.status === "failed"
         await sql`
           UPDATE shamel_migration_runs SET status = ${failed ? "failed" : "done"}, message = ${String(body.message || "").slice(0, 2000) || null},

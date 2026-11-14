@@ -1378,9 +1378,9 @@ export default function UnifiedSalesDelivery({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [items, form.vat_percent, dialogOpen, itemsCollectionView, accountsCollectionView, itemVat.version, itemVat.enabled])
 
-  // تفاصيل كميات الصنف: يجلب current_stock الفعلي (product_stock) لكل صنف مختلف بالسند عبر
-  // /api/inventory/products?id=<id> — يُعاد الجلب فقط عند تغيّر مجموعة الأصناف المختارة فعلياً (لا
-  // كل تعديل كمية) لتفادي طلبات متكررة أثناء الكتابة.
+  // تفاصيل كميات الصنف: يجلب current_stock الفعلي (product_stock) لأصناف السند دفعة واحدة لكل 500 صنف عبر
+  // /api/inventory/products?ids=... (كان طلباً لكل صنف — مئات الطلبات لسند كبير) — يُعاد الجلب فقط عند تغيّر
+  // مجموعة الأصناف المختارة فعلياً (لا كل تعديل كمية) لتفادي طلبات متكررة أثناء الكتابة.
   const uniqueProductIds = useMemo(
     () => Array.from(new Set(items.filter((r) => r.product_id).map((r) => Number(r.product_id)))),
     [items],
@@ -1391,18 +1391,21 @@ export default function UnifiedSalesDelivery({
       return
     }
     let cancelled = false
+    const chunks: number[][] = []
+    for (let index = 0; index < uniqueProductIds.length; index += 500) chunks.push(uniqueProductIds.slice(index, index + 500))
     Promise.all(
-      uniqueProductIds.map((id) =>
-        fetch(`/api/inventory/products?id=${id}`)
-          .then((res) => (res.ok ? res.json() : null))
-          .then((data) => ({ id, stock: Number(data?.products?.[0]?.current_stock ?? data?.[0]?.current_stock ?? 0) }))
-          .catch(() => ({ id, stock: 0 })),
+      chunks.map((ids) =>
+        fetch(`/api/inventory/products?lite=1&activeOnly=false&ids=${ids.join(",")}`)
+          .then((res) => (res.ok ? res.json() : []))
+          .then((data) => (Array.isArray(data) ? data : Array.isArray(data?.products) ? data.products : []))
+          .catch(() => []),
       ),
     ).then((results) => {
       if (cancelled) return
       const map: Record<number, number> = {}
-      results.forEach((r) => {
-        map[r.id] = r.stock
+      uniqueProductIds.forEach((id) => { map[id] = 0 })
+      results.flat().forEach((product: any) => {
+        if (product?.id) map[Number(product.id)] = Number(product.current_stock ?? 0)
       })
       setStockByProductId(map)
     })

@@ -1,3 +1,4 @@
+import { ensureVoucherIndexes } from "@/lib/voucher-indexes"
 import { type NextRequest, NextResponse } from "next/server"
 import { withVoucherAudit } from "@/lib/voucher-audit"
 import sql from "@/lib/database"
@@ -9,6 +10,7 @@ import { workingPeriodErrorMessage } from "@/lib/working-period"
 
 export async function GET(request: NextRequest, { params }: { params: { id: string } }) {
   try {
+    await ensureVoucherIndexes()
     const id = Number(params.id)
     if (!id) {
       return NextResponse.json({ error: "معرف السند غير صالح" }, { status: 400 })

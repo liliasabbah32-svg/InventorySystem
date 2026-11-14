@@ -121,6 +121,8 @@ export async function voucherBookFor(userId: string, vchType: number): Promise<n
   return rows[0] ? Number((rows[0] as any).vch_book_id) : null
 }
 
+const STOCK_VOUCHER_MAX_LINES = 500
+
 export async function processStockBalances(rows: Row[], ctx: StepContext, last: boolean) {
   await stageRows(ctx.run.id, ctx.step, rows)
   ctx.stats.received += rows.length
@@ -161,6 +163,9 @@ export async function processStockBalances(rows: Row[], ctx: StepContext, last: 
         lines = fresh
       }
       if (!lines.length) continue
+      // سند لكل 500 سطر: سند واحد بآلاف الأسطر (كل أصناف المستودع) بطيء الفتح والطباعة
+      for (let start = 0; start < lines.length; start += STOCK_VOUCHER_MAX_LINES) {
+      const chunk = lines.slice(start, start + STOCK_VOUCHER_MAX_LINES)
       try {
         const bookId = await voucherBookFor(ctx.run.created_by, vchType)
         if (!bookId) throw new Error(`لا يوجد دفتر سندات لـ ${direction === "in" ? "سند ادخال بضاعة" : "سند اخراج بضاعة"} — عرّفه من صلاحيات دفاتر السندات`)
@@ -168,21 +173,22 @@ export async function processStockBalances(rows: Row[], ctx: StepContext, last: 
           await sql`SELECT pg_advisory_xact_lock(hashtext(${`stock-voucher-number:${vchType}`}))`
           const vchCode = await regenerateVoucherCode("", vchType, bookId, ctx.run.branch_id)
           if (!vchCode) throw new Error("تعذر توليد رقم السند")
-          const amount = lines.reduce((sum, line) => sum + line.quantity * line.price, 0)
+          const amount = chunk.reduce((sum, line) => sum + line.quantity * line.price, 0)
           const voucher = { id: await insertRow("voucher_header_tbl", {
             vch_type: vchType, vch_code: vchCode, vch_date: ctx.run.balance_date, vch_book_id: bookId, branch_id: ctx.run.branch_id, currency_id: 1, rate: 1,
             to_store_id: direction === "in" ? storeId : null, from_store_id: direction === "out" ? storeId : null,
             amount: Math.round(amount * 1000) / 1000, manual_voucher: "SHAMEL", note: "كميات أول المدة - ترحيل من الشامل", status: 2, vch_status: 2, is_printed: 0,
           }) }
-          const saved = await saveVoucherItems(Number(voucher.id), lines)
+          const saved = await saveVoucherItems(Number(voucher.id), chunk)
           await applyVoucherStockEffect(vchType, Number(voucher.id), saved, direction === "out" ? storeId : null, direction === "in" ? storeId : null)
           await markPosted(`${postedPrefix}:${voucher.id}`, Number(voucher.id))
           return vchCode
         }))
         codes.push(code)
-        ctx.stats.created += lines.length
+        ctx.stats.created += chunk.length
       } catch (error) {
-        for (const line of lines) ctx.error(line.note, error instanceof Error ? error.message : String(error))
+        for (const line of chunk) ctx.error(line.note, error instanceof Error ? error.message : String(error))
+      }
       }
     }
   }
